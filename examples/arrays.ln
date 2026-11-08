@@ -1,0 +1,74 @@
+// Dull is a trait that states that the type is not a pointer and does not
+// contain any, meaning it can be an item type of an array or slice.
+fn len_squared::<T: Dull>(slice: [T; &]): usize {
+    let len: usize = slice.len();
+    return std::math::pow(len, 2);
+}
+
+test fn len_squared_returns_zero_on_empty_slice() {
+    let empty_array: [u8; _] = [];
+    std::test::assert_eq(len_squared(empty_array[..]), 0, "len_squared does not return 0 on an empty slice")
+}
+
+test fn len_squared_returns_4_on_2_length_slice() {
+    let array: [u8; 2] = [1, 2];
+    std::test::assert_eq(len_squared(array[..]), 4, "len_squared does not return 4 on a 2-length slice")
+}
+
+// This does not compile:
+// err(type::array_pointy_items): Arrays and slices must have an item type that
+// is not pointy.
+// help: add Dull to T's bounds: `T: Dull`
+fn len_squared_erroring::<T>(slice: [T; &]): usize {
+    let len: usize = slice.len();
+    return std::math::pow(len, 2);
+}
+
+fn main() {
+    let mut fixed: [i32; 4] = [1, 2, 3, 4];
+    let mut fixed_zeroed: [f64; 8] = [0.; 8];
+    let inferred: [u8; _] = [4, 2, 0];
+
+    let mut finished: [f32] = [4., 1., 2., 0.];
+    let mut arena: [i64; ..+] = [];
+    let mut stack: [i64; -..+] = [];
+
+    fixed[1] = 3;
+    fixed_zeroed[4] = 1.; // not so zeroed now
+    
+    std::io::println("second element of inferred is {inferred[1]}")
+
+    finished[2] = 2.;
+
+    for i in 0..200 {
+        arena.push(i);
+    }
+
+    let slice: [i64; &] = arena[2..6];
+
+    std::io::println("fourth element of arena is {slice[1]}");
+
+    arena.push(201);
+
+    std::io::println("fourth element of arena is STILL {slice[1]}");
+
+    for i in 0..1000 {
+        stack.push(i);
+    }
+
+    let shrinkable_slice: [i64; &] = stack[5..20];
+
+    std::io::println("ninth element of stack is {shrinkable_slice[3]}");
+    // shrinkable_slice dies here
+
+    // valid since no refs remain
+    stack.pop();
+    stack.pop();
+    stack.pop();
+    stack.pop();
+
+    // new ref into resized stack
+    let another_shrinkable_slice: [i64; &] = stack[5..20];
+
+    std::io::println("new ninth element of stack is {another_shrinkable_slice[3]}");
+}
