@@ -94,7 +94,6 @@ pub struct FnDecl {
     pub ret: Option<Ty>,
     pub body: Option<Block>,
     pub is_unsafe: bool,
-    pub is_test: bool,
     /// C-style variadic (`...` as the last parameter); extern fns only.
     pub variadic: bool,
     /// Span of the signature (name through return type).

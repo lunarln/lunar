@@ -172,8 +172,6 @@ pub enum Token {
     Struct,
     #[token("super")]
     Super,
-    #[token("test")]
-    Test,
     #[token("trait")]
     Trait,
     #[token("true")]
@@ -396,7 +394,6 @@ impl Token {
             Static => "`static`",
             Struct => "`struct`",
             Super => "`super`",
-            Test => "`test`",
             Trait => "`trait`",
             True => "`true`",
             Type => "`type`",

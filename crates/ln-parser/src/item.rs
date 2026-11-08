@@ -8,7 +8,7 @@ use ln_parse_kit::{Expected, Fatal, PResult};
 
 /// Tokens that can begin an item (used for recovery and statement dispatch).
 pub(crate) const ITEM_START: &[T] =
-    &[T::Fn, T::Struct, T::Enum, T::Trait, T::Impl, T::Use, T::Mod, T::Const, T::Static, T::Extern, T::Type, T::Pub, T::Hash, T::Test];
+    &[T::Fn, T::Struct, T::Enum, T::Trait, T::Impl, T::Use, T::Mod, T::Const, T::Static, T::Extern, T::Type, T::Pub, T::Hash];
 
 impl P<'_, '_, '_> {
     pub(crate) fn items_until_eof(&mut self) -> Vec<Item> {
@@ -60,8 +60,7 @@ impl P<'_, '_, '_> {
     pub(crate) fn at_item_start(&mut self) -> bool {
         match self.k.peek() {
             Some(T::Unsafe) => self.k.nth_at(1, T::Fn),
-            Some(T::Test) => self.k.nth_at(1, T::Fn),
-            Some(t) => ITEM_START.contains(&t) && t != T::Test,
+            Some(t) => ITEM_START.contains(&t),
             None => false,
         }
     }
@@ -80,7 +79,7 @@ impl P<'_, '_, '_> {
     }
 
     fn meta_name(&mut self) -> PResult<Ident> {
-        // Attribute names may be keywords such as `test` or `unsafe`.
+        // Attribute names may be keywords such as `unsafe`.
         let t = match self.k.current() {
             Some(t) if t.kind == T::Ident || self.tok_text(t).chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => t,
             _ => return Err(self.k.error_expected_named("attribute name")),
@@ -94,14 +93,10 @@ impl P<'_, '_, '_> {
         let attrs = self.attrs()?;
         let is_pub = self.k.eat(T::Pub);
         let kind = match self.k.peek() {
-            Some(T::Fn) => ItemKind::Fn(self.fn_decl(false, false)?),
+            Some(T::Fn) => ItemKind::Fn(self.fn_decl(false)?),
             Some(T::Unsafe) if self.k.nth_at(1, T::Fn) => {
                 self.k.bump();
-                ItemKind::Fn(self.fn_decl(true, false)?)
-            }
-            Some(T::Test) if self.k.nth_at(1, T::Fn) => {
-                self.k.bump();
-                ItemKind::Fn(self.fn_decl(false, true)?)
+                ItemKind::Fn(self.fn_decl(true)?)
             }
             Some(T::Struct) => ItemKind::Struct(self.struct_decl()?),
             Some(T::Enum) => ItemKind::Enum(self.enum_decl()?),
@@ -205,7 +200,7 @@ impl P<'_, '_, '_> {
         Ok(out)
     }
 
-    fn fn_decl(&mut self, is_unsafe: bool, is_test: bool) -> PResult<FnDecl> {
+    fn fn_decl(&mut self, is_unsafe: bool) -> PResult<FnDecl> {
         let sig_start = self.start();
         self.k.expect(T::Fn)?;
         let name = self.ident()?;
@@ -234,7 +229,7 @@ impl P<'_, '_, '_> {
         let ret = if self.k.eat(T::Colon) { Some(self.ret_ty()?) } else { None };
         let sig_span = self.span_from(sig_start);
         let body = if self.k.eat(T::Semi) { None } else { Some(self.block()?) };
-        Ok(FnDecl { name, generics, params, ret, body, is_unsafe, is_test, variadic, sig_span })
+        Ok(FnDecl { name, generics, params, ret, body, is_unsafe, variadic, sig_span })
     }
 
     fn param(&mut self) -> PResult<Param> {
@@ -396,7 +391,7 @@ impl P<'_, '_, '_> {
     /// An identifier or one of the path keywords (`crate`, `self`, `super`, `Self`).
     pub(crate) fn path_segment_ident(&mut self) -> PResult<Ident> {
         match self.k.peek() {
-            Some(t) if t == T::Ident || t == T::Test || t.is_path_keyword() => {
+            Some(t) if t == T::Ident || t.is_path_keyword() => {
                 let tok = self.k.bump();
                 Ok(Ident::new(self.tok_text(tok), self.tok_span(tok)))
             }

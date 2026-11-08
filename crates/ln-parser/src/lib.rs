@@ -180,11 +180,6 @@ impl<'s, 't, 'i> P<'s, 't, 'i> {
     }
 
     pub(crate) fn ident(&mut self) -> PResult<Ident> {
-        // `test` is contextual: a keyword only directly before `fn`.
-        if self.k.nth_at(0, Token::Test) {
-            let t = self.k.bump();
-            return Ok(Ident::new(self.tok_text(t), self.tok_span(t)));
-        }
         let t = self.k.expect(Token::Ident)?;
         Ok(Ident::new(self.tok_text(t), self.tok_span(t)))
     }

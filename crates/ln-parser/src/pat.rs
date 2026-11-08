@@ -81,7 +81,7 @@ impl P<'_, '_, '_> {
                 }
                 PatKind::Tuple(pats)
             }
-            Some(T::Ident | T::Test | T::SelfType | T::Crate | T::Super) => {
+            Some(T::Ident | T::SelfType | T::Crate | T::Super) => {
                 let path = self.path_ty_style()?;
                 if self.k.at(T::LParen) {
                     self.k.bump();
