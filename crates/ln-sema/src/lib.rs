@@ -1,0 +1,209 @@
+//! Semantic analysis for Lunar: name resolution, type checking, traits, the
+//! `Dull` auto trait, unsafe checking, and move/borrow checking. Produces a
+//! typed IR ([`thir`]) for code generation.
+
+pub mod borrowck;
+mod collect;
+pub mod defs;
+pub mod loader;
+mod lower;
+mod resolve;
+pub mod thir;
+pub mod traits;
+pub mod ty;
+mod typeck;
+
+use defs::*;
+use ln_ast as ast;
+use ln_diag::{Diagnostic, Diagnostics};
+use loader::CrateSource;
+use std::collections::HashMap;
+use ty::Ty;
+
+/// Compilation target information used by `#[cfg(...)]`.
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// `windows`, `linux`, `macos`, ...
+    pub target_os: String,
+    /// `windows` or `unix`.
+    pub target_family: String,
+    /// `x86_64`, `aarch64`, ...
+    pub target_arch: String,
+    /// Building the test harness (`lunar test`).
+    pub test: bool,
+}
+
+impl Options {
+    pub fn host(test: bool) -> Self {
+        let os = std::env::consts::OS.to_string();
+        let family = if cfg!(windows) { "windows" } else { "unix" }.to_string();
+        Self { target_os: os, target_family: family, target_arch: std::env::consts::ARCH.to_string(), test }
+    }
+}
+
+/// The analyzed program handed to code generation.
+#[derive(Debug, Default)]
+pub struct Program {
+    pub defs: Vec<DefInfo>,
+    pub bodies: HashMap<DefId, thir::Body>,
+    /// Lang items (`#[lang = "..."]`) by name.
+    pub lang: HashMap<String, DefId>,
+    pub crate_roots: Vec<(String, DefId)>,
+    pub impls: Vec<DefId>,
+    pub main: Option<DefId>,
+    pub tests: Vec<DefId>,
+}
+
+impl Program {
+    pub fn def(&self, id: DefId) -> &DefInfo {
+        &self.defs[id.0 as usize]
+    }
+
+    pub fn fn_data(&self, id: DefId) -> &FnData {
+        match &self.def(id).data {
+            DefData::Fn(f) => f,
+            _ => panic!("not a fn: {}", self.def(id).name),
+        }
+    }
+
+    pub fn adt(&self, id: DefId) -> &AdtData {
+        match &self.def(id).data {
+            DefData::Adt(a) => a,
+            _ => panic!("not an adt: {}", self.def(id).name),
+        }
+    }
+
+    pub fn trait_data(&self, id: DefId) -> &TraitData {
+        match &self.def(id).data {
+            DefData::Trait(t) => t,
+            _ => panic!("not a trait"),
+        }
+    }
+
+    pub fn impl_data(&self, id: DefId) -> &ImplData {
+        match &self.def(id).data {
+            DefData::Impl(i) => i,
+            _ => panic!("not an impl"),
+        }
+    }
+
+    pub fn lang_item(&self, name: &str) -> Option<DefId> {
+        self.lang.get(name).copied()
+    }
+
+    /// Fully qualified display path of an item, e.g. `std::io::println`.
+    pub fn path_of(&self, id: DefId) -> String {
+        let d = self.def(id);
+        match d.kind {
+            DefKind::Mod => {
+                let DefData::Mod(md) = &d.data else { unreachable!() };
+                match md.parent {
+                    Some(p) if md.is_block => self.path_of(p),
+                    Some(p) => format!("{}::{}", self.path_of(p), d.name),
+                    None => d.name.clone(),
+                }
+            }
+            DefKind::Variant => format!("{}::{}", self.path_of(d.parent.unwrap()), d.name),
+            DefKind::Fn if d.parent.is_some() => {
+                let parent = d.parent.unwrap();
+                match self.def(parent).kind {
+                    DefKind::Impl => {
+                        let i = self.impl_data(parent);
+                        format!("{}::{}", self.ty_str(&i.self_ty), d.name)
+                    }
+                    _ => format!("{}::{}", self.path_of(parent), d.name),
+                }
+            }
+            _ => format!("{}::{}", self.path_of(d.module), d.name),
+        }
+    }
+
+    pub fn ty_str(&self, t: &Ty) -> String {
+        let names = |id: DefId| self.def(id).name.clone();
+        ty::TyDisplay { ty: t, names: &names }.to_string()
+    }
+
+    pub fn is_enum(&self, id: DefId) -> bool {
+        self.def(id).kind == DefKind::Enum
+    }
+}
+
+/// AST node backing a definition (only during analysis).
+#[derive(Clone, Copy)]
+pub(crate) enum AstRef<'a> {
+    None,
+    /// The bool marks functions declared in `extern` blocks.
+    Fn(&'a ast::FnDecl, bool),
+    Struct(&'a ast::StructDecl),
+    Enum(&'a ast::EnumDecl),
+    Variant(&'a ast::VariantDecl),
+    Trait(&'a ast::TraitDecl),
+    Impl(&'a ast::ImplDecl),
+    Const(&'a ast::ConstDecl),
+    Static(&'a ast::StaticDecl),
+    Alias(&'a ast::TypeAlias),
+}
+
+pub(crate) struct Sema<'a> {
+    pub(crate) p: Program,
+    pub(crate) asts: Vec<AstRef<'a>>,
+    pub(crate) diags: Diagnostics,
+    pub(crate) opts: Options,
+    pub(crate) pending_uses: Vec<(DefId, &'a ast::UseTree, bool)>,
+    pub(crate) impl_items: HashMap<DefId, Vec<DefId>>,
+    pub(crate) block_scopes: HashMap<ast::NodeId, DefId>,
+    pub(crate) prelude: Option<DefId>,
+    /// Array element / `!` checks deferred until all ADT fields are known.
+    pub(crate) deferred: Vec<lower::Deferred>,
+    pub(crate) alias_stack: Vec<DefId>,
+}
+
+impl<'a> Sema<'a> {
+    pub(crate) fn err(&mut self, d: Diagnostic) {
+        self.diags.push(d);
+    }
+}
+
+/// Analyze a set of crates. The first crate is the user's; `core` and `std`
+/// must be among them. Returns the program (if there were no errors) and all
+/// diagnostics.
+pub fn analyze(crates: &[CrateSource], opts: Options) -> (Option<Program>, Vec<Diagnostic>) {
+    let mut s = Sema {
+        p: Program::default(),
+        asts: Vec::new(),
+        diags: Diagnostics::new(),
+        opts,
+        pending_uses: Vec::new(),
+        impl_items: HashMap::new(),
+        block_scopes: HashMap::new(),
+        prelude: None,
+        deferred: Vec::new(),
+        alias_stack: Vec::new(),
+    };
+    let mut user_root = None;
+    for (i, c) in crates.iter().enumerate() {
+        let root = s.collect_crate(c);
+        if i == 0 {
+            user_root = Some(root);
+        }
+    }
+    if let Some((_, core)) = s.p.crate_roots.iter().find(|(n, _)| n == "core").cloned()
+        && let Some(b) = s.lookup_in(core, "prelude", Ns::Type)
+    {
+        s.prelude = Some(b.def);
+    }
+    s.resolve_imports();
+    s.lower_all();
+    if let Some(root) = user_root
+        && let Some(b) = s.lookup_in(root, "main", Ns::Value)
+        && s.p.def(b.def).kind == DefKind::Fn
+    {
+        s.p.main = Some(b.def);
+    }
+    if !s.diags.has_errors() {
+        s.check_bodies();
+    }
+    let diags = s.diags.into_vec();
+    let ok = !diags.iter().any(|d| d.is_error());
+    (ok.then_some(s.p), diags)
+}
