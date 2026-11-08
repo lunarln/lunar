@@ -1,0 +1,245 @@
+//! Literal decoding: numbers, escapes, and format-string pieces.
+
+use crate::{IdGen, parse_expr_at};
+use ln_ast::{FmtPiece, FmtString, Span};
+use ln_diag::FileId;
+
+const INT_SUFFIXES: &[&str] = &["i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize"];
+const FLOAT_SUFFIXES: &[&str] = &["f32", "f64"];
+
+/// Split a numeric literal into its digits and an optional type suffix.
+fn split_suffix(text: &str, radix_prefixed: bool) -> (&str, Option<&str>) {
+    for s in INT_SUFFIXES.iter().chain(FLOAT_SUFFIXES) {
+        if let Some(body) = text.strip_suffix(s) {
+            // `0xff` must not lose an `f`-suffix-looking tail.
+            if radix_prefixed && s.starts_with('f') {
+                continue;
+            }
+            if !body.is_empty() {
+                return (body, Some(s));
+            }
+        }
+    }
+    (text, None)
+}
+
+/// Parse an integer literal. Returns the value and suffix, or an error message.
+pub fn parse_int_lit(text: &str) -> Result<(u128, Option<String>), String> {
+    let (radix, digits_start) = match text.get(..2) {
+        Some("0x") => (16, 2),
+        Some("0o") => (8, 2),
+        Some("0b") => (2, 2),
+        _ => (10, 0),
+    };
+    let (body, suffix) = split_suffix(&text[digits_start..], radix != 10);
+    if let Some(s) = suffix
+        && FLOAT_SUFFIXES.contains(&s)
+    {
+        return Err(format!("float suffix `{s}` on an integer literal"));
+    }
+    let cleaned: String = body.chars().filter(|&c| c != '_').collect();
+    if cleaned.is_empty() {
+        return Err("integer literal has no digits".into());
+    }
+    let rest_has_letters = cleaned.chars().any(|c| !c.is_digit(radix));
+    if rest_has_letters {
+        return Err(format!("invalid digit or suffix in `{text}`"));
+    }
+    u128::from_str_radix(&cleaned, radix)
+        .map(|v| (v, suffix.map(str::to_string)))
+        .map_err(|_| "integer literal is too large".into())
+}
+
+pub fn parse_float_lit(text: &str) -> Result<(f64, Option<String>), String> {
+    let (body, suffix) = split_suffix(text, false);
+    if let Some(s) = suffix
+        && INT_SUFFIXES.contains(&s)
+    {
+        return Err(format!("integer suffix `{s}` on a float literal"));
+    }
+    let cleaned: String = body.chars().filter(|&c| c != '_').collect();
+    cleaned.parse::<f64>().map(|v| (v, suffix.map(str::to_string))).map_err(|_| format!("invalid float literal `{text}`"))
+}
+
+/// Unescape the body of a string/char literal (without quotes). On error
+/// returns the byte offset (within `raw`) and message.
+pub(crate) fn unescape(raw: &str) -> Result<String, (usize, usize, String)> {
+    let mut out = String::with_capacity(raw.len());
+    let mut it = raw.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some((_, e)) = it.next() else {
+            return Err((i, i + 1, "trailing backslash".into()));
+        };
+        match e {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            '0' => out.push('\0'),
+            '\\' => out.push('\\'),
+            '"' => out.push('"'),
+            '\'' => out.push('\''),
+            '\n' => {
+                // Line continuation: skip leading whitespace on the next line.
+                while let Some(&(_, w)) = it.peek() {
+                    if w.is_whitespace() {
+                        it.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            'x' => {
+                let h: String = (0..2).filter_map(|_| it.next().map(|(_, c)| c)).collect();
+                match u8::from_str_radix(&h, 16) {
+                    Ok(b) if b < 0x80 => out.push(b as char),
+                    _ => return Err((i, i + 4, "`\\x` escapes must be two hex digits below 0x80".into())),
+                }
+            }
+            'u' => {
+                if it.next().map(|x| x.1) != Some('{') {
+                    return Err((i, i + 2, "expected `{` after `\\u`".into()));
+                }
+                let mut h = String::new();
+                let mut end = i + 3;
+                for (j, c) in it.by_ref() {
+                    end = j + 1;
+                    if c == '}' {
+                        break;
+                    }
+                    h.push(c);
+                }
+                match u32::from_str_radix(&h, 16).ok().and_then(char::from_u32) {
+                    Some(ch) => out.push(ch),
+                    None => return Err((i, end, format!("invalid unicode escape `\\u{{{h}}}`"))),
+                }
+            }
+            other => return Err((i, i + 1 + other.len_utf8(), format!("unknown escape `\\{other}`"))),
+        }
+    }
+    Ok(out)
+}
+
+/// Interpret a string literal body (`raw`, between the quotes, starting at
+/// byte `offset` of `file`) as a format string: `{expr}` holes, `{{`/`}}`
+/// escapes.
+pub(crate) fn parse_format(raw: &str, offset: u32, file: FileId, ids: &mut IdGen) -> FmtString {
+    let mut pieces = Vec::new();
+    let mut text_start = 0;
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    let mut text = String::new();
+    let span_at = |a: usize, b: usize| Span::new(file, offset + a as u32, offset + b as u32);
+
+    let flush_text = |text: &mut String, seg: &str, start: usize| -> Result<(), FmtString> {
+        match unescape(seg) {
+            Ok(s) => {
+                text.push_str(&s);
+                Ok(())
+            }
+            Err((a, b, m)) => Err(FmtString::Err(m, span_at(start + a, start + b))),
+        }
+    };
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                // Skip the escaped character so `\{` is not seen as a hole.
+                i += 2;
+            }
+            b'{' if bytes.get(i + 1) == Some(&b'{') => {
+                if let Err(e) = flush_text(&mut text, &raw[text_start..i], text_start) {
+                    return e;
+                }
+                text.push('{');
+                i += 2;
+                text_start = i;
+            }
+            b'}' if bytes.get(i + 1) == Some(&b'}') => {
+                if let Err(e) = flush_text(&mut text, &raw[text_start..i], text_start) {
+                    return e;
+                }
+                text.push('}');
+                i += 2;
+                text_start = i;
+            }
+            b'}' => return FmtString::Err("unmatched `}` in format string (use `}}` for a literal brace)".into(), span_at(i, i + 1)),
+            b'{' => {
+                if let Err(e) = flush_text(&mut text, &raw[text_start..i], text_start) {
+                    return e;
+                }
+                if !text.is_empty() {
+                    pieces.push(FmtPiece::Text(std::mem::take(&mut text)));
+                }
+                // Find the matching close brace, honouring nesting and strings.
+                let open = i;
+                let mut depth = 1;
+                let mut j = i + 1;
+                let mut in_str = false;
+                while j < bytes.len() && depth > 0 {
+                    match bytes[j] {
+                        b'\\' if in_str => j += 1,
+                        b'"' => in_str = !in_str,
+                        b'{' if !in_str => depth += 1,
+                        b'}' if !in_str => depth -= 1,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if depth != 0 {
+                    return FmtString::Err("unclosed `{` in format string (use `{{` for a literal brace)".into(), span_at(open, open + 1));
+                }
+                let inner = &raw[open + 1..j - 1];
+                if inner.trim().is_empty() {
+                    return FmtString::Err("empty `{}` in format string: put an expression inside, e.g. `{x}`".into(), span_at(open, j));
+                }
+                match parse_expr_at(inner, offset + open as u32 + 1, file, ids) {
+                    Ok(e) => pieces.push(FmtPiece::Expr(Box::new(e))),
+                    Err(diags) => {
+                        let msg = diags.first().map(|d| d.message.clone()).unwrap_or_default();
+                        return FmtString::Err(format!("invalid expression in format string: {msg}"), span_at(open, j));
+                    }
+                }
+                i = j;
+                text_start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if let Err(e) = flush_text(&mut text, &raw[text_start.min(raw.len())..], text_start) {
+        return e;
+    }
+    if !text.is_empty() {
+        pieces.push(FmtPiece::Text(text));
+    }
+    FmtString::Ok(pieces)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ints() {
+        assert_eq!(parse_int_lit("1_000").unwrap(), (1000, None));
+        assert_eq!(parse_int_lit("0xffu8").unwrap(), (255, Some("u8".into())));
+        assert_eq!(parse_int_lit("0b101").unwrap(), (5, None));
+        assert!(parse_int_lit("12abc").is_err());
+    }
+
+    #[test]
+    fn floats() {
+        assert_eq!(parse_float_lit("0.").unwrap(), (0.0, None));
+        assert_eq!(parse_float_lit("1.5f32").unwrap(), (1.5, Some("f32".into())));
+        assert_eq!(parse_float_lit("2e3").unwrap(), (2000.0, None));
+    }
+
+    #[test]
+    fn escapes() {
+        assert_eq!(unescape(r"a\nb\u{41}\x41").unwrap(), "a\nbAA");
+        assert!(unescape(r"\q").is_err());
+    }
+}

@@ -1,0 +1,12 @@
+[package]
+name = "ln-parser"
+description = "Parser for the Lunar programming language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ln-ast.workspace = true
+ln-diag.workspace = true
+ln-lexer.workspace = true
+ln-parse-kit.workspace = true
