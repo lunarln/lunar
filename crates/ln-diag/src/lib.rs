@@ -3,11 +3,11 @@
 //! Every error the compiler reports carries a *scoped* code such as
 //! `type::array_pointy_items`, rendered as `err(type::array_pointy_items): ...`.
 
-mod codes;
+pub mod codes;
 mod render;
 mod source;
 
-pub use codes::*;
+pub use codes::{ALL_CODES, ty};
 pub use render::{render, render_to_string};
 pub use source::{FileId, SourceFile, SourceMap, Span};
 

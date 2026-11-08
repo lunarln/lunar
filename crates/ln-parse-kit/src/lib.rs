@@ -117,6 +117,11 @@ impl<'t, K: Copy + Eq + Debug> Parser<'t, K> {
         self.pos.checked_sub(1).and_then(|i| self.toks.get(i)).copied()
     }
 
+    /// Index of the current token (for progress checks).
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
     pub fn at_eof(&self) -> bool {
         self.pos >= self.toks.len()
     }
