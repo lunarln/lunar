@@ -15,15 +15,6 @@ test fn len_squared_returns_4_on_2_length_slice() {
     std::test::assert_eq(len_squared(array[..]), 4, "len_squared does not return 4 on a 2-length slice")
 }
 
-// This does not compile:
-// err(type::array_pointy_items): Arrays and slices must have an item type that
-// is not pointy.
-// help: add Dull to T's bounds: `T: Dull`
-fn len_squared_erroring::<T>(slice: [T; &]): usize {
-    let len: usize = slice.len();
-    return std::math::pow(len, 2);
-}
-
 fn main() {
     let mut fixed: [i32; 4] = [1, 2, 3, 4];
     let mut fixed_zeroed: [f64; 8] = [0.; 8];
@@ -36,7 +27,7 @@ fn main() {
     fixed[1] = 3;
     fixed_zeroed[4] = 1.; // not so zeroed now
     
-    std::io::println("second element of inferred is {inferred[1]}")
+    std::io::println("second element of inferred is {inferred[1]}");
 
     finished[2] = 2.;
 
