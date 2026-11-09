@@ -67,6 +67,7 @@ codes! {
         BAD_FORMAT = "bad_format",
         MISSING_SEMI = "missing_semi",
         BAD_ATTRIBUTE = "bad_attribute",
+        CONFLICT_MARKER = "conflict_marker",
     }
     name ("name") => {
         UNRESOLVED = "unresolved",

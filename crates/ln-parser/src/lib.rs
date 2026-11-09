@@ -40,6 +40,12 @@ impl IdGen {
 
 /// Parse a complete source file.
 pub fn parse_file(src: &str, file: FileId, ids: &mut IdGen) -> (File, Vec<Diagnostic>) {
+    // A half-merged file would only produce a cascade of syntax errors.
+    let conflicts = ln_lexer::conflict_markers(src);
+    if !conflicts.is_empty() {
+        let diags = conflicts.iter().map(|c| conflict_diag(src, file, c)).collect();
+        return (File { items: Vec::new(), span: Span::new(file, 0, src.len() as u32) }, diags);
+    }
     let (toks, diags) = lex_with_offset(src, 0, file);
     let mut p = P::new(src, 0, &toks, file, ids, src.len() as u32);
     p.diags = diags;
@@ -66,6 +72,43 @@ pub(crate) fn parse_expr_at(src: &str, offset: u32, file: FileId, ids: &mut IdGe
     }
 }
 
+/// `err(syntax::conflict_marker)` for one conflict region.
+fn conflict_diag(src: &str, file: FileId, c: &ln_lexer::Conflict) -> Diagnostic {
+    let span = |r: &std::ops::Range<usize>| Span::new(file, r.start as u32, (r.start + 7).min(r.end) as u32);
+    // The text after the marker names the side, e.g. `HEAD` or a branch.
+    let side = |r: &std::ops::Range<usize>| {
+        let t = src[r.start + 7.min(r.len())..r.end].trim();
+        if t.is_empty() { String::new() } else { format!(" (`{t}`)") }
+    };
+    let kind = &src[c.start.start..c.start.start + 1];
+    if kind != "<" {
+        return Diagnostic::error(syntax::CONFLICT_MARKER, span(&c.start), "encountered a version control conflict marker")
+            .with_label("conflict marker without a matching `<<<<<<<`")
+            .with_help("finish resolving the conflict, then delete every line that holds a conflict marker");
+    }
+    let mut d = Diagnostic::error(syntax::CONFLICT_MARKER, span(&c.start), "encountered a version control conflict marker");
+    let ours = side(&c.start);
+    match (&c.base, &c.mid) {
+        (Some(_), _) => d = d.with_label(format!("between this marker and `|||||||` is our code{ours}")),
+        (None, Some(_)) => d = d.with_label(format!("between this marker and `=======` is our code{ours}")),
+        (None, None) => d = d.with_label(format!("conflict region starts here{ours}, with no `=======` or `>>>>>>>` after it")),
+    }
+    if let Some(b) = &c.base {
+        d = d.with_secondary(span(b), format!("between this marker and `=======` is the original code both sides changed{}", side(b)));
+    }
+    if let Some(m) = &c.mid {
+        let theirs = c.end.as_ref().map(side).unwrap_or_default();
+        d = d.with_secondary(span(m), format!("between this marker and `>>>>>>>` is the incoming code{theirs}"));
+    }
+    if let Some(e) = &c.end {
+        d = d.with_secondary(span(e), "this marker concludes the conflict region");
+    }
+    d.with_note("conflict markers indicate that a merge was started but could not be completed due to merge conflicts")
+        .with_note("if you are in a merge, the top section is the code you already had checked out and the bottom section is the new code")
+        .with_note("if you are in a rebase, the top section is the code being rebased onto and the bottom section is the code you had checked out which is being rebased")
+        .with_help("keep the code you want from each section, then delete the lines that hold conflict markers")
+}
+
 fn lex_with_offset(src: &str, offset: u32, file: FileId) -> (Vec<Tok<Token>>, Vec<Diagnostic>) {
     let (toks, errs) = ln_lexer::lex(src);
     let toks = toks.into_iter().map(|s| Tok::new(s.token, s.range.start as u32 + offset, s.range.end as u32 + offset)).collect();
@@ -74,6 +117,13 @@ fn lex_with_offset(src: &str, offset: u32, file: FileId) -> (Vec<Tok<Token>>, Ve
         .map(|e| {
             let span = Span::new(file, e.range.start as u32 + offset, e.range.end as u32 + offset);
             let text = &src[e.range.clone()];
+            if e.kind == ln_lexer::LexErrorKind::UnterminatedComment {
+                let open = Span::new(file, span.start, span.start + 2);
+                return Diagnostic::error(syntax::UNTERMINATED, open, "unterminated block comment")
+                    .with_label("this comment is never closed")
+                    .with_note("block comments nest: every `/*` inside a comment needs its own `*/`")
+                    .with_help("add `*/` where the comment should end");
+            }
             let (code, msg) = if text.starts_with('"') {
                 (syntax::UNTERMINATED, "unterminated string literal".to_string())
             } else if text.starts_with('\'') {

@@ -1,0 +1,12 @@
+// error: syntax::conflict_marker
+fn greet(): str {
+<<<<<<< HEAD
+    return "hello";
+=======
+    return "hi there";
+>>>>>>> feat/friendlier
+}
+
+fn main() {
+    println("{greet()}");
+}

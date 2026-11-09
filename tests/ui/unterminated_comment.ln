@@ -1,0 +1,5 @@
+// error: syntax::unterminated
+fn main() {
+    /* outer /* inner */
+    println("hi");
+}

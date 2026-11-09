@@ -1,4 +1,4 @@
-# syntax::unterminated: a string or character literal is not closed
+# syntax::unterminated: a string, character literal or block comment is not closed
 
 A string literal was opened with `"` but never closed, or a character
 literal starting with `'` is malformed: it has no closing `'`, it is empty
@@ -9,8 +9,9 @@ followed by an `unexpected_token` error at "end of file". Fixing the literal
 fixes both. A `"` inside a string must be escaped as `\"`, and a newline
 inside a character literal is not allowed (write `'\n'`).
 
-Block comments are different: an unclosed `/*` comment silently extends to
-the end of the file.
+A block comment opened with `/*` but never closed is reported the same way.
+Block comments nest, so `/* outer /* inner */` is still open: every `/*`
+inside a comment needs its own `*/`.
 
 ## Erroneous example
 

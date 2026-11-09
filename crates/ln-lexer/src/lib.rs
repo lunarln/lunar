@@ -263,8 +263,9 @@ fn lex_number(lex: &mut Lexer<Token>) -> NumKind {
     kind
 }
 
-/// Nested `/* ... */` comments. Unterminated comments run to end of input.
-fn lex_block_comment(lex: &mut Lexer<Token>) -> logos::Skip {
+/// Nested `/* ... */` comments. An unterminated comment is an error
+/// covering the rest of the input.
+fn lex_block_comment(lex: &mut Lexer<Token>) -> logos::FilterResult<(), ()> {
     let rest = lex.remainder().as_bytes();
     let mut depth = 1;
     let mut i = 0;
@@ -280,7 +281,7 @@ fn lex_block_comment(lex: &mut Lexer<Token>) -> logos::Skip {
         }
     }
     lex.bump(i);
-    logos::Skip
+    if depth > 0 { logos::FilterResult::Error(()) } else { logos::FilterResult::Skip }
 }
 
 /// A lexed token and its byte range in the source.
@@ -294,6 +295,15 @@ pub struct Spanned {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LexError {
     pub range: Range<usize>,
+    pub kind: LexErrorKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LexErrorKind {
+    /// Characters that start no token (or a malformed literal).
+    Invalid,
+    /// A `/*` comment without its closing `*/`; the range runs to the end.
+    UnterminatedComment,
 }
 
 /// Lex a whole source file.
@@ -305,14 +315,80 @@ pub fn lex(src: &str) -> (Vec<Spanned>, Vec<LexError>) {
         let range = lexer.span();
         match res {
             Ok(token) => toks.push(Spanned { token, range }),
+            Err(()) if src[range.clone()].starts_with("/*") => errs.push(LexError { range, kind: LexErrorKind::UnterminatedComment }),
             Err(()) => match errs.last_mut() {
                 // Merge runs of adjacent bad characters into one error.
-                Some(last) if last.range.end == range.start => last.range.end = range.end,
-                _ => errs.push(LexError { range }),
+                Some(last) if last.range.end == range.start && last.kind == LexErrorKind::Invalid => last.range.end = range.end,
+                _ => errs.push(LexError { range, kind: LexErrorKind::Invalid }),
             },
         }
     }
     (toks, errs)
+}
+
+/// A version control conflict region left in a file by an unfinished merge
+/// or rebase. Each field is the byte range of a marker line (without its
+/// newline).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Conflict {
+    /// `<<<<<<< ours`
+    pub start: Range<usize>,
+    /// `||||||| base` (diff3 style), if present.
+    pub base: Option<Range<usize>>,
+    /// `=======`
+    pub mid: Option<Range<usize>>,
+    /// `>>>>>>> theirs`
+    pub end: Option<Range<usize>>,
+}
+
+/// Which conflict marker, if any, the line starting at `line` is.
+fn marker_at(line: &str) -> Option<u8> {
+    let b = line.as_bytes();
+    let c = *b.first()?;
+    if !matches!(c, b'<' | b'|' | b'=' | b'>') || b.len() < 7 || !b[..7].iter().all(|x| *x == c) {
+        return None;
+    }
+    // Exactly seven marker characters, then the end of the line or a space
+    // (`<<<<<<< HEAD`). `=======` stands alone.
+    match b.get(7) {
+        None | Some(b'\r') => Some(c),
+        Some(b' ') | Some(b'\t') if c != b'=' => Some(c),
+        _ => None,
+    }
+}
+
+/// Find conflict markers (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>` at
+/// the start of a line). Checked before lexing so that a half-merged file
+/// gets one clear error instead of a cascade of syntax errors.
+pub fn conflict_markers(src: &str) -> Vec<Conflict> {
+    let mut out: Vec<Conflict> = Vec::new();
+    let mut open: Option<Conflict> = None;
+    let mut pos = 0;
+    for line in src.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\n', '\r']);
+        let range = pos..pos + text.len();
+        pos += line.len();
+        let Some(m) = marker_at(text) else { continue };
+        match (m, &mut open) {
+            (b'<', _) => {
+                if let Some(c) = open.take() {
+                    out.push(c);
+                }
+                open = Some(Conflict { start: range, base: None, mid: None, end: None });
+            }
+            (b'|', Some(c)) if c.mid.is_none() => c.base = Some(range),
+            (b'=', Some(c)) if c.mid.is_none() => c.mid = Some(range),
+            (b'>', Some(c)) => {
+                c.end = Some(range);
+                out.push(open.take().unwrap());
+            }
+            // A stray marker outside a `<<<<<<<` region: report it alone.
+            (_, None) => out.push(Conflict { start: range, base: None, mid: None, end: None }),
+            _ => {}
+        }
+    }
+    out.extend(open);
+    out
 }
 
 impl Token {
@@ -456,5 +532,30 @@ mod tests {
     fn generics_do_not_fuse_closers() {
         use Token::*;
         assert_eq!(kinds("A::<B::<C>>"), vec![Ident, PathSep, LAngle, Ident, PathSep, LAngle, Ident, RAngle, RAngle]);
+    }
+
+    #[test]
+    fn unterminated_block_comment() {
+        let (toks, errs) = lex("a /* x /* y */ b");
+        assert_eq!(toks.len(), 1);
+        assert_eq!(errs, vec![LexError { range: 2..16, kind: LexErrorKind::UnterminatedComment }]);
+        let (_, errs) = lex("a /* x /* y */ b */ c");
+        assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn conflict_markers_found_only_at_line_start() {
+        let src = "fn f() {\n<<<<<<< HEAD\n    1\n=======\n    2\n>>>>>>> topic\n}\n";
+        let c = conflict_markers(src);
+        assert_eq!(c.len(), 1);
+        assert_eq!(&src[c[0].start.clone()], "<<<<<<< HEAD");
+        assert_eq!(&src[c[0].mid.clone().unwrap()], "=======");
+        assert_eq!(&src[c[0].end.clone().unwrap()], ">>>>>>> topic");
+        // CRLF line endings.
+        assert_eq!(conflict_markers(&src.replace('\n', "\r\n")).len(), 1);
+        // Not markers: indented, too many characters, inside an expression.
+        assert!(conflict_markers("  <<<<<<< x\n========\na <<<<<<< b\n").is_empty());
+        // A stray marker on its own is still reported.
+        assert_eq!(conflict_markers("x\n>>>>>>> other\n").len(), 1);
     }
 }
