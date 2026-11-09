@@ -72,13 +72,38 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let last = p.segments.last().unwrap().ident.span;
         match &r {
             ValueRes::Local(l) => self.record_local(last, *l),
-            ValueRes::Fn { def, .. } | ValueRes::Const(def) | ValueRes::Static(def) | ValueRes::TraitMethod { def, .. } => self.record_def(last, *def),
+            ValueRes::Fn { def, .. } => {
+                self.record_def(last, *def);
+                self.check_method_privacy(*def, last);
+            }
+            ValueRes::Const(def) | ValueRes::Static(def) | ValueRes::TraitMethod { def, .. } => self.record_def(last, *def),
             ValueRes::Ctor { adt, variant, .. } => {
                 let v = self.s.p.adt(*adt).variants[*variant].def;
                 self.record_def(last, v);
             }
         }
         Some(r)
+    }
+
+    /// Inherent methods and associated functions are private to the impl's
+    /// module (and its children) unless marked `pub`. Trait methods are as
+    /// visible as their trait.
+    fn check_method_privacy(&mut self, def: DefId, span: Span) {
+        let d = self.s.p.def(def);
+        let Some(parent) = d.parent else { return };
+        if d.is_pub || self.s.p.def(parent).kind != DefKind::Impl || self.s.p.impl_data(parent).trait_ref.is_some() {
+            return;
+        }
+        if self.s.is_ancestor_or_self(d.module, self.module()) {
+            return;
+        }
+        let what = if self.s.p.fn_data(def).has_self { "method" } else { "associated function" };
+        let (name, dspan) = (d.name.clone(), d.span);
+        self.err(
+            Diagnostic::error(name::PRIVATE, span, format!("{what} `{name}` is private"))
+                .with_secondary(dspan, "defined here")
+                .with_help("mark it `pub` to use it from other modules"),
+        );
     }
 
     fn resolve_value_path_inner(&mut self, p: &ast::Path, span: Span) -> Option<ValueRes> {
@@ -462,6 +487,12 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             }
             ValueRes::Ctor { adt, variant, args: gargs } => {
                 let v = self.s.p.adt(adt).variants[variant].clone();
+                // Constructing a tuple struct names every field.
+                if v.ctor == CtorKind::Tuple {
+                    for i in 0..v.fields.len() {
+                        self.check_field_privacy(adt, i, fspan);
+                    }
+                }
                 let ty = Ty::Adt(adt, gargs.clone());
                 if let Some(e) = expect {
                     let snapshot = (self.vars.clone(), self.lens.clone());
@@ -640,6 +671,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             return self.error_expr(span);
         };
         self.record_def(name.span, pick.def);
+        self.check_method_privacy(pick.def, name.span);
         let fd = self.s.p.fn_data(pick.def).clone();
         let mut all = pick.args.clone();
         let own = self.own_args(pick.def, generics, name.span);

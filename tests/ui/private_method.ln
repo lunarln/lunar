@@ -1,0 +1,28 @@
+// error: name::private
+mod shapes {
+    pub struct Sq {
+        pub side: i32,
+    }
+
+    impl Sq {
+        pub fn new(side: i32): Sq {
+            return Sq { side };
+        }
+        fn secret(self): i32 {
+            return self.side * 2;
+        }
+        fn hidden(): i32 {
+            return 7;
+        }
+        pub fn area(self): i32 {
+            return self.side * self.side + self.secret() - self.secret();
+        }
+    }
+}
+
+fn main() {
+    let s = shapes::Sq::new(3);
+    println("{s.area()}");
+    println("{s.secret()}");
+    println("{shapes::Sq::hidden()}");
+}

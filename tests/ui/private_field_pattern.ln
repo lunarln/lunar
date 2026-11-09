@@ -1,0 +1,33 @@
+// error: name::private
+mod m {
+    pub struct C {
+        pub id: i32,
+        r: i32,
+    }
+
+    pub struct P(pub i32, i32);
+
+    pub fn make(): C {
+        return C { id: 1, r: 2 };
+    }
+
+    pub fn pair(): P {
+        return P(1, 2);
+    }
+
+    pub fn inside(c: C): i32 {
+        let C { id, r } = c;
+        return id + r;
+    }
+}
+
+fn main() {
+    let c = m::make();
+    let m::C { id, .. } = c;
+    let m::C { r, .. } = c;
+    let p = m::pair();
+    let m::P(a, ..) = p;
+    let m::P(_, b) = p;
+    let q = m::P(5, 6);
+    println("{id} {r} {a} {b} {m::inside(c)}");
+}

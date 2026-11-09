@@ -9,6 +9,26 @@ use ln_ast as ast;
 use ln_diag::{Diagnostic, Span, codes::ty as tyc};
 
 impl<'s, 'a> FnCtx<'s, 'a> {
+    /// Struct fields are private to the struct's module (and its children)
+    /// unless `pub`; enum variant fields are always visible.
+    pub(crate) fn check_field_privacy(&mut self, adt: DefId, field: usize, span: Span) {
+        let data = self.s.p.adt(adt);
+        if data.is_enum {
+            return;
+        }
+        let f = &data.variants[0].fields[field];
+        let owner_mod = self.s.p.def(adt).module;
+        if f.is_pub || self.s.is_ancestor_or_self(owner_mod, self.module()) {
+            return;
+        }
+        let (fname, fspan, sname) = (f.name.clone(), f.span, self.s.p.def(adt).name.clone());
+        self.err(
+            Diagnostic::error(ln_diag::codes::name::PRIVATE, span, format!("field `{fname}` of `{sname}` is private"))
+                .with_secondary(fspan, "declared here")
+                .with_help("mark the field `pub`, or match the rest with `..`"),
+        );
+    }
+
     /// Check a pattern against `ty`, declaring its bindings in the current scope.
     pub(crate) fn check_pat(&mut self, p: &ast::Pat, ty: &Ty, _is_let: bool) -> Pat {
         let span = p.span;
@@ -62,6 +82,12 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                     }
                     let ftys: Vec<Ty> = v.fields.iter().map(|f| f.ty.subst(&args)).collect();
                     let has_rest = pats.iter().position(|x| matches!(x.kind, ast::PatKind::Rest));
+                    // Positions written out (not covered by `..`) must be visible.
+                    let after = has_rest.map_or(0, |r| pats.len() - r - 1);
+                    let before = has_rest.unwrap_or(pats.len());
+                    for i in (0..v.fields.len()).filter(|i| *i < before || *i + after >= v.fields.len()) {
+                        self.check_field_privacy(adt, i, span);
+                    }
                     let fields = self.tuple_like(pats, &ftys, has_rest, span);
                     PatKind::Adt { def: adt, variant, fields }
                 }
@@ -86,6 +112,8 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                         self.err(Diagnostic::error(tyc::NO_FIELD, f.name.span, format!("`{}` has no field named `{}`", v.name, f.name.name)));
                         continue;
                     };
+                    self.check_field_privacy(adt, idx, f.name.span);
+                    self.s.p.refs.push(crate::Ref { span: f.name.span, target: crate::RefTarget::Field { adt, variant, field: idx } });
                     let ft = v.fields[idx].ty.subst(&args);
                     out.push((idx, self.check_pat(&f.pat, &ft, false)));
                 }
