@@ -450,8 +450,8 @@ impl<'p> Cx<'p, '_> {
                         d.with_note(format!("this function takes ownership of {n}, so it is freed when the function returns"))
                             .with_help("borrow the parameter instead (`: &T`), or return the owner itself")
                     } else {
-                        d.with_note(format!("{n} is passed by value, so it is a copy owned by this function"))
-                            .with_help("take a slice parameter or a borrowed owner (`: &T`) instead")
+                        d.with_note(format!("{n} has a Dull type, so it is passed as a copy owned by this function"))
+                            .with_help("take a slice parameter or an in-out parameter (`: &mut T`) instead")
                     };
                 }
                 self.err(d);
@@ -644,7 +644,7 @@ impl<'p> Cx<'p, '_> {
             if self.reported.insert((span, 1 << 29)) {
                 self.err(
                     Diagnostic::error(borrow::SHRINK_NOT_OWNER, span, format!("only the owner of `{n}` can mark it as shrinkable (`!`)"))
-                        .with_secondary(ls, format!("`{n}` is a parameter, so its caller owns it"))
+                        .with_secondary(ls, format!("`{n}` is a borrowed parameter, so its caller owns it"))
                         .with_help(format!("declare the parameter as `{n}: &mut !{ty}` so callers know it may shrink")),
                 );
             }
@@ -1070,7 +1070,9 @@ impl Moves<'_, '_, '_> {
             let n = self.cx.local(l).name.clone();
             self.cx.err(
                 Diagnostic::error(borrow::USE_AFTER_MOVE, span, format!("use of moved value `{n}`"))
-                    .with_note(format!("`{n}` owns its data, so binding, assigning or returning it moves it"))
+                    .with_note(format!(
+                        "`{n}` owns its data, so binding, assigning, returning or passing it to a parameter that takes ownership moves it"
+                    ))
                     .with_help("move it only once, or `.clone()` it before moving"),
             );
         }
@@ -1085,13 +1087,20 @@ impl Moves<'_, '_, '_> {
         match self.cx.place_root(place) {
             Some(Root::Local(l)) => {
                 let local = self.cx.local(l);
-                if let LocalKind::Param { owned: false, .. } = local.kind {
+                if let LocalKind::Param { owned: false, inout, .. } = local.kind {
                     let n = local.name.clone();
+                    let borrow = if inout { "&mut " } else { "&" };
+                    let take = if n == "self" {
+                        format!("`self` rather than `{borrow}self`")
+                    } else {
+                        let ty = self.cx.p.ty_str(local.ty.strip_bang());
+                        format!("`{n}: {ty}` rather than `{n}: {borrow}{ty}`")
+                    };
                     if self.cx.reported.insert((span, 3 << 28)) {
                         self.cx.err(
                             Diagnostic::error(borrow::MOVE_OUT_OF_BORROW, span, format!("cannot move out of parameter `{n}`"))
                                 .with_note("this parameter is borrowed from the caller, so its owned data cannot be taken")
-                                .with_help(format!("take ownership instead (`{n}: T` rather than `{n}: &T`), or use `.clone()` to make an owned copy")),
+                                .with_help(format!("take ownership instead ({take}), or use `.clone()` to make an owned copy")),
                         );
                     }
                     return;

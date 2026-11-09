@@ -600,7 +600,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         out
     }
 
-    /// An argument for a `mut` (in-out) parameter: a mutable place.
+    /// An argument for an in-out (`&mut`) parameter: a mutable place.
     pub(crate) fn check_inout_arg(&mut self, a: &ast::Expr, pt: &Ty) -> Arg {
         let Some(place) = self.check_place(a) else {
             let v = self.check_expr(a, Some(pt));
