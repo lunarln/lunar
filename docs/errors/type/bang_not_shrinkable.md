@@ -23,7 +23,7 @@ fn add(log: &mut !Log, line: i32) {
 
 fn main() {
     let mut log = Log { lines: [] };
-    add(log, 7);
+    add(&mut log, 7);
 }
 ```
 
@@ -43,6 +43,6 @@ fn add(log: &mut Log, line: i32) {
 
 fn main() {
     let mut log = Log { lines: [] };
-    add(log, 7);
+    add(&mut log, 7);
 }
 ```

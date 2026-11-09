@@ -1,0 +1,21 @@
+// error: borrow::wrong_marker
+// absent: borrow::missing_marker
+fn len(s: &String): usize {
+    return s.len();
+}
+
+fn take(s: String): usize {
+    return s.len();
+}
+
+fn bump(x: &mut i32) {
+    x += 1;
+}
+
+fn main() {
+    let mut s = String::from("a");
+    let mut n = 1;
+    bump(&n);
+    println("{len(&mut s)} {n}");
+    println("{take(&s)}");
+}

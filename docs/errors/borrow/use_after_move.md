@@ -10,9 +10,8 @@ a `self` receiver) *moves* it: the new place becomes the owner and the old
 variable no longer holds a value. Only one owner may free the data, so the
 old variable cannot be used again until it is assigned a new value.
 
-Call sites look the same for every parameter mode, so `f(s)` moves `s` only
-if `f` declares the parameter `s: String` rather than `s: &String` or
-`s: &mut String`.
+A plain argument `f(s)` moves `s`; lending it is written at the call:
+`f(&s)` for a `&String` parameter, `f(&mut s)` for a `&mut String` one.
 
 Moves are tracked per field. Moving `p.a` out of a struct leaves `p.b`
 usable, but `p` as a whole, and `p.a` itself, can no longer be used. A move
@@ -52,7 +51,7 @@ fn shout(s: &String): String {
 
 fn main() {
     let name = String::from("lunar");
-    let loud = shout(name);
+    let loud = shout(&name);
     println("{name} {loud}");
 }
 ```

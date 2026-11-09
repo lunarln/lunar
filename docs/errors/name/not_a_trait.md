@@ -16,7 +16,7 @@ struct Printable;
 fn show::<T: Printable>(x: &T) {}
 
 fn main() {
-    show(1);
+    show(&1);
 }
 ```
 
@@ -40,6 +40,6 @@ fn show::<T: Printable>(x: &T) {
 }
 
 fn main() {
-    show(1);
+    show(&1);
 }
 ```

@@ -40,10 +40,10 @@ fn apply_len(f: fn(&String): usize, s: &String): usize {
 
 fn main() {
     let arr: [i32; 4] = [10, 20, 30, 40];
-    let v = first_two(arr);
+    let v = first_two(&arr);
     println("{v[0]} {v[1]} {v.len()}");
     let b = Big { vals: [1; 64], tag: 7 };
-    println("{total(b)}");
+    println("{total(&b)}");
 
     let s = String::from("pointer");
     let f: fn(&String): usize = len_of;
@@ -51,9 +51,9 @@ fn main() {
     let h: fn(String): usize = consume;
     let k: fn(i32, i32): i32 = add;
     let mut n = 1;
-    g(n);
-    g(n);
-    println("{f(s)} {apply_len(len_of, s)} {n} {k(2, 3)}");
+    g(&mut n);
+    g(&mut n);
+    println("{f(&s)} {apply_len(len_of, &s)} {n} {k(2, 3)}");
     let mut total: usize = 0;
     for _ in 0..100000 {
         total += h(String::from("ab"));

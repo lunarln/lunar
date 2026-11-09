@@ -1,0 +1,48 @@
+// Borrows are written at the call site, except for receivers and for
+// parameters that already are borrows.
+
+struct Person {
+    name: String,
+    age: u32,
+}
+
+fn len(s: &String): usize {
+    return s.len();
+}
+
+fn shout(s: &mut String) {
+    s.push('!');
+}
+
+/// A borrowed parameter is passed on as-is.
+fn len_twice(s: &String): usize {
+    return len(s) + len(s);
+}
+
+/// An in-out parameter is passed on as-is, also where only a borrow is needed.
+fn shout_and_measure(s: &mut String): usize {
+    shout(s);
+    return len(s);
+}
+
+fn birthday(p: &mut Person) {
+    p.age += 1;
+    shout(&mut p.name);
+}
+
+fn main() {
+    let mut s = String::from("hi");
+    println("{len(&s)} {len_twice(&s)}");
+    shout(&mut s);
+    println("{s} {shout_and_measure(&mut s)} {s}");
+
+    // Receivers borrow on their own.
+    s.push('?');
+    println("{s.len()}");
+
+    // Fields, and temporaries.
+    let mut p = Person { name: String::from("Ada"), age: 36 };
+    birthday(&mut p);
+    let n = len(&String::from("four"));
+    println("{p.name} {p.age} {len(&p.name)} {n}");
+}

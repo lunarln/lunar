@@ -188,6 +188,7 @@ pub fn expr(e: &Expr) -> String {
             };
             format!("{op}{}", expr(x))
         }
+        ExprKind::Borrow { mutable, expr: x } => format!("&{}{}", if *mutable { "mut " } else { "" }, expr(x)),
         ExprKind::Binary(op, a, b) => format!("{} {} {}", expr(a), op.as_str(), expr(b)),
         ExprKind::Paren(x) => format!("({})", expr(x)),
         ExprKind::Cast(x, t) => format!("{} as {}", expr(x), ty(t)),

@@ -23,7 +23,7 @@ fn pick_name(out: &mut str) {
 
 fn main() {
     let mut s: str = "";
-    pick_name(s);
+    pick_name(&mut s);
     println("{s}");
 }
 ```
@@ -40,7 +40,7 @@ fn pick_name(out: &mut String) {
 
 fn main() {
     let mut s = String::new();
-    pick_name(s);
+    pick_name(&mut s);
     println("{s}");
 }
 ```

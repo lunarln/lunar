@@ -35,7 +35,7 @@ fn take_all(inbox: &Inbox): [i32; ..+] {
 
 fn main() {
     let inbox = Inbox { messages: [1, 2] };
-    let all = take_all(inbox);
+    let all = take_all(&inbox);
     println("{all.len()}");
 }
 ```

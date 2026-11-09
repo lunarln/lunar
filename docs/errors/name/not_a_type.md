@@ -63,6 +63,6 @@ fn print_area::<S: Shape>(s: &S) {
 }
 
 fn main() {
-    print_area(Square { side: 2.0 });
+    print_area(&Square { side: 2.0 });
 }
 ```

@@ -11,13 +11,13 @@ impl String {
     /// This empty string, limited to `bytes` bytes: it reserves only the
     /// address space that needs, and growing past it is a fatal error.
     pub fn capped(mut self, bytes: usize): String {
-        intrinsics::string_cap(self, bytes);
+        intrinsics::string_cap(&mut self, bytes);
         return self;
     }
 
     pub fn from(s: str): String {
         let mut out = intrinsics::string_new();
-        intrinsics::string_push_str(out, s);
+        intrinsics::string_push_str(&mut out, s);
         return out;
     }
 
@@ -118,6 +118,6 @@ impl Eq for String {
 
 impl Ord for String {
     fn cmp(&self, other: &String): crater::cmp::Ordering {
-        return self.as_str().cmp(other.as_str());
+        return self.as_str().cmp(&other.as_str());
     }
 }

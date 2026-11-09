@@ -485,7 +485,7 @@ pub fn init(dir: &Path, lib: bool) -> Result<String> {
     std::fs::create_dir_all(&src).map_err(|e| io_error(&src, e))?;
     write_new(&manifest, &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n\n[dependencies]\n"))?;
     if lib {
-        let code = "/// Add two numbers.\npub fn add(a: i32, b: i32): i32 {\n    return a + b;\n}\n\n#[test]\nfn adds() {\n    std::test::assert_eq(add(2, 2), 4, \"2 + 2\");\n}\n";
+        let code = "/// Add two numbers.\npub fn add(a: i32, b: i32): i32 {\n    return a + b;\n}\n\n#[test]\nfn adds() {\n    assert_eq(&add(2, 2), &4, \"2 + 2\");\n}\n";
         write_new(&src.join("lib.ln"), code)?;
     } else {
         write_new(&src.join("main.ln"), "fn main() {\n    println(\"Hello, world!\");\n}\n")?;

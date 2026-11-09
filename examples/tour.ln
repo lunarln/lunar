@@ -106,7 +106,7 @@ fn main() {
 
     // Traits with default methods.
     let mut s = String::new();
-    p.describe(s);
+    p.describe(&mut s);
     println("{s}");
 
     // Generics and Option.
@@ -167,7 +167,7 @@ fn main() {
 
     // Raw pointers.
     let mut cell: i32 = 7;
-    let ptr = core::intrinsics::addr_of_mut(cell);
+    let ptr = core::intrinsics::addr_of_mut(&mut cell);
     unsafe {
         *ptr = *ptr * 6;
     }

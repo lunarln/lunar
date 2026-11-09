@@ -34,7 +34,7 @@ fn main() {
     for round in 0..20000 {
         let small: [u64] = [1, 2, 3];
         let big: [u64] = [round as u64; 5000];
-        total += checksum(small) + checksum(big);
+        total += checksum(&small) + checksum(&big);
         let mut c: [u8; ..+] = [].capped(100);
         c.push(1);
         total += c.len() as u64;

@@ -184,7 +184,7 @@ pub fn lex(src: str): ([Spanned; -..+], [LexError; -..+]) {
         let (token, end) = token_at(src, i);
         match token {
             Some(t) => toks.push(Spanned { token: t, range: Range { start: i, end } }),
-            None => invalid(errs, i, end),
+            None => invalid(&mut errs, i, end),
         }
         i = end;
     }
@@ -874,7 +874,7 @@ fn dump_range(r: Option::<Range>, out: &mut String) {
 /// The token names of `src`, space-separated; there must be no errors.
 fn kinds(src: str): String {
     let (toks, errs) = lex(src);
-    std::test::assert_eq(errs.len(), 0, "lex errors");
+    std::test::assert_eq(&errs.len(), &0, "lex errors");
     let mut out = String::new();
     for t in toks {
         if !out.is_empty() {
@@ -887,71 +887,71 @@ fn kinds(src: str): String {
 
 #[test]
 fn numbers_and_ranges() {
-    std::test::assert_eq(kinds("0..200").as_str(), "Number(Int) DotDot Number(Int)", "range");
-    std::test::assert_eq(kinds("0.").as_str(), "Number(Float)", "trailing dot");
-    std::test::assert_eq(kinds("[0.; 8]").as_str(), "LBracket Number(Float) Semi Number(Int) RBracket", "float in array");
+    std::test::assert_eq(&kinds("0..200").as_str(), &"Number(Int) DotDot Number(Int)", "range");
+    std::test::assert_eq(&kinds("0.").as_str(), &"Number(Float)", "trailing dot");
+    std::test::assert_eq(&kinds("[0.; 8]").as_str(), &"LBracket Number(Float) Semi Number(Int) RBracket", "float in array");
     std::test::assert_eq(
-        kinds("1.5e3 2e-1 7u8 1f32 0xffu8").as_str(),
-        "Number(Float) Number(Float) Number(Int) Number(Float) Number(Int)",
+        &kinds("1.5e3 2e-1 7u8 1f32 0xffu8").as_str(),
+        &"Number(Float) Number(Float) Number(Int) Number(Float) Number(Int)",
         "exponents and suffixes",
     );
-    std::test::assert_eq(kinds("x.0").as_str(), "Ident Dot Number(Int)", "tuple field");
-    std::test::assert_eq(kinds("1.max").as_str(), "Number(Int) Dot Ident", "method on an integer");
+    std::test::assert_eq(&kinds("x.0").as_str(), &"Ident Dot Number(Int)", "tuple field");
+    std::test::assert_eq(&kinds("1.max").as_str(), &"Number(Int) Dot Ident", "method on an integer");
 }
 
 #[test]
 fn array_types() {
-    std::test::assert_eq(kinds("[T; -..+]").as_str(), "LBracket Ident Semi Minus DotDot Plus RBracket", "growable");
-    std::test::assert_eq(kinds("![T; &mut]").as_str(), "Bang LBracket Ident Semi Amp Mut RBracket", "mutable slice");
+    std::test::assert_eq(&kinds("[T; -..+]").as_str(), &"LBracket Ident Semi Minus DotDot Plus RBracket", "growable");
+    std::test::assert_eq(&kinds("![T; &mut]").as_str(), &"Bang LBracket Ident Semi Amp Mut RBracket", "mutable slice");
 }
 
 #[test]
 fn comments_and_strings() {
-    std::test::assert_eq(kinds("/* a /* b */ c */ x // y\n\"s\\\"{x}\" 'a' '\\n'").as_str(), "Ident Str Char Char", "comments");
-    std::test::assert_eq(kinds("b'a' b'\\xff' b 'c' b2'd'").as_str(), "Byte Byte Ident Char Ident Char", "bytes");
+    std::test::assert_eq(&kinds("/* a /* b */ c */ x // y\n\"s\\\"{x}\" 'a' '\\n'").as_str(), &"Ident Str Char Char", "comments");
+    std::test::assert_eq(&kinds("b'a' b'\\xff' b 'c' b2'd'").as_str(), &"Byte Byte Ident Char Ident Char", "bytes");
 }
 
 #[test]
 fn doc_comments() {
-    std::test::assert_eq(kinds("/// docs\nfn").as_str(), "DocComment Fn", "docs");
-    std::test::assert_eq(kinds("///\nx").as_str(), "DocComment Ident", "empty docs");
-    std::test::assert_eq(kinds("//// not docs\n// nor this\nx").as_str(), "Ident", "not docs");
+    std::test::assert_eq(&kinds("/// docs\nfn").as_str(), &"DocComment Fn", "docs");
+    std::test::assert_eq(&kinds("///\nx").as_str(), &"DocComment Ident", "empty docs");
+    std::test::assert_eq(&kinds("//// not docs\n// nor this\nx").as_str(), &"Ident", "not docs");
     let (toks, _) = lex("/// a b\n");
-    std::test::assert_eq(toks[0].range.start, 0, "doc start");
-    std::test::assert_eq(toks[0].range.end, 7, "doc end");
+    std::test::assert_eq(&toks[0].range.start, &0, "doc start");
+    std::test::assert_eq(&toks[0].range.end, &7, "doc end");
 }
 
 #[test]
 fn generics_do_not_fuse_closers() {
-    std::test::assert_eq(kinds("A::<B::<C>>").as_str(), "Ident PathSep LAngle Ident PathSep LAngle Ident RAngle RAngle", "closers");
+    std::test::assert_eq(&kinds("A::<B::<C>>").as_str(), &"Ident PathSep LAngle Ident PathSep LAngle Ident RAngle RAngle", "closers");
 }
 
 #[test]
 fn unterminated_block_comment() {
     let (toks, errs) = lex("a /* x /* y */ b");
-    std::test::assert_eq(toks.len(), 1, "only `a`");
-    std::test::assert_eq(errs.len(), 1, "one error");
-    std::test::assert_eq(errs[0].range.start, 2, "from the `/*`");
-    std::test::assert_eq(errs[0].range.end, 16, "to the end");
-    std::test::assert_eq(errs[0].kind.name(), "UnterminatedComment", "kind");
+    std::test::assert_eq(&toks.len(), &1, "only `a`");
+    std::test::assert_eq(&errs.len(), &1, "one error");
+    std::test::assert_eq(&errs[0].range.start, &2, "from the `/*`");
+    std::test::assert_eq(&errs[0].range.end, &16, "to the end");
+    std::test::assert_eq(&errs[0].kind.name(), &"UnterminatedComment", "kind");
     let (_, errs) = lex("a /* x /* y */ b */ c");
-    std::test::assert_eq(errs.len(), 0, "closed");
+    std::test::assert_eq(&errs.len(), &0, "closed");
 }
 
 #[test]
 fn conflict_markers_found_only_at_line_start() {
     let src = "fn f() {\n<<<<<<< HEAD\n    1\n=======\n    2\n>>>>>>> topic\n}\n";
     let c = conflict_markers(src);
-    std::test::assert_eq(c.len(), 1, "one conflict");
-    std::test::assert_eq(src[c[0].start.start..c[0].start.end], "<<<<<<< HEAD", "start");
+    std::test::assert_eq(&c.len(), &1, "one conflict");
+    std::test::assert_eq(&src[c[0].start.start..c[0].start.end], &"<<<<<<< HEAD", "start");
     let mid = c[0].mid.unwrap();
-    std::test::assert_eq(src[mid.start..mid.end], "=======", "mid");
+    std::test::assert_eq(&src[mid.start..mid.end], &"=======", "mid");
     let end = c[0].end.unwrap();
-    std::test::assert_eq(src[end.start..end.end], ">>>>>>> topic", "end");
+    std::test::assert_eq(&src[end.start..end.end], &">>>>>>> topic", "end");
     // CRLF line endings.
-    std::test::assert_eq(conflict_markers("fn f() {\r\n<<<<<<< HEAD\r\n    1\r\n=======\r\n    2\r\n>>>>>>> topic\r\n}\r\n").len(), 1, "CRLF");
+    std::test::assert_eq(&conflict_markers("fn f() {\r\n<<<<<<< HEAD\r\n    1\r\n=======\r\n    2\r\n>>>>>>> topic\r\n}\r\n").len(), &1, "CRLF");
     // Not markers: indented, too many characters, inside an expression.
-    std::test::assert_eq(conflict_markers("  <<<<<<< x\n========\na <<<<<<< b\n").len(), 0, "not markers");
+    std::test::assert_eq(&conflict_markers("  <<<<<<< x\n========\na <<<<<<< b\n").len(), &0, "not markers");
     // A stray marker on its own is still reported.
-    std::test::assert_eq(conflict_markers("x\n>>>>>>> other\n").len(), 1, "stray marker");
+    std::test::assert_eq(&conflict_markers("x\n>>>>>>> other\n").len(), &1, "stray marker");
 }

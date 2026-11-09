@@ -19,7 +19,7 @@ fn drop_last(s: &![i32; -..+]) {
 
 fn main() {
     let mut a: [i32; -..+] = [1, 2];
-    drop_last(a);
+    drop_last(&a);
     println("{a.len()}");
 }
 ```
@@ -35,7 +35,7 @@ fn drop_last(s: &mut ![i32; -..+]) {
 
 fn main() {
     let mut a: [i32; -..+] = [1, 2];
-    drop_last(a);
+    drop_last(&mut a);
     println("{a.len()}");
 }
 ```

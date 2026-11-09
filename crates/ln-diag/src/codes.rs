@@ -100,6 +100,9 @@ codes! {
         OUTLIVES_ROOT = "outlives_root",
         ESCAPES_FUNCTION = "escapes_function",
         ESCAPES_VIA_PARAM = "escapes_via_param",
+        MISSING_MARKER = "missing_marker",
+        WRONG_MARKER = "wrong_marker",
+        NOT_AN_ARGUMENT = "not_an_argument",
     }
     unsafe_ ("unsafe") => {
         OUTSIDE_UNSAFE = "outside_unsafe",

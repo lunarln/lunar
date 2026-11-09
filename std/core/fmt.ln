@@ -17,7 +17,7 @@ pub fn write(out: &mut String, args: FmtArgs) {
 /// Format into a new `String`.
 pub fn format(args: FmtArgs): String {
     let mut s = String::new();
-    intrinsics::fmt_write(args, s);
+    intrinsics::fmt_write(args, &mut s);
     return s;
 }
 

@@ -68,11 +68,11 @@ fn main() {
 
 fn run(src: str) {
     let mut tokens: [Token; ..+] = [];
-    if !tokenize(src, tokens) {
+    if !tokenize(src, &mut tokens) {
         return;
     }
     let mut stack: [f64; -..+] = [];
-    match eval(tokens[..], stack) {
+    match eval(tokens[..], &mut stack) {
         Some(v) => println("{src} = {v}"),
         None => println("{src} = <stack underflow>"),
     }

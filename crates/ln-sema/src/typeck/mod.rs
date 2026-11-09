@@ -232,6 +232,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         self.scopes.last_mut().unwrap().names.push((name.to_string(), id));
     }
 
+    pub(crate) fn local_kind(&self, id: LocalId) -> thir::LocalKind {
+        self.locals[id.0 as usize].kind
+    }
+
     pub(crate) fn lookup_local(&self, name: &str) -> Option<LocalId> {
         for s in self.scopes.iter().rev() {
             if let Some((_, id)) = s.names.iter().rev().find(|(n, _)| n == name) {

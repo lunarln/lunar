@@ -4,7 +4,7 @@ use crater::sys;
 #[lang = "panic_fmt"]
 pub fn panic(args: FmtArgs): ! {
     let mut s = String::from("panicked: ");
-    core::fmt::write(s, args);
+    core::fmt::write(&mut s, args);
     s.push('\n');
     sys::write(2, s.as_bytes());
     sys::exit(101);

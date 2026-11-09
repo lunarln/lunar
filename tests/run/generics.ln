@@ -123,7 +123,7 @@ fn main() {
     show(parse("12x"));
 
     let mut v: [i64; -..+] = [10, 20, 30];
-    let t = drain_total(v);
+    let t = drain_total(&mut v);
     println("drained {t}, now {v.len()} elements");
 
     let a = Vec2 { x: 1.5, y: 2.0 };

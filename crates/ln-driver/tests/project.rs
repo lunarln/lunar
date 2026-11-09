@@ -53,11 +53,11 @@ fn path_and_git_dependencies() {
     let mathx = w.join("mathx");
     std::fs::write(
         mathx.join("src/lib.ln"),
-        "pub fn add(a: i32, b: i32): i32 {\n    return a + b;\n}\n\npub fn describe(a: i32, b: i32): String {\n    let mut s = String::from(\"sum is \");\n    s.write(\"{add(a, b)}\");\n    return strutil::shout(s);\n}\n\n#[test]\nfn adds() {\n    std::test::assert_eq(add(2, 2), 4, \"2 + 2\");\n}\n",
+        "pub fn add(a: i32, b: i32): i32 {\n    return a + b;\n}\n\npub fn describe(a: i32, b: i32): String {\n    let mut s = String::from(\"sum is \");\n    s.write(\"{add(a, b)}\");\n    return strutil::shout(s);\n}\n\n#[test]\nfn adds() {\n    std::test::assert_eq(&add(2, 2), &4, \"2 + 2\");\n}\n",
     )
     .unwrap();
     std::fs::create_dir_all(mathx.join("tests")).unwrap();
-    std::fs::write(mathx.join("tests/sums.ln"), "#[test]\nfn uses_lib() {\n    std::test::assert_eq(mathx::add(1, 1), 2, \"1 + 1\");\n}\n").unwrap();
+    std::fs::write(mathx.join("tests/sums.ln"), "#[test]\nfn uses_lib() {\n    std::test::assert_eq(&mathx::add(1, 1), &2, \"1 + 1\");\n}\n").unwrap();
     let url = strutil.to_string_lossy().replace('\\', "/");
     ok(&mathx, &home, &["add", "strutil", "--git", &url, "--tag", "v0.1.0"]);
     let out = ok(&mathx, &home, &["test"]);
@@ -156,7 +156,7 @@ fn workspaces() {
     ok(&ws.join("crates"), &home, &["new", "app"]);
     std::fs::write(
         ws.join("crates/core-util/src/lib.ln"),
-        "pub fn twice(x: i32): i32 {\n    return x * 2;\n}\n\n#[test]\nfn doubles() {\n    std::test::assert_eq(twice(2), 4, \"twice\");\n}\n",
+        "pub fn twice(x: i32): i32 {\n    return x * 2;\n}\n\n#[test]\nfn doubles() {\n    std::test::assert_eq(&twice(2), &4, \"twice\");\n}\n",
     )
     .unwrap();
     ok(&ws.join("crates/app"), &home, &["add", "core-util", "--path", "../core-util"]);

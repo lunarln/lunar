@@ -448,6 +448,12 @@ pub enum ExprKind {
     Lit(Lit),
     Path(Path),
     Unary(UnOp, Box<Expr>),
+    /// `&x` / `&mut x`: an argument lent to a borrowing (`&T`) or in-out
+    /// (`&mut T`) parameter. Only valid as a call argument.
+    Borrow {
+        mutable: bool,
+        expr: Box<Expr>,
+    },
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Assign(Box<Expr>, Box<Expr>),
     AssignOp(BinOp, Box<Expr>, Box<Expr>),

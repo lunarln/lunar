@@ -22,7 +22,7 @@ fn double(x: &mut i32) {
 }
 
 fn main() {
-    double(21);
+    double(&mut 21);
 }
 ```
 
@@ -37,7 +37,7 @@ fn double(x: &mut i32) {
 
 fn main() {
     let mut n = 21;
-    double(n);
+    double(&mut n);
     println("{n}");
 }
 ```

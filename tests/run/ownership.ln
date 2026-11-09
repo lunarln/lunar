@@ -50,7 +50,7 @@ fn main() {
 
     // A taken parameter changed and returned.
     let loud = shout(name);
-    println("{loud} {length(loud)}");
+    println("{loud} {length(&loud)}");
 
     // Many rounds: every String is taken and freed exactly once.
     let mut total: usize = 0;
@@ -61,7 +61,7 @@ fn main() {
             total += consume(s);
         } else {
             let t = shout(s);
-            total += length(t);
+            total += length(&t);
         }
         let q = Person::new(String::from("q"), 1);
         total += q.into_name().len();

@@ -34,7 +34,7 @@ fn bump(x: &mut i32) {
 
 fn main() {
     let mut n = 1;
-    bump(n);
+    bump(&mut n);
     println("{n}");
 }
 ```

@@ -22,7 +22,7 @@ unsafe fn read(p: *mut i32): i32 {
 
 fn main() {
     let mut x: i32 = 7;
-    let p = core::intrinsics::addr_of_mut(x);
+    let p = core::intrinsics::addr_of_mut(&mut x);
     let v = unsafe { read(p) };
     println("{v}");
 }
@@ -39,7 +39,7 @@ unsafe fn read(p: *mut i32): i32 {
 
 fn main() {
     let mut x: i32 = 7;
-    let p = core::intrinsics::addr_of_mut(x);
+    let p = core::intrinsics::addr_of_mut(&mut x);
     let v = unsafe { read(p) };
     println("{v}");
 }

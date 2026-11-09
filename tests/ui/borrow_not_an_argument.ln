@@ -1,0 +1,6 @@
+// error: borrow::not_an_argument
+fn main() {
+    let x = 1;
+    let y = &x;
+    println("{y}");
+}

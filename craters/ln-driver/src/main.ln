@@ -13,7 +13,7 @@ fn main() {
         match fs::read_to_string(path) {
             Ok(text) => {
                 out.write("== {path}\n");
-                ln_lexer::dump(text.as_str(), out);
+                ln_lexer::dump(text.as_str(), &mut out);
             }
             Err(e) => {
                 eprintln("ln-driver: {path}: {e}");

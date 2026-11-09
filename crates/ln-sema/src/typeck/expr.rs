@@ -285,6 +285,16 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             K::Paren(x) => self.check_expr_mode(x, expect, mode),
             K::Path(p) => self.check_path_value(p, expect, span),
             K::Unary(op, x) => self.check_unary(*op, x, expect, span),
+            // Call arguments are handled by `check_args`; anywhere else a
+            // borrow has nothing to lend to.
+            K::Borrow { expr, .. } => {
+                self.err(
+                    Diagnostic::error(ln_diag::codes::borrow::NOT_AN_ARGUMENT, span, "`&` and `&mut` lend a call argument; they make no value on their own")
+                        .with_note("Lunar has no references: borrowing is a parameter mode, written at the call")
+                        .with_help("remove the `&`, or pass this directly to a function that takes `&T` or `&mut T`"),
+                );
+                self.check_expr_mode(expr, expect, mode)
+            }
             K::Binary(op, a, b) => self.check_binary(*op, a, b, expect, span),
             K::Assign(lhs, rhs) => self.check_assign(lhs, rhs, span),
             K::AssignOp(op, lhs, rhs) => self.check_assign_op(*op, lhs, rhs, span),

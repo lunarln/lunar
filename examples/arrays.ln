@@ -8,13 +8,13 @@ fn len_squared::<T: Dull>(slice: [T; &]): usize {
 #[test]
 fn len_squared_returns_zero_on_empty_slice() {
     let empty_array: [u8; _] = [];
-    std::test::assert_eq(len_squared(empty_array[..]), 0, "len_squared does not return 0 on an empty slice")
+    std::test::assert_eq(&len_squared(empty_array[..]), &0, "len_squared does not return 0 on an empty slice")
 }
 
 #[test]
 fn len_squared_returns_4_on_2_length_slice() {
     let array: [u8; 2] = [1, 2];
-    std::test::assert_eq(len_squared(array[..]), 4, "len_squared does not return 4 on a 2-length slice")
+    std::test::assert_eq(&len_squared(array[..]), &4, "len_squared does not return 4 on a 2-length slice")
 }
 
 fn main() {

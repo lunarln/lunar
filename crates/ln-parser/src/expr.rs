@@ -209,6 +209,14 @@ impl P<'_, '_, '_> {
             Some(T::Minus) => UnOp::Neg,
             Some(T::Bang) => UnOp::Not,
             Some(T::Star) => UnOp::Deref,
+            // `&x` / `&mut x`: lending an argument (checked against the
+            // parameter's mode by the type checker).
+            Some(T::Amp) => {
+                self.k.bump();
+                let mutable = self.k.eat(T::Mut);
+                let inner = self.unary(r)?;
+                return Ok(self.mk(ExprKind::Borrow { mutable, expr: Box::new(inner) }, start));
+            }
             _ => return self.postfix(r),
         };
         self.k.bump();

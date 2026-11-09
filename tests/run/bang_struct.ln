@@ -20,5 +20,5 @@ fn main() {
     let mut s = Stack { items: [1, 2, 3], name: "nums" };
     let peek = s.items[..];
     println("{peek.len()}");
-    println("{drain(s)} left={s.items.len()}");
+    println("{drain(&mut s)} left={s.items.len()}");
 }

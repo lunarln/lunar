@@ -577,6 +577,13 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         }
         let mut out = Vec::new();
         for (i, a) in args.iter().enumerate() {
+            // `&x` / `&mut x` say how the argument is lent; check the marker,
+            // then check what it lends.
+            let (marker, a) = match &a.kind {
+                ast::ExprKind::Borrow { mutable, expr } => (Some(*mutable), &**expr),
+                _ => (None, a),
+            };
+            self.check_marker(marker, sig.get(i).map(|(_, m)| *m), a, args[i].span);
             match sig.get(i) {
                 Some((pt, ParamMode::InOut)) => out.push(self.check_inout_arg(a, pt)),
                 Some((pt, ParamMode::Borrow)) => {
@@ -600,6 +607,57 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             }
         }
         out
+    }
+
+    /// Borrows are written at the call site: `&x` for a `&T` parameter,
+    /// `&mut x` for a `&mut T` one, nothing for one that takes ownership. A
+    /// parameter that already is a borrow is passed on without a marker
+    /// (an in-out one also where only a borrow is needed).
+    fn check_marker(&mut self, marker: Option<bool>, mode: Option<ParamMode>, arg: &ast::Expr, span: Span) {
+        use ln_diag::codes::borrow::{MISSING_MARKER, WRONG_MARKER};
+        let lent = self.lent_param(arg);
+        let shown = ast::pretty::expr(arg);
+        let d = match (mode, marker) {
+            (Some(ParamMode::InOut), Some(true)) | (Some(ParamMode::Borrow), Some(false)) => return,
+            (Some(ParamMode::InOut), None) if lent == Some(ParamMode::InOut) => return,
+            (Some(ParamMode::Borrow), None) if lent.is_some() => return,
+            (Some(ParamMode::Take) | None, None) => return,
+            (Some(ParamMode::InOut), None) => Diagnostic::error(MISSING_MARKER, span, "this argument is passed in-out, but the call does not say so")
+                .with_label("the parameter is `&mut`")
+                .with_help(format!("write `&mut {shown}`")),
+            (Some(ParamMode::Borrow), None) => Diagnostic::error(MISSING_MARKER, span, "this argument is borrowed, but the call does not say so")
+                .with_label("the parameter is `&`")
+                .with_help(format!("write `&{shown}`")),
+            (Some(ParamMode::InOut), Some(false)) => Diagnostic::error(WRONG_MARKER, span, "`&` lends read-only, but this parameter is in-out")
+                .with_label("the parameter is `&mut`")
+                .with_help(format!("write `&mut {shown}`")),
+            (Some(ParamMode::Borrow), Some(true)) => Diagnostic::error(WRONG_MARKER, span, "`&mut` lends for changing, but this parameter only borrows")
+                .with_label("the parameter is `&`")
+                .with_help(format!("write `&{shown}`")),
+            (Some(ParamMode::Take) | None, Some(m)) => Diagnostic::error(
+                WRONG_MARKER,
+                span,
+                format!("this parameter takes ownership, so the argument is not lent with `{}`", if m { "&mut" } else { "&" }),
+            )
+            .with_label("the parameter takes ownership")
+            .with_help(format!("pass `{shown}` itself (it is moved, or copied if it is Dull)")),
+        };
+        self.err(d);
+    }
+
+    /// The mode of the parameter `e` names, if `e` is just a borrowed or
+    /// in-out parameter of the current function.
+    fn lent_param(&self, e: &ast::Expr) -> Option<ParamMode> {
+        let ast::ExprKind::Path(p) = &e.kind else { return None };
+        if !p.is_single() {
+            return None;
+        }
+        let l = self.lookup_local(&p.segments[0].ident.name)?;
+        match self.local_kind(l) {
+            thir::LocalKind::Param { inout: true, .. } => Some(ParamMode::InOut),
+            thir::LocalKind::Param { owned: false, .. } => Some(ParamMode::Borrow),
+            _ => None,
+        }
     }
 
     /// An argument for an in-out (`&mut`) parameter: a mutable place.

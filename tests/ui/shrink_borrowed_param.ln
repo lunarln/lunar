@@ -6,5 +6,5 @@ fn last(log: &[u8; -..+]): Option::<u8> {
 
 fn main() {
     let a: [u8; -..+] = [1, 2];
-    let _ = last(a);
+    let _ = last(&a);
 }

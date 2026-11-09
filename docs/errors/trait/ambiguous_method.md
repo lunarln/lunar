@@ -71,6 +71,6 @@ impl Swim for Duck {
 
 fn main() {
     let d = Duck;
-    println("{Walk::go(d)} {Swim::go(d)}");
+    println("{Walk::go(&d)} {Swim::go(&d)}");
 }
 ```

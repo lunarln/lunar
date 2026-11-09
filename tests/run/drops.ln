@@ -31,7 +31,7 @@ fn main() {
         total += String::from("abc").len();
         // Locals dropped at the end of each iteration.
         let n = make(i);
-        total += consume_len(n);
+        total += consume_len(&n);
         // Enum payloads.
         match maybe(i) {
             Some(s) => total += s.len(),

@@ -26,7 +26,7 @@ fn double(x: &i32): i32 {
 }
 
 fn main() {
-    println("{double(21)}");
+    println("{double(&21)}");
 }
 ```
 

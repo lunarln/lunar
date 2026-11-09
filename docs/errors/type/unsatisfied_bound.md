@@ -27,7 +27,7 @@ fn show::<T: Display>(value: &T) {
 }
 
 fn main() {
-    show(Point { x: 1, y: 2 });
+    show(&Point { x: 1, y: 2 });
 }
 ```
 
@@ -52,6 +52,6 @@ fn show::<T: Display>(value: &T) {
 }
 
 fn main() {
-    show(Point { x: 1, y: 2 });
+    show(&Point { x: 1, y: 2 });
 }
 ```
