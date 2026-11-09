@@ -1,9 +1,0 @@
-// error: borrow::shrink_while_borrowed
-fn main() {
-    let mut stack: [i64; -..+] = [];
-    stack.push(1);
-    stack.push(2);
-    let s: [i64; &] = stack[0..1];
-    stack.pop();
-    println("{s[0]}");
-}

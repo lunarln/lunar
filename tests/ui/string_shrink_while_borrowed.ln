@@ -1,0 +1,9 @@
+// error: borrow::shrink_while_borrowed
+fn main() {
+    let mut string: String = String::new();
+    string.push('a');
+    string.push('b');
+    let s: str = string[0..1];
+    string.pop();
+    println("{s.as_bytes()[0]}");
+}
