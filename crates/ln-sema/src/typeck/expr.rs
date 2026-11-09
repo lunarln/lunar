@@ -704,6 +704,13 @@ impl<'s, 'a> FnCtx<'s, 'a> {
 
     fn check_array(&mut self, elems: &[ast::Expr], expect: Option<&Ty>, span: Span) -> Expr {
         let exp = expect.map(|t| self.shallow(t));
+        // `[]` is also a valid (empty) slice.
+        if elems.is_empty()
+            && let Some(Ty::Array(e, k)) = &exp
+            && k.is_slice()
+        {
+            return self.mk(ExprKind::Array(Vec::new()), Ty::Array(e.clone(), *k), span);
+        }
         let (elem_ty, kind) = match &exp {
             Some(Ty::Array(e, k)) if !k.is_slice() => ((**e).clone(), *k),
             _ => (self.new_var(span), ArrKind::Fixed(elems.len() as u64)),

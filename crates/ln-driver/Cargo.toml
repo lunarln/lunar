@@ -1,7 +1,24 @@
 [package]
 name = "ln-driver"
-version = "0.1.0"
-edition = "2024"
+description = "The `lunar` command line compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "lunar"
+path = "src/main.rs"
+
+[lib]
+name = "ln_driver"
+path = "src/lib.rs"
 
 [dependencies]
-ln-lexer.workspace = true
+ln-diag.workspace = true
+ln-parser.workspace = true
+ln-sema.workspace = true
+ln-codegen.workspace = true
+clap = { version = "4.6", features = ["derive"] }
+
+cc.workspace = true
