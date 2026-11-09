@@ -186,7 +186,12 @@ impl<'p> Cx<'p, '_> {
             }
             ExprKind::Temp(inner) => {
                 let mut r = self.value_roots(inner);
-                r.insert(Root::Temp);
+                // Slicing a temporary view (`s.as_bytes()[0..2]`) points
+                // wherever that view points; only a temporary owner or
+                // fixed array holds the data itself.
+                if !self.is_view_container(&place.ty) {
+                    r.insert(Root::Temp);
+                }
                 r
             }
             _ => Roots::new(),

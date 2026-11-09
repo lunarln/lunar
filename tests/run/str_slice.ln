@@ -1,0 +1,15 @@
+// Slicing str and String by byte range; slicing a temporary view.
+
+fn main() {
+    let s: str = "hello, wörld";
+    let a: str = s[0..5];
+    let b = s[7..];
+    let c = s[..5];
+    println("{a} | {b} | {c} | {s[..]}");
+    let mut owned = String::from("lunar lang");
+    owned.push_str("!");
+    let d: str = owned[0..5];
+    let e: str = owned.as_str();
+    let bytes: [u8; &] = s.as_bytes()[0..2];
+    println("{d} | {e} | {bytes.len()} | {s.len()}");
+}

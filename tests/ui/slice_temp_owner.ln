@@ -1,0 +1,9 @@
+// error: borrow::outlives_root
+fn make(): [u8] {
+    return [1, 2, 3];
+}
+
+fn main() {
+    let v: [u8; &] = make()[0..2];
+    println("{v.len()}");
+}
