@@ -9,7 +9,7 @@
 use crate::Cg;
 use inkwell::IntPredicate;
 use inkwell::basic_block::BasicBlock;
-use inkwell::types::{BasicType, BasicTypeEnum};
+use inkwell::types::BasicTypeEnum;
 use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PointerValue};
 use ln_diag::Span;
 use ln_sema::defs::ConstVal;
@@ -53,7 +53,17 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
     pub fn generate(cg: &'a mut Cg<'ctx, 'p>, f: FunctionValue<'ctx>, body: &'p Body, args: &[Ty]) -> Result<(), String> {
         let entry = cg.ctx.append_basic_block(f, "entry");
         cg.b.position_at_end(entry);
-        let mut fc = FnCg { cg, f, body, args: args.to_vec(), locals: vec![None; body.locals.len()], cleanups: Vec::new(), marks: Vec::new(), loops: HashMap::new(), error: None };
+        let mut fc = FnCg {
+            cg,
+            f,
+            body,
+            args: args.to_vec(),
+            locals: vec![None; body.locals.len()],
+            cleanups: Vec::new(),
+            marks: Vec::new(),
+            loops: HashMap::new(),
+            error: None,
+        };
         // Parameters.
         for (i, &l) in body.params.iter().enumerate() {
             let param = f.get_nth_param(i as u32).unwrap();
@@ -113,10 +123,6 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         t.subst(&self.args)
     }
 
-    pub fn ll(&mut self, t: &Ty) -> BasicTypeEnum<'ctx> {
-        let t = self.t(t);
-        self.cg.llty(&t)
-    }
 
     /// An alloca in the entry block.
     pub fn alloca(&mut self, ty: BasicTypeEnum<'ctx>, name: &str) -> PointerValue<'ctx> {
@@ -1008,7 +1014,11 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 let val = self.load(ptr, ty).into_int_value();
                 let (Ok(l), Ok(h)) = (self.cg.const_val(lo, ty), self.cg.const_val(hi, ty)) else { return };
                 let signed = matches!(ty, Ty::Int(i) if i.signed());
-                let (ge, le) = if signed { (IntPredicate::SGE, if *inclusive { IntPredicate::SLE } else { IntPredicate::SLT }) } else { (IntPredicate::UGE, if *inclusive { IntPredicate::ULE } else { IntPredicate::ULT }) };
+                let (ge, le) = if signed {
+                    (IntPredicate::SGE, if *inclusive { IntPredicate::SLE } else { IntPredicate::SLT })
+                } else {
+                    (IntPredicate::UGE, if *inclusive { IntPredicate::ULE } else { IntPredicate::ULT })
+                };
                 let a = self.cg.b.build_int_compare(ge, val, l.into_int_value(), "").unwrap();
                 let b = self.cg.b.build_int_compare(le, val, h.into_int_value(), "").unwrap();
                 let both = self.cg.b.build_and(a, b, "").unwrap();

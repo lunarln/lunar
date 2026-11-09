@@ -41,8 +41,14 @@ fn main() {
                 v.push(format!("{p}/bin/llvm-config"));
             }
             v.extend(
-                ["llvm-config-20", "llvm-config", "/opt/homebrew/opt/llvm@20/bin/llvm-config", "/usr/local/opt/llvm@20/bin/llvm-config", "/usr/lib/llvm-20/bin/llvm-config"]
-                    .map(String::from),
+                [
+                    "llvm-config-20",
+                    "llvm-config",
+                    "/opt/homebrew/opt/llvm@20/bin/llvm-config",
+                    "/usr/local/opt/llvm@20/bin/llvm-config",
+                    "/usr/lib/llvm-20/bin/llvm-config",
+                ]
+                .map(String::from),
             );
             v
         }

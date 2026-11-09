@@ -37,8 +37,7 @@ impl<'a> Sema<'a> {
         if let Some(prev) = self.mod_data(module).ns(ns).get(name) {
             let prev_span = prev.span;
             self.err(
-                Diagnostic::error(name::DUPLICATE, span, format!("`{name}` is defined multiple times"))
-                    .with_secondary(prev_span, "previous definition here"),
+                Diagnostic::error(name::DUPLICATE, span, format!("`{name}` is defined multiple times")).with_secondary(prev_span, "previous definition here"),
             );
             return;
         }
@@ -110,9 +109,10 @@ impl<'a> Sema<'a> {
                 ast::Meta::NameValue(n, _) if n.name == "doc" => {}
                 m => {
                     let n = m.name();
-                    self.err(Diagnostic::error(syntax::BAD_ATTRIBUTE, a.span, format!("unknown attribute `{}`", n.name)).with_note(
-                        "known attributes: cfg, test, inline, lang, intrinsic, link_name, allow, doc",
-                    ));
+                    self.err(
+                        Diagnostic::error(syntax::BAD_ATTRIBUTE, a.span, format!("unknown attribute `{}`", n.name))
+                            .with_note("known attributes: cfg, test, inline, lang, intrinsic, link_name, allow, doc"),
+                    );
                 }
             }
         }
@@ -186,8 +186,7 @@ impl<'a> Sema<'a> {
                     }
                     variants.push(VariantDef { name: v.name.name.clone(), def: vid, ctor, fields: Vec::new(), span: v.span });
                 }
-                self.p.defs[id.0 as usize].data =
-                    DefData::Adt(Box::new(AdtData { generics: Generics::default(), variants, is_enum: true }));
+                self.p.defs[id.0 as usize].data = DefData::Adt(Box::new(AdtData { generics: Generics::default(), variants, is_enum: true }));
             }
             ast::ItemKind::Trait(t) => {
                 let id = self.new_def(&t.name.name, DefKind::Trait, Some(module), t.name.span, AstRef::Trait(t));
@@ -215,12 +214,8 @@ impl<'a> Sema<'a> {
                         self.collect_block_items(module, body, src);
                     }
                 }
-                self.p.defs[id.0 as usize].data = DefData::Trait(Box::new(TraitData {
-                    generics: Generics::default(),
-                    supertraits: Vec::new(),
-                    methods,
-                    auto: false,
-                }));
+                self.p.defs[id.0 as usize].data =
+                    DefData::Trait(Box::new(TraitData { generics: Generics::default(), supertraits: Vec::new(), methods, auto: false }));
             }
             ast::ItemKind::Impl(im) => {
                 let id = self.new_def("<impl>", DefKind::Impl, Some(module), item.span, AstRef::Impl(im));
@@ -290,7 +285,11 @@ impl<'a> Sema<'a> {
                 for inner in &block.items {
                     match &inner.kind {
                         ast::ItemKind::Fn(f) if f.body.is_none() => self.collect_item(module, inner, src, chain, Some(abi)),
-                        _ => self.err(Diagnostic::error(syntax::UNEXPECTED_TOKEN, inner.span, "extern blocks may only contain function declarations without bodies")),
+                        _ => self.err(Diagnostic::error(
+                            syntax::UNEXPECTED_TOKEN,
+                            inner.span,
+                            "extern blocks may only contain function declarations without bodies",
+                        )),
                     }
                 }
             }

@@ -72,11 +72,7 @@ impl<'a> Sema<'a> {
                 }
                 None
             }
-            DefData::Adt(adt) if adt.is_enum => adt
-                .variants
-                .iter()
-                .find(|v| v.name == name)
-                .map(|v| Binding { def: v.def, is_pub: true, span: v.span }),
+            DefData::Adt(adt) if adt.is_enum => adt.variants.iter().find(|v| v.name == name).map(|v| Binding { def: v.def, is_pub: true, span: v.span }),
             _ => None,
         }
     }
@@ -337,7 +333,13 @@ impl<'a> Sema<'a> {
     }
 }
 
-fn flatten_use<'a>(m: DefId, mut prefix: Vec<ast::Ident>, tree: &'a ast::UseTree, is_pub: bool, out: &mut Vec<(DefId, Vec<ast::Ident>, &'a ast::UseTree, bool)>) {
+fn flatten_use<'a>(
+    m: DefId,
+    mut prefix: Vec<ast::Ident>,
+    tree: &'a ast::UseTree,
+    is_pub: bool,
+    out: &mut Vec<(DefId, Vec<ast::Ident>, &'a ast::UseTree, bool)>,
+) {
     prefix.extend(tree.prefix.iter().cloned());
     match &tree.kind {
         ast::UseKind::Nested(children) => {

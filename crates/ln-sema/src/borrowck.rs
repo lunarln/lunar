@@ -231,8 +231,12 @@ impl<'p> Cx<'p, '_> {
                         continue;
                     }
                     self.err(
-                        Diagnostic::error(borrow::OUTLIVES_ROOT, span, format!("`{dname}` would point into a temporary value that is freed at the end of this statement"))
-                            .with_help("bind the value to a variable first so it lives long enough"),
+                        Diagnostic::error(
+                            borrow::OUTLIVES_ROOT,
+                            span,
+                            format!("`{dname}` would point into a temporary value that is freed at the end of this statement"),
+                        )
+                        .with_help("bind the value to a variable first so it lives long enough"),
                     );
                 }
                 Root::Local(l) => {
@@ -271,7 +275,9 @@ impl<'p> Cx<'p, '_> {
                 if let Root::Local(l) = r
                     && let LocalKind::Param { .. } = self.local(l).kind
                 {
-                    d = d.with_note(format!("{n} is passed by value, so it is a copy owned by this function")).with_help("take a slice parameter or an owning array instead");
+                    d = d
+                        .with_note(format!("{n} is passed by value, so it is a copy owned by this function"))
+                        .with_help("take a slice parameter or an owning array instead");
                 }
                 self.err(d);
             }
@@ -314,8 +320,12 @@ impl<'p> Cx<'p, '_> {
                                 if !roots.is_empty() && self.reported.insert((value.span, 9)) {
                                     let n = self.local(l).name.clone();
                                     self.err(
-                                        Diagnostic::error(borrow::ESCAPES_VIA_PARAM, value.span, format!("cannot store a view of a local value into parameter `{n}`"))
-                                            .with_note("the caller's data may outlive the value being viewed"),
+                                        Diagnostic::error(
+                                            borrow::ESCAPES_VIA_PARAM,
+                                            value.span,
+                                            format!("cannot store a view of a local value into parameter `{n}`"),
+                                        )
+                                        .with_note("the caller's data may outlive the value being viewed"),
                                     );
                                 }
                             } else if !self.place_through_view(place) {
@@ -425,7 +435,11 @@ impl<'p> Cx<'p, '_> {
         }
         let held_conflict = self.held.iter().any(|r| r.contains(&Root::Local(root)));
         if held_conflict && what == "shrink" && self.reported.insert((span, u32::MAX - 1)) {
-            self.err(Diagnostic::error(borrow::SHRINK_WHILE_BORROWED, span, format!("`{rname}` may be shrunk here while another argument of this call points into it")));
+            self.err(Diagnostic::error(
+                borrow::SHRINK_WHILE_BORROWED,
+                span,
+                format!("`{rname}` may be shrunk here while another argument of this call points into it"),
+            ));
         }
     }
 
@@ -435,7 +449,11 @@ impl<'p> Cx<'p, '_> {
             Some(Root::Local(l)) => l,
             Some(Root::Temp) => return None,
             None => {
-                self.err(Diagnostic::error(borrow::SHRINK_NOT_OWNER, span, "only an array's owner can mark it as shrinkable (`!`), and this place has no owner here"));
+                self.err(Diagnostic::error(
+                    borrow::SHRINK_NOT_OWNER,
+                    span,
+                    "only an array's owner can mark it as shrinkable (`!`), and this place has no owner here",
+                ));
                 return None;
             }
         };

@@ -68,10 +68,7 @@ pub(crate) fn parse_expr_at(src: &str, offset: u32, file: FileId, ids: &mut IdGe
 
 fn lex_with_offset(src: &str, offset: u32, file: FileId) -> (Vec<Tok<Token>>, Vec<Diagnostic>) {
     let (toks, errs) = ln_lexer::lex(src);
-    let toks = toks
-        .into_iter()
-        .map(|s| Tok::new(s.token, s.range.start as u32 + offset, s.range.end as u32 + offset))
-        .collect();
+    let toks = toks.into_iter().map(|s| Tok::new(s.token, s.range.start as u32 + offset, s.range.end as u32 + offset)).collect();
     let diags = errs
         .into_iter()
         .map(|e| {
@@ -91,8 +88,7 @@ fn lex_with_offset(src: &str, offset: u32, file: FileId) -> (Vec<Tok<Token>>, Ve
 }
 
 /// Delimiter pairs for error recovery.
-pub(crate) const NEST: &[(Token, Token)] =
-    &[(Token::LParen, Token::RParen), (Token::LBracket, Token::RBracket), (Token::LBrace, Token::RBrace)];
+pub(crate) const NEST: &[(Token, Token)] = &[(Token::LParen, Token::RParen), (Token::LBracket, Token::RBracket), (Token::LBrace, Token::RBrace)];
 
 /// The Lunar parser: a thin grammar layer over [`ln_parse_kit::Parser`].
 pub(crate) struct P<'s, 't, 'i> {
@@ -136,8 +132,7 @@ impl<'s, 't, 'i> P<'s, 't, 'i> {
                         }
                         None => "end of file".to_string(),
                     };
-                    Diagnostic::error(syntax::UNEXPECTED_TOKEN, span, format!("expected {exp}, found {found_s}"))
-                        .with_label(format!("expected {exp}"))
+                    Diagnostic::error(syntax::UNEXPECTED_TOKEN, span, format!("expected {exp}, found {found_s}")).with_label(format!("expected {exp}"))
                 }
                 ParseErrorKind::Custom(msg) => Diagnostic::error(syntax::UNEXPECTED_TOKEN, span, msg),
             };

@@ -53,9 +53,8 @@ pub fn compile(program: &Program, map: &SourceMap, opts: &Options, out: &Path) -
         2 => OptimizationLevel::Default,
         _ => OptimizationLevel::Aggressive,
     };
-    let tm = target
-        .create_target_machine(&triple, "generic", "", level, RelocMode::PIC, CodeModel::Default)
-        .ok_or("could not create an LLVM target machine")?;
+    let tm =
+        target.create_target_machine(&triple, "generic", "", level, RelocMode::PIC, CodeModel::Default).ok_or("could not create an LLVM target machine")?;
     let ctx = Context::create();
     let module = ctx.create_module("lunar");
     module.set_triple(&triple);

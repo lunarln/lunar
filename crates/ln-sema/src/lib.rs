@@ -136,6 +136,7 @@ pub(crate) enum AstRef<'a> {
     Fn(&'a ast::FnDecl, bool),
     Struct(&'a ast::StructDecl),
     Enum(&'a ast::EnumDecl),
+    #[allow(dead_code)]
     Variant(&'a ast::VariantDecl),
     Trait(&'a ast::TraitDecl),
     Impl(&'a ast::ImplDecl),

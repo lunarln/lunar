@@ -47,9 +47,7 @@ pub fn render(map: &SourceMap, diags: &[Diagnostic], color: bool, out: &mut dyn 
             continue;
         }
         let range = d.span.start as usize..d.span.end as usize;
-        let mut report = Report::build(ReportKind::Custom(&head, c), (d.span.file, range.clone()))
-            .with_config(config)
-            .with_message(&d.message);
+        let mut report = Report::build(ReportKind::Custom(&head, c), (d.span.file, range.clone())).with_config(config).with_message(&d.message);
         let primary = Label::new((d.span.file, range)).with_color(c);
         let primary = match &d.primary_label {
             Some(m) => primary.with_message(m),
@@ -60,11 +58,7 @@ pub fn render(map: &SourceMap, diags: &[Diagnostic], color: bool, out: &mut dyn 
             if l.span.is_dummy() {
                 continue;
             }
-            report = report.with_label(
-                Label::new((l.span.file, l.span.start as usize..l.span.end as usize))
-                    .with_message(&l.message)
-                    .with_color(Color::Blue),
-            );
+            report = report.with_label(Label::new((l.span.file, l.span.start as usize..l.span.end as usize)).with_message(&l.message).with_color(Color::Blue));
         }
         for n in &d.notes {
             report = report.with_note(n);

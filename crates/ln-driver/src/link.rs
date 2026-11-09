@@ -36,10 +36,12 @@ fn link_windows(obj: &Path, out: &Path) -> Result<(), String> {
         return Err("no linker found: install the MSVC build tools (or LLVM clang), or set LUNAR_CC".into());
     };
     let mut cmd = tool.to_command();
-    cmd.arg("/NOLOGO")
-        .arg(format!("/OUT:{}", out.display()))
-        .arg(obj)
-        .args(["/SUBSYSTEM:CONSOLE", "libcmt.lib", "kernel32.lib", "legacy_stdio_definitions.lib"]);
+    cmd.arg("/NOLOGO").arg(format!("/OUT:{}", out.display())).arg(obj).args([
+        "/SUBSYSTEM:CONSOLE",
+        "libcmt.lib",
+        "kernel32.lib",
+        "legacy_stdio_definitions.lib",
+    ]);
     run(&mut cmd)
 }
 
@@ -62,10 +64,5 @@ fn run(cmd: &mut Command) -> Result<(), String> {
     if output.status.success() {
         return Ok(());
     }
-    Err(format!(
-        "linking failed ({:?}):\n{}{}",
-        cmd.get_program(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    ))
+    Err(format!("linking failed ({:?}):\n{}{}", cmd.get_program(), String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)))
 }

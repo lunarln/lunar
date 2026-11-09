@@ -307,14 +307,7 @@ impl<'t, K: Copy + Eq + Debug> Parser<'t, K> {
 
     /// Parse `open item (sep item)* sep? close`. Errors inside an item recover
     /// to the next separator or closer.
-    pub fn delimited<T>(
-        &mut self,
-        open: K,
-        close: K,
-        sep: K,
-        nest: &[(K, K)],
-        mut item: impl FnMut(&mut Self) -> PResult<T>,
-    ) -> PResult<Vec<T>> {
+    pub fn delimited<T>(&mut self, open: K, close: K, sep: K, nest: &[(K, K)], mut item: impl FnMut(&mut Self) -> PResult<T>) -> PResult<Vec<T>> {
         self.expect(open)?;
         let mut out = Vec::new();
         loop {

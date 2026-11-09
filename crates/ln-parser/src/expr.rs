@@ -83,7 +83,6 @@ impl P<'_, '_, '_> {
             self.k.peek(),
             Some(
                 T::Ident
-                   
                     | T::Number(_)
                     | T::Str
                     | T::Char
@@ -181,8 +180,12 @@ impl P<'_, '_, '_> {
             {
                 let s = self.start();
                 self.error(
-                    Diagnostic::error(syntax::UNEXPECTED_TOKEN, self.span(s, s + 1), format!("comparison operators cannot be chained (`{}` after `{}`)", op2.as_str(), op.as_str()))
-                        .with_help("split the comparison with `&&`, e.g. `a < b && b < c`"),
+                    Diagnostic::error(
+                        syntax::UNEXPECTED_TOKEN,
+                        self.span(s, s + 1),
+                        format!("comparison operators cannot be chained (`{}` after `{}`)", op2.as_str(), op.as_str()),
+                    )
+                    .with_help("split the comparison with `&&`, e.g. `a < b && b < c`"),
                 );
             }
         }
@@ -376,11 +379,7 @@ impl P<'_, '_, '_> {
             T::Number(_) | T::Str | T::Char | T::True | T::False => ExprKind::Lit(self.literal()?),
             T::Ident | T::SelfValue | T::SelfType | T::Crate | T::Super => {
                 let path = self.path_ty_style()?;
-                if self.k.at(T::LBrace) && !r.no_struct && self.looks_like_struct_lit(&path) {
-                    self.struct_lit(path)?
-                } else {
-                    ExprKind::Path(path)
-                }
+                if self.k.at(T::LBrace) && !r.no_struct && self.looks_like_struct_lit(&path) { self.struct_lit(path)? } else { ExprKind::Path(path) }
             }
             T::LParen => {
                 self.k.bump();
@@ -637,10 +636,8 @@ impl P<'_, '_, '_> {
         }
         // A statement starting with a block-like expression ends with it, so
         // `if c { } *p = 1;` is two statements, not a multiplication.
-        let block_start = matches!(
-            self.k.peek(),
-            Some(T::If | T::Match | T::While | T::Loop | T::For | T::LBrace)
-        ) || (self.k.at(T::Unsafe) && self.k.nth_at(1, T::LBrace));
+        let block_start =
+            matches!(self.k.peek(), Some(T::If | T::Match | T::While | T::Loop | T::For | T::LBrace)) || (self.k.at(T::Unsafe) && self.k.nth_at(1, T::LBrace));
         let e = if block_start {
             let e = self.primary(Restr::default())?;
             if self.k.at(T::Dot) || self.k.at(T::Question) || self.k.at(T::As) {

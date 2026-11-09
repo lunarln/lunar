@@ -174,7 +174,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                     }
                     Ty::Error => Some(self.error_expr(e.span)),
                     t => {
-                        self.err(Diagnostic::error(tyc::BAD_OPERAND, e.span, format!("type `{}` cannot be dereferenced", self.ty_str(&t))).with_note("only raw pointers (`*T`, `*mut T`) can be dereferenced"));
+                        self.err(
+                            Diagnostic::error(tyc::BAD_OPERAND, e.span, format!("type `{}` cannot be dereferenced", self.ty_str(&t)))
+                                .with_note("only raw pointers (`*T`, `*mut T`) can be dereferenced"),
+                        );
                         Some(self.error_expr(e.span))
                     }
                 }
@@ -479,10 +482,14 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             UnOp::Neg => {
                 // Fold `-literal` so `-128i8` range-checks correctly.
                 if let ast::ExprKind::Lit(ast::Lit::Int { value, .. }) = &x.kind {
-                    let mut lit = self.check_lit(match &x.kind {
-                        ast::ExprKind::Lit(l) => l,
-                        _ => unreachable!(),
-                    }, expect, x.span);
+                    let mut lit = self.check_lit(
+                        match &x.kind {
+                            ast::ExprKind::Lit(l) => l,
+                            _ => unreachable!(),
+                        },
+                        expect,
+                        x.span,
+                    );
                     if let ExprKind::Lit(ConstVal::Int(_)) = lit.kind {
                         lit.kind = ExprKind::Lit(ConstVal::Int(-(*value as i128)));
                         if let Some(last) = self.lit_checks.last_mut() {
@@ -609,7 +616,11 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             self.err(
                 Diagnostic::error(tyc::BAD_OPERAND, span, format!("cannot apply this operator to `{ts}`"))
                     .with_note(format!("`{ts}` does not implement `{tn}`"))
-                    .with_help(if matches!(self_ty, Ty::Param(..)) { format!("add `{tn}` to the parameter's bounds") } else { format!("implement `{tn}` for `{ts}`") }),
+                    .with_help(if matches!(self_ty, Ty::Param(..)) {
+                        format!("add `{tn}` to the parameter's bounds")
+                    } else {
+                        format!("implement `{tn}` for `{ts}`")
+                    }),
             );
             return self.error_expr(span);
         }
@@ -629,7 +640,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     fn check_assign(&mut self, lhs: &ast::Expr, rhs: &ast::Expr, span: Span) -> Expr {
         let Some(place) = self.check_place(lhs) else {
             let _ = self.check_expr(lhs, None);
-            self.err(Diagnostic::error(tyc::NOT_A_PLACE, lhs.span, "invalid left-hand side of assignment").with_note("only variables, fields, indexes and `*ptr` can be assigned"));
+            self.err(
+                Diagnostic::error(tyc::NOT_A_PLACE, lhs.span, "invalid left-hand side of assignment")
+                    .with_note("only variables, fields, indexes and `*ptr` can be assigned"),
+            );
             let _ = self.check_expr(rhs, None);
             return self.unit_expr(span);
         };
@@ -842,7 +856,19 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let ev = self.check_expr(e, Some(&elem));
         let ev = self.coerce(ev, &elem, e.span);
         let ty = Ty::Adt(range, vec![elem]);
-        self.mk(ExprKind::Adt { def: range, args: match &ty { Ty::Adt(_, a) => a.clone(), _ => vec![] }, variant: 0, fields: vec![(0, sv), (1, ev)] }, ty, span)
+        self.mk(
+            ExprKind::Adt {
+                def: range,
+                args: match &ty {
+                    Ty::Adt(_, a) => a.clone(),
+                    _ => vec![],
+                },
+                variant: 0,
+                fields: vec![(0, sv), (1, ev)],
+            },
+            ty,
+            span,
+        )
     }
 
     // ===================================================================== blocks
@@ -929,14 +955,18 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 })
             }
             None => {
-                self.err(Diagnostic::error(tyc::ANNOTATIONS_NEEDED, span, "`let` bindings must be initialized").with_help("give it a value: `let x: T = ...;`"));
+                self.err(
+                    Diagnostic::error(tyc::ANNOTATIONS_NEEDED, span, "`let` bindings must be initialized").with_help("give it a value: `let x: T = ...;`"),
+                );
                 None
             }
         };
         let t = declared.or_else(|| init.as_ref().map(|i| i.ty.clone())).unwrap_or(Ty::Error);
         let p = self.check_pat(pat, &t, true);
         if !p.is_irrefutable(&|d| self.s.p.is_enum(d)) {
-            self.err(Diagnostic::error(tyc::NON_EXHAUSTIVE, pat.span, "refutable pattern in `let`").with_help("use `if let` or `match` to handle the other cases"));
+            self.err(
+                Diagnostic::error(tyc::NON_EXHAUSTIVE, pat.span, "refutable pattern in `let`").with_help("use `if let` or `match` to handle the other cases"),
+            );
         }
         thir::Stmt::Let { pat: p, init, span }
     }
@@ -980,7 +1010,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         self.push_scope(None);
         let p = self.check_pat(pat, &st, false);
         let has_else = else_.is_some();
-        let then_e = if has_else { self.check_block_expr(then, expect, false) } else {
+        let then_e = if has_else {
+            self.check_block_expr(then, expect, false)
+        } else {
             let b = self.check_block(then, Some(&Ty::unit()));
             self.mk(ExprKind::Block(b), Ty::unit(), then.span)
         };
@@ -1008,7 +1040,11 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let brk = self.mk(ExprKind::Break { id, value: None }, Ty::Never, span);
         let brk = self.mk(ExprKind::Coerce { kind: Coercion::NeverToAny, expr: Box::new(brk) }, Ty::unit(), span);
         let wild = thir::Pat { kind: PatKind::Wild, ty: st, span };
-        let m = self.mk(ExprKind::Match { scrut: Box::new(s), arms: vec![Arm { pat: p, guard: None, body: body_e }, Arm { pat: wild, guard: None, body: brk }] }, Ty::unit(), span);
+        let m = self.mk(
+            ExprKind::Match { scrut: Box::new(s), arms: vec![Arm { pat: p, guard: None, body: body_e }, Arm { pat: wild, guard: None, body: brk }] },
+            Ty::unit(),
+            span,
+        );
         let blk = thir::Block { stmts: vec![thir::Stmt::Expr(m)], tail: None, locals: Vec::new(), span };
         self.mk(ExprKind::Loop { body: blk, id }, Ty::unit(), span)
     }
@@ -1124,7 +1160,11 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             self.err(
                 Diagnostic::error(tyc::NOT_ITERABLE, iter_span, format!("`{t}` is not iterable"))
                     .with_note("`for` loops work over integer ranges, arrays and slices, and types implementing `Iterator`")
-                    .with_help(if matches!(it_ty, Ty::Str | Ty::String) { "iterate `s.chars()` or `s.bytes()`" } else { "implement `core::iter::Iterator` for it" }),
+                    .with_help(if matches!(it_ty, Ty::Str | Ty::String) {
+                        "iterate `s.chars()` or `s.bytes()`"
+                    } else {
+                        "implement `core::iter::Iterator` for it"
+                    }),
             );
             return self.error_expr(span);
         };
@@ -1142,7 +1182,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let tr = TraitRef { trait_id: iter_trait, args: vec![item.clone()] };
         let tmp_place = self.mk(ExprKind::Local(tmp), it_ty.clone(), iter_span);
         let next = self.mk(
-            ExprKind::Call { callee: Callee::Trait { trait_ref: tr, self_ty: it_ty.clone(), method: "next".into(), method_args: vec![] }, args: vec![thir::Arg::InOut(tmp_place)] },
+            ExprKind::Call {
+                callee: Callee::Trait { trait_ref: tr, self_ty: it_ty.clone(), method: "next".into(), method_args: vec![] },
+                args: vec![thir::Arg::InOut(tmp_place)],
+            },
             opt_ty.clone(),
             iter_span,
         );
@@ -1152,11 +1195,20 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let brk = self.mk(ExprKind::Break { id, value: None }, Ty::Never, span);
         let brk = self.mk(ExprKind::Coerce { kind: Coercion::NeverToAny, expr: Box::new(brk) }, Ty::unit(), span);
         let wild = thir::Pat { kind: PatKind::Wild, ty: opt_ty, span };
-        let m = self.mk(ExprKind::Match { scrut: Box::new(next), arms: vec![Arm { pat: some_pat, guard: None, body: body_e }, Arm { pat: wild, guard: None, body: brk }] }, Ty::unit(), span);
+        let m = self.mk(
+            ExprKind::Match { scrut: Box::new(next), arms: vec![Arm { pat: some_pat, guard: None, body: body_e }, Arm { pat: wild, guard: None, body: brk }] },
+            Ty::unit(),
+            span,
+        );
         let lp = self.mk(ExprKind::Loop { body: thir::Block { stmts: vec![thir::Stmt::Expr(m)], tail: None, locals: vec![], span }, id }, Ty::unit(), span);
         let init = self.read(it, ReadMode::Move);
         let bind_tmp = thir::Pat { kind: PatKind::Binding { local: tmp, mode: ReadMode::Move, sub: None }, ty: it_ty, span: iter_span };
-        let outer = thir::Block { stmts: vec![thir::Stmt::Let { pat: bind_tmp, init: Some(init), span: iter_span }, thir::Stmt::Expr(lp)], tail: None, locals: vec![tmp], span };
+        let outer = thir::Block {
+            stmts: vec![thir::Stmt::Let { pat: bind_tmp, init: Some(init), span: iter_span }, thir::Stmt::Expr(lp)],
+            tail: None,
+            locals: vec![tmp],
+            span,
+        };
         self.mk(ExprKind::Block(outer), Ty::unit(), span)
     }
 
@@ -1200,7 +1252,11 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 let val_ty = args[0].clone();
                 let val = self.new_local("<ok>", val_ty.clone(), false, LocalKind::Let, span, depth + 1);
                 let ok_pat = thir::Pat {
-                    kind: PatKind::Adt { def: *d, variant: ok_idx, fields: vec![(0, thir::Pat { kind: PatKind::Binding { local: val, mode: ReadMode::Move, sub: None }, ty: val_ty.clone(), span })] },
+                    kind: PatKind::Adt {
+                        def: *d,
+                        variant: ok_idx,
+                        fields: vec![(0, thir::Pat { kind: PatKind::Binding { local: val, mode: ReadMode::Move, sub: None }, ty: val_ty.clone(), span })],
+                    },
                     ty: vt.clone(),
                     span,
                 };
@@ -1219,7 +1275,11 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                     }
                     let e_local = self.new_local("<err>", et.clone(), false, LocalKind::Let, span, depth + 1);
                     let pat = thir::Pat {
-                        kind: PatKind::Adt { def: *d, variant: err_idx, fields: vec![(0, thir::Pat { kind: PatKind::Binding { local: e_local, mode: ReadMode::Move, sub: None }, ty: et.clone(), span })] },
+                        kind: PatKind::Adt {
+                            def: *d,
+                            variant: err_idx,
+                            fields: vec![(0, thir::Pat { kind: PatKind::Binding { local: e_local, mode: ReadMode::Move, sub: None }, ty: et.clone(), span })],
+                        },
                         ty: vt.clone(),
                         span,
                     };
@@ -1236,10 +1296,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             (Ty::Error, _) | (_, Ty::Error) => self.error_expr(span),
             _ => {
                 let (a, b) = (self.ty_str(&vt), self.ty_str(&ret));
-                self.err(
-                    Diagnostic::error(tyc::MISMATCH, span, format!("`?` cannot be used on `{a}` in a function returning `{b}`"))
-                        .with_note("`?` works on `Option` in functions returning `Option`, and on `Result` in functions returning `Result` with the same error type"),
-                );
+                self.err(Diagnostic::error(tyc::MISMATCH, span, format!("`?` cannot be used on `{a}` in a function returning `{b}`")).with_note(
+                    "`?` works on `Option` in functions returning `Option`, and on `Result` in functions returning `Result` with the same error type",
+                ));
                 self.error_expr(span)
             }
         }

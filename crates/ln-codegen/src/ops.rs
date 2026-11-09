@@ -4,7 +4,7 @@
 use crate::Cg;
 use crate::func::{BV, FnCg, tri};
 use inkwell::intrinsics::Intrinsic;
-use inkwell::types::{BasicMetadataTypeEnum, BasicType};
+use inkwell::types::BasicMetadataTypeEnum;
 use inkwell::values::{BasicMetadataValueEnum, FunctionValue, IntValue, PointerValue};
 use inkwell::{FloatPredicate, IntPredicate};
 use ln_ast::{BinOp, UnOp};
@@ -693,7 +693,10 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         };
         let fl = self.cg.const_str(&file);
         let i32t = self.cg.ctx.i32_type();
-        self.cg.b.build_call(f, &[i.into(), len.into(), fl.into(), i32t.const_int(line as u64, false).into(), i32t.const_int(col as u64, false).into()], "").unwrap();
+        self.cg
+            .b
+            .build_call(f, &[i.into(), len.into(), fl.into(), i32t.const_int(line as u64, false).into(), i32t.const_int(col as u64, false).into()], "")
+            .unwrap();
         self.cg.b.build_unreachable().unwrap();
     }
 }

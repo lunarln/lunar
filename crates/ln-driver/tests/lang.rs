@@ -72,7 +72,12 @@ fn run_dir(dir: &str) {
             let out = lunar().arg("run").arg(&f).output().unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
             if !out.status.success() {
-                failures.push(format!("{}: exited with {:?}\nstdout:\n{stdout}\nstderr:\n{}", f.display(), out.status.code(), strip_ansi(&String::from_utf8_lossy(&out.stderr))));
+                failures.push(format!(
+                    "{}: exited with {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+                    f.display(),
+                    out.status.code(),
+                    strip_ansi(&String::from_utf8_lossy(&out.stderr))
+                ));
                 continue;
             }
             let expect_path = f.with_extension("out");
@@ -86,7 +91,12 @@ fn run_dir(dir: &str) {
         if src.contains("#[test]") {
             let out = lunar().arg("test").arg(&f).output().unwrap();
             if !out.status.success() {
-                failures.push(format!("{}: `lunar test` failed\n{}{}", f.display(), String::from_utf8_lossy(&out.stdout), strip_ansi(&String::from_utf8_lossy(&out.stderr))));
+                failures.push(format!(
+                    "{}: `lunar test` failed\n{}{}",
+                    f.display(),
+                    String::from_utf8_lossy(&out.stdout),
+                    strip_ansi(&String::from_utf8_lossy(&out.stderr))
+                ));
             }
         }
     }

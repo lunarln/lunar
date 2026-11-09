@@ -277,11 +277,17 @@ pub enum TyKind {
     /// `!T`: parameter-only marker that the argument may have been shrunk.
     Bang(Box<Ty>),
     /// `*T` / `*mut T`
-    Ptr { is_mut: bool, inner: Box<Ty> },
+    Ptr {
+        is_mut: bool,
+        inner: Box<Ty>,
+    },
     /// `()` and `(A, B)`
     Tuple(Vec<Ty>),
     /// `fn(A, B): R`
-    Fn { params: Vec<Ty>, ret: Option<Box<Ty>> },
+    Fn {
+        params: Vec<Ty>,
+        ret: Option<Box<Ty>>,
+    },
     /// `!` in return position.
     Never,
     /// `_` (only valid where inference is allowed).
@@ -323,7 +329,11 @@ pub struct Stmt {
 
 #[derive(Clone, Debug)]
 pub enum StmtKind {
-    Let { pat: Pat, ty: Option<Ty>, init: Option<Expr> },
+    Let {
+        pat: Pat,
+        ty: Option<Ty>,
+        init: Option<Expr>,
+    },
     /// Expression statement. Block-like expressions (`if`, `match`, loops,
     /// blocks) may omit the `;`.
     Expr(Expr),
@@ -406,27 +416,62 @@ pub enum ExprKind {
     Assign(Box<Expr>, Box<Expr>),
     AssignOp(BinOp, Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
-    MethodCall { recv: Box<Expr>, name: Ident, generics: Option<Vec<Ty>>, args: Vec<Expr> },
+    MethodCall {
+        recv: Box<Expr>,
+        name: Ident,
+        generics: Option<Vec<Ty>>,
+        args: Vec<Expr>,
+    },
     Field(Box<Expr>, Ident),
     TupleField(Box<Expr>, u32, Span),
     Index(Box<Expr>, Box<Expr>),
     /// `a..b`, `a..`, `..b`, `..`, `a..=b`
-    Range { start: Option<Box<Expr>>, end: Option<Box<Expr>>, inclusive: bool },
+    Range {
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+        inclusive: bool,
+    },
     Array(Vec<Expr>),
     /// `[value; count]`
     ArrayRepeat(Box<Expr>, Box<Expr>),
     Tuple(Vec<Expr>),
-    StructLit { path: Path, fields: Vec<FieldInit> },
+    StructLit {
+        path: Path,
+        fields: Vec<FieldInit>,
+    },
     Block(Block),
     Unsafe(Block),
-    If { cond: Box<Expr>, then: Block, else_: Option<Box<Expr>> },
+    If {
+        cond: Box<Expr>,
+        then: Block,
+        else_: Option<Box<Expr>>,
+    },
     /// `if let pat = expr { } else { }`
-    IfLet { pat: Pat, scrut: Box<Expr>, then: Block, else_: Option<Box<Expr>> },
-    Match { scrut: Box<Expr>, arms: Vec<Arm> },
-    While { cond: Box<Expr>, body: Block },
-    WhileLet { pat: Pat, scrut: Box<Expr>, body: Block },
+    IfLet {
+        pat: Pat,
+        scrut: Box<Expr>,
+        then: Block,
+        else_: Option<Box<Expr>>,
+    },
+    Match {
+        scrut: Box<Expr>,
+        arms: Vec<Arm>,
+    },
+    While {
+        cond: Box<Expr>,
+        body: Block,
+    },
+    WhileLet {
+        pat: Pat,
+        scrut: Box<Expr>,
+        body: Block,
+    },
     Loop(Block),
-    For { pat: Pat, iter: Box<Expr>, body: Block },
+    For {
+        pat: Pat,
+        iter: Box<Expr>,
+        body: Block,
+    },
     Break(Option<Box<Expr>>),
     Continue,
     Return(Option<Box<Expr>>),
@@ -474,14 +519,23 @@ pub struct Arm {
 
 #[derive(Clone, Debug)]
 pub enum Lit {
-    Int { value: u128, suffix: Option<String> },
-    Float { value: f64, suffix: Option<String> },
+    Int {
+        value: u128,
+        suffix: Option<String>,
+    },
+    Float {
+        value: f64,
+        suffix: Option<String>,
+    },
     Bool(bool),
     Char(char),
     /// A string literal. `value` is the unescaped text. `fmt` holds the
     /// pre-parsed interpolation pieces, used only when the literal converts
     /// to `FmtArgs`.
-    Str { value: String, fmt: FmtString },
+    Str {
+        value: String,
+        fmt: FmtString,
+    },
 }
 
 /// The interpretation of a string literal as a format string.
@@ -512,14 +566,28 @@ pub enum PatKind {
     Wild,
     /// `x`, `mut x`. A single-segment path pattern that names a unit
     /// variant/struct or const is resolved later.
-    Binding { is_mut: bool, name: Ident },
+    Binding {
+        is_mut: bool,
+        name: Ident,
+    },
     Lit(Lit, bool /* negated */),
-    Range { lo: (Lit, bool), hi: (Lit, bool), inclusive: bool },
+    Range {
+        lo: (Lit, bool),
+        hi: (Lit, bool),
+        inclusive: bool,
+    },
     Tuple(Vec<Pat>),
     /// `Path(p, ..)`
-    TupleStruct { path: Path, pats: Vec<Pat> },
+    TupleStruct {
+        path: Path,
+        pats: Vec<Pat>,
+    },
     /// `Path { f: p, g, .. }`
-    Struct { path: Path, fields: Vec<FieldPat>, rest: bool },
+    Struct {
+        path: Path,
+        fields: Vec<FieldPat>,
+        rest: bool,
+    },
     /// Multi-segment path: unit variant / unit struct / const.
     Path(Path),
     Or(Vec<Pat>),

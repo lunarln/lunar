@@ -90,7 +90,8 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                     out.push((idx, self.check_pat(&f.pat, &ft, false)));
                 }
                 if !rest {
-                    let missing: Vec<&str> = v.fields.iter().enumerate().filter(|(i, _)| !out.iter().any(|(j, _)| j == i)).map(|(_, f)| f.name.as_str()).collect();
+                    let missing: Vec<&str> =
+                        v.fields.iter().enumerate().filter(|(i, _)| !out.iter().any(|(j, _)| j == i)).map(|(_, f)| f.name.as_str()).collect();
                     if !missing.is_empty() {
                         self.err(
                             Diagnostic::error(tyc::BAD_PATTERN, span, format!("pattern does not mention field(s) {}", missing.join(", ")))
@@ -140,7 +141,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 let before = self.locals.len();
                 let ps: Vec<Pat> = alts.iter().map(|a| self.check_pat(a, ty, false)).collect();
                 if self.locals.len() != before {
-                    self.err(Diagnostic::error(tyc::BAD_PATTERN, span, "bindings are not supported inside `|` patterns yet").with_help("use separate match arms"));
+                    self.err(
+                        Diagnostic::error(tyc::BAD_PATTERN, span, "bindings are not supported inside `|` patterns yet").with_help("use separate match arms"),
+                    );
                 }
                 PatKind::Or(ps)
             }
@@ -283,7 +286,11 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 } else {
                     let default: Vec<Vec<Lite>> = rows.iter().filter(|r| matches!(r[0], Lite::Wild)).map(|r| r[1..].to_vec()).collect();
                     let w = self.missing(&default, rest_tys)?;
-                    let missing_ctor = all.iter().find(|(c, _, _)| !used.contains(c)).map(|(_, n, f)| if f.is_empty() { n.clone() } else { format!("{n}(..)") }).unwrap_or_else(|| "_".into());
+                    let missing_ctor = all
+                        .iter()
+                        .find(|(c, _, _)| !used.contains(c))
+                        .map(|(_, n, f)| if f.is_empty() { n.clone() } else { format!("{n}(..)") })
+                        .unwrap_or_else(|| "_".into());
                     let mut out = vec![missing_ctor];
                     out.extend(w);
                     Some(out)
@@ -364,11 +371,16 @@ fn expand(p: &Lite) -> Vec<Lite> {
             let mut acc: Vec<Vec<Lite>> = vec![vec![]];
             for s in subs {
                 let alts = expand(s);
-                acc = acc.into_iter().flat_map(|prefix| alts.iter().map(move |a| {
-                    let mut v = prefix.clone();
-                    v.push(a.clone());
-                    v
-                })).collect();
+                acc = acc
+                    .into_iter()
+                    .flat_map(|prefix| {
+                        alts.iter().map(move |a| {
+                            let mut v = prefix.clone();
+                            v.push(a.clone());
+                            v
+                        })
+                    })
+                    .collect();
             }
             acc.into_iter().map(|v| Lite::Ctor(*c, v)).collect()
         }

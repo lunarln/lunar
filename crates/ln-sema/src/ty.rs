@@ -18,8 +18,7 @@ pub enum IntTy {
 }
 
 impl IntTy {
-    pub const ALL: [IntTy; 10] =
-        [IntTy::I8, IntTy::I16, IntTy::I32, IntTy::I64, IntTy::Isize, IntTy::U8, IntTy::U16, IntTy::U32, IntTy::U64, IntTy::Usize];
+    pub const ALL: [IntTy; 10] = [IntTy::I8, IntTy::I16, IntTy::I32, IntTy::I64, IntTy::Isize, IntTy::U8, IntTy::U16, IntTy::U32, IntTy::U64, IntTy::Usize];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -55,7 +54,13 @@ impl IntTy {
     }
 
     pub fn max(self) -> u128 {
-        if self.signed() { (1u128 << (self.bits() - 1)) - 1 } else if self.bits() == 128 { u128::MAX } else { (1u128 << self.bits()) - 1 }
+        if self.signed() {
+            (1u128 << (self.bits() - 1)) - 1
+        } else if self.bits() == 128 {
+            u128::MAX
+        } else {
+            (1u128 << self.bits()) - 1
+        }
     }
 
     /// Magnitude of the minimum value (0 for unsigned).

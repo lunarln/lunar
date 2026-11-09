@@ -6,7 +6,7 @@
 
 use crate::Program;
 use crate::defs::*;
-use crate::ty::{ArrKind, Ty, TraitRef};
+use crate::ty::{ArrKind, TraitRef, Ty};
 
 /// How a trait method call is implemented for a concrete self type.
 #[derive(Clone, Debug)]

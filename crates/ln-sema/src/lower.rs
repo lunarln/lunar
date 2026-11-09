@@ -194,13 +194,9 @@ impl<'a> Sema<'a> {
                             has_self: false,
                         })),
                         DefKind::Struct => DefData::Adt(Box::new(AdtData { generics: g, variants: Vec::new(), is_enum: false })),
-                        DefKind::Impl => DefData::Impl(Box::new(ImplData {
-                            generics: g,
-                            trait_ref: None,
-                            self_ty: Ty::Error,
-                            methods: Default::default(),
-                            negative: false,
-                        })),
+                        DefKind::Impl => {
+                            DefData::Impl(Box::new(ImplData { generics: g, trait_ref: None, self_ty: Ty::Error, methods: Default::default(), negative: false }))
+                        }
                         DefKind::TypeAlias => DefData::Alias(AliasData { generics: g, ty: None }),
                         _ => DefData::None,
                     }
@@ -466,7 +462,9 @@ impl<'a> Sema<'a> {
         if f.body.is_none() && !is_extern && !attrs.intrinsic {
             let in_trait = parent.is_some_and(|p| self.p.defs[p.0 as usize].kind == DefKind::Trait);
             if !in_trait {
-                self.err(Diagnostic::error(tyc::RETURN_MISSING, f.sig_span, format!("function `{}` has no body", f.name.name)).with_help("add a body: `{ ... }`"));
+                self.err(
+                    Diagnostic::error(tyc::RETURN_MISSING, f.sig_span, format!("function `{}` has no body", f.name.name)).with_help("add a body: `{ ... }`"),
+                );
             }
         }
         if f.variadic && !is_extern {
@@ -540,7 +538,13 @@ impl<'a> Sema<'a> {
                     );
                     return inner_ty;
                 }
-                self.deferred.push(Deferred { kind: DeferKind::Bang, ty: inner_ty.clone(), env: cx.env.clone(), span: t.span, generics_span: cx.generics_span });
+                self.deferred.push(Deferred {
+                    kind: DeferKind::Bang,
+                    ty: inner_ty.clone(),
+                    env: cx.env.clone(),
+                    span: t.span,
+                    generics_span: cx.generics_span,
+                });
                 Ty::Bang(Box::new(inner_ty))
             }
             ast::TyKind::DynArray(elem) => {
@@ -645,11 +649,14 @@ impl<'a> Sema<'a> {
                         };
                         if args.len() != want {
                             let name = self.p.defs[def.0 as usize].name.clone();
-                            self.err(Diagnostic::error(
-                                tyc::GENERIC_COUNT,
-                                p.span,
-                                format!("`{name}` takes {want} generic argument(s) but {} were supplied", args.len()),
-                            ).with_help(format!("write `{name}::<...>`")));
+                            self.err(
+                                Diagnostic::error(
+                                    tyc::GENERIC_COUNT,
+                                    p.span,
+                                    format!("`{name}` takes {want} generic argument(s) but {} were supplied", args.len()),
+                                )
+                                .with_help(format!("write `{name}::<...>`")),
+                            );
                             return Ty::Error;
                         }
                         if kind == DefKind::TypeAlias {
@@ -797,8 +804,12 @@ impl<'a> Sema<'a> {
             if !ok {
                 let s = self.p.ty_str(&data.self_ty);
                 self.err(
-                    Diagnostic::error(trait_::INHERENT_FOREIGN, im.self_ty.span, format!("cannot define inherent methods on `{s}` outside the crate that defines it"))
-                        .with_help("define a trait with these methods and implement it instead"),
+                    Diagnostic::error(
+                        trait_::INHERENT_FOREIGN,
+                        im.self_ty.span,
+                        format!("cannot define inherent methods on `{s}` outside the crate that defines it"),
+                    )
+                    .with_help("define a trait with these methods and implement it instead"),
                 );
             }
             return;
@@ -813,7 +824,11 @@ impl<'a> Sema<'a> {
             return;
         }
         if data.negative {
-            self.err(Diagnostic::error(trait_::NEGATIVE_IMPL, im.trait_ref.as_ref().unwrap().span, format!("negative impls are only meaningful for auto traits, and `{tname}` is not one")));
+            self.err(Diagnostic::error(
+                trait_::NEGATIVE_IMPL,
+                im.trait_ref.as_ref().unwrap().span,
+                format!("negative impls are only meaningful for auto traits, and `{tname}` is not one"),
+            ));
             return;
         }
         let td = self.p.trait_data(tr.trait_id).clone();
@@ -866,8 +881,12 @@ impl<'a> Sema<'a> {
         }
         if tf.sig.params.len() != imf.sig.params.len() {
             self.err(
-                Diagnostic::error(trait_::SIGNATURE, sp, format!("method takes {} parameter(s) but the trait declares {}", imf.sig.params.len(), tf.sig.params.len()))
-                    .with_secondary(self.p.defs[trait_m.0 as usize].span, "trait method declared here"),
+                Diagnostic::error(
+                    trait_::SIGNATURE,
+                    sp,
+                    format!("method takes {} parameter(s) but the trait declares {}", imf.sig.params.len(), tf.sig.params.len()),
+                )
+                .with_secondary(self.p.defs[trait_m.0 as usize].span, "trait method declared here"),
             );
             return;
         }

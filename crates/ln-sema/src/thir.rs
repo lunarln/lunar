@@ -145,49 +145,125 @@ pub enum ExprKind {
     Local(LocalId),
     Static(DefId),
     /// Field of a struct, tuple, or (inside a matched pattern) enum variant.
-    Field { base: Box<Expr>, variant: usize, field: usize },
+    Field {
+        base: Box<Expr>,
+        variant: usize,
+        field: usize,
+    },
     /// Bounds-checked element of an array, slice or owner.
-    Index { base: Box<Expr>, index: Box<Expr> },
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
     /// `*p` on a raw pointer.
     Deref(Box<Expr>),
     /// A value materialized into a temporary so it can be used as a place.
     Temp(Box<Expr>),
 
     // ----- values -----
-    Read { place: Box<Expr>, mode: ReadMode },
+    Read {
+        place: Box<Expr>,
+        mode: ReadMode,
+    },
     Lit(ConstVal),
-    FnRef { def: DefId, args: Vec<Ty> },
-    Call { callee: Callee, args: Vec<Arg> },
+    FnRef {
+        def: DefId,
+        args: Vec<Ty>,
+    },
+    Call {
+        callee: Callee,
+        args: Vec<Arg>,
+    },
     Unary(UnOp, Box<Expr>),
     /// Primitive arithmetic/comparison; operands have the same primitive type.
     Binary(BinOp, Box<Expr>, Box<Expr>),
     /// Short-circuiting `&&` (true) / `||` (false).
-    Logical { and: bool, lhs: Box<Expr>, rhs: Box<Expr> },
+    Logical {
+        and: bool,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
     Cast(Box<Expr>),
-    Assign { place: Box<Expr>, value: Box<Expr> },
+    Assign {
+        place: Box<Expr>,
+        value: Box<Expr>,
+    },
     /// Primitive compound assignment.
-    AssignOp { op: BinOp, place: Box<Expr>, value: Box<Expr> },
+    AssignOp {
+        op: BinOp,
+        place: Box<Expr>,
+        value: Box<Expr>,
+    },
     Tuple(Vec<Expr>),
-    Adt { def: DefId, args: Vec<Ty>, variant: usize, fields: Vec<(usize, Expr)> },
+    Adt {
+        def: DefId,
+        args: Vec<Ty>,
+        variant: usize,
+        fields: Vec<(usize, Expr)>,
+    },
     /// Array literal; the array kind comes from `ty`.
     Array(Vec<Expr>),
     /// `[value; count]`; `count` is a usize expression.
-    ArrayRepeat { value: Box<Expr>, count: Box<Expr> },
+    ArrayRepeat {
+        value: Box<Expr>,
+        count: Box<Expr>,
+    },
     /// `base[start..end]` producing a slice / str view.
-    Slice { base: Box<Expr>, start: Option<Box<Expr>>, end: Option<Box<Expr>>, inclusive: bool, mutable: bool },
+    Slice {
+        base: Box<Expr>,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+        inclusive: bool,
+        mutable: bool,
+    },
     Block(Block),
-    If { cond: Box<Expr>, then: Box<Expr>, else_: Option<Box<Expr>> },
-    Match { scrut: Box<Expr>, arms: Vec<Arm> },
-    Loop { body: Block, id: LoopId },
-    While { cond: Box<Expr>, body: Block, id: LoopId },
+    If {
+        cond: Box<Expr>,
+        then: Box<Expr>,
+        else_: Option<Box<Expr>>,
+    },
+    Match {
+        scrut: Box<Expr>,
+        arms: Vec<Arm>,
+    },
+    Loop {
+        body: Block,
+        id: LoopId,
+    },
+    While {
+        cond: Box<Expr>,
+        body: Block,
+        id: LoopId,
+    },
     /// `for var in start..end` over integers.
-    ForRange { var: LocalId, start: Box<Expr>, end: Box<Expr>, inclusive: bool, body: Block, id: LoopId },
+    ForRange {
+        var: LocalId,
+        start: Box<Expr>,
+        end: Box<Expr>,
+        inclusive: bool,
+        body: Block,
+        id: LoopId,
+    },
     /// `for pat in array` (by-value elements of a Dull array place).
-    ForArray { pat: Pat, array: Box<Expr>, index: LocalId, body: Block, id: LoopId },
-    Break { id: LoopId, value: Option<Box<Expr>> },
-    Continue { id: LoopId },
+    ForArray {
+        pat: Pat,
+        array: Box<Expr>,
+        index: LocalId,
+        body: Block,
+        id: LoopId,
+    },
+    Break {
+        id: LoopId,
+        value: Option<Box<Expr>>,
+    },
+    Continue {
+        id: LoopId,
+    },
     Return(Option<Box<Expr>>),
-    Coerce { kind: Coercion, expr: Box<Expr> },
+    Coerce {
+        kind: Coercion,
+        expr: Box<Expr>,
+    },
     /// A string literal converted to `FmtArgs`.
     FmtArgs(Vec<FmtPiece>),
     /// Placeholder for an expression that failed to type-check.
@@ -196,10 +272,7 @@ pub enum ExprKind {
 
 impl Expr {
     pub fn is_place(&self) -> bool {
-        matches!(
-            self.kind,
-            ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Deref(_) | ExprKind::Temp(_)
-        )
+        matches!(self.kind, ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Deref(_) | ExprKind::Temp(_))
     }
 }
 
@@ -213,12 +286,24 @@ pub struct Pat {
 #[derive(Clone, Debug)]
 pub enum PatKind {
     Wild,
-    Binding { local: LocalId, mode: ReadMode, sub: Option<Box<Pat>> },
+    Binding {
+        local: LocalId,
+        mode: ReadMode,
+        sub: Option<Box<Pat>>,
+    },
     Lit(ConstVal),
-    Range { lo: ConstVal, hi: ConstVal, inclusive: bool },
+    Range {
+        lo: ConstVal,
+        hi: ConstVal,
+        inclusive: bool,
+    },
     Tuple(Vec<Pat>),
     /// Struct or enum variant with field sub-patterns.
-    Adt { def: DefId, variant: usize, fields: Vec<(usize, Pat)> },
+    Adt {
+        def: DefId,
+        variant: usize,
+        fields: Vec<(usize, Pat)>,
+    },
     Or(Vec<Pat>),
 }
 

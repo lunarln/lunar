@@ -106,10 +106,11 @@ fn load_mod(
         } else if let Some(t) = files.read(&nested) {
             (nested, t, true)
         } else {
-            diags.push(
-                Diagnostic::error(name::MODULE_FILE, ident.span, format!("file not found for module `{}`", ident.name))
-                    .with_help(format!("create `{}` or `{}`", normalize(&flat).display(), normalize(&nested).display())),
-            );
+            diags.push(Diagnostic::error(name::MODULE_FILE, ident.span, format!("file not found for module `{}`", ident.name)).with_help(format!(
+                "create `{}` or `{}`",
+                normalize(&flat).display(),
+                normalize(&nested).display()
+            )));
             continue;
         };
         let child = load_mod(&child_path, text, owner, display_prefix, files, map, ids, diags);

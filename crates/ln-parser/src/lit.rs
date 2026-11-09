@@ -45,9 +45,7 @@ pub fn parse_int_lit(text: &str) -> Result<(u128, Option<String>), String> {
     if rest_has_letters {
         return Err(format!("invalid digit or suffix in `{text}`"));
     }
-    u128::from_str_radix(&cleaned, radix)
-        .map(|v| (v, suffix.map(str::to_string)))
-        .map_err(|_| "integer literal is too large".into())
+    u128::from_str_radix(&cleaned, radix).map(|v| (v, suffix.map(str::to_string))).map_err(|_| "integer literal is too large".into())
 }
 
 pub fn parse_float_lit(text: &str) -> Result<(f64, Option<String>), String> {

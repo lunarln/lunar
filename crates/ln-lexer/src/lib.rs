@@ -431,7 +431,10 @@ mod tests {
         assert_eq!(kinds("0..200"), vec![Number(NumKind::Int), DotDot, Number(NumKind::Int)]);
         assert_eq!(kinds("0."), vec![Number(NumKind::Float)]);
         assert_eq!(kinds("[0.; 8]"), vec![LBracket, Number(NumKind::Float), Semi, Number(NumKind::Int), RBracket]);
-        assert_eq!(kinds("1.5e3 2e-1 7u8 1f32 0xffu8"), vec![Number(NumKind::Float), Number(NumKind::Float), Number(NumKind::Int), Number(NumKind::Float), Number(NumKind::Int)]);
+        assert_eq!(
+            kinds("1.5e3 2e-1 7u8 1f32 0xffu8"),
+            vec![Number(NumKind::Float), Number(NumKind::Float), Number(NumKind::Int), Number(NumKind::Float), Number(NumKind::Int)]
+        );
         assert_eq!(kinds("x.0"), vec![Ident, Dot, Number(NumKind::Int)]);
         assert_eq!(kinds("1.max"), vec![Number(NumKind::Int), Dot, Ident]);
     }

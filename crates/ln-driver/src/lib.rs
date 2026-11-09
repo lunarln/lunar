@@ -57,7 +57,11 @@ pub fn analyze_for(path: &Path, test: bool, target_os: Option<&str>) -> Analysis
         match loader::load_crate(name, &root, prefix, provider.as_ref(), &mut map, &mut ids, &mut diags) {
             Some(c) => crates.push(c),
             None => {
-                diags.push(Diagnostic::error(ln_diag::codes::build::IO, ln_diag::Span::DUMMY, format!("standard library crate `{name}` not found at {}", root.display())));
+                diags.push(Diagnostic::error(
+                    ln_diag::codes::build::IO,
+                    ln_diag::Span::DUMMY,
+                    format!("standard library crate `{name}` not found at {}", root.display()),
+                ));
                 return Analysis { map, program: None, diags };
             }
         }

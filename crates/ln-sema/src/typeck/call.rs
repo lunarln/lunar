@@ -246,7 +246,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             for p in &d.generics.preds {
                 let pty = self.resolve(&p.ty.subst(&args));
                 let ptr = p.trait_ref.subst(&args);
-                if !pty.has_infer() && !self.s.p.implements(&pty, &TraitRef { trait_id: ptr.trait_id, args: ptr.args.iter().map(|a| self.resolve(a)).collect() }, &self.env) {
+                if !pty.has_infer()
+                    && !self.s.p.implements(&pty, &TraitRef { trait_id: ptr.trait_id, args: ptr.args.iter().map(|a| self.resolve(a)).collect() }, &self.env)
+                {
                     (self.vars, self.lens) = snapshot;
                     return None;
                 }
@@ -348,7 +350,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                     }
                     _ => {
                         let n = v.name.clone();
-                        self.err(Diagnostic::error(name::NOT_A_VALUE, span, format!("`{n}` must be called with its fields")).with_help(format!("write `{n}(...)` or `{n} {{ ... }}`")));
+                        self.err(
+                            Diagnostic::error(name::NOT_A_VALUE, span, format!("`{n}` must be called with its fields"))
+                                .with_help(format!("write `{n}(...)` or `{n} {{ ... }}`")),
+                        );
                         self.error_expr(span)
                     }
                 }
@@ -451,7 +456,11 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                     }
                 }
                 if v.ctor != CtorKind::Tuple {
-                    let msg = if v.ctor == CtorKind::Unit { format!("`{}` takes no fields", v.name) } else { format!("`{}` has named fields; use `{} {{ ... }}`", v.name, v.name) };
+                    let msg = if v.ctor == CtorKind::Unit {
+                        format!("`{}` takes no fields", v.name)
+                    } else {
+                        format!("`{}` has named fields; use `{} {{ ... }}`", v.name, v.name)
+                    };
                     self.err(Diagnostic::error(tyc::NOT_CALLABLE, fspan, msg));
                     return self.error_expr(span);
                 }
@@ -509,7 +518,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             let p = self.expr_as_place(v);
             return Arg::InOut(p);
         };
-        if matches!(place.kind, ExprKind::Static(_)) && matches!(&self.s.p.def(match place.kind { ExprKind::Static(d) => d, _ => unreachable!() }).data, DefData::Static(s) if s.mutable) {
+        if matches!(place.kind, ExprKind::Static(_))
+            && matches!(&self.s.p.def(match place.kind { ExprKind::Static(d) => d, _ => unreachable!() }).data, DefData::Static(s) if s.mutable)
+        {
             self.require_unsafe(a.span, "accessing a `static mut`");
         }
         if !self.is_mutable_place(&place) && !place.ty.is_error() {
@@ -718,7 +729,11 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         }
         let missing: Vec<&str> = v.fields.iter().enumerate().filter(|(i, _)| !out.iter().any(|(j, _)| j == i)).map(|(_, f)| f.name.as_str()).collect();
         if !missing.is_empty() {
-            self.err(Diagnostic::error(tyc::MISSING_FIELD, path.span, format!("missing field(s) {} in initializer of `{}`", missing.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", "), v.name)));
+            self.err(Diagnostic::error(
+                tyc::MISSING_FIELD,
+                path.span,
+                format!("missing field(s) {} in initializer of `{}`", missing.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", "), v.name),
+            ));
         }
         out.sort_by_key(|(i, _)| *i);
         self.mk(ExprKind::Adt { def: adt, args, variant, fields: out }, ty, span)

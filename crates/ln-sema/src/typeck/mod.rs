@@ -134,9 +134,13 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let block = if !diverges_or_ok && body.tail.is_none() && !ret.is_unit() {
             let r = fcx.ty_str(&ret);
             fcx.err(
-                Diagnostic::error(tyc::RETURN_MISSING, f.sig_span, format!("function `{}` must return `{r}` but its body can finish without returning", f.name.name))
-                    .with_secondary(body.span.shrink_to_hi(), "body ends here")
-                    .with_help("add a `return` statement or a tail expression"),
+                Diagnostic::error(
+                    tyc::RETURN_MISSING,
+                    f.sig_span,
+                    format!("function `{}` must return `{r}` but its body can finish without returning", f.name.name),
+                )
+                .with_secondary(body.span.shrink_to_hi(), "body ends here")
+                .with_help("add a `return` statement or a tail expression"),
             );
             block
         } else {
@@ -614,7 +618,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                     .with_help("wrap the operation in `unsafe { ... }`"),
             );
         } else {
-            self.err(Diagnostic::error(unsafe_::OUTSIDE_UNSAFE, span, format!("{what} is unsafe and requires an `unsafe` block")).with_help("wrap the operation in `unsafe { ... }`"));
+            self.err(
+                Diagnostic::error(unsafe_::OUTSIDE_UNSAFE, span, format!("{what} is unsafe and requires an `unsafe` block"))
+                    .with_help("wrap the operation in `unsafe { ... }`"),
+            );
         }
     }
 
@@ -624,10 +631,6 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         self.obligations.push((ty, tr, span));
     }
 
-    /// Check an obligation right away if its types are known; otherwise defer.
-    pub(crate) fn oblige_now_or_later(&mut self, ty: Ty, tr: TraitRef, span: Span) {
-        self.oblige(ty, tr, span);
-    }
 
     /// Resolve remaining inference, check deferred obligations and literals.
     fn finish(&mut self) {
@@ -675,10 +678,11 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 let ok = if v < 0 { v.unsigned_abs() <= it.min_magnitude() } else { (v as u128) <= it.max() };
                 if !ok {
                     let lo = if it.signed() { format!("-{}", it.min_magnitude()) } else { "0".into() };
-                    self.err(
-                        Diagnostic::error(tyc::LITERAL_RANGE, span, format!("literal `{v}` does not fit in `{}`", it.name()))
-                            .with_note(format!("`{}` ranges from {lo} to {}", it.name(), it.max())),
-                    );
+                    self.err(Diagnostic::error(tyc::LITERAL_RANGE, span, format!("literal `{v}` does not fit in `{}`", it.name())).with_note(format!(
+                        "`{}` ranges from {lo} to {}",
+                        it.name(),
+                        it.max()
+                    )));
                 }
             }
         }

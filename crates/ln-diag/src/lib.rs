@@ -59,16 +59,7 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     pub fn error(code: Code, span: Span, message: impl Into<String>) -> Self {
-        Self {
-            severity: Severity::Error,
-            code,
-            message: message.into(),
-            span,
-            primary_label: None,
-            labels: Vec::new(),
-            notes: Vec::new(),
-            helps: Vec::new(),
-        }
+        Self { severity: Severity::Error, code, message: message.into(), span, primary_label: None, labels: Vec::new(), notes: Vec::new(), helps: Vec::new() }
     }
 
     pub fn warning(code: Code, span: Span, message: impl Into<String>) -> Self {

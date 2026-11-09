@@ -7,8 +7,7 @@ use ln_lexer::{NumKind, Token as T};
 use ln_parse_kit::{Expected, Fatal, PResult};
 
 /// Tokens that can begin an item (used for recovery and statement dispatch).
-pub(crate) const ITEM_START: &[T] =
-    &[T::Fn, T::Struct, T::Enum, T::Trait, T::Impl, T::Use, T::Mod, T::Const, T::Static, T::Extern, T::Type, T::Pub, T::Hash];
+pub(crate) const ITEM_START: &[T] = &[T::Fn, T::Struct, T::Enum, T::Trait, T::Impl, T::Use, T::Mod, T::Const, T::Static, T::Extern, T::Type, T::Pub, T::Hash];
 
 impl P<'_, '_, '_> {
     pub(crate) fn items_until_eof(&mut self) -> Vec<Item> {

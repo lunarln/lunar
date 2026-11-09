@@ -23,7 +23,11 @@ macro_rules! codes {
 // rendered as `type`.
 pub mod ty {
     use super::Code;
-    macro_rules! c { ($k:ident = $n:literal) => { pub const $k: Code = Code::new("type", $n); }; }
+    macro_rules! c {
+        ($k:ident = $n:literal) => {
+            pub const $k: Code = Code::new("type", $n);
+        };
+    }
     c!(MISMATCH = "mismatch");
     c!(ARRAY_POINTY_ITEMS = "array_pointy_items");
     c!(BANG_OUTSIDE_PARAM = "bang_outside_param");
