@@ -1,0 +1,19 @@
+// Operating system interface. Exactly one implementation is compiled in.
+//
+// Every platform provides:
+//   write(fd: i32, bytes: [u8; &])
+//   read(fd: i32, buf: [u8; &mut]): isize
+//   exit(code: i32): !
+//   reserve(size: usize): *mut u8       (address space, not yet usable)
+//   commit(base: *mut u8, size: usize)  (make the first `size` bytes usable)
+//   release(base: *mut u8, size: usize)
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use self::windows::*;
+
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+pub use self::unix::*;

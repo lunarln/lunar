@@ -1,0 +1,51 @@
+// Float formatting: the shortest decimal representation that round-trips.
+
+use core::fmt::Display;
+use core::intrinsics;
+
+extern "C" {
+    fn sprintf(buf: *mut u8, fmt: *u8, ...): i32;
+    fn strtod(s: *u8, end: *mut *mut u8): f64;
+}
+
+fn write_f64(mut out: String, v: f64) {
+    if v != v {
+        out.push_str("NaN");
+        return;
+    }
+    if v > 1.7976931348623157e308 {
+        out.push_str("inf");
+        return;
+    }
+    if v < -1.7976931348623157e308 {
+        out.push_str("-inf");
+        return;
+    }
+    let mut buf: [u8; 64] = [0; 64];
+    let mut prec: i32 = 1;
+    let mut n: i32 = 0;
+    while prec <= 17 {
+        unsafe {
+            n = sprintf(buf.as_mut_ptr(),"%.*g\0".as_bytes().as_ptr(), prec, v);
+            let back = strtod(buf.as_ptr(), intrinsics::ptr_null_mut::<*mut u8>());
+            if back == v {
+                break;
+            }
+        }
+        prec += 1;
+    }
+    let s = unsafe { intrinsics::str_from_bytes(buf[..n as usize]) };
+    out.push_str(s);
+}
+
+impl Display for f64 {
+    fn fmt(self, mut out: String) {
+        write_f64(out, self);
+    }
+}
+
+impl Display for f32 {
+    fn fmt(self, mut out: String) {
+        write_f64(out, self as f64);
+    }
+}

@@ -1,0 +1,69 @@
+use core::num::Int;
+
+/// `base` raised to `exp`.
+pub fn pow::<T: Int>(base: T, exp: u32): T {
+    let mut result = T::one();
+    let mut b = base;
+    let mut e = exp;
+    while e > 0 {
+        if e & 1 == 1 {
+            result = result * b;
+        }
+        e = e >> 1;
+        if e > 0 {
+            b = b * b;
+        }
+    }
+    return result;
+}
+
+pub fn min::<T: Ord + Dull>(a: T, b: T): T {
+    return core::cmp::min(a, b);
+}
+
+pub fn max::<T: Ord + Dull>(a: T, b: T): T {
+    return core::cmp::max(a, b);
+}
+
+pub fn clamp::<T: Ord + Dull>(x: T, lo: T, hi: T): T {
+    if x < lo { return lo; }
+    if x > hi { return hi; }
+    return x;
+}
+
+pub fn abs_f64(x: f64): f64 {
+    if x < 0.0 { return -x; }
+    return x;
+}
+
+pub const PI: f64 = 3.141592653589793;
+pub const E: f64 = 2.718281828459045;
+
+extern "C" {
+    fn sqrt(x: f64): f64;
+    #[link_name = "pow"]
+    fn c_pow(x: f64, y: f64): f64;
+    fn sin(x: f64): f64;
+    fn cos(x: f64): f64;
+    fn floor(x: f64): f64;
+    fn ceil(x: f64): f64;
+    fn log(x: f64): f64;
+    fn exp(x: f64): f64;
+}
+
+pub fn sqrt_f64(x: f64): f64 { return unsafe { sqrt(x) }; }
+pub fn powf(x: f64, y: f64): f64 { return unsafe { c_pow(x, y) }; }
+pub fn sin_f64(x: f64): f64 { return unsafe { sin(x) }; }
+pub fn cos_f64(x: f64): f64 { return unsafe { cos(x) }; }
+pub fn floor_f64(x: f64): f64 { return unsafe { floor(x) }; }
+pub fn ceil_f64(x: f64): f64 { return unsafe { ceil(x) }; }
+pub fn ln_f64(x: f64): f64 { return unsafe { log(x) }; }
+pub fn exp_f64(x: f64): f64 { return unsafe { exp(x) }; }
+
+impl f64 {
+    pub fn sqrt(self): f64 { return sqrt_f64(self); }
+    pub fn floor(self): f64 { return floor_f64(self); }
+    pub fn ceil(self): f64 { return ceil_f64(self); }
+    pub fn abs(self): f64 { return abs_f64(self); }
+    pub fn powf(self, y: f64): f64 { return powf(self, y); }
+}

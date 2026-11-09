@@ -1,0 +1,116 @@
+// `String`: owned UTF-8 text. Laid out exactly like a `[u8; -..+]` living on
+// its own data stack; `str` is the borrowed view.
+
+use crate::intrinsics;
+
+impl String {
+    pub fn new(): String {
+        return intrinsics::string_new();
+    }
+
+    pub fn from(s: str): String {
+        let mut out = intrinsics::string_new();
+        intrinsics::string_push_str(out, s);
+        return out;
+    }
+
+    pub fn as_str(self): str {
+        return intrinsics::string_as_str(self);
+    }
+
+    pub fn as_bytes(self): [u8; &] {
+        return intrinsics::str_bytes(intrinsics::string_as_str(self));
+    }
+
+    /// Length in bytes.
+    pub fn len(self): usize {
+        return intrinsics::str_len(intrinsics::string_as_str(self));
+    }
+
+    pub fn is_empty(self): bool {
+        return self.len() == 0;
+    }
+
+    pub fn push_str(mut self, s: str) {
+        intrinsics::string_push_str(self, s);
+    }
+
+    /// Append a character, UTF-8 encoded.
+    pub fn push(mut self, c: char) {
+        let cp = c as u32;
+        let mut buf: [u8; 4] = [0; 4];
+        let n: usize = if cp < 128 {
+            buf[0] = cp as u8;
+            1
+        } else if cp < 2048 {
+            buf[0] = (192 | (cp >> 6)) as u8;
+            buf[1] = (128 | (cp & 63)) as u8;
+            2
+        } else if cp < 65536 {
+            buf[0] = (224 | (cp >> 12)) as u8;
+            buf[1] = (128 | ((cp >> 6) & 63)) as u8;
+            buf[2] = (128 | (cp & 63)) as u8;
+            3
+        } else {
+            buf[0] = (240 | (cp >> 18)) as u8;
+            buf[1] = (128 | ((cp >> 12) & 63)) as u8;
+            buf[2] = (128 | ((cp >> 6) & 63)) as u8;
+            buf[3] = (128 | (cp & 63)) as u8;
+            4
+        };
+        intrinsics::string_push_str(self, unsafe { intrinsics::str_from_bytes(buf[..n]) });
+    }
+
+    /// Append formatted text: `s.write("x = {x}")`.
+    pub fn write(mut self, args: FmtArgs) {
+        intrinsics::fmt_write(args, self);
+    }
+
+    pub fn clear(mut self: !Self) {
+        intrinsics::string_truncate(self, 0);
+    }
+
+    /// Shorten to `len` bytes, which must be on a character boundary.
+    pub fn truncate(mut self: !Self, len: usize) {
+        if len < self.len() {
+            let b = self.as_bytes()[len];
+            if b >= 128 && b < 192 {
+                panic("String::truncate: {len} is not a char boundary");
+            }
+        }
+        intrinsics::string_truncate(self, len);
+    }
+
+    /// Remove and return the last character.
+    pub fn pop(mut self: !Self): Option::<char> {
+        let n = self.len();
+        if n == 0 {
+            return None;
+        }
+        let mut start = n - 1;
+        while start > 0 && self.as_bytes()[start] >= 128 && self.as_bytes()[start] < 192 {
+            start -= 1;
+        }
+        let c = self.as_str()[start..].chars().next();
+        intrinsics::string_truncate(self, start);
+        return c;
+    }
+}
+
+impl Clone for String {
+    fn clone(self): String {
+        return String::from(self.as_str());
+    }
+}
+
+impl Eq for String {
+    fn eq(self, other: String): bool {
+        return self.as_str() == other.as_str();
+    }
+}
+
+impl Ord for String {
+    fn cmp(self, other: String): crate::cmp::Ordering {
+        return self.as_str().cmp(other.as_str());
+    }
+}

@@ -1,0 +1,68 @@
+/// An optional value.
+#[lang = "option"]
+pub enum Option::<T> {
+    None,
+    Some(T),
+}
+
+impl::<T> Option::<T> {
+    pub fn is_some(self): bool {
+        return match self {
+            Option::Some(_) => true,
+            Option::None => false,
+        };
+    }
+
+    pub fn is_none(self): bool {
+        return !self.is_some();
+    }
+}
+
+impl::<T: Dull> Option::<T> {
+    /// The contained value; panics on `None`.
+    pub fn unwrap(self): T {
+        return match self {
+            Option::Some(v) => v,
+            Option::None => panic("called `Option::unwrap()` on a `None` value"),
+        };
+    }
+
+    pub fn expect(self, msg: str): T {
+        return match self {
+            Option::Some(v) => v,
+            Option::None => panic("{msg}"),
+        };
+    }
+
+    pub fn unwrap_or(self, default: T): T {
+        return match self {
+            Option::Some(v) => v,
+            Option::None => default,
+        };
+    }
+}
+
+impl::<T: Eq + Dull> Eq for Option::<T> {
+    fn eq(self, other: Option::<T>): bool {
+        return match self {
+            Option::Some(a) => match other {
+                Option::Some(b) => a == b,
+                Option::None => false,
+            },
+            Option::None => other.is_none(),
+        };
+    }
+}
+
+impl::<T: crate::fmt::Display + Dull> crate::fmt::Display for Option::<T> {
+    fn fmt(self, mut out: String) {
+        match self {
+            Option::Some(v) => {
+                out.push_str("Some(");
+                v.fmt(out);
+                out.push_str(")");
+            }
+            Option::None => out.push_str("None"),
+        }
+    }
+}

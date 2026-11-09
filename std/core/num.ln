@@ -1,0 +1,66 @@
+use crate::ops::{Add, Sub, Mul, Div, Rem};
+
+/// Integer types.
+pub trait Int: Add + Sub + Mul + Div + Rem + Eq + Ord + Dull + crate::fmt::Display {
+    fn zero(): Self;
+    fn one(): Self;
+    fn min_value(): Self;
+    fn max_value(): Self;
+}
+
+impl Int for i8 { fn zero(): i8 { return 0; } fn one(): i8 { return 1; } fn min_value(): i8 { return -128; } fn max_value(): i8 { return 127; } }
+impl Int for i16 { fn zero(): i16 { return 0; } fn one(): i16 { return 1; } fn min_value(): i16 { return -32768; } fn max_value(): i16 { return 32767; } }
+impl Int for i32 { fn zero(): i32 { return 0; } fn one(): i32 { return 1; } fn min_value(): i32 { return -2147483648; } fn max_value(): i32 { return 2147483647; } }
+impl Int for i64 { fn zero(): i64 { return 0; } fn one(): i64 { return 1; } fn min_value(): i64 { return -9223372036854775808; } fn max_value(): i64 { return 9223372036854775807; } }
+impl Int for isize { fn zero(): isize { return 0; } fn one(): isize { return 1; } fn min_value(): isize { return -9223372036854775808; } fn max_value(): isize { return 9223372036854775807; } }
+impl Int for u8 { fn zero(): u8 { return 0; } fn one(): u8 { return 1; } fn min_value(): u8 { return 0; } fn max_value(): u8 { return 255; } }
+impl Int for u16 { fn zero(): u16 { return 0; } fn one(): u16 { return 1; } fn min_value(): u16 { return 0; } fn max_value(): u16 { return 65535; } }
+impl Int for u32 { fn zero(): u32 { return 0; } fn one(): u32 { return 1; } fn min_value(): u32 { return 0; } fn max_value(): u32 { return 4294967295; } }
+impl Int for u64 { fn zero(): u64 { return 0; } fn one(): u64 { return 1; } fn min_value(): u64 { return 0; } fn max_value(): u64 { return 18446744073709551615; } }
+impl Int for usize { fn zero(): usize { return 0; } fn one(): usize { return 1; } fn min_value(): usize { return 0; } fn max_value(): usize { return 18446744073709551615; } }
+
+/// Wrapping arithmetic (no overflow panic).
+#[intrinsic] pub fn wrapping_add::<T: Int>(a: T, b: T): T;
+#[intrinsic] pub fn wrapping_sub::<T: Int>(a: T, b: T): T;
+#[intrinsic] pub fn wrapping_mul::<T: Int>(a: T, b: T): T;
+
+impl u64 {
+    pub fn wrapping_sub(self, rhs: u64): u64 { return wrapping_sub(self, rhs); }
+    pub fn wrapping_add(self, rhs: u64): u64 { return wrapping_add(self, rhs); }
+    pub fn wrapping_mul(self, rhs: u64): u64 { return wrapping_mul(self, rhs); }
+}
+
+impl u32 {
+    pub fn wrapping_sub(self, rhs: u32): u32 { return wrapping_sub(self, rhs); }
+    pub fn wrapping_add(self, rhs: u32): u32 { return wrapping_add(self, rhs); }
+    pub fn wrapping_mul(self, rhs: u32): u32 { return wrapping_mul(self, rhs); }
+}
+
+impl usize {
+    pub fn wrapping_sub(self, rhs: usize): usize { return wrapping_sub(self, rhs); }
+    pub fn wrapping_add(self, rhs: usize): usize { return wrapping_add(self, rhs); }
+    pub fn wrapping_mul(self, rhs: usize): usize { return wrapping_mul(self, rhs); }
+}
+
+impl i64 {
+    pub fn wrapping_sub(self, rhs: i64): i64 { return wrapping_sub(self, rhs); }
+    pub fn wrapping_add(self, rhs: i64): i64 { return wrapping_add(self, rhs); }
+    pub fn wrapping_mul(self, rhs: i64): i64 { return wrapping_mul(self, rhs); }
+    pub fn abs(self): i64 { if self < 0 { return -self; } return self; }
+}
+
+impl i32 {
+    pub fn wrapping_sub(self, rhs: i32): i32 { return wrapping_sub(self, rhs); }
+    pub fn wrapping_add(self, rhs: i32): i32 { return wrapping_add(self, rhs); }
+    pub fn wrapping_mul(self, rhs: i32): i32 { return wrapping_mul(self, rhs); }
+    pub fn abs(self): i32 { if self < 0 { return -self; } return self; }
+}
+
+/// Floating point types.
+pub trait Float: Add + Sub + Mul + Div + Eq + Ord + Dull {
+    fn zero(): Self;
+    fn one(): Self;
+}
+
+impl Float for f32 { fn zero(): f32 { return 0.0; } fn one(): f32 { return 1.0; } }
+impl Float for f64 { fn zero(): f64 { return 0.0; } fn one(): f64 { return 1.0; } }

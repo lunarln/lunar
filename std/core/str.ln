@@ -1,0 +1,204 @@
+// Methods on `str`, a borrowed view of UTF-8 text.
+
+use crate::intrinsics;
+
+impl str {
+    /// Length in bytes.
+    pub fn len(self): usize {
+        return intrinsics::str_len(self);
+    }
+
+    pub fn is_empty(self): bool {
+        return intrinsics::str_len(self) == 0;
+    }
+
+    pub fn as_bytes(self): [u8; &] {
+        return intrinsics::str_bytes(self);
+    }
+
+    pub fn chars(self): Chars {
+        return Chars { s: self, pos: 0 };
+    }
+
+    pub fn bytes(self): Bytes {
+        return Bytes { s: self, pos: 0 };
+    }
+
+    pub fn starts_with(self, prefix: str): bool {
+        return self.as_bytes().starts_with(prefix.as_bytes());
+    }
+
+    pub fn ends_with(self, suffix: str): bool {
+        let n = self.len();
+        let m = suffix.len();
+        if m > n {
+            return false;
+        }
+        return self.as_bytes()[n - m..] == suffix.as_bytes();
+    }
+
+    pub fn contains(self, needle: str): bool {
+        return self.find(needle).is_some();
+    }
+
+    /// Byte index of the first occurrence of `needle`.
+    pub fn find(self, needle: str): Option::<usize> {
+        let h = self.as_bytes();
+        let n = needle.as_bytes();
+        if n.len() > h.len() {
+            return None;
+        }
+        let mut i: usize = 0;
+        while i + n.len() <= h.len() {
+            if h[i..i + n.len()] == n {
+                return Some(i);
+            }
+            i += 1;
+        }
+        return None;
+    }
+
+    /// Without leading and trailing ASCII whitespace.
+    pub fn trim(self): str {
+        let b = self.as_bytes();
+        let mut start: usize = 0;
+        let mut end = b.len();
+        while start < end && is_space(b[start]) {
+            start += 1;
+        }
+        while end > start && is_space(b[end - 1]) {
+            end -= 1;
+        }
+        return self[start..end];
+    }
+
+    /// Parse a decimal integer (optionally signed).
+    pub fn parse_i64(self): Option::<i64> {
+        let b = self.as_bytes();
+        if b.len() == 0 {
+            return None;
+        }
+        let mut i: usize = 0;
+        let mut neg = false;
+        if b[0] == 45 {
+            neg = true;
+            i = 1;
+        } else if b[0] == 43 {
+            i = 1;
+        }
+        if i == b.len() {
+            return None;
+        }
+        let mut v: i64 = 0;
+        while i < b.len() {
+            let c = b[i];
+            if c < 48 || c > 57 {
+                return None;
+            }
+            v = v * 10 + (c - 48) as i64;
+            i += 1;
+        }
+        if neg {
+            return Some(-v);
+        }
+        return Some(v);
+    }
+
+    pub fn to_string(self): String {
+        return String::from(self);
+    }
+}
+
+fn is_space(c: u8): bool {
+    return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+/// Iterator over the `char`s of a `str`.
+pub struct Chars {
+    s: str,
+    pos: usize,
+}
+
+impl Iterator::<char> for Chars {
+    fn next(mut self): Option::<char> {
+        let b = self.s.as_bytes();
+        if self.pos >= b.len() {
+            return None;
+        }
+        let c0 = b[self.pos] as u32;
+        let (len, init) = if c0 < 128 {
+            (1, c0)
+        } else if c0 < 224 {
+            (2, c0 & 31)
+        } else if c0 < 240 {
+            (3, c0 & 15)
+        } else {
+            (4, c0 & 7)
+        };
+        let mut cp = init;
+        let mut k: usize = 1;
+        while k < len {
+            cp = (cp << 6) | (b[self.pos + k] as u32 & 63);
+            k += 1;
+        }
+        self.pos += len;
+        return Some(char_from_u32(cp));
+    }
+}
+
+/// Iterator over the bytes of a `str`.
+pub struct Bytes {
+    s: str,
+    pos: usize,
+}
+
+impl Iterator::<u8> for Bytes {
+    fn next(mut self): Option::<u8> {
+        let b = self.s.as_bytes();
+        if self.pos >= b.len() {
+            return None;
+        }
+        let v = b[self.pos];
+        self.pos += 1;
+        return Some(v);
+    }
+}
+
+#[intrinsic] pub fn char_from_u32(cp: u32): char;
+
+impl char {
+    pub fn to_u32(self): u32 {
+        return self as u32;
+    }
+
+    pub fn from_u32(cp: u32): Option::<char> {
+        if cp > 1114111 || (cp >= 55296 && cp <= 57343) {
+            return None;
+        }
+        return Some(char_from_u32(cp));
+    }
+
+    pub fn is_digit(self): bool {
+        let c = self as u32;
+        return c >= 48 && c <= 57;
+    }
+
+    pub fn is_alphabetic(self): bool {
+        let c = self as u32;
+        return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+    }
+
+    pub fn is_whitespace(self): bool {
+        let c = self as u32;
+        return c == 32 || c == 9 || c == 10 || c == 13;
+    }
+
+    /// Number of bytes in the UTF-8 encoding.
+    pub fn len_utf8(self): usize {
+        let c = self as u32;
+        if c < 128 { return 1; }
+        if c < 2048 { return 2; }
+        if c < 65536 { return 3; }
+        return 4;
+    }
+}

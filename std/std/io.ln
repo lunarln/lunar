@@ -1,0 +1,56 @@
+use crate::sys;
+
+/// Print formatted text to standard output.
+pub fn print(args: FmtArgs) {
+    let mut s = String::new();
+    core::fmt::write(s, args);
+    sys::write(1, s.as_bytes());
+}
+
+/// Print formatted text and a newline to standard output.
+pub fn println(args: FmtArgs) {
+    let mut s = String::new();
+    core::fmt::write(s, args);
+    s.push('\n');
+    sys::write(1, s.as_bytes());
+}
+
+/// Print formatted text to standard error.
+pub fn eprint(args: FmtArgs) {
+    let mut s = String::new();
+    core::fmt::write(s, args);
+    sys::write(2, s.as_bytes());
+}
+
+/// Print formatted text and a newline to standard error.
+pub fn eprintln(args: FmtArgs) {
+    let mut s = String::new();
+    core::fmt::write(s, args);
+    s.push('\n');
+    sys::write(2, s.as_bytes());
+}
+
+/// Write raw text to standard output without formatting.
+pub fn write_str(s: str) {
+    sys::write(1, s.as_bytes());
+}
+
+/// Read one line from standard input (without the trailing newline).
+/// Returns `false` at end of input.
+pub fn read_line(mut out: String): bool {
+    let mut buf: [u8; 1] = [0];
+    let mut got_any = false;
+    loop {
+        let n = sys::read(0, buf[..]);
+        if n <= 0 {
+            return got_any;
+        }
+        got_any = true;
+        if buf[0] == 10 {
+            return true;
+        }
+        if buf[0] != 13 {
+            out.push_str(unsafe { core::intrinsics::str_from_bytes(buf[..]) });
+        }
+    }
+}

@@ -1,0 +1,278 @@
+// Methods on arrays and slices. Method lookup "autoslices": a call on a
+// `[T; -..+]` also finds methods of `[T; ..+]`, `[T]`, `[T; &mut]` and
+// `[T; &]`, in that order.
+
+use crate::intrinsics;
+
+impl::<T: Dull> [T; &] {
+    pub fn len(self): usize {
+        return intrinsics::slice_len(self);
+    }
+
+    pub fn is_empty(self): bool {
+        return intrinsics::slice_len(self) == 0;
+    }
+
+    pub fn get(self, i: usize): Option::<T> {
+        if i < self.len() {
+            return Some(self[i]);
+        }
+        return None;
+    }
+
+    pub fn first(self): Option::<T> {
+        return self.get(0);
+    }
+
+    pub fn last(self): Option::<T> {
+        let n = self.len();
+        if n == 0 {
+            return None;
+        }
+        return Some(self[n - 1]);
+    }
+
+    pub fn as_ptr(self): *T {
+        return intrinsics::slice_ptr(self);
+    }
+
+    /// A `[T]` holding a copy of these elements.
+    pub fn to_dyn(self): [T] {
+        return intrinsics::arr_from_slice(self);
+    }
+
+    /// A growable copy of these elements.
+    pub fn to_grow(self): [T; -..+] {
+        let mut out: [T; -..+] = [];
+        intrinsics::arr_extend(out, self);
+        return out;
+    }
+}
+
+impl::<T: Dull + Eq> [T; &] {
+    pub fn contains(self, x: T): bool {
+        for v in self {
+            if v == x {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn index_of(self, x: T): Option::<usize> {
+        let mut i: usize = 0;
+        while i < self.len() {
+            if self[i] == x {
+                return Some(i);
+            }
+            i += 1;
+        }
+        return None;
+    }
+
+    pub fn starts_with(self, prefix: [T; &]): bool {
+        if prefix.len() > self.len() {
+            return false;
+        }
+        let mut i: usize = 0;
+        while i < prefix.len() {
+            if !(self[i] == prefix[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
+    }
+}
+
+impl::<T: Dull + Eq> Eq for [T; &] {
+    fn eq(self, other: [T; &]): bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        let mut i: usize = 0;
+        while i < self.len() {
+            if !(self[i] == other[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
+    }
+}
+
+impl::<T: Dull> [T; &mut] {
+    pub fn as_mut_ptr(self): *mut T {
+        return intrinsics::slice_mut_ptr(self);
+    }
+
+    pub fn fill(self, value: T) {
+        let mut i: usize = 0;
+        let n = self.len();
+        while i < n {
+            self[i] = value;
+            i += 1;
+        }
+    }
+
+    pub fn swap(self, a: usize, b: usize) {
+        let t = self[a];
+        self[a] = self[b];
+        self[b] = t;
+    }
+
+    pub fn reverse(self) {
+        let n = self.len();
+        let mut i: usize = 0;
+        while i < n / 2 {
+            self.swap(i, n - 1 - i);
+            i += 1;
+        }
+    }
+
+    /// Copy every element of `src` (which must have the same length).
+    pub fn copy_from(self, src: [T; &]) {
+        if src.len() != self.len() {
+            panic("copy_from: length mismatch ({src.len()} vs {self.len()})");
+        }
+        let mut i: usize = 0;
+        while i < src.len() {
+            self[i] = src[i];
+            i += 1;
+        }
+    }
+}
+
+impl::<T: Dull + Ord> [T; &mut] {
+    /// Sort in ascending order (heapsort: in place, O(n log n), not stable).
+    pub fn sort(self) {
+        let n = self.len();
+        if n < 2 {
+            return;
+        }
+        let mut start = n / 2;
+        while start > 0 {
+            start -= 1;
+            sift_down(self, start, n);
+        }
+        let mut end = n;
+        while end > 1 {
+            end -= 1;
+            self.swap(0, end);
+            sift_down(self, 0, end);
+        }
+    }
+}
+
+fn sift_down::<T: Dull + Ord>(s: [T; &mut], start: usize, end: usize) {
+    let mut root = start;
+    loop {
+        let child = 2 * root + 1;
+        if child >= end {
+            return;
+        }
+        let mut swap = root;
+        if s[swap] < s[child] {
+            swap = child;
+        }
+        if child + 1 < end && s[swap] < s[child + 1] {
+            swap = child + 1;
+        }
+        if swap == root {
+            return;
+        }
+        s.swap(root, swap);
+        root = swap;
+    }
+}
+
+impl::<T: Dull> [T; ..+] {
+    /// Append an element. Growth never moves existing elements, so slices
+    /// into the array stay valid.
+    pub fn push(mut self, value: T) {
+        intrinsics::arr_push(self, value);
+    }
+
+    pub fn extend(mut self, items: [T; &]) {
+        intrinsics::arr_extend(self, items);
+    }
+
+    pub fn reserve(mut self, extra: usize) {
+        intrinsics::arr_reserve(self, extra);
+    }
+}
+
+impl::<T: Dull> [T; -..+] {
+    /// Remove and return the last element. Takes `!Self`: the caller's
+    /// slices into this array must be dead.
+    pub fn pop(mut self: !Self): Option::<T> {
+        let n = self.len();
+        if n == 0 {
+            return None;
+        }
+        let v = self[n - 1];
+        intrinsics::arr_truncate(self, n - 1);
+        return Some(v);
+    }
+
+    pub fn truncate(mut self: !Self, len: usize) {
+        intrinsics::arr_truncate(self, len);
+    }
+
+    pub fn clear(mut self: !Self) {
+        intrinsics::arr_truncate(self, 0);
+    }
+
+    /// Remove the element at `i`, shifting later elements down.
+    pub fn remove(mut self: !Self, i: usize): T {
+        let n = self.len();
+        if i >= n {
+            panic("remove index {i} out of bounds for length {n}");
+        }
+        let v = self[i];
+        let mut j = i;
+        while j + 1 < n {
+            self[j] = self[j + 1];
+            j += 1;
+        }
+        intrinsics::arr_truncate(self, n - 1);
+        return v;
+    }
+
+    /// Insert `value` at `i`, shifting later elements up.
+    pub fn insert(mut self, i: usize, value: T) {
+        let n = self.len();
+        if i > n {
+            panic("insert index {i} out of bounds for length {n}");
+        }
+        intrinsics::arr_push(self, value);
+        let mut j = n;
+        while j > i {
+            self[j] = self[j - 1];
+            j -= 1;
+        }
+        self[i] = value;
+    }
+}
+
+impl::<T: Dull> Clone for [T] {
+    fn clone(self): [T] {
+        return intrinsics::arr_from_slice(self[..]);
+    }
+}
+
+impl::<T: Dull> Clone for [T; ..+] {
+    fn clone(self): [T; ..+] {
+        let mut out: [T; ..+] = [];
+        intrinsics::arr_extend(out, self[..]);
+        return out;
+    }
+}
+
+impl::<T: Dull> Clone for [T; -..+] {
+    fn clone(self): [T; -..+] {
+        let mut out: [T; -..+] = [];
+        intrinsics::arr_extend(out, self[..]);
+        return out;
+    }
+}

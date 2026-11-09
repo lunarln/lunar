@@ -1,0 +1,76 @@
+// Windows implementation (kernel32).
+
+use core::intrinsics;
+
+extern "C" {
+    fn GetStdHandle(n: u32): *mut u8;
+    fn WriteFile(h: *mut u8, buf: *u8, n: u32, written: *mut u32, overlapped: *mut u8): i32;
+    fn ReadFile(h: *mut u8, buf: *mut u8, n: u32, got: *mut u32, overlapped: *mut u8): i32;
+    fn VirtualAlloc(addr: *mut u8, size: usize, kind: u32, protect: u32): *mut u8;
+    fn VirtualFree(addr: *mut u8, size: usize, kind: u32): i32;
+    fn ExitProcess(code: u32): !;
+}
+
+const MEM_COMMIT: u32 = 4096;
+const MEM_RESERVE: u32 = 8192;
+const MEM_RELEASE: u32 = 32768;
+const PAGE_NOACCESS: u32 = 1;
+const PAGE_READWRITE: u32 = 4;
+
+fn handle(fd: i32): *mut u8 {
+    // STD_INPUT_HANDLE = -10, STD_OUTPUT_HANDLE = -11, STD_ERROR_HANDLE = -12
+    let n: u32 = if fd == 0 { 4294967286 } else if fd == 1 { 4294967285 } else { 4294967284 };
+    return unsafe { GetStdHandle(n) };
+}
+
+pub fn write(fd: i32, bytes: [u8; &]) {
+    let h = handle(fd);
+    let mut off: usize = 0;
+    while off < bytes.len() {
+        let mut written: u32 = 0;
+        let mut chunk = bytes.len() - off;
+        if chunk > 1073741824 {
+            chunk = 1073741824;
+        }
+        let ok = unsafe {
+            WriteFile(h, intrinsics::ptr_offset(bytes.as_ptr(), off as isize), chunk as u32, intrinsics::addr_of_mut(written), core::ptr::null_mut())
+        };
+        if ok == 0 || written == 0 {
+            return;
+        }
+        off += written as usize;
+    }
+}
+
+pub fn read(fd: i32, buf: [u8; &mut]): isize {
+    let h = handle(fd);
+    let mut got: u32 = 0;
+    let ok = unsafe { ReadFile(h, buf.as_mut_ptr(), buf.len() as u32, intrinsics::addr_of_mut(got), core::ptr::null_mut()) };
+    if ok == 0 {
+        return -1;
+    }
+    return got as isize;
+}
+
+pub fn exit(code: i32): ! {
+    unsafe { ExitProcess(code as u32) }
+}
+
+pub fn reserve(size: usize): *mut u8 {
+    return unsafe { VirtualAlloc(core::ptr::null_mut(), size, MEM_RESERVE, PAGE_NOACCESS) };
+}
+
+pub fn commit(base: *mut u8, size: usize) {
+    let p = unsafe { VirtualAlloc(base, size, MEM_COMMIT, PAGE_READWRITE) };
+    if (p as usize) == 0 {
+        write(2, "fatal: out of memory (could not commit data stack pages)\n".as_bytes());
+        exit(134);
+    }
+}
+
+pub fn release(base: *mut u8, size: usize) {
+    let _ = size;
+    unsafe {
+        VirtualFree(base, 0, MEM_RELEASE);
+    }
+}

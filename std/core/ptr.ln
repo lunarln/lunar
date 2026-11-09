@@ -1,0 +1,18 @@
+// `Dull` is implemented by the compiler for every type that is not a pointer
+// or array and contains none. Only Dull types can be array or slice items.
+// It cannot be implemented (or `!`implemented) manually.
+#[lang = "dull"]
+pub trait Dull {}
+
+/// Whether a raw pointer is null.
+pub fn is_null::<T>(p: *T): bool {
+    return (p as usize) == 0;
+}
+
+pub fn null::<T>(): *T {
+    return crate::intrinsics::ptr_null::<T>();
+}
+
+pub fn null_mut::<T>(): *mut T {
+    return crate::intrinsics::ptr_null_mut::<T>();
+}

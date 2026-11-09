@@ -1,0 +1,20 @@
+use crate::sys;
+
+/// Stop the program with a message. Exits with status 101.
+#[lang = "panic_fmt"]
+pub fn panic(args: FmtArgs): ! {
+    let mut s = String::from("panicked: ");
+    core::fmt::write(s, args);
+    s.push('\n');
+    sys::write(2, s.as_bytes());
+    sys::exit(101);
+}
+
+/// Exit the process with `code`.
+pub fn exit(code: i32): ! {
+    sys::exit(code);
+}
+
+pub fn abort(): ! {
+    core::intrinsics::abort();
+}

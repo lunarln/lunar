@@ -1,0 +1,136 @@
+// The Lunar runtime.
+//
+// Data stacks: every owning array (`[T]`, `[T; ..+]`, `[T; -..+]`, `String`)
+// lives on its own data stack: a large reservation of address space whose
+// pages are committed on demand. Growing never moves existing elements, so
+// views into an array stay valid while it grows. Freed stacks are kept in a
+// small pool for reuse.
+//
+// Layout of a data stack: [header: 64 bytes][elements...]. The array handle
+// `{ ptr, len, cap }` points at the first element.
+
+use crate::sys;
+use core::intrinsics;
+
+/// Address space reserved for each data stack.
+const RESERVE: usize = 8589934592;
+/// Granularity of commits.
+const CHUNK: usize = 65536;
+const HEADER: usize = 64;
+const POOL_SIZE: usize = 64;
+
+/// Freed stacks (base addresses) available for reuse.
+static mut POOL: [usize; 64] = [0; 64];
+static mut POOL_LEN: usize = 0;
+
+pub static mut ARGC: i32 = 0;
+pub static mut ARGV: usize = 0;
+
+/// The in-memory form of every owning array handle.
+struct RawArr {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+}
+
+/// Header at the start of each data stack.
+struct Header {
+    /// Bytes committed after the header.
+    committed: usize,
+}
+
+#[lang = "rt_init"]
+fn rt_init(argc: i32, argv: usize) {
+    unsafe {
+        ARGC = argc;
+        ARGV = argv;
+    }
+}
+
+fn acquire(): *mut u8 {
+    unsafe {
+        if POOL_LEN > 0 {
+            POOL_LEN -= 1;
+            return POOL[POOL_LEN] as *mut u8;
+        }
+        let base = sys::reserve(RESERVE);
+        if (base as usize) == 0 {
+            sys::write(2, "fatal: could not reserve address space for a data stack\n".as_bytes());
+            sys::exit(134);
+        }
+        sys::commit(base, CHUNK);
+        let h = base as *mut Header;
+        intrinsics::ptr_write(h, Header { committed: CHUNK - HEADER });
+        return base;
+    }
+}
+
+/// Grow the array behind `handle` so it can hold `len + additional`
+/// elements of `elem_size` bytes.
+#[lang = "ds_grow"]
+fn ds_grow(handle: *mut RawArr, elem_size: usize, additional: usize) {
+    unsafe {
+        let mut a = intrinsics::ptr_read(handle);
+        if a.ptr as usize == 0 {
+            let base = acquire();
+            a.ptr = intrinsics::ptr_offset_mut(base, HEADER as isize);
+        }
+        let base = intrinsics::ptr_offset_mut(a.ptr, 0 - (HEADER as isize));
+        let h = base as *mut Header;
+        let mut header = intrinsics::ptr_read(h);
+        let need = (a.len + additional) * elem_size;
+        if need > header.committed {
+            let mut want = header.committed * 2;
+            if want < need {
+                want = need;
+            }
+            // Round up to whole chunks (including the header).
+            let total = (want + HEADER + CHUNK - 1) / CHUNK * CHUNK;
+            if total > RESERVE {
+                sys::write(2, "fatal: data stack overflow (array exceeds 8 GiB)\n".as_bytes());
+                sys::exit(134);
+            }
+            sys::commit(base, total);
+            header.committed = total - HEADER;
+            intrinsics::ptr_write(h, header);
+        }
+        a.cap = header.committed / elem_size;
+        intrinsics::ptr_write(handle, a);
+    }
+}
+
+/// Release the data stack whose first element is at `ptr`.
+#[lang = "ds_free"]
+fn ds_free(ptr: *mut u8) {
+    if ptr as usize == 0 {
+        return;
+    }
+    unsafe {
+        let base = intrinsics::ptr_offset_mut(ptr, 0 - (HEADER as isize));
+        if POOL_LEN < POOL_SIZE {
+            POOL[POOL_LEN] = base as usize;
+            POOL_LEN += 1;
+        } else {
+            sys::release(base, RESERVE);
+        }
+    }
+}
+
+/// Panic raised by compiler-inserted checks.
+#[lang = "panic_str"]
+fn panic_str(msg: str, file: str, line: u32, col: u32): ! {
+    let mut s = String::from("panicked at ");
+    s.push_str(file);
+    s.write(":{line}:{col}: {msg}\n");
+    sys::write(2, s.as_bytes());
+    sys::exit(101);
+}
+
+#[lang = "panic_bounds"]
+fn panic_bounds(index: usize, len: usize, file: str, line: u32, col: u32): ! {
+    let mut s = String::from("panicked at ");
+    s.push_str(file);
+    s.write(":{line}:{col}: index out of bounds: the length is {len} but the index is {index}\n");
+    sys::write(2, s.as_bytes());
+    sys::exit(101);
+}

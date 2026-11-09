@@ -1,0 +1,102 @@
+// Formatting. A string literal passed to a `FmtArgs` parameter is
+// interpolated: `"x = {x}"` calls `Display::fmt` on `x`.
+
+use crate::intrinsics;
+
+/// Types that can be written into a `String` by format strings.
+#[lang = "display"]
+pub trait Display {
+    fn fmt(self, mut out: String);
+}
+
+/// Append formatted text to `out`.
+pub fn write(mut out: String, args: FmtArgs) {
+    intrinsics::fmt_write(args, out);
+}
+
+/// Format into a new `String`.
+pub fn format(args: FmtArgs): String {
+    let mut s = String::new();
+    intrinsics::fmt_write(args, s);
+    return s;
+}
+
+/// Write the decimal digits of `value`.
+pub fn write_u64(mut out: String, value: u64) {
+    let mut buf: [u8; 20] = [0; 20];
+    let mut i: usize = 20;
+    let mut v = value;
+    if v == 0 {
+        out.push_str("0");
+        return;
+    }
+    while v > 0 {
+        i -= 1;
+        buf[i] = (v % 10) as u8 + 48;
+        v /= 10;
+    }
+    out.push_str(unsafe { intrinsics::str_from_bytes(buf[i..]) });
+}
+
+pub fn write_i64(mut out: String, value: i64) {
+    if value < 0 {
+        out.push_str("-");
+        // Negate in u64 so that i64::MIN works.
+        write_u64(out, (0 as u64).wrapping_sub(value as u64));
+    } else {
+        write_u64(out, value as u64);
+    }
+}
+
+/// Write `value` in the given radix (2..=36) without a prefix.
+pub fn write_radix(mut out: String, value: u64, radix: u64) {
+    let mut buf: [u8; 64] = [0; 64];
+    let mut i: usize = 64;
+    let mut v = value;
+    if v == 0 {
+        out.push_str("0");
+        return;
+    }
+    while v > 0 {
+        i -= 1;
+        let d = (v % radix) as u8;
+        buf[i] = if d < 10 { d + 48 } else { d - 10 + 97 };
+        v /= radix;
+    }
+    out.push_str(unsafe { intrinsics::str_from_bytes(buf[i..]) });
+}
+
+impl Display for u8 { fn fmt(self, mut out: String) { write_u64(out, self as u64); } }
+impl Display for u16 { fn fmt(self, mut out: String) { write_u64(out, self as u64); } }
+impl Display for u32 { fn fmt(self, mut out: String) { write_u64(out, self as u64); } }
+impl Display for u64 { fn fmt(self, mut out: String) { write_u64(out, self); } }
+impl Display for usize { fn fmt(self, mut out: String) { write_u64(out, self as u64); } }
+impl Display for i8 { fn fmt(self, mut out: String) { write_i64(out, self as i64); } }
+impl Display for i16 { fn fmt(self, mut out: String) { write_i64(out, self as i64); } }
+impl Display for i32 { fn fmt(self, mut out: String) { write_i64(out, self as i64); } }
+impl Display for i64 { fn fmt(self, mut out: String) { write_i64(out, self); } }
+impl Display for isize { fn fmt(self, mut out: String) { write_i64(out, self as i64); } }
+
+impl Display for bool {
+    fn fmt(self, mut out: String) {
+        out.push_str(if self { "true" } else { "false" });
+    }
+}
+
+impl Display for char {
+    fn fmt(self, mut out: String) {
+        out.push(self);
+    }
+}
+
+impl Display for str {
+    fn fmt(self, mut out: String) {
+        out.push_str(self);
+    }
+}
+
+impl Display for String {
+    fn fmt(self, mut out: String) {
+        out.push_str(self.as_str());
+    }
+}

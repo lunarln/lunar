@@ -1,0 +1,7 @@
+/// Explicit duplication. Every copyable (non-owning) type implements it
+/// natively; owning types such as `String` and growable arrays implement it
+/// by copying their data onto a fresh data stack.
+#[lang = "clone"]
+pub trait Clone {
+    fn clone(self): Self;
+}

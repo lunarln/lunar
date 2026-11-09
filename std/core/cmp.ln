@@ -1,0 +1,77 @@
+#[lang = "ordering"]
+pub enum Ordering {
+    Less,
+    Equal,
+    Greater,
+}
+
+/// Equality, used by `==` and `!=`.
+#[lang = "eq"]
+pub trait Eq {
+    fn eq(self, other: Self): bool;
+}
+
+/// Total ordering, used by `<`, `<=`, `>` and `>=`.
+#[lang = "ord"]
+pub trait Ord: Eq {
+    fn cmp(self, other: Self): Ordering;
+
+    fn lt(self, other: Self): bool {
+        return match self.cmp(other) {
+            Ordering::Less => true,
+            _ => false,
+        };
+    }
+
+    fn le(self, other: Self): bool {
+        return match self.cmp(other) {
+            Ordering::Greater => false,
+            _ => true,
+        };
+    }
+
+    fn gt(self, other: Self): bool {
+        return match self.cmp(other) {
+            Ordering::Greater => true,
+            _ => false,
+        };
+    }
+
+    fn ge(self, other: Self): bool {
+        return match self.cmp(other) {
+            Ordering::Less => false,
+            _ => true,
+        };
+    }
+}
+
+impl Eq for Ordering {
+    fn eq(self, other: Ordering): bool {
+        return match (self, other) {
+            (Ordering::Less, Ordering::Less) => true,
+            (Ordering::Equal, Ordering::Equal) => true,
+            (Ordering::Greater, Ordering::Greater) => true,
+            _ => false,
+        };
+    }
+}
+
+impl crate::fmt::Display for Ordering {
+    fn fmt(self, mut out: String) {
+        out.push_str(match self {
+            Ordering::Less => "Less",
+            Ordering::Equal => "Equal",
+            Ordering::Greater => "Greater",
+        });
+    }
+}
+
+pub fn min::<T: Ord + Dull>(a: T, b: T): T {
+    if b < a { return b; }
+    return a;
+}
+
+pub fn max::<T: Ord + Dull>(a: T, b: T): T {
+    if b > a { return b; }
+    return a;
+}

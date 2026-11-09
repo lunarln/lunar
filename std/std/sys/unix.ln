@@ -1,0 +1,71 @@
+// Unix implementation (Linux and macOS) on top of libc.
+
+use core::intrinsics;
+
+extern "C" {
+    #[link_name = "write"]
+    fn c_write(fd: i32, buf: *u8, n: usize): isize;
+    #[link_name = "read"]
+    fn c_read(fd: i32, buf: *mut u8, n: usize): isize;
+    #[link_name = "exit"]
+    fn c_exit(code: i32): !;
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64): *mut u8;
+    fn mprotect(addr: *mut u8, len: usize, prot: i32): i32;
+    fn munmap(addr: *mut u8, len: usize): i32;
+}
+
+const PROT_NONE: i32 = 0;
+const PROT_READ_WRITE: i32 = 3;
+const MAP_PRIVATE: i32 = 2;
+
+#[cfg(target_os = "macos")]
+const MAP_ANON: i32 = 4096;
+#[cfg(target_os = "macos")]
+const MAP_NORESERVE: i32 = 64;
+
+#[cfg(not(target_os = "macos"))]
+const MAP_ANON: i32 = 32;
+#[cfg(not(target_os = "macos"))]
+const MAP_NORESERVE: i32 = 16384;
+
+pub fn write(fd: i32, bytes: [u8; &]) {
+    let mut off: usize = 0;
+    while off < bytes.len() {
+        let n = unsafe { c_write(fd, intrinsics::ptr_offset(bytes.as_ptr(), off as isize), bytes.len() - off) };
+        if n <= 0 {
+            return;
+        }
+        off += n as usize;
+    }
+}
+
+pub fn read(fd: i32, buf: [u8; &mut]): isize {
+    return unsafe { c_read(fd, buf.as_mut_ptr(), buf.len()) };
+}
+
+pub fn exit(code: i32): ! {
+    unsafe { c_exit(code) }
+}
+
+pub fn reserve(size: usize): *mut u8 {
+    let p = unsafe { mmap(core::ptr::null_mut(), size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0) };
+    // MAP_FAILED is (void*)-1.
+    if (p as usize) == 18446744073709551615 {
+        return core::ptr::null_mut();
+    }
+    return p;
+}
+
+pub fn commit(base: *mut u8, size: usize) {
+    let r = unsafe { mprotect(base, size, PROT_READ_WRITE) };
+    if r != 0 {
+        write(2, "fatal: out of memory (could not commit data stack pages)\n".as_bytes());
+        exit(134);
+    }
+}
+
+pub fn release(base: *mut u8, size: usize) {
+    unsafe {
+        munmap(base, size);
+    }
+}

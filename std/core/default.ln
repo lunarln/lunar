@@ -1,0 +1,11 @@
+/// A default value. Primitives default to zero / false / "".
+#[lang = "default"]
+pub trait Default {
+    fn default(): Self;
+}
+
+impl Default for String {
+    fn default(): String {
+        return String::new();
+    }
+}
