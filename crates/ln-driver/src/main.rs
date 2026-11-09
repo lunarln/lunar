@@ -1,6 +1,7 @@
 //! `lunar`: the Lunar compiler.
 
 use clap::{Parser, Subcommand};
+use ln_diag::Diagnostic;
 use ln_driver::{Analysis, BuildOptions, analyze, build, emit_diagnostics};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -162,12 +163,21 @@ fn finish_front(a: &Analysis, color: bool) -> Result<(), ()> {
 fn compile(file: &Path, out: &Path, release: bool, test: bool, emit_llvm: Option<PathBuf>, color: bool) -> Result<(), ()> {
     let a = analyze(file, test);
     finish_front(&a, color)?;
-    if !test && a.program.as_ref().is_some_and(|p| p.main.is_none()) {
-        eprintln!("error: `{}` has no `main` function", file.display());
-        return Err(());
+    if let Some(d) = ln_driver::check_main(&a, file, test) {
+        return Err(report(&a, d, color));
     }
     let opts = BuildOptions { release, test, output: out.to_path_buf(), emit_llvm, overflow_checks: !release };
-    build(&a, &opts).map_err(|e| eprintln!("error: {e}"))
+    build(&a, &opts).map_err(|d| report(&a, d, color))
+}
+
+/// Print a diagnostic from after the front end (a missing `main`, a code
+/// generation or link failure) with the `lunar explain` hint.
+fn report(a: &Analysis, d: Diagnostic, color: bool) {
+    let diags = [d];
+    emit_diagnostics(&a.map, &diags, color);
+    if let Some(hint) = explain::hint(&diags) {
+        eprintln!("\n{hint}");
+    }
 }
 
 /// Forward a program's exit status. A crash (a signal on Unix, an NTSTATUS
@@ -189,12 +199,11 @@ fn exit_code_of(s: std::process::ExitStatus) -> ExitCode {
 fn emit_ir(file: &Path, release: bool, test: bool, color: bool) -> Result<String, ()> {
     let a = analyze(file, test);
     finish_front(&a, color)?;
-    if !test && a.program.as_ref().is_some_and(|p| p.main.is_none()) {
-        eprintln!("error: `{}` has no `main` function", file.display());
-        return Err(());
+    if let Some(d) = ln_driver::check_main(&a, file, test) {
+        return Err(report(&a, d, color));
     }
     let opts = BuildOptions { release, test, output: PathBuf::new(), emit_llvm: None, overflow_checks: !release };
-    ln_driver::emit_llvm(&a, &opts).map_err(|e| eprintln!("error: {e}"))
+    ln_driver::emit_llvm(&a, &opts).map_err(|d| report(&a, d, color))
 }
 
 fn default_exe(file: &Path) -> PathBuf {
@@ -217,8 +226,8 @@ fn run_tests(file: &Path, filter: Option<&str>, release: bool, color: bool) -> E
     let names: Vec<String> = program.tests.iter().map(|t| program.def(*t).name.clone()).collect();
     let out = temp_exe(file, "test");
     let opts = BuildOptions { release, test: true, output: out.clone(), emit_llvm: None, overflow_checks: !release };
-    if let Err(e) = build(&a, &opts) {
-        eprintln!("error: {e}");
+    if let Err(d) = build(&a, &opts) {
+        report(&a, d, color);
         return ExitCode::FAILURE;
     }
     let selected: Vec<(usize, &String)> = names.iter().enumerate().filter(|(_, n)| filter.is_none_or(|f| n.contains(f))).collect();

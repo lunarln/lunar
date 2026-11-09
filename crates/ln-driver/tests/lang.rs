@@ -1,7 +1,13 @@
 //! End-to-end language tests driven by files in the repository:
 //!
-//! * `tests/ui/*.ln`: must fail to compile; every `// error: scope::name`
-//!   line must appear as `err(scope::name)` in the diagnostics.
+//! * `tests/ui/*.ln`: every `// error: scope::name` line must appear as
+//!   `err(scope::name)` in the diagnostics, and every `// warning:
+//!   scope::name` line as `warn(scope::name)`. A file with `// error:`
+//!   lines must fail to compile; one with only `// warning:` lines must
+//!   compile. `// absent: scope::name` must not be reported at all, and
+//!   `// once: scope::name` exactly once. A `// command: build` line runs
+//!   `lunar build` instead of `lunar check` (for errors only a build
+//!   reports, such as a missing `main`).
 //! * `tests/run/*.ln` and `examples/*.ln`: must compile and run; if a
 //!   sibling `.out` file exists, stdout must match it exactly.
 //! * Files with `#[test]` functions are also run through `lunar test`.
@@ -47,17 +53,40 @@ fn ui_tests_report_expected_errors() {
     let mut failures = Vec::new();
     for f in ln_files(&root().join("tests/ui")) {
         let src = std::fs::read_to_string(&f).unwrap();
-        let expected: Vec<&str> = src.lines().filter_map(|l| l.trim().strip_prefix("// error:")).map(str::trim).collect();
-        assert!(!expected.is_empty(), "{} declares no `// error:` lines", f.display());
-        let out = lunar().arg("check").arg(&f).output().unwrap();
-        let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
-        if out.status.success() {
-            failures.push(format!("{}: compiled successfully but should fail", f.display()));
-            continue;
+        let header = |prefix: &str| -> Vec<String> { src.lines().filter_map(|l| l.trim().strip_prefix(prefix)).map(|c| c.trim().to_string()).collect() };
+        let errors = header("// error:");
+        let warnings = header("// warning:");
+        assert!(!errors.is_empty() || !warnings.is_empty(), "{} declares no `// error:` or `// warning:` lines", f.display());
+        let mut cmd = lunar();
+        if header("// command:").iter().any(|c| c == "build") {
+            let exe =
+                PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("ui-{}{}", f.file_stem().unwrap().to_string_lossy(), std::env::consts::EXE_SUFFIX));
+            cmd.arg("build").arg(&f).arg("-o").arg(exe);
+        } else {
+            cmd.arg("check").arg(&f);
         }
-        for code in expected {
-            if !stderr.contains(&format!("err({code})")) {
-                failures.push(format!("{}: expected err({code}), got:\n{stderr}", f.display()));
+        let out = cmd.output().unwrap();
+        let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+        match (errors.is_empty(), out.status.success()) {
+            (false, true) => failures.push(format!("{}: compiled successfully but should fail", f.display())),
+            (true, false) => failures.push(format!("{}: should compile with warnings only, but failed:\n{stderr}", f.display())),
+            _ => {}
+        }
+        for (kind, codes) in [("err", &errors), ("warn", &warnings)] {
+            for code in codes {
+                if !stderr.contains(&format!("{kind}({code})")) {
+                    failures.push(format!("{}: expected {kind}({code}), got:\n{stderr}", f.display()));
+                }
+            }
+        }
+        for code in header("// absent:") {
+            if stderr.contains(&format!("({code})")) {
+                failures.push(format!("{}: {code} should not be reported, got:\n{stderr}", f.display()));
+            }
+        }
+        for (code, n) in header("// once:").iter().map(|c| (c, stderr.matches(&format!("({c})")).count())) {
+            if n != 1 {
+                failures.push(format!("{}: {code} should be reported exactly once, got {n}:\n{stderr}", f.display()));
             }
         }
     }

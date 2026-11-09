@@ -1,5 +1,5 @@
 use crate::{Diagnostic, Severity, SourceMap};
-use ariadne::{Color, Config, IndexType, Label, Report, ReportKind, Source};
+use ariadne::{Color, Config, Fmt, IndexType, Label, Report, ReportKind, Source};
 use std::io::Write;
 
 struct Cache<'a> {
@@ -37,13 +37,7 @@ pub fn render(map: &SourceMap, diags: &[Diagnostic], color: bool, out: &mut dyn 
         let head = format!("{kind_word}({})", d.code);
         let config = Config::default().with_index_type(IndexType::Byte).with_color(color);
         if d.span.is_dummy() {
-            let _ = writeln!(out, "{head}: {}", d.message);
-            for n in &d.notes {
-                let _ = writeln!(out, "  note: {n}");
-            }
-            for h in &d.helps {
-                let _ = writeln!(out, "  help: {h}");
-            }
+            render_without_source(d, &head, c, color, out);
             continue;
         }
         let range = d.span.start as usize..d.span.end as usize;
@@ -65,6 +59,24 @@ pub fn render(map: &SourceMap, diags: &[Diagnostic], color: bool, out: &mut dyn 
             report = report.with_help(h);
         }
         let _ = report.finish().write(&mut cache, &mut *out);
+    }
+}
+
+/// A diagnostic that is not about a place in the source (a missing `main`,
+/// a linker failure, ...): the header line as ariadne would print it, then
+/// its notes and helps. Multi-line text, such as a linker's output, is
+/// indented under its `note:` / `help:` prefix.
+fn render_without_source(d: &Diagnostic, head: &str, c: Color, color: bool, out: &mut dyn Write) {
+    let head = format!("{head}:");
+    let head = if color { head.fg(c).to_string() } else { head };
+    let _ = writeln!(out, "{head} {}", d.message);
+    for (kind, text) in d.notes.iter().map(|n| ("note", n)).chain(d.helps.iter().map(|h| ("help", h))) {
+        let mut lines = text.trim_end().lines();
+        let _ = writeln!(out, "  {kind}: {}", lines.next().unwrap_or(""));
+        let indent = " ".repeat(kind.len() + 4);
+        for l in lines {
+            let _ = writeln!(out, "{indent}{l}");
+        }
     }
 }
 

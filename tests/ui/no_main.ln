@@ -1,0 +1,5 @@
+// command: build
+// error: build::no_main
+fn greet() {
+    println("hello");
+}

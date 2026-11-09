@@ -15,12 +15,15 @@ The linker used is:
 
 To fix it, install a linker (the MSVC build tools or LLVM `clang` on
 Windows, a C toolchain elsewhere) or point `LUNAR_CC` at one. If the linker
-runs but fails, its output is printed; undefined symbols usually come from
-an `extern` function that does not exist in the C runtime or the system
-libraries that are linked by default.
+runs but fails, its output is shown in a note under the error; undefined
+symbols usually come from an `extern` function that does not exist in the C
+runtime or the system libraries that are linked by default.
 
 The program's source is not at fault, so there is no erroneous example.
-`lunar check` never links and never reports this error.
+`lunar check` never links and never reports this error. With
+`LUNAR_CC=missing-cc`, `lunar build` reports:
 
-The current compiler prints link failures as a plain `error: ...` line
-rather than with this code.
+```text
+err(build::link): could not run the linker `missing-cc`: program not found
+  help: install a linker, or point `LUNAR_CC` at one
+```
