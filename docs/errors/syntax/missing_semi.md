@@ -1,4 +1,4 @@
-# syntax::missing_semi: a statement is missing its `;`
+# syntax::missing_semi: a statement or item is missing its `;`
 
 Inside a block, every `let` statement and every expression statement must
 end with a semicolon. Only two things may go without one:
@@ -11,9 +11,12 @@ end with a semicolon. Only two things may go without one:
 The error points at the place where the `;` should go, right after the end
 of the previous statement or expression.
 
-A missing `;` after an item that needs one (`use`, `const`, `static`,
-`type`, `struct S;`, `mod m;`) is reported as `syntax::unexpected_token`
-instead, pointing at the token that follows.
+Items that do not end in a `{ ... }` block also end with a semicolon:
+`use`, `const`, `static`, `type`, unit and tuple structs (`struct S;`,
+`struct P(i32);`) and `mod m;`. A missing `;` after one of them is reported
+with this code when the next token starts another item (or closes the
+enclosing block, or ends the file). Anything else after the item is
+`syntax::unexpected_token`.
 
 ## Erroneous example
 

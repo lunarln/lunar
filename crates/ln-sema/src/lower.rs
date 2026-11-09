@@ -6,7 +6,7 @@ use crate::resolve::ModRes;
 use crate::ty::{ArrKind, IntTy, TraitRef, Ty};
 use crate::{AstRef, Sema};
 use ln_ast as ast;
-use ln_diag::{Diagnostic, Span, codes::name, codes::trait_, codes::ty as tyc};
+use ln_diag::{Diagnostic, Span, codes::name, codes::syntax, codes::trait_, codes::ty as tyc};
 
 /// A check that needs complete ADT information.
 pub(crate) struct Deferred {
@@ -472,12 +472,18 @@ impl<'a> Sema<'a> {
             let in_trait = parent.is_some_and(|p| self.p.defs[p.0 as usize].kind == DefKind::Trait);
             if !in_trait {
                 self.err(
-                    Diagnostic::error(tyc::RETURN_MISSING, f.sig_span, format!("function `{}` has no body", f.name.name)).with_help("add a body: `{ ... }`"),
+                    Diagnostic::error(syntax::MISSING_BODY, f.sig_span, format!("function `{}` has no body", f.name.name))
+                        .with_label("expected `{ ... }` after this signature")
+                        .with_help("add a body: `{ ... }`; only trait methods and functions in `extern` blocks are declared without one"),
                 );
             }
         }
         if f.variadic && !is_extern {
-            self.err(Diagnostic::error(tyc::FFI_TYPE, f.sig_span, "only extern functions can be variadic"));
+            self.err(
+                Diagnostic::error(tyc::VARIADIC_NOT_EXTERN, f.sig_span, format!("function `{}` is variadic but not an extern function", f.name.name))
+                    .with_note("only functions declared in an `extern \"C\" { ... }` block can take `...`")
+                    .with_help("take the extra arguments as a slice instead, e.g. `args: [i32; &]`"),
+            );
         }
         if let DefData::Fn(fd) = &mut self.p.defs[id.0 as usize].data {
             fd.sig = FnSig { params, ret, ret_span };

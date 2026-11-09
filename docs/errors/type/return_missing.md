@@ -6,9 +6,8 @@ the body without a `;`). This error is reported when the body has no tail
 expression and control can reach its end, for example when a `return` only
 happens inside an `if`.
 
-The same code is reported for a function declared without a body
-(`fn f(): i32;`) outside a trait or `extern` block. Only trait methods and
-extern functions can be declared without a body.
+A function declared without any body (`fn f(): i32;`) outside a trait or
+`extern` block is a different error: `syntax::missing_body`.
 
 When the body does end in a block-like expression without a value, such as
 an `if` without `else` or a `for` loop, that expression is the tail and the

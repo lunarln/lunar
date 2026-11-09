@@ -55,6 +55,7 @@ codes! {
         BAD_MAIN = "bad_main",
         BAD_TEST = "bad_test",
         CONST_EVAL = "const_eval",
+        VARIADIC_NOT_EXTERN = "variadic_not_extern",
     }
     syntax ("syntax") => {
         UNEXPECTED_TOKEN = "unexpected_token",
@@ -64,6 +65,8 @@ codes! {
         BAD_NUMBER = "bad_number",
         BAD_FORMAT = "bad_format",
         MISSING_SEMI = "missing_semi",
+        MISSING_BODY = "missing_body",
+        BAD_CHAR = "bad_char",
         BAD_ATTRIBUTE = "bad_attribute",
     }
     name ("name") => {
@@ -112,5 +115,6 @@ codes! {
         LLVM = "llvm",
         IO = "io",
         NO_MAIN = "no_main",
+        MISSING_LANG_ITEM = "missing_lang_item",
     }
 }

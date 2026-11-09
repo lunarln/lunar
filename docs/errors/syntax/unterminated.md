@@ -1,8 +1,9 @@
 # syntax::unterminated: a string or character literal is not closed
 
 A string literal was opened with `"` but never closed, or a character
-literal starting with `'` is malformed: it has no closing `'`, it is empty
-(`''`), or it contains more than one plain character (`'ab'`).
+literal starting with `'` has no closing `'` on the same line. A character
+literal that is closed but empty (`''`) or holds several characters
+(`'ab'`) is `syntax::bad_char`.
 
 An unclosed string runs to the end of the file, so this error is usually
 followed by an `unexpected_token` error at "end of file". Fixing the literal

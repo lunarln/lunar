@@ -7,7 +7,7 @@ use crate::thir::{self, Arm, Callee, Coercion, Expr, ExprKind, FmtPiece, LocalKi
 use crate::ty::{ArrKind, IntTy, TraitRef, Ty};
 use ln_ast as ast;
 use ln_ast::{BinOp, UnOp};
-use ln_diag::{Diagnostic, Span, codes::name, codes::syntax, codes::ty as tyc};
+use ln_diag::{Diagnostic, Span, codes::build, codes::name, codes::syntax, codes::ty as tyc};
 
 impl<'s, 'a> FnCtx<'s, 'a> {
     pub(crate) fn mk(&self, kind: ExprKind, ty: Ty, span: Span) -> Expr {
@@ -16,6 +16,17 @@ impl<'s, 'a> FnCtx<'s, 'a> {
 
     pub(crate) fn error_expr(&self, span: Span) -> Expr {
         Expr { kind: ExprKind::Error, ty: Ty::Error, span }
+    }
+
+    /// `what` needs the lang item `name`, which the loaded `core` does not
+    /// define (only possible with a modified standard library).
+    pub(crate) fn missing_lang_item(&mut self, name: &str, what: &str, span: Span) {
+        self.err(
+            Diagnostic::error(build::MISSING_LANG_ITEM, span, format!("{what} needs the lang item `{name}`, which the standard library does not define"))
+                .with_note(format!(
+                    "`core` must mark an item `#[lang = \"{name}\"]`; if `LUNAR_STD_DIR` is set, check that it points at an unmodified standard library"
+                )),
+        );
     }
 
     pub(crate) fn unit_expr(&self, span: Span) -> Expr {
@@ -622,7 +633,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     /// Call an operator trait method on a non-primitive operand.
     fn op_trait_call(&mut self, lang: &str, method: &str, lhs: Expr, rhs: Option<Expr>, span: Span) -> Expr {
         let Some(tr) = lang_trait_ref(&self.s.p, lang) else {
-            self.err(Diagnostic::error(tyc::BAD_OPERAND, span, format!("operator trait `{lang}` is not available (missing lang item)")));
+            self.missing_lang_item(lang, &format!("the operator method `{method}`"), span);
             return self.error_expr(span);
         };
         let self_ty = self.resolve(&lhs.ty);
@@ -862,7 +873,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     /// A range used as a value: `core::ops::Range::<T> { start, end }`.
     fn check_range_value(&mut self, start: Option<&ast::Expr>, end: Option<&ast::Expr>, inclusive: bool, expect: Option<&Ty>, span: Span) -> Expr {
         let Some(range) = self.s.p.lang_item("range") else {
-            self.err(Diagnostic::error(tyc::BAD_OPERAND, span, "ranges are not available (missing lang item)"));
+            self.missing_lang_item("range", "a range value", span);
             return self.error_expr(span);
         };
         let (Some(s), Some(e)) = (start, end) else {
@@ -1180,7 +1191,8 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     /// `for x in it` over an `Iterator::<T>` value: `loop { match it.next() { Some(x) => body, _ => break } }`.
     fn check_for_iterator(&mut self, pat: &ast::Pat, it: Expr, it_ty: Ty, body: &ast::Block, iter_span: Span, span: Span) -> Expr {
         let (Some(iter_trait), Some(option)) = (self.s.p.lang_item("iterator"), self.s.p.lang_item("option")) else {
-            self.err(Diagnostic::error(tyc::NOT_ITERABLE, iter_span, "iteration is not available (missing lang items)"));
+            let missing = if self.s.p.lang_item("iterator").is_none() { "iterator" } else { "option" };
+            self.missing_lang_item(missing, "a `for` loop over an iterator", iter_span);
             return self.error_expr(span);
         };
         // Find the item type from an impl or bound.
@@ -1269,6 +1281,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let v = self.check_place_or_temp(x);
         let vt = self.shallow(&v.ty);
         let (Some(option), result) = (self.s.p.lang_item("option"), self.s.p.lang_item("result")) else {
+            self.missing_lang_item("option", "the `?` operator", span);
             return self.error_expr(span);
         };
         let ret = self.shallow(&self.ret_ty.clone());

@@ -1,0 +1,7 @@
+// error: syntax::missing_body
+// absent: type::return_missing
+fn answer(): i32;
+
+fn main() {
+    println("{answer()}");
+}
