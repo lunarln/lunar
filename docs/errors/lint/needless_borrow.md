@@ -1,8 +1,11 @@
-# lint::needless_borrow: a parameter borrows a Dull value
+# lint::needless_borrow: a parameter borrows a small Dull value
 
-A parameter is declared `x: &T`, but `T` is Dull: it has no pointers or
-arrays, so passing it by value already makes a cheap, independent copy.
-Borrowing it gains nothing, so take it by value instead.
+A parameter is declared `x: &T`, but `T` is Dull (it has no pointers or
+arrays) and at most 16 bytes, so passing it by value makes an independent
+copy that is just as cheap as passing its address. Take it by value instead.
+
+Larger Dull values are not reported: borrowing passes an address and avoids
+copying the whole value.
 
 `&mut T` on a Dull type is different and is not reported: it makes the
 parameter in-out, so the function can change the caller's variable.

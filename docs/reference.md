@@ -83,7 +83,7 @@ Struct fields are private unless `pub`.
 | `String` | owned UTF-8 text (a `[u8; -..+]` with a UTF-8 invariant) |
 | `FmtArgs` | parameter only: an interpolated string literal |
 | `*T`, `*mut T` | raw pointers (dereferencing is unsafe) |
-| `fn(A, B): R` | function pointers |
+| `fn(A, &B, &mut C): R` | function pointers; parameter modes are part of the type |
 | `!` | the never type (return type of functions that never return) |
 
 ### Dull and pointy types
@@ -197,8 +197,15 @@ type is pointless (`warn(lint::needless_borrow)`), and a `mut` parameter
 that is changed but never read again probably meant `&mut`
 (`warn(lint::mut_param_not_read)`).
 
-A function that takes ownership of owned values cannot be used as a
-function pointer: calls through pointers always borrow.
+Borrowed parameters are passed by address, so a view into a borrowed value
+points into the caller's data and may be returned:
+`fn first_two(a: &[i32; 4]): [i32; &] { return a[0..2]; }`.
+
+Function pointer types record each parameter's mode, written as in
+signatures: `fn(&String): usize`, `fn(&mut i32)`, `fn(String): usize`. A
+function converts to a pointer type with the same modes, and a call through
+the pointer passes, borrows and moves arguments exactly as a direct call
+would.
 
 ### Mutation
 

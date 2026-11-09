@@ -1,6 +1,7 @@
 //! Semantic types.
 
 use crate::defs::DefId;
+pub use ln_ast::ParamMode;
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -138,7 +139,8 @@ pub enum Ty {
     /// `!T` parameter marker.
     Bang(Box<Ty>),
     Ptr(Box<Ty>, bool /* mutable */),
-    FnPtr(Vec<Ty>, Box<Ty>),
+    /// `fn(A, &B, &mut C): R`: each parameter's mode is part of the type.
+    FnPtr(Vec<(ParamMode, Ty)>, Box<Ty>),
     /// Generic parameter number `idx` of the enclosing item (impl params come first).
     Param(u32, String),
     /// Inference variable.
@@ -199,7 +201,7 @@ impl Ty {
             Ty::Tuple(ts) | Ty::Adt(_, ts) => ts.iter().for_each(|t| t.walk(f)),
             Ty::Array(t, _) | Ty::Bang(t) | Ty::Ptr(t, _) => t.walk(f),
             Ty::FnPtr(ps, r) => {
-                ps.iter().for_each(|t| t.walk(f));
+                ps.iter().for_each(|(_, t)| t.walk(f));
                 r.walk(f);
             }
             _ => {}
@@ -232,7 +234,7 @@ impl Ty {
             Ty::Array(t, k) => Ty::Array(Box::new(t.map(f)), *k),
             Ty::Bang(t) => Ty::Bang(Box::new(t.map(f))),
             Ty::Ptr(t, m) => Ty::Ptr(Box::new(t.map(f)), *m),
-            Ty::FnPtr(ps, r) => Ty::FnPtr(ps.iter().map(|t| t.map(f)).collect(), Box::new(r.map(f))),
+            Ty::FnPtr(ps, r) => Ty::FnPtr(ps.iter().map(|(m, t)| (*m, t.map(f))).collect(), Box::new(r.map(f))),
             t => t.clone(),
         };
         f(t)
@@ -297,7 +299,18 @@ impl fmt::Display for TyDisplay<'_> {
             Ty::Bang(t) => write!(f, "!{}", d(t)),
             Ty::Ptr(t, m) => write!(f, "*{}{}", if *m { "mut " } else { "" }, d(t)),
             Ty::FnPtr(ps, r) => {
-                write!(f, "fn({})", list(ps))?;
+                let params: Vec<String> = ps
+                    .iter()
+                    .map(|(m, t)| {
+                        let prefix = match m {
+                            ParamMode::Take => "",
+                            ParamMode::Borrow => "&",
+                            ParamMode::InOut => "&mut ",
+                        };
+                        format!("{prefix}{}", d(t))
+                    })
+                    .collect();
+                write!(f, "fn({})", params.join(", "))?;
                 if !r.is_unit() {
                     write!(f, ": {}", d(r))?;
                 }

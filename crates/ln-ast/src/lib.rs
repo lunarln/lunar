@@ -114,7 +114,7 @@ pub struct Param {
 }
 
 /// How a parameter is passed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ParamMode {
     /// `x: T`, `self`: the function takes ownership (the caller's value is
     /// moved, or copied if it is Dull).
@@ -300,9 +300,9 @@ pub enum TyKind {
     },
     /// `()` and `(A, B)`
     Tuple(Vec<Ty>),
-    /// `fn(A, B): R`
+    /// `fn(A, &B, &mut C): R`: parameter modes are part of the type.
     Fn {
-        params: Vec<Ty>,
+        params: Vec<(ParamMode, Ty)>,
         ret: Option<Box<Ty>>,
     },
     /// `!` in return position.

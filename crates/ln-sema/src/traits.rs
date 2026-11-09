@@ -189,7 +189,7 @@ impl Program {
             (Ty::Ptr(a, m1), Ty::Ptr(b, m2)) => m1 == m2 && Self::match_ty(a, b, out),
             (Ty::Bang(a), Ty::Bang(b)) => Self::match_ty(a, b, out),
             (Ty::FnPtr(a, r1), Ty::FnPtr(b, r2)) => {
-                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Self::match_ty(x, y, out)) && Self::match_ty(r1, r2, out)
+                a.len() == b.len() && a.iter().zip(b).all(|((m1, x), (m2, y))| m1 == m2 && Self::match_ty(x, y, out)) && Self::match_ty(r1, r2, out)
             }
             (a, b) => a == b,
         }
@@ -390,7 +390,7 @@ fn resolve(t: &Ty, s: &HashMap<u32, Ty>) -> Ty {
         Ty::Array(e, k) => Ty::Array(Box::new(r(e)), *k),
         Ty::Bang(e) => Ty::Bang(Box::new(r(e))),
         Ty::Ptr(e, m) => Ty::Ptr(Box::new(r(e)), *m),
-        Ty::FnPtr(ps, ret) => Ty::FnPtr(ps.iter().map(r).collect(), Box::new(r(ret))),
+        Ty::FnPtr(ps, ret) => Ty::FnPtr(ps.iter().map(|(m, t)| (*m, r(t))).collect(), Box::new(r(ret))),
         _ => t,
     }
 }
@@ -424,7 +424,9 @@ fn unify(a: &Ty, b: &Ty, s: &mut HashMap<u32, Ty>) -> bool {
         (Ty::Array(x, k1), Ty::Array(y, k2)) => k1 == k2 && unify(x, y, s),
         (Ty::Bang(x), Ty::Bang(y)) => unify(x, y, s),
         (Ty::Ptr(x, m1), Ty::Ptr(y, m2)) => m1 == m2 && unify(x, y, s),
-        (Ty::FnPtr(p1, r1), Ty::FnPtr(p2, r2)) => p1.len() == p2.len() && p1.iter().zip(p2).all(|(x, y)| unify(x, y, s)) && unify(r1, r2, s),
+        (Ty::FnPtr(p1, r1), Ty::FnPtr(p2, r2)) => {
+            p1.len() == p2.len() && p1.iter().zip(p2).all(|((m1, x), (m2, y))| m1 == m2 && unify(x, y, s)) && unify(r1, r2, s)
+        }
         _ => false,
     }
 }

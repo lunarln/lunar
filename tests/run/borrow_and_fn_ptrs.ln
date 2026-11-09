@@ -1,0 +1,62 @@
+// Borrowed parameters are passed by address: views into borrowed inline
+// data can be returned, and function pointers record parameter modes.
+
+struct Big {
+    vals: [i64; 64],
+    tag: u8,
+}
+
+fn first_two(a: &[i32; 4]): [i32; &] {
+    return a[0..2];
+}
+
+fn total(b: &Big): i64 {
+    let mut s: i64 = 0;
+    for v in b.vals {
+        s += v;
+    }
+    return s + b.tag as i64;
+}
+
+fn len_of(s: &String): usize {
+    return s.len();
+}
+
+fn bump(x: &mut i32) {
+    x += 1;
+}
+
+fn consume(s: String): usize {
+    return s.len() * 10;
+}
+
+fn add(a: i32, b: i32): i32 {
+    return a + b;
+}
+
+fn apply_len(f: fn(&String): usize, s: &String): usize {
+    return f(s);
+}
+
+fn main() {
+    let arr: [i32; 4] = [10, 20, 30, 40];
+    let v = first_two(arr);
+    println("{v[0]} {v[1]} {v.len()}");
+    let b = Big { vals: [1; 64], tag: 7 };
+    println("{total(b)}");
+
+    let s = String::from("pointer");
+    let f: fn(&String): usize = len_of;
+    let g: fn(&mut i32) = bump;
+    let h: fn(String): usize = consume;
+    let k: fn(i32, i32): i32 = add;
+    let mut n = 1;
+    g(n);
+    g(n);
+    println("{f(s)} {apply_len(len_of, s)} {n} {k(2, 3)}");
+    let mut total: usize = 0;
+    for _ in 0..100000 {
+        total += h(String::from("ab"));
+    }
+    println("{total} {s}");
+}

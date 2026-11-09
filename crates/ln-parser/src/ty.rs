@@ -107,7 +107,10 @@ impl P<'_, '_, '_> {
                     if self.k.eat(T::RParen) {
                         break;
                     }
-                    params.push(self.ty()?);
+                    // Modes as in signatures: `T` takes, `&T` borrows,
+                    // `&mut T` is in-out.
+                    let mode = if self.k.eat(T::Amp) { if self.k.eat(T::Mut) { ParamMode::InOut } else { ParamMode::Borrow } } else { ParamMode::Take };
+                    params.push((mode, self.ty()?));
                     if !self.k.eat(T::Comma) {
                         self.k.expect(T::RParen)?;
                         break;

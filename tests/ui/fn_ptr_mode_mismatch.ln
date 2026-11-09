@@ -1,0 +1,11 @@
+// error: type::mismatch
+// A function pointer's type records parameter modes; they must match.
+fn len_of(s: &String): usize {
+    return s.len();
+}
+
+fn main() {
+    let f: fn(String): usize = len_of;
+    let n = f(String::from("x"));
+    println("{n}");
+}

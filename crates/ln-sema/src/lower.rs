@@ -9,6 +9,9 @@ use ln_ast as ast;
 use ln_diag::{Diagnostic, Span, codes::lint, codes::name, codes::syntax, codes::trait_, codes::ty as tyc};
 
 /// A check that needs complete ADT information.
+/// Largest Dull value (in bytes) for which a borrow is reported as needless.
+const NEEDLESS_BORROW_MAX: u64 = 16;
+
 pub(crate) struct Deferred {
     pub kind: DeferKind,
     pub ty: Ty,
@@ -573,7 +576,7 @@ impl<'a> Sema<'a> {
             ast::TyKind::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.lower_ty(cx, t, TyPos::Other)).collect()),
             ast::TyKind::Ptr { is_mut, inner } => Ty::Ptr(Box::new(self.lower_ty(cx, inner, TyPos::Other)), *is_mut),
             ast::TyKind::Fn { params, ret } => {
-                let ps = params.iter().map(|t| self.lower_ty(cx, t, TyPos::Other)).collect();
+                let ps = params.iter().map(|(m, t)| (*m, self.lower_ty(cx, t, TyPos::Param))).collect();
                 let r = ret.as_ref().map_or(Ty::unit(), |r| self.lower_ty(cx, r, TyPos::Other));
                 Ty::FnPtr(ps, Box::new(r))
             }
@@ -797,12 +800,19 @@ impl<'a> Sema<'a> {
                     }
                 }
                 DeferKind::NeedlessBorrow => {
+                    // Borrowing passes an address, which pays off for large
+                    // values; for a small Dull value a copy is just as cheap.
                     let inner = d.ty.strip_bang();
-                    if self.p.is_dull(inner, &d.env) {
+                    let small = self.p.layout_of(inner).is_some_and(|l| l.size <= NEEDLESS_BORROW_MAX);
+                    if small && self.p.is_dull(inner, &d.env) {
                         let s = self.p.ty_str(inner);
                         self.err(
-                            Diagnostic::warning(lint::NEEDLESS_BORROW, d.span, format!("borrowing `{s}` is pointless: it is Dull, so it is copied anyway"))
-                                .with_help(format!("take it by value: `: {s}`")),
+                            Diagnostic::warning(
+                                lint::NEEDLESS_BORROW,
+                                d.span,
+                                format!("borrowing `{s}` is pointless: it is small and Dull, so copying it is just as cheap"),
+                            )
+                            .with_help(format!("take it by value: `: {s}`")),
                         );
                     }
                 }

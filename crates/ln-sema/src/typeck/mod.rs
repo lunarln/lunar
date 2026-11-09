@@ -415,7 +415,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             (Ty::Array(e1, k1), Ty::Array(e2, k2)) => self.unify_len(*k1, *k2) && self.unify(e1, e2),
             (Ty::Ptr(x, m1), Ty::Ptr(y, m2)) => m1 == m2 && self.unify(x, y),
             (Ty::Bang(x), Ty::Bang(y)) => self.unify(x, y),
-            (Ty::FnPtr(p1, r1), Ty::FnPtr(p2, r2)) => p1.len() == p2.len() && p1.iter().zip(p2).all(|(x, y)| self.unify(x, y)) && self.unify(r1, r2),
+            (Ty::FnPtr(p1, r1), Ty::FnPtr(p2, r2)) => {
+                p1.len() == p2.len() && p1.iter().zip(p2).all(|((m1, x), (m2, y))| m1 == m2 && self.unify(x, y)) && self.unify(r1, r2)
+            }
             (x, y) => x == y,
         }
     }

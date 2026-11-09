@@ -238,9 +238,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         t.is_unit() || matches!(t, Ty::Never)
     }
 
-    /// LLVM function type for a Lunar signature.
+    /// LLVM function type for a Lunar signature: `(type, passed by pointer)`.
     pub fn fn_ty(&mut self, params: &[(Ty, bool)], ret: &Ty, variadic: bool) -> FunctionType<'ctx> {
-        let ps: Vec<BasicMetadataTypeEnum> = params.iter().map(|(t, inout)| if *inout { self.ptr_ty().into() } else { self.llty(t).into() }).collect();
+        let ps: Vec<BasicMetadataTypeEnum> = params.iter().map(|(t, by_ref)| if *by_ref { self.ptr_ty().into() } else { self.llty(t).into() }).collect();
         if Self::is_void(ret) { self.ctx.void_type().fn_type(&ps, variadic) } else { self.llty(ret).fn_type(&ps, variadic) }
     }
 
@@ -263,7 +263,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             return *f;
         }
         let fd = self.p.fn_data(def).clone();
-        let params: Vec<(Ty, bool)> = fd.sig.params.iter().map(|p| (p.ty.subst(args), p.inout)).collect();
+        let params: Vec<(Ty, bool)> = fd.sig.params.iter().enumerate().map(|(i, p)| (p.ty.subst(args), self.p.param_by_ref(def, i))).collect();
         let ret = fd.sig.ret.subst(args);
         let fty = self.fn_ty(&params, &ret, fd.variadic);
         let f = if fd.abi == Abi::C {

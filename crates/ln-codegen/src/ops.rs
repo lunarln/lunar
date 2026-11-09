@@ -9,7 +9,7 @@ use inkwell::values::{BasicMetadataValueEnum, FunctionValue, IntValue, PointerVa
 use inkwell::{FloatPredicate, IntPredicate};
 use ln_ast::{BinOp, UnOp};
 use ln_diag::Span;
-use ln_sema::defs::ParamMode;
+use ln_sema::defs::{DefId, ParamMode};
 use ln_sema::thir::*;
 use ln_sema::traits::MethodImpl;
 use ln_sema::ty::{ArrKind, FloatTy, IntTy, TraitRef, Ty};
@@ -26,17 +26,23 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         }
     }
 
-    /// Whether each parameter of `callee` takes ownership (`x: T`), so the
-    /// callee frees the argument. Calls through function pointers borrow.
-    fn takes_ownership(&self, callee: &Callee) -> Vec<bool> {
-        let def = match callee {
+    /// The place a borrowing argument reads, if it reads one in place.
+    fn borrowed_place(e: &Expr) -> Option<&Expr> {
+        match &e.kind {
+            ExprKind::Read { place, mode } if *mode != ReadMode::Move => Some(place),
+            // Owner kinds and `[T; &mut]` -> `[T; &]` share a layout.
+            ExprKind::Coerce { expr, kind: Coercion::Weaken } => Self::borrowed_place(expr),
+            _ => None,
+        }
+    }
+
+    /// The declaration whose signature decides how arguments are passed
+    /// (`None` for calls through function pointers, which take values).
+    fn callee_def(&self, callee: &Callee) -> Option<DefId> {
+        match callee {
             Callee::Fn { def, .. } | Callee::Intrinsic { def, .. } => Some(*def),
             Callee::Trait { trait_ref, method, .. } => self.cg.p.trait_data(trait_ref.trait_id).methods.iter().find(|m| &m.name == method).map(|m| m.def),
             Callee::Indirect(_) => None,
-        };
-        match def {
-            Some(d) => self.cg.p.fn_data(d).sig.params.iter().map(|p| p.mode == ParamMode::Take).collect(),
-            None => Vec::new(),
         }
     }
 
@@ -45,14 +51,58 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             Callee::Indirect(f) => Some(tri!(self.value(f)).into_pointer_value()),
             _ => None,
         };
-        let takes = self.takes_ownership(callee);
+        let def = self.callee_def(callee);
+        // How each argument is passed: from the callee's declaration, or for
+        // a call through a pointer, from the modes in the pointer's type.
+        let ptr_modes: Option<Vec<ParamMode>> = match callee {
+            Callee::Indirect(f) => match self.t(&f.ty) {
+                Ty::FnPtr(ps, _) => Some(ps.iter().map(|(m, _)| *m).collect()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let n = args.len();
+        let by_ref_at: Vec<bool> = (0..n)
+            .map(|i| match &ptr_modes {
+                Some(ms) => ms.get(i).is_some_and(|m| *m != ParamMode::Take),
+                None => def.is_some_and(|d| self.cg.p.param_by_ref(d, i)),
+            })
+            .collect();
+        let taken_at: Vec<bool> = (0..n)
+            .map(|i| match &ptr_modes {
+                Some(ms) => ms.get(i) == Some(&ParamMode::Take),
+                None => def.is_some_and(|d| self.cg.p.fn_data(d).sig.params.get(i).is_some_and(|p| p.mode == ParamMode::Take)),
+            })
+            .collect();
         let mut vals: Vec<BV<'ctx>> = Vec::new();
+        // Types of arguments passed by pointer, for built-in implementations
+        // that need the values.
+        let mut by_ref_tys: Vec<Option<Ty>> = Vec::new();
         for (i, a) in args.iter().enumerate() {
             match a {
                 Arg::Value(e) => {
+                    let by_ref = by_ref_at[i];
+                    if by_ref {
+                        // A borrowed parameter gets the address of the
+                        // caller's place, or of a temporary that lives until
+                        // the end of the statement.
+                        by_ref_tys.push(Some(self.t(&e.ty)));
+                        if let Some(place) = Self::borrowed_place(e) {
+                            vals.push(tri!(self.place(place)).into());
+                            continue;
+                        }
+                        let v = tri!(self.value(e));
+                        let ty = self.t(&e.ty);
+                        let tmp = self.alloca_for(&ty, "argtmp");
+                        self.cg.b.build_store(tmp, v).unwrap();
+                        self.register_cleanup(tmp, &ty);
+                        vals.push(tmp.into());
+                        continue;
+                    }
+                    by_ref_tys.push(None);
                     let v = tri!(self.value(e));
                     let ty = self.t(&e.ty);
-                    let taken = takes.get(i).copied().unwrap_or(false);
+                    let taken = taken_at[i];
                     if self.cg.p.has_owner(&ty) && !Self::is_borrowed(e) && !taken {
                         // An owned temporary lent to a borrowing parameter:
                         // dropped after the statement. (A parameter that takes
@@ -63,7 +113,10 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                     }
                     vals.push(v);
                 }
-                Arg::InOut(p) => vals.push(tri!(self.place(p)).into()),
+                Arg::InOut(p) => {
+                    by_ref_tys.push(None);
+                    vals.push(tri!(self.place(p)).into());
+                }
             }
         }
         let result = match callee {
@@ -81,7 +134,17 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                         let f = self.cg.instance(def, &args);
                         self.emit_call(f, &vals)
                     }
-                    Some(MethodImpl::Builtin { lang, method }) => Some(self.builtin(&lang, &method, &vals, &st, ret, span)),
+                    Some(MethodImpl::Builtin { lang, method }) => {
+                        // Built-in implementations work on values.
+                        let mut vs = vals.clone();
+                        for (v, t) in vs.iter_mut().zip(&by_ref_tys) {
+                            if let Some(t) = t {
+                                let lt = self.cg.llty(t);
+                                *v = self.cg.b.build_load(lt, v.into_pointer_value(), "").unwrap();
+                            }
+                        }
+                        Some(self.builtin(&lang, &method, &vs, &st, ret, span))
+                    }
                     None => {
                         let (s, tn) = (self.cg.p.ty_str(&st), self.cg.p.def(tr.trait_id).name.clone());
                         self.ice(format!("no implementation of `{tn}::{method}` for `{s}`"));
@@ -98,7 +161,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                     self.ice("indirect call through a non-function");
                     return None;
                 };
-                let ps: Vec<(Ty, bool)> = params.iter().map(|t| (t.clone(), false)).collect();
+                let ps: Vec<(Ty, bool)> = params.iter().map(|(m, t)| (t.clone(), *m != ParamMode::Take)).collect();
                 let fty = self.cg.fn_ty(&ps, &r, false);
                 let args: Vec<BasicMetadataValueEnum> = vals.iter().map(|v| (*v).into()).collect();
                 let cs = self.cg.b.build_indirect_call(fty, indirect.unwrap(), &args, "").unwrap();
@@ -653,7 +716,9 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                     match cg.p.resolve_method(&tr, t, "fmt", &[]) {
                         Some(MethodImpl::Fn { def, args }) => {
                             let callee = cg.instance(def, &args);
-                            cg.b.build_call(callee, &[v.into(), out.into()], "").unwrap();
+                            // `fmt(&self, ..)` takes the value's address.
+                            let recv = if cg.p.param_by_ref(def, 0) { fp.into() } else { v.into() };
+                            cg.b.build_call(callee, &[recv, out.into()], "").unwrap();
                         }
                         _ => return Err(format!("no `Display` implementation for `{}`", cg.p.ty_str(t))),
                     }

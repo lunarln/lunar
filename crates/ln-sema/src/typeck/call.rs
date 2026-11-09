@@ -433,16 +433,18 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             }
             ValueRes::Fn { def, args } => {
                 let fd = self.s.p.fn_data(def).clone();
-                let params: Vec<Ty> = fd.sig.params.iter().map(|p| p.ty.subst(&args)).collect();
+                // The pointer type records each parameter's mode, so calls
+                // through it pass arguments exactly as a direct call would.
+                let params: Vec<(ParamMode, Ty)> = fd.sig.params.iter().map(|p| (p.mode, p.ty.subst(&args))).collect();
                 let ret = fd.sig.ret.subst(&args);
-                // Calls through a pointer borrow every argument, so the
-                // function must not take ownership of owned values.
-                let takes_owner = fd.sig.params.iter().any(|p| p.mode == ParamMode::Take && !self.s.p.is_copy(p.ty.strip_bang(), &self.env));
-                if fd.sig.params.iter().any(|p| p.inout) || takes_owner || self.s.p.def(def).attrs.intrinsic {
+                if self.s.p.def(def).attrs.intrinsic {
+                    self.err(Diagnostic::error(tyc::NOT_CALLABLE, span, "intrinsics cannot be used as function pointers; wrap the call in a function"));
+                } else if fd.abi == Abi::C && fd.sig.params.iter().any(|p| p.mode != ParamMode::Take) {
+                    // `extern` functions take every argument by value.
                     self.err(Diagnostic::error(
                         tyc::NOT_CALLABLE,
                         span,
-                        "functions with `&mut` parameters, parameters that take ownership of owned values, or intrinsics cannot be used as function pointers",
+                        "an `extern` function with `&` or `&mut` parameters cannot be used as a function pointer",
                     ));
                 }
                 self.oblige_preds(def, &args, span);
@@ -475,7 +477,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let ct = self.shallow(&callee.ty);
         match ct {
             Ty::FnPtr(params, ret) => {
-                let sig: Vec<(Ty, ParamMode)> = params.iter().map(|t| (t.clone(), ParamMode::Borrow)).collect();
+                let sig: Vec<(Ty, ParamMode)> = params.iter().map(|(m, t)| (t.clone(), *m)).collect();
                 let a = self.check_args(&sig, false, args, span);
                 self.mk(ExprKind::Call { callee: Callee::Indirect(Box::new(callee)), args: a }, *ret, span)
             }

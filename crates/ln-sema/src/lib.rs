@@ -117,6 +117,18 @@ impl Program {
         }
     }
 
+    /// Whether parameter `index` of function `def` is passed as a pointer to
+    /// the caller's place: in-out (`&mut T`) and borrowed (`&T`) parameters
+    /// of Lunar functions. Intrinsics and `extern` functions take values.
+    pub fn param_by_ref(&self, def: DefId, index: usize) -> bool {
+        let fd = self.fn_data(def);
+        let Some(p) = fd.sig.params.get(index) else { return false };
+        if p.inout {
+            return true;
+        }
+        p.mode == ParamMode::Borrow && fd.abi == Abi::Lunar && !self.def(def).attrs.intrinsic
+    }
+
     pub fn lang_item(&self, name: &str) -> Option<DefId> {
         self.lang.get(name).copied()
     }

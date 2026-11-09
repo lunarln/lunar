@@ -68,7 +68,10 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         for (i, &l) in body.params.iter().enumerate() {
             let param = f.get_nth_param(i as u32).unwrap();
             let local = body.local(l);
-            if let LocalKind::Param { inout: true, .. } = local.kind {
+            // In-out and borrowed parameters arrive as pointers to the
+            // caller's place.
+            let by_ref = matches!(local.kind, LocalKind::Param { index, .. } if fc.cg.p.param_by_ref(body.def, index));
+            if by_ref {
                 fc.locals[l.0 as usize] = Some(param.into_pointer_value());
             } else {
                 let ty = fc.t(&local.ty);

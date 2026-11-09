@@ -435,7 +435,7 @@ impl<'p> Cx<'p, '_> {
                 Root::Local(l) => match self.local(l).kind {
                     // A view into a borrowed (or in-out) owner points into the
                     // caller's value; an owned parameter is freed on return.
-                    LocalKind::Param { inout, owned, .. } => !owned && (inout || self.p.has_owner(&self.local(l).ty)),
+                    LocalKind::Param { owned, .. } => !owned,
                     _ => false,
                 },
                 Root::Temp => false,
@@ -1079,9 +1079,7 @@ impl Moves<'_, '_, '_> {
             let n = self.cx.local(l).name.clone();
             self.cx.err(
                 Diagnostic::error(borrow::USE_AFTER_MOVE, span, format!("use of moved value `{n}`"))
-                    .with_note(format!(
-                        "`{n}` owns its data, so binding, assigning, returning or passing it to a parameter that takes ownership moves it"
-                    ))
+                    .with_note(format!("`{n}` owns its data, so binding, assigning, returning or passing it to a parameter that takes ownership moves it"))
                     .with_help("move it only once, or `.clone()` it before moving"),
             );
         }
