@@ -556,6 +556,7 @@ impl P<'_, '_, '_> {
                 return Err(self.k.error_expected());
             }
             let start = self.start();
+            let iter_start = self.k.position();
             let arm = (|| -> PResult<Arm> {
                 let pat = self.pat()?;
                 let guard = if self.k.eat(T::If) { Some(self.expr()?) } else { None };
@@ -577,6 +578,10 @@ impl P<'_, '_, '_> {
                     self.k.recover_until(&[T::Comma, T::RBrace], NEST);
                     self.k.eat(T::Comma);
                 }
+            }
+            if self.k.position() == iter_start && !self.k.at(T::RBrace) && !self.k.at_eof() {
+                // A stray closer like `)`: skip it to guarantee progress.
+                self.k.bump();
             }
         }
     }
