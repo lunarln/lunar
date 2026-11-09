@@ -816,12 +816,11 @@ fn glue<'ctx>(cg: &mut Cg<'ctx, '_>, t: &Ty) -> Result<FunctionValue<'ctx>, Stri
         }
         _ => {}
     }
-    // Nested glue generation may have moved the builder; finish in the last block.
-    if let Some(last) = f.get_last_basic_block() {
-        cg.b.position_at_end(last);
-        if last.get_terminator().is_none() {
-            cg.b.build_return(None).unwrap();
-        }
+    // Nested glue generation restores the builder to our current block.
+    if let Some(cur) = cg.b.get_insert_block()
+        && cur.get_terminator().is_none()
+    {
+        cg.b.build_return(None).unwrap();
     }
     if let Some(bb) = saved {
         cg.b.position_at_end(bb);

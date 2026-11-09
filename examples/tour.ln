@@ -1,0 +1,186 @@
+// A tour of Lunar features.
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+impl Point {
+    fn new(x: i32, y: i32): Point {
+        return Point { x, y };
+    }
+
+    fn manhattan(self): i32 {
+        return self.x.abs() + self.y.abs();
+    }
+
+    fn shift(mut self, dx: i32) {
+        self.x += dx;
+    }
+}
+
+impl Display for Point {
+    fn fmt(self, mut out: String) {
+        out.write("({self.x}, {self.y})");
+    }
+}
+
+impl Eq for Point {
+    fn eq(self, other: Point): bool {
+        return self.x == other.x && self.y == other.y;
+    }
+}
+
+enum Shape {
+    Circle(f64),
+    Rect { w: f64, h: f64 },
+    Empty,
+}
+
+fn area(s: Shape): f64 {
+    return match s {
+        Shape::Circle(r) => 3.14159 * r * r,
+        Shape::Rect { w, h } => w * h,
+        Shape::Empty => 0.0,
+    };
+}
+
+trait Describe {
+    fn name(self): str;
+    fn describe(self, mut out: String) {
+        out.write("I am {self.name()}");
+    }
+}
+
+impl Describe for Point {
+    fn name(self): str {
+        return "a point";
+    }
+}
+
+fn largest::<T: Ord + Dull>(items: [T; &]): Option::<T> {
+    let mut best = items.first()?;
+    for x in items {
+        if x > best {
+            best = x;
+        }
+    }
+    return Some(best);
+}
+
+fn sum_squares(n: u64): u64 {
+    let mut total: u64 = 0;
+    for i in 1..=n {
+        total += i * i;
+    }
+    return total;
+}
+
+fn fib(n: u32): u64 {
+    if n < 2 {
+        return n as u64;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+static mut COUNTER: u32 = 0;
+
+fn bump(): u32 {
+    unsafe {
+        COUNTER += 1;
+        return COUNTER;
+    }
+}
+
+fn main() {
+    // Structs, methods, in-out parameters.
+    let mut p = Point::new(3, -4);
+    println("p = {p}, manhattan = {p.manhattan()}");
+    p.shift(10);
+    println("shifted: {p}");
+    println("equal to (13, -4)? {p == Point::new(13, -4)}");
+
+    // Enums and match.
+    let shapes: [f64; 3] = [area(Shape::Circle(1.0)), area(Shape::Rect { w: 2.0, h: 3.5 }), area(Shape::Empty)];
+    println("areas: {shapes[0]} {shapes[1]} {shapes[2]}");
+
+    // Traits with default methods.
+    let mut s = String::new();
+    p.describe(s);
+    println("{s}");
+
+    // Generics and Option.
+    let nums: [i32; _] = [5, 17, -3, 9];
+    match largest(nums[..]) {
+        Some(m) => println("largest = {m}"),
+        None => println("empty"),
+    }
+    let none: [i32; 0] = [];
+    println("largest of empty = {largest(none[..])}");
+
+    // Loops and recursion.
+    println("sum of squares 1..=10 = {sum_squares(10)}");
+    println("fib(20) = {fib(20)}");
+
+    // Strings and chars.
+    let mut greeting = String::from("hello");
+    greeting.push_str(", world");
+    greeting.push('!');
+    println("{greeting} has {greeting.len()} bytes");
+    let mut vowels = 0;
+    for c in greeting.as_str().chars() {
+        if c == 'o' || c == 'e' {
+            vowels += 1;
+        }
+    }
+    println("e/o count: {vowels}");
+    let word = "  trim me  ".trim();
+    let starts = word.starts_with("trim");
+    let parsed = "-1234".parse_i64().unwrap();
+    println("[{word}] starts with 'trim': {starts}");
+    println("parsed: {parsed}");
+    greeting.pop();
+    println("after pop: {greeting}");
+
+    // Sorting a growable array.
+    let mut v: [i64; -..+] = [];
+    for i in 0..10 {
+        v.push((i * 37) % 11);
+    }
+    v.sort();
+    let mut line = String::new();
+    for x in v {
+        line.write("{x} ");
+    }
+    println("sorted: {line}");
+    let last = v.pop().unwrap();
+    println("popped {last}, len now {v.len()}");
+
+    // Floats.
+    let r: f64 = 2.0;
+    println("sqrt(2) = {r.sqrt()}, 1/3 = {1.0 / 3.0}, big = {1e21}");
+
+    // Statics and unsafe.
+    bump();
+    bump();
+    println("counter = {bump()}");
+
+    // Raw pointers.
+    let mut cell: i32 = 7;
+    let ptr = core::intrinsics::addr_of_mut(cell);
+    unsafe {
+        *ptr = *ptr * 6;
+    }
+    println("cell = {cell}");
+
+    // Tuples and destructuring.
+    let (a, b) = (1, "two");
+    println("tuple: {a} {b}");
+
+    // while let with an iterator.
+    let mut it = "xyz".bytes();
+    while let Some(byte) = it.next() {
+        print("{byte} ");
+    }
+    println("");
+}

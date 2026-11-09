@@ -1,0 +1,59 @@
+// Owned values must be freed: every String / growable array reserves 8 GiB of
+// address space for its data stack, so leaking 100k of them would exhaust
+// the address space and crash.
+
+struct Named {
+    name: String,
+    tags: [u8; -..+],
+}
+
+fn make(i: u32): Named {
+    let mut t: [u8; -..+] = [];
+    t.push(i as u8);
+    return Named { name: String::from("item"), tags: t };
+}
+
+fn consume_len(n: Named): usize {
+    return n.name.len() + n.tags.len();
+}
+
+fn maybe(i: u32): Option::<String> {
+    if i % 2 == 0 {
+        return Some(String::from("even"));
+    }
+    return None;
+}
+
+fn main() {
+    let mut total: usize = 0;
+    for i in 0..100000 {
+        // Temporaries in expressions.
+        total += String::from("abc").len();
+        // Locals dropped at the end of each iteration.
+        let n = make(i);
+        total += consume_len(n);
+        // Enum payloads.
+        match maybe(i) {
+            Some(s) => total += s.len(),
+            None => {}
+        }
+        // Reassignment drops the old value.
+        let mut s = String::from("x");
+        s = String::from("yy");
+        total += s.len();
+        // Early exit paths drop too.
+        if i == 99999 {
+            let keep = String::from("bye");
+            println("total = {total}, last = {keep}");
+            break;
+        }
+    }
+    // Growth keeps existing elements in place.
+    let mut big: [u64; ..+] = [];
+    for i in 0..1000000 {
+        big.push(i);
+    }
+    let view: [u64; &] = big[999990..];
+    big.push(7);
+    println("big has {big.len()} elements; view[9] = {view[9]}");
+}
