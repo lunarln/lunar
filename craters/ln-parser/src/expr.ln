@@ -1,0 +1,723 @@
+// Expressions, statements and blocks.
+
+use core::arena::{Id, List};
+use ln_ast::*;
+use ln_lexer::{NumKind, Token as T};
+use crater::{Parser, PResult, Named, Expected, Code, Tok};
+use crater::pat::is_uppercase;
+
+/// A binary operator at the cursor: the operator, its precedence and how
+/// many tokens it takes.
+struct BinOpAt {
+    op: BinOp,
+    prec: u8,
+    n: usize,
+}
+
+/// A statement, or the block's tail expression.
+enum StmtOrTail {
+    Stmt(Stmt),
+    Tail(Id::<Expr>),
+}
+
+/// An assignment operator: `None` for `=`, and how many tokens it takes.
+struct AssignAt {
+    op: Option::<BinOp>,
+    n: usize,
+}
+
+impl Parser {
+    fn mk(&mut self, kind: ExprKind, start: u32): Id::<Expr> {
+        return self.add_expr(kind, self.span_from(start));
+    }
+
+    pub fn expr(&mut self): PResult::<Id::<Expr>> {
+        return self.assign(false);
+    }
+
+    fn expr_no_struct(&mut self): PResult::<Id::<Expr>> {
+        return self.assign(true);
+    }
+
+    // ----- assignment -----
+
+    fn assign_op(&mut self): Option::<AssignAt> {
+        let t = self.peek()?;
+        let op = match t {
+            T::Eq => return Some(AssignAt { op: None, n: 1 }),
+            T::PlusEq => BinOp::Add,
+            T::MinusEq => BinOp::Sub,
+            T::StarEq => BinOp::Mul,
+            T::SlashEq => BinOp::Div,
+            T::PercentEq => BinOp::Rem,
+            T::AmpEq => BinOp::BitAnd,
+            T::PipeEq => BinOp::BitOr,
+            T::CaretEq => BinOp::BitXor,
+            T::ShlEq => BinOp::Shl,
+            T::RAngle => {
+                if self.at_glued3(T::RAngle, T::RAngle, T::Eq) {
+                    return Some(AssignAt { op: Some(BinOp::Shr), n: 3 });
+                }
+                return None;
+            }
+            _ => return None,
+        };
+        return Some(AssignAt { op: Some(op), n: 1 });
+    }
+
+    fn assign(&mut self, no_struct: bool): PResult::<Id::<Expr>> {
+        let start = self.start();
+        let lhs = self.range(no_struct)?;
+        if let Some(a) = self.assign_op() {
+            let mut k: usize = 0;
+            while k < a.n {
+                self.bump();
+                k += 1;
+            }
+            let rhs = self.assign(no_struct)?;
+            let kind = match a.op {
+                None => ExprKind::Assign(lhs, rhs),
+                Some(op) => ExprKind::AssignOp(op, lhs, rhs),
+            };
+            return Ok(self.mk(kind, start));
+        }
+        return Ok(lhs);
+    }
+
+    // ----- ranges -----
+
+    /// Whether the current token can begin an expression.
+    pub fn can_start_expr(&mut self): bool {
+        return match self.peek() {
+            Some(T::Ident | T::Number(_) | T::Str | T::Char | T::Byte | T::True | T::False | T::LParen | T::LBracket | T::LBrace | T::Minus | T::Bang | T::Star) => true,
+            Some(T::SelfValue | T::SelfType | T::Crater | T::Super | T::If | T::Match | T::Unsafe | T::Loop | T::While | T::For | T::Move | T::Pipe | T::PipePipe) => true,
+            _ => false,
+        };
+    }
+
+    /// The end of a range after `..`, if there is one.
+    fn range_end(&mut self, no_struct: bool): PResult::<Option::<Id::<Expr>>> {
+        if self.can_start_expr() && !(no_struct && self.at(T::LBrace)) {
+            return Ok(Some(self.binary(0, no_struct)?));
+        }
+        return Ok(None);
+    }
+
+    fn range(&mut self, no_struct: bool): PResult::<Id::<Expr>> {
+        let start = self.start();
+        if self.at(T::DotDot) || self.at(T::DotDotEq) {
+            let inclusive = self.bump().kind == T::DotDotEq;
+            let end = self.range_end(no_struct)?;
+            return Ok(self.mk(ExprKind::Range { start: None, end, inclusive }, start));
+        }
+        let lhs = self.binary(0, no_struct)?;
+        if self.at(T::DotDot) || self.at(T::DotDotEq) {
+            let inclusive = self.bump().kind == T::DotDotEq;
+            let end = self.range_end(no_struct)?;
+            return Ok(self.mk(ExprKind::Range { start: Some(lhs), end, inclusive }, start));
+        }
+        return Ok(lhs);
+    }
+
+    // ----- binary operators (precedence climbing) -----
+
+    fn peek_binop(&mut self): Option::<BinOpAt> {
+        let t = self.peek()?;
+        return Some(match t {
+            T::PipePipe => BinOpAt { op: BinOp::Or, prec: 1, n: 1 },
+            T::AmpAmp => BinOpAt { op: BinOp::And, prec: 2, n: 1 },
+            T::EqEq => BinOpAt { op: BinOp::Eq, prec: 3, n: 1 },
+            T::BangEq => BinOpAt { op: BinOp::Ne, prec: 3, n: 1 },
+            T::LAngle => BinOpAt { op: BinOp::Lt, prec: 3, n: 1 },
+            T::Le => BinOpAt { op: BinOp::Le, prec: 3, n: 1 },
+            T::RAngle => {
+                if self.at_glued(T::RAngle, T::RAngle) {
+                    if self.at_glued3(T::RAngle, T::RAngle, T::Eq) {
+                        // `>>=` is an assignment operator.
+                        return None;
+                    }
+                    BinOpAt { op: BinOp::Shr, prec: 7, n: 2 }
+                } else if self.at_glued(T::RAngle, T::Eq) {
+                    BinOpAt { op: BinOp::Ge, prec: 3, n: 2 }
+                } else {
+                    BinOpAt { op: BinOp::Gt, prec: 3, n: 1 }
+                }
+            }
+            T::Pipe => BinOpAt { op: BinOp::BitOr, prec: 4, n: 1 },
+            T::Caret => BinOpAt { op: BinOp::BitXor, prec: 5, n: 1 },
+            T::Amp => BinOpAt { op: BinOp::BitAnd, prec: 6, n: 1 },
+            T::Shl => BinOpAt { op: BinOp::Shl, prec: 7, n: 1 },
+            T::Plus => BinOpAt { op: BinOp::Add, prec: 8, n: 1 },
+            T::Minus => BinOpAt { op: BinOp::Sub, prec: 8, n: 1 },
+            T::Star => BinOpAt { op: BinOp::Mul, prec: 9, n: 1 },
+            T::Slash => BinOpAt { op: BinOp::Div, prec: 9, n: 1 },
+            T::Percent => BinOpAt { op: BinOp::Rem, prec: 9, n: 1 },
+            _ => return None,
+        });
+    }
+
+    fn binary(&mut self, min_prec: u8, no_struct: bool): PResult::<Id::<Expr>> {
+        let start = self.start();
+        let mut lhs = self.cast(no_struct)?;
+        loop {
+            let b = match self.peek_binop() {
+                Some(b) => b,
+                None => break,
+            };
+            if b.prec <= min_prec {
+                break;
+            }
+            let mut k: usize = 0;
+            while k < b.n {
+                self.bump();
+                k += 1;
+            }
+            // Comparisons are non-associative: parse the rhs one level higher.
+            let rhs = self.binary(b.prec, no_struct)?;
+            lhs = self.mk(ExprKind::Binary(b.op, lhs, rhs), start);
+            if b.op.is_comparison() {
+                if let Some(b2) = self.peek_binop() {
+                    if b2.prec == 3 {
+                        let s = self.start();
+                        let mut m = String::new();
+                        m.write("comparison operators cannot be chained (`{b2.op.as_str()}` after `{b.op.as_str()}`)");
+                        self.diag(Code::UnexpectedToken, Span::new(s, s + 1), m.as_str());
+                    }
+                }
+            }
+        }
+        return Ok(lhs);
+    }
+
+    fn cast(&mut self, no_struct: bool): PResult::<Id::<Expr>> {
+        let start = self.start();
+        let mut e = self.unary(no_struct)?;
+        while self.eat(T::As) {
+            let t = self.ty()?;
+            e = self.mk(ExprKind::Cast(e, t), start);
+        }
+        return Ok(e);
+    }
+
+    fn unary(&mut self, no_struct: bool): PResult::<Id::<Expr>> {
+        let start = self.start();
+        let op = match self.peek() {
+            Some(T::Minus) => UnOp::Neg,
+            Some(T::Bang) => UnOp::Not,
+            Some(T::Star) => UnOp::Deref,
+            // `&x` / `&mut x`: lending an argument.
+            Some(T::Amp) => {
+                self.bump();
+                let mutable = self.eat(T::Mut);
+                let inner = self.unary(no_struct)?;
+                return Ok(self.mk(ExprKind::Borrow { mutable, expr: inner }, start));
+            }
+            _ => return self.postfix(no_struct),
+        };
+        self.bump();
+        let inner = self.unary(no_struct)?;
+        return Ok(self.mk(ExprKind::Unary(op, inner), start));
+    }
+
+    /// `move? |params| body` or `move? |params|: R { ... }`; `||` has no
+    /// parameters.
+    fn closure(&mut self): PResult::<Closure> {
+        let is_move = self.eat(T::Move);
+        let mut params: [ClosureParam; ..+] = [];
+        if !self.eat(T::PipePipe) {
+            self.expect(T::Pipe)?;
+            loop {
+                if self.eat(T::Pipe) {
+                    break;
+                }
+                let start = self.start();
+                let is_mut = self.eat(T::Mut);
+                let name = if self.eat(T::Placeholder) { None } else { Some(self.ident()?) };
+                let mut mode: Option::<ParamMode> = None;
+                let mut ty: Option::<Id::<Ty>> = None;
+                if self.eat(T::Colon) {
+                    if self.eat(T::Amp) {
+                        mode = Some(if self.eat(T::Mut) { ParamMode::InOut } else { ParamMode::Borrow });
+                    }
+                    ty = Some(self.ty()?);
+                }
+                params.push(ClosureParam { is_mut, name, mode, ty, span: self.span_from(start) });
+                if !self.eat(T::Comma) {
+                    self.expect(T::Pipe)?;
+                    break;
+                }
+            }
+        }
+        let params = self.ast.closure_params.add_list(params[..]);
+        // With a return type, the body must be a block.
+        if self.eat(T::Colon) {
+            let ret = self.ret_ty()?;
+            let start = self.start();
+            let b = self.block()?;
+            let body = self.mk(ExprKind::Block(b), start);
+            return Ok(Closure { is_move, params, ret: Some(ret), body });
+        }
+        let body = self.expr()?;
+        return Ok(Closure { is_move, params, ret: None, body });
+    }
+
+    fn call_args(&mut self): PResult::<List::<Id::<Expr>>> {
+        self.expect(T::LParen)?;
+        let mut args: [Id::<Expr>; ..+] = [];
+        loop {
+            if self.eat(T::RParen) {
+                break;
+            }
+            match self.expr() {
+                Ok(e) => args.push(e),
+                Err(_) => self.recover_until([T::Comma, T::RParen][..]),
+            }
+            if !self.eat(T::Comma) {
+                self.expect(T::RParen)?;
+                break;
+            }
+        }
+        return Ok(self.ast.expr_ids.add_list(args[..]));
+    }
+
+    fn postfix(&mut self, no_struct: bool): PResult::<Id::<Expr>> {
+        let start = self.start();
+        let e = self.primary(no_struct)?;
+        return self.postfix_ops(e, start);
+    }
+
+    /// Continue parsing after an already-parsed block-like expression.
+    fn continue_expr(&mut self, e: Id::<Expr>, start: u32): PResult::<Id::<Expr>> {
+        let mut e = self.postfix_ops(e, start)?;
+        while self.eat(T::As) {
+            let t = self.ty()?;
+            e = self.mk(ExprKind::Cast(e, t), start);
+        }
+        return Ok(e);
+    }
+
+    fn postfix_ops(&mut self, e: Id::<Expr>, start: u32): PResult::<Id::<Expr>> {
+        let mut e = e;
+        loop {
+            match self.peek() {
+                Some(T::LParen) => {
+                    let args = self.call_args()?;
+                    e = self.mk(ExprKind::Call(e, args), start);
+                }
+                Some(T::LBracket) => {
+                    self.bump();
+                    let idx = self.expr()?;
+                    self.expect(T::RBracket)?;
+                    e = self.mk(ExprKind::Index(e, idx), start);
+                }
+                Some(T::Question) => {
+                    self.bump();
+                    e = self.mk(ExprKind::Try(e), start);
+                }
+                Some(T::Dot) => {
+                    self.bump();
+                    match self.peek() {
+                        Some(T::Number(kind)) => {
+                            let t = self.bump();
+                            e = self.tuple_fields_of(e, t, kind, start);
+                        }
+                        _ => {
+                            let name = self.ident()?;
+                            let mut generics: Option::<List::<Id::<Ty>>> = None;
+                            if self.at(T::PathSep) && self.nth_at(1, T::LAngle) {
+                                self.bump();
+                                generics = Some(self.generic_args()?);
+                            }
+                            if self.at(T::LParen) {
+                                let args = self.call_args()?;
+                                e = self.mk(ExprKind::MethodCall { recv: e, name, generics, args }, start);
+                            } else {
+                                if generics.is_some() {
+                                    self.diag(Code::UnexpectedToken, name.span, "field access cannot take generic arguments");
+                                }
+                                e = self.mk(ExprKind::Field(e, name), start);
+                            }
+                        }
+                    }
+                }
+                _ => return Ok(e),
+            }
+        }
+    }
+
+    /// `e.0`, and `e.0.1`, which lexes `0.1` as one float token.
+    fn tuple_fields_of(&mut self, e: Id::<Expr>, t: Tok, kind: NumKind, start: u32): Id::<Expr> {
+        let text = self.tok_text(t);
+        let mut e = e;
+        let mut off = t.start;
+        let mut part_start: usize = 0;
+        let b = text.as_bytes();
+        let mut i: usize = 0;
+        while i <= b.len() {
+            // Parts end at a `.` (only a float token has one) or the end.
+            if i == b.len() || (kind == NumKind::Float && b[i] == b'.') {
+                let part = text[part_start..i];
+                let sp = Span::new(off, off + part.len() as u32);
+                off += part.len() as u32 + 1;
+                match parse_u32(part) {
+                    Some(n) => e = self.add_expr(ExprKind::TupleField(e, n, sp), Span::new(start, sp.hi)),
+                    None => self.diag(Code::BadNumber, sp, "invalid tuple field index"),
+                }
+                part_start = i + 1;
+            }
+            i += 1;
+        }
+        return e;
+    }
+
+    // ----- primary expressions -----
+
+    fn primary(&mut self, no_struct: bool): PResult::<Id::<Expr>> {
+        let start = self.start();
+        let t = match self.peek() {
+            Some(t) => t,
+            None => {
+                self.expect_note(Expected::Named(Named::Expression));
+                return Err(self.error_expected());
+            }
+        };
+        let kind = match t {
+            T::Number(_) | T::Str | T::Char | T::Byte | T::True | T::False => ExprKind::Lit(self.literal()?),
+            T::Ident | T::SelfValue | T::SelfType | T::Crater | T::Super => {
+                let path = self.path_ty_style()?;
+                if self.at_mac_bang() {
+                    ExprKind::MacCall(self.mac_call(path)?)
+                } else if self.at(T::LBrace) && !no_struct && self.looks_like_struct_lit(path) {
+                    self.struct_lit(path)?
+                } else {
+                    ExprKind::Path(path)
+                }
+            }
+            T::Pipe | T::PipePipe | T::Move => ExprKind::Closure(self.closure()?),
+            T::LParen => {
+                self.bump();
+                if self.eat(T::RParen) {
+                    ExprKind::Tuple(List::empty())
+                } else {
+                    let first = self.expr()?;
+                    if self.eat(T::RParen) {
+                        ExprKind::Paren(first)
+                    } else {
+                        let mut elems: [Id::<Expr>; ..+] = [first];
+                        while self.eat(T::Comma) {
+                            if self.at(T::RParen) {
+                                break;
+                            }
+                            elems.push(self.expr()?);
+                        }
+                        self.expect(T::RParen)?;
+                        ExprKind::Tuple(self.ast.expr_ids.add_list(elems[..]))
+                    }
+                }
+            }
+            T::LBracket => {
+                self.bump();
+                if self.eat(T::RBracket) {
+                    ExprKind::Array(List::empty())
+                } else {
+                    let first = self.expr()?;
+                    if self.eat(T::Semi) {
+                        let count = self.expr()?;
+                        self.expect(T::RBracket)?;
+                        ExprKind::ArrayRepeat(first, count)
+                    } else {
+                        let mut elems: [Id::<Expr>; ..+] = [first];
+                        while self.eat(T::Comma) {
+                            if self.at(T::RBracket) {
+                                break;
+                            }
+                            elems.push(self.expr()?);
+                        }
+                        self.expect(T::RBracket)?;
+                        ExprKind::Array(self.ast.expr_ids.add_list(elems[..]))
+                    }
+                }
+            }
+            T::LBrace => ExprKind::Block(self.block()?),
+            T::Unsafe => {
+                self.bump();
+                ExprKind::Unsafe(self.block()?)
+            }
+            T::If => return self.if_expr(),
+            T::Match => {
+                self.bump();
+                let scrut = self.expr_no_struct()?;
+                let arms = self.match_arms()?;
+                ExprKind::Match { scrut, arms }
+            }
+            T::While => {
+                self.bump();
+                if self.eat(T::Let) {
+                    let p = self.pat()?;
+                    self.expect(T::Eq)?;
+                    let scrut = self.expr_no_struct()?;
+                    let body = self.block()?;
+                    ExprKind::WhileLet { pat: p, scrut, body }
+                } else {
+                    let cond = self.expr_no_struct()?;
+                    let body = self.block()?;
+                    ExprKind::While { cond, body }
+                }
+            }
+            T::Loop => {
+                self.bump();
+                ExprKind::Loop(self.block()?)
+            }
+            T::For => {
+                self.bump();
+                let p = self.pat()?;
+                self.expect(T::In)?;
+                let iter = self.expr_no_struct()?;
+                let body = self.block()?;
+                ExprKind::For { pat: p, iter, body }
+            }
+            T::Return => {
+                self.bump();
+                let v = if self.can_start_expr() || self.at(T::DotDot) { Some(self.assign(no_struct)?) } else { None };
+                ExprKind::Return(v)
+            }
+            T::Break => {
+                self.bump();
+                let v = if self.can_start_expr() && !(no_struct && self.at(T::LBrace)) { Some(self.assign(no_struct)?) } else { None };
+                ExprKind::Break(v)
+            }
+            T::Continue => {
+                self.bump();
+                ExprKind::Continue
+            }
+            _ => {
+                self.expect_note(Expected::Named(Named::Expression));
+                return Err(self.error_expected());
+            }
+        };
+        return Ok(self.mk(kind, start));
+    }
+
+    /// After a path, `{` starts a struct literal only if it looks like one:
+    /// `{ }`, `{ ident: ...`, `{ ident, ...` or `{ ident }`.
+    fn looks_like_struct_lit(&mut self, path: Path): bool {
+        let last = self.ast.last_segment(path);
+        let starts_upper = match self.ast.text(last.ident.name).chars().next() {
+            Some(c) => is_uppercase(c),
+            None => false,
+        };
+        let (a, b) = (self.nth(1), self.nth(2));
+        if a == Some(T::RBrace) {
+            return starts_upper;
+        }
+        if a == Some(T::Ident) && b == Some(T::Colon) {
+            return true;
+        }
+        if a == Some(T::Ident) && (b == Some(T::Comma) || b == Some(T::RBrace)) {
+            return starts_upper;
+        }
+        return false;
+    }
+
+    fn struct_lit(&mut self, path: Path): PResult::<ExprKind> {
+        self.expect(T::LBrace)?;
+        let mut fields: [FieldInit; ..+] = [];
+        loop {
+            if self.eat(T::RBrace) {
+                break;
+            }
+            let start = self.start();
+            let name = self.ident()?;
+            let value = if self.eat(T::Colon) { Some(self.expr()?) } else { None };
+            fields.push(FieldInit { name, value, span: self.span_from(start) });
+            if !self.eat(T::Comma) {
+                self.expect(T::RBrace)?;
+                break;
+            }
+        }
+        return Ok(ExprKind::StructLit { path, fields: self.ast.field_inits.add_list(fields[..]) });
+    }
+
+    fn if_expr(&mut self): PResult::<Id::<Expr>> {
+        let start = self.start();
+        self.expect(T::If)?;
+        if self.eat(T::Let) {
+            let p = self.pat()?;
+            self.expect(T::Eq)?;
+            let scrut = self.expr_no_struct()?;
+            let then = self.block()?;
+            let else_ = self.else_branch()?;
+            return Ok(self.mk(ExprKind::IfLet { pat: p, scrut, then, else_ }, start));
+        }
+        let cond = self.expr_no_struct()?;
+        let then = self.block()?;
+        let else_ = self.else_branch()?;
+        return Ok(self.mk(ExprKind::If { cond, then, else_ }, start));
+    }
+
+    fn else_branch(&mut self): PResult::<Option::<Id::<Expr>>> {
+        if !self.eat(T::Else) {
+            return Ok(None);
+        }
+        if self.at(T::If) {
+            return Ok(Some(self.if_expr()?));
+        }
+        let start = self.start();
+        let b = self.block()?;
+        return Ok(Some(self.mk(ExprKind::Block(b), start)));
+    }
+
+    fn arm(&mut self, start: u32): PResult::<Arm> {
+        let p = self.pat()?;
+        let guard = if self.eat(T::If) { Some(self.expr()?) } else { None };
+        self.expect(T::FatArrow)?;
+        let body = self.expr()?;
+        return Ok(Arm { pat: p, guard, body, span: self.span_from(start) });
+    }
+
+    fn match_arms(&mut self): PResult::<List::<Arm>> {
+        self.expect(T::LBrace)?;
+        let mut arms: [Arm; ..+] = [];
+        loop {
+            if self.eat(T::RBrace) {
+                break;
+            }
+            if self.at_eof() {
+                return Err(self.error_expected());
+            }
+            let start = self.start();
+            let iter_start = self.position();
+            match self.arm(start) {
+                Ok(a) => {
+                    let block_like = self.ast.exprs.get(a.body).kind.is_block_like();
+                    arms.push(a);
+                    if !self.eat(T::Comma) && !block_like && !self.at(T::RBrace) {
+                        self.error_expected();
+                        self.recover_until([T::Comma, T::RBrace][..]);
+                        self.eat(T::Comma);
+                    }
+                }
+                Err(_) => {
+                    self.recover_until([T::Comma, T::RBrace][..]);
+                    self.eat(T::Comma);
+                }
+            }
+            if self.position() == iter_start && !self.at(T::RBrace) && !self.at_eof() {
+                // A stray closer like `)`: skip it to guarantee progress.
+                self.bump();
+            }
+        }
+        return Ok(self.ast.arms.add_list(arms[..]));
+    }
+
+    // ----- blocks & statements -----
+
+    pub fn block(&mut self): PResult::<Id::<Block>> {
+        let start = self.start();
+        self.expect(T::LBrace)?;
+        let mut stmts: [Stmt; ..+] = [];
+        let mut tail: Option::<Id::<Expr>> = None;
+        loop {
+            if self.eat(T::RBrace) {
+                break;
+            }
+            if self.at_eof() {
+                self.expect_note(Expected::Tok(T::RBrace));
+                return Err(self.error_expected());
+            }
+            if self.eat(T::Semi) {
+                continue;
+            }
+            match self.stmt() {
+                Ok(StmtOrTail::Stmt(s)) => stmts.push(s),
+                Ok(StmtOrTail::Tail(e)) => {
+                    tail = Some(e);
+                    self.expect(T::RBrace)?;
+                    break;
+                }
+                Err(_) => {
+                    let before = self.position();
+                    self.recover_until([T::Semi, T::RBrace, T::Let][..]);
+                    if !self.eat(T::Semi) && self.position() == before && !self.at(T::RBrace) && !self.at_eof() {
+                        // A stray closer like `)`: skip it to guarantee progress.
+                        self.bump();
+                    }
+                }
+            }
+        }
+        let l = self.ast.stmts.add_list(stmts[..]);
+        return Ok(self.ast.blocks.add(Block { stmts: l, tail, span: self.span_from(start) }));
+    }
+
+    fn stmt(&mut self): PResult::<StmtOrTail> {
+        let start = self.start();
+        if self.at(T::Let) {
+            self.bump();
+            let p = self.pat()?;
+            let ty = if self.eat(T::Colon) { Some(self.ty()?) } else { None };
+            let init = if self.eat(T::Eq) { Some(self.expr()?) } else { None };
+            self.expect_semi()?;
+            return Ok(StmtOrTail::Stmt(Stmt { kind: StmtKind::Let { pat: p, ty, init }, span: self.span_from(start) }));
+        }
+        if self.at_item_start() {
+            let it = self.item()?;
+            return Ok(StmtOrTail::Stmt(Stmt { kind: StmtKind::Item(it), span: self.span_from(start) }));
+        }
+        // A statement starting with a block-like expression ends with it, so
+        // `if c { } *p = 1;` is two statements, not a multiplication.
+        let block_start = match self.peek() {
+            Some(T::If | T::Match | T::While | T::Loop | T::For | T::LBrace) => true,
+            _ => self.at(T::Unsafe) && self.nth_at(1, T::LBrace),
+        };
+        let e = if block_start {
+            let e = self.primary(false)?;
+            if self.at(T::Dot) || self.at(T::Question) || self.at(T::As) {
+                // `match x { .. }.method()` style: keep parsing as an expression.
+                self.continue_expr(e, start)?
+            } else {
+                e
+            }
+        } else {
+            self.expr()?
+        };
+        if self.eat(T::Semi) {
+            return Ok(StmtOrTail::Stmt(Stmt { kind: StmtKind::Expr(e), span: self.span_from(start) }));
+        }
+        if self.at(T::RBrace) {
+            return Ok(StmtOrTail::Tail(e));
+        }
+        let ex = self.ast.exprs.get(e);
+        if ex.kind.is_block_like() {
+            return Ok(StmtOrTail::Stmt(Stmt { kind: StmtKind::Expr(e), span: self.span_from(start) }));
+        }
+        self.diag(Code::MissingSemi, ex.span.shrink_to_hi(), "expected `;` after expression");
+        return Ok(StmtOrTail::Stmt(Stmt { kind: StmtKind::Expr(e), span: self.span_from(start) }));
+    }
+
+    fn expect_semi(&mut self): PResult::<()> {
+        if self.eat(T::Semi) {
+            return Ok(());
+        }
+        let at = self.prev_end();
+        self.diag(Code::MissingSemi, Span::new(at, at), "expected `;`");
+        return Ok(());
+    }
+}
+
+/// A tuple field index: decimal digits that fit in `u32`.
+fn parse_u32(s: str): Option::<u32> {
+    if s.len() == 0 {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for c in s.bytes() {
+        if c < b'0' || c > b'9' {
+            return None;
+        }
+        v = v * 10 + (c - b'0') as u64;
+        if v > 0xffffffff {
+            return None;
+        }
+    }
+    return Some(v as u32);
+}

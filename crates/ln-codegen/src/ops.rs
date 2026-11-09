@@ -766,9 +766,22 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         let env_fields: Vec<_> = arg_tys.iter().map(|t| self.cg.llty(t)).collect();
         let env_ty = self.cg.ctx.struct_type(&env_fields, false);
         let env = self.alloca(env_ty.into(), "fmt_env");
+        let args: Vec<&Expr> = pieces
+            .iter()
+            .filter_map(|p| match p {
+                FmtPiece::Arg(e, _) => Some(e),
+                FmtPiece::Text(_) => None,
+            })
+            .collect();
         for (i, v) in arg_vals.iter().enumerate() {
             let fp = self.struct_field(env_ty.into(), env, i as u32);
             self.cg.b.build_store(fp, *v).unwrap();
+            // An owned value made for the hole (`{name()}`) is a temporary
+            // of the statement; a borrowed place is not ours to free.
+            if !Self::is_borrowed(args[i]) {
+                let t = arg_tys[i].clone();
+                self.register_cleanup(fp, &t);
+            }
         }
         let thunk = match self.fmt_thunk(pieces, &arg_tys, env_ty) {
             Ok(f) => f,

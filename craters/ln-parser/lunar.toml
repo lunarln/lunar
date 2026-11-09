@@ -1,0 +1,7 @@
+[package]
+name = "ln-parser"
+version = "0.1.0"
+
+[dependencies]
+ln-lexer = { path = "../ln-lexer" }
+ln-ast = { path = "../ln-ast" }

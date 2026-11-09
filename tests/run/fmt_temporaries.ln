@@ -1,0 +1,21 @@
+// A value made for a format hole (`{name(i)}`) is a temporary: it is freed
+// after the statement. Before that was so, every such `String` kept its
+// data stack, and this loop ran out of address space.
+
+fn name(i: i32): String {
+    let mut s = String::new();
+    s.write("item{i}");
+    return s;
+}
+
+fn main() {
+    let mut total: usize = 0;
+    let mut i = 0;
+    while i < 100000 {
+        let mut line = String::new();
+        line.write("{name(i)} = {i}");
+        total += line.len();
+        i += 1;
+    }
+    println("{total}");
+}

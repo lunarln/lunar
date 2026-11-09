@@ -1,0 +1,190 @@
+// Types and paths.
+
+use core::arena::{Id, List};
+use ln_ast::*;
+use ln_lexer::{NumKind, Token as T};
+use crater::{Parser, PResult, Named, Expected};
+
+impl Parser {
+    /// A path such as `std::io::println`, `Pair::<i32>::new`, `Self`,
+    /// `crater::x`. Generic arguments are always introduced with `::<`.
+    pub fn path_ty_style(&mut self): PResult::<Path> {
+        let start = self.start();
+        let mut segs: [PathSegment; ..+] = [];
+        loop {
+            let ident = self.path_segment_ident()?;
+            let mut args: Option::<List::<Id::<Ty>>> = None;
+            if self.at(T::PathSep) && self.nth_at(1, T::LAngle) {
+                self.bump();
+                args = Some(self.generic_args()?);
+            }
+            segs.push(PathSegment { ident, args });
+            if self.at(T::PathSep) && self.path_keyword_or_ident_at(1) {
+                self.bump();
+                continue;
+            }
+            break;
+        }
+        let segments = self.ast.segments.add_list(segs[..]);
+        return Ok(Path { segments, span: self.span_from(start) });
+    }
+
+    fn path_keyword_or_ident_at(&mut self, n: usize): bool {
+        return match self.nth(n) {
+            Some(T::Ident | T::SelfType | T::SelfValue | T::Super | T::Crater) => true,
+            _ => false,
+        };
+    }
+
+    /// `<A, B>` (the leading `::` already consumed).
+    pub fn generic_args(&mut self): PResult::<List::<Id::<Ty>>> {
+        self.expect(T::LAngle)?;
+        let mut out: [Id::<Ty>; ..+] = [];
+        loop {
+            if self.eat(T::RAngle) {
+                break;
+            }
+            out.push(self.ty()?);
+            if !self.eat(T::Comma) {
+                self.expect(T::RAngle)?;
+                break;
+            }
+        }
+        return Ok(self.ast.ty_ids.add_list(out[..]));
+    }
+
+    /// A return type: `!` alone means "never returns".
+    pub fn ret_ty(&mut self): PResult::<Id::<Ty>> {
+        if self.at(T::Bang) && !self.ty_can_start(1) {
+            let t = self.bump();
+            return Ok(self.add_ty(TyKind::Never, self.tok_span(t)));
+        }
+        return self.ty();
+    }
+
+    fn ty_can_start(&mut self, n: usize): bool {
+        return match self.nth(n) {
+            Some(T::Ident | T::SelfType | T::Crater | T::Super | T::SelfValue | T::LBracket | T::LParen | T::Star | T::Bang | T::Fn | T::Placeholder | T::Impl) => true,
+            _ => false,
+        };
+    }
+
+    pub fn ty(&mut self): PResult::<Id::<Ty>> {
+        let start = self.start();
+        let kind = match self.peek() {
+            Some(T::Ident | T::SelfType | T::Crater | T::Super | T::SelfValue) => {
+                let path = self.path_ty_style()?;
+                if self.at_mac_bang() { TyKind::MacCall(self.mac_call(path)?) } else { TyKind::Path(path) }
+            }
+            Some(T::Placeholder) => {
+                self.bump();
+                TyKind::Infer
+            }
+            Some(T::Bang) => {
+                self.bump();
+                if self.ty_can_start(0) { TyKind::Bang(self.ty()?) } else { TyKind::Never }
+            }
+            Some(T::Star) => {
+                self.bump();
+                let is_mut = self.eat(T::Mut);
+                TyKind::Ptr { is_mut, inner: self.ty()? }
+            }
+            Some(T::LParen) => {
+                self.bump();
+                let mut elems: [Id::<Ty>; ..+] = [];
+                let mut trailing_comma = false;
+                loop {
+                    if self.eat(T::RParen) {
+                        break;
+                    }
+                    elems.push(self.ty()?);
+                    trailing_comma = self.eat(T::Comma);
+                    if !trailing_comma {
+                        self.expect(T::RParen)?;
+                        break;
+                    }
+                }
+                if elems.len() == 1 && !trailing_comma {
+                    return Ok(elems[0]);
+                }
+                TyKind::Tuple(self.ast.ty_ids.add_list(elems[..]))
+            }
+            Some(T::Fn) => {
+                self.bump();
+                self.fn_sig_tail()?
+            }
+            Some(T::Impl) => {
+                self.bump();
+                TyKind::ImplTrait(self.bounds()?)
+            }
+            Some(T::LBracket) => {
+                self.bump();
+                let elem = self.ty()?;
+                if self.eat(T::RBracket) {
+                    TyKind::DynArray(elem)
+                } else {
+                    self.expect(T::Semi)?;
+                    let size = self.array_size()?;
+                    self.expect(T::RBracket)?;
+                    TyKind::Array(elem, size)
+                }
+            }
+            _ => {
+                self.expect_note(Expected::Named(Named::Type));
+                return Err(self.error_expected());
+            }
+        };
+        return Ok(self.add_ty(kind, self.span_from(start)));
+    }
+
+    /// `(A, &B, &mut C): R` after `fn` in a type, or after `Fn` in a bound.
+    pub fn fn_sig_tail(&mut self): PResult::<TyKind> {
+        self.expect(T::LParen)?;
+        let mut params: [FnTyParam; ..+] = [];
+        loop {
+            if self.eat(T::RParen) {
+                break;
+            }
+            // Modes as in signatures: `T` takes, `&T` borrows, `&mut T` is
+            // in-out.
+            let mode = if self.eat(T::Amp) { if self.eat(T::Mut) { ParamMode::InOut } else { ParamMode::Borrow } } else { ParamMode::Take };
+            params.push(FnTyParam { mode, ty: self.ty()? });
+            if !self.eat(T::Comma) {
+                self.expect(T::RParen)?;
+                break;
+            }
+        }
+        let ret = if self.eat(T::Colon) { Some(self.ret_ty()?) } else { None };
+        return Ok(TyKind::Fn { params: self.ast.fn_ty_params.add_list(params[..]), ret });
+    }
+
+    /// The part after `;` in `[T; ...]`.
+    fn array_size(&mut self): PResult::<ArraySize> {
+        return match self.peek() {
+            Some(T::Placeholder) => {
+                self.bump();
+                Ok(ArraySize::Inferred)
+            }
+            Some(T::Amp) => {
+                self.bump();
+                Ok(if self.eat(T::Mut) { ArraySize::SliceMut } else { ArraySize::Slice })
+            }
+            Some(T::DotDot) if self.nth_at(1, T::Plus) => {
+                self.bump();
+                self.bump();
+                Ok(ArraySize::Grow)
+            }
+            Some(T::Minus) if self.nth_at(1, T::DotDot) && self.nth_at(2, T::Plus) => {
+                self.bump();
+                self.bump();
+                self.bump();
+                Ok(ArraySize::GrowShrink)
+            }
+            Some(T::Number(NumKind::Int) | T::Ident | T::LParen | T::LBrace) => Ok(ArraySize::Fixed(self.expr()?)),
+            _ => {
+                self.expect_note(Expected::Named(Named::ArraySize));
+                Err(self.error_expected())
+            }
+        };
+    }
+}

@@ -1,0 +1,1475 @@
+// The syntax tree of a Lunar source file, written in Lunar: a port of the
+// Rust `ln-ast` crate (crates/ln-ast) built from arenas
+// (docs/design/trees-and-collections.md). Every `Box` there is an `Id` into
+// one of the arenas of an `Ast` here, every `Vec` a `List`, and names and
+// strings are interned `Symbol`s.
+//
+// `dump` prints the same text as `ln_ast::dump` in Rust, which
+// crates/ln-driver/tests/selfhost.rs compares over every program.
+
+use core::arena::{Arena, Id, List};
+use core::intern::{Interner, Symbol};
+use ln_lexer::Token;
+
+/// A byte range in the source file.
+pub struct Span {
+    pub lo: u32,
+    pub hi: u32,
+}
+
+impl Span {
+    pub fn new(lo: u32, hi: u32): Span {
+        return Span { lo, hi };
+    }
+
+    /// From the start of `self` to the end of `other`.
+    pub fn to(self, other: Span): Span {
+        return Span { lo: self.lo, hi: other.hi };
+    }
+
+    /// The empty span at the end.
+    pub fn shrink_to_hi(self): Span {
+        return Span { lo: self.hi, hi: self.hi };
+    }
+}
+
+pub struct Ident {
+    pub name: Symbol,
+    pub span: Span,
+}
+
+// ===================================================================== macros
+
+pub enum Delim {
+    Paren,
+    Bracket,
+    Brace,
+}
+
+/// One token of a macro's input or body (its text is the source at `span`).
+pub struct Tt {
+    pub kind: Token,
+    pub span: Span,
+}
+
+pub enum TokenTree {
+    Token(Tt),
+    Group { delim: Delim, open: Span, close: Span, trees: List::<TokenTree> },
+}
+
+/// `path!(...)`, `path![...]` or `path!{...}`.
+pub struct MacCall {
+    pub path: Path,
+    pub delim: Delim,
+    pub tokens: List::<TokenTree>,
+    pub span: Span,
+}
+
+pub struct MacroRule {
+    pub matcher: List::<TokenTree>,
+    pub body: List::<TokenTree>,
+    pub span: Span,
+}
+
+pub struct MacroDef {
+    pub name: Ident,
+    pub rules: List::<MacroRule>,
+}
+
+// ===================================================================== items
+
+pub struct Attr {
+    pub meta: Meta,
+    pub span: Span,
+}
+
+/// Attribute contents: `name`, `name = "value"`, or `name(meta, ...)`.
+pub enum Meta {
+    Word(Ident),
+    NameValue(Ident, Symbol),
+    Nested(Ident, List::<Meta>),
+}
+
+pub struct Item {
+    pub attrs: List::<Attr>,
+    pub is_pub: bool,
+    pub kind: ItemKind,
+    pub span: Span,
+}
+
+pub enum ItemKind {
+    Fn(FnDecl),
+    Struct(StructDecl),
+    Enum(EnumDecl),
+    Trait(TraitDecl),
+    Impl(ImplDecl),
+    Use(UseTree),
+    Mod(ModDecl),
+    Const(ConstDecl),
+    Static(StaticDecl),
+    Extern(ExternBlock),
+    TypeAlias(TypeAlias),
+    Macro(MacroDef),
+    MacCall(MacCall),
+}
+
+pub struct Generics {
+    pub params: List::<GenericParam>,
+    pub span: Span,
+}
+
+pub struct GenericParam {
+    pub name: Ident,
+    pub bounds: List::<Path>,
+}
+
+pub struct FnDecl {
+    pub name: Ident,
+    pub generics: Generics,
+    pub params: List::<Param>,
+    pub ret: Option::<Id::<Ty>>,
+    pub body: Option::<Id::<Block>>,
+    pub is_unsafe: bool,
+    pub variadic: bool,
+    pub sig_span: Span,
+}
+
+pub enum ParamMode {
+    Take,
+    Borrow,
+    InOut,
+}
+
+pub enum ParamKind {
+    SelfParam,
+    Named(Ident),
+    Wild,
+}
+
+pub struct Param {
+    pub is_mut: bool,
+    pub mode: ParamMode,
+    pub kind: ParamKind,
+    pub ty: Option::<Id::<Ty>>,
+    pub self_bang: bool,
+    pub span: Span,
+}
+
+pub struct StructDecl {
+    pub name: Ident,
+    pub generics: Generics,
+    pub kind: VariantData,
+}
+
+pub enum VariantData {
+    Unit,
+    Tuple(List::<TupleField>),
+    Named(List::<FieldDecl>),
+}
+
+pub struct TupleField {
+    pub is_pub: bool,
+    pub ty: Id::<Ty>,
+}
+
+pub struct FieldDecl {
+    pub attrs: List::<Attr>,
+    pub is_pub: bool,
+    pub name: Ident,
+    pub ty: Id::<Ty>,
+    pub span: Span,
+}
+
+pub struct EnumDecl {
+    pub name: Ident,
+    pub generics: Generics,
+    pub variants: List::<VariantDecl>,
+}
+
+pub struct VariantDecl {
+    pub attrs: List::<Attr>,
+    pub name: Ident,
+    pub data: VariantData,
+    pub span: Span,
+}
+
+pub struct TraitDecl {
+    pub name: Ident,
+    pub generics: Generics,
+    pub supertraits: List::<Path>,
+    pub items: List::<Id::<Item>>,
+}
+
+pub struct ImplDecl {
+    pub generics: Generics,
+    pub negative: bool,
+    pub trait_ref: Option::<Path>,
+    pub self_ty: Id::<Ty>,
+    pub items: List::<Id::<Item>>,
+}
+
+pub struct UseTree {
+    pub prefix: List::<Ident>,
+    pub kind: UseKind,
+    pub span: Span,
+}
+
+pub enum UseKind {
+    Simple(Option::<Ident>),
+    Glob,
+    Nested(List::<UseTree>),
+}
+
+pub struct ModDecl {
+    pub name: Ident,
+    /// `None` for `mod foo;`.
+    pub items: Option::<List::<Id::<Item>>>,
+}
+
+pub struct ConstDecl {
+    pub name: Ident,
+    pub ty: Id::<Ty>,
+    pub value: Id::<Expr>,
+}
+
+pub struct StaticDecl {
+    pub name: Ident,
+    pub is_mut: bool,
+    pub ty: Id::<Ty>,
+    pub value: Id::<Expr>,
+}
+
+pub struct ExternBlock {
+    pub abi: Option::<Symbol>,
+    pub items: List::<Id::<Item>>,
+}
+
+pub struct TypeAlias {
+    pub name: Ident,
+    pub generics: Generics,
+    pub ty: Id::<Ty>,
+}
+
+// ===================================================================== paths & types
+
+pub struct Path {
+    pub segments: List::<PathSegment>,
+    pub span: Span,
+}
+
+pub struct PathSegment {
+    pub ident: Ident,
+    /// `::<T, U>` attached to this segment.
+    pub args: Option::<List::<Id::<Ty>>>,
+}
+
+pub struct Ty {
+    pub kind: TyKind,
+    pub span: Span,
+}
+
+pub enum TyKind {
+    Path(Path),
+    Array(Id::<Ty>, ArraySize),
+    DynArray(Id::<Ty>),
+    Bang(Id::<Ty>),
+    Ptr { is_mut: bool, inner: Id::<Ty> },
+    Tuple(List::<Id::<Ty>>),
+    Fn { params: List::<FnTyParam>, ret: Option::<Id::<Ty>> },
+    Never,
+    Infer,
+    MacCall(MacCall),
+    ImplTrait(List::<Path>),
+}
+
+pub struct FnTyParam {
+    pub mode: ParamMode,
+    pub ty: Id::<Ty>,
+}
+
+pub enum ArraySize {
+    Fixed(Id::<Expr>),
+    Inferred,
+    Grow,
+    GrowShrink,
+    Slice,
+    SliceMut,
+}
+
+// ===================================================================== statements & expressions
+
+pub struct Block {
+    pub stmts: List::<Stmt>,
+    pub tail: Option::<Id::<Expr>>,
+    pub span: Span,
+}
+
+pub struct Stmt {
+    pub kind: StmtKind,
+    pub span: Span,
+}
+
+pub enum StmtKind {
+    Let { pat: Id::<Pat>, ty: Option::<Id::<Ty>>, init: Option::<Id::<Expr>> },
+    Expr(Id::<Expr>),
+    Item(Id::<Item>),
+}
+
+pub struct Expr {
+    pub kind: ExprKind,
+    pub span: Span,
+}
+
+#[derive(Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+}
+
+impl BinOp {
+    pub fn as_str(self): str {
+        return match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Rem => "%",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
+            BinOp::Eq => "==",
+            BinOp::Ne => "!=",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
+            BinOp::And => "&&",
+            BinOp::Or => "||",
+        };
+    }
+
+    pub fn is_comparison(self): bool {
+        return match self {
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => true,
+            _ => false,
+        };
+    }
+}
+
+pub enum UnOp {
+    Neg,
+    Not,
+    Deref,
+}
+
+pub enum ExprKind {
+    Lit(Lit),
+    Path(Path),
+    Unary(UnOp, Id::<Expr>),
+    Borrow { mutable: bool, expr: Id::<Expr> },
+    Binary(BinOp, Id::<Expr>, Id::<Expr>),
+    Assign(Id::<Expr>, Id::<Expr>),
+    AssignOp(BinOp, Id::<Expr>, Id::<Expr>),
+    Call(Id::<Expr>, List::<Id::<Expr>>),
+    MethodCall { recv: Id::<Expr>, name: Ident, generics: Option::<List::<Id::<Ty>>>, args: List::<Id::<Expr>> },
+    Field(Id::<Expr>, Ident),
+    TupleField(Id::<Expr>, u32, Span),
+    Index(Id::<Expr>, Id::<Expr>),
+    Range { start: Option::<Id::<Expr>>, end: Option::<Id::<Expr>>, inclusive: bool },
+    Array(List::<Id::<Expr>>),
+    ArrayRepeat(Id::<Expr>, Id::<Expr>),
+    Tuple(List::<Id::<Expr>>),
+    StructLit { path: Path, fields: List::<FieldInit> },
+    Block(Id::<Block>),
+    Unsafe(Id::<Block>),
+    If { cond: Id::<Expr>, then: Id::<Block>, else_: Option::<Id::<Expr>> },
+    IfLet { pat: Id::<Pat>, scrut: Id::<Expr>, then: Id::<Block>, else_: Option::<Id::<Expr>> },
+    Match { scrut: Id::<Expr>, arms: List::<Arm> },
+    While { cond: Id::<Expr>, body: Id::<Block> },
+    WhileLet { pat: Id::<Pat>, scrut: Id::<Expr>, body: Id::<Block> },
+    Loop(Id::<Block>),
+    For { pat: Id::<Pat>, iter: Id::<Expr>, body: Id::<Block> },
+    Break(Option::<Id::<Expr>>),
+    Continue,
+    Return(Option::<Id::<Expr>>),
+    Cast(Id::<Expr>, Id::<Ty>),
+    Paren(Id::<Expr>),
+    Try(Id::<Expr>),
+    MacCall(MacCall),
+    Closure(Closure),
+    Error,
+}
+
+impl ExprKind {
+    /// Block-like expressions may stand as statements without a `;`.
+    pub fn is_block_like(self): bool {
+        return match self {
+            ExprKind::Block(_) | ExprKind::Unsafe(_) | ExprKind::If { .. } | ExprKind::IfLet { .. } | ExprKind::Match { .. } => true,
+            ExprKind::While { .. } | ExprKind::WhileLet { .. } | ExprKind::Loop(_) | ExprKind::For { .. } => true,
+            ExprKind::MacCall(m) => match m.delim {
+                Delim::Brace => true,
+                _ => false,
+            },
+            _ => false,
+        };
+    }
+}
+
+pub struct Closure {
+    pub is_move: bool,
+    pub params: List::<ClosureParam>,
+    pub ret: Option::<Id::<Ty>>,
+    pub body: Id::<Expr>,
+}
+
+pub struct ClosureParam {
+    pub is_mut: bool,
+    pub name: Option::<Ident>,
+    pub mode: Option::<ParamMode>,
+    pub ty: Option::<Id::<Ty>>,
+    pub span: Span,
+}
+
+pub struct FieldInit {
+    pub name: Ident,
+    pub value: Option::<Id::<Expr>>,
+    pub span: Span,
+}
+
+pub struct Arm {
+    pub pat: Id::<Pat>,
+    pub guard: Option::<Id::<Expr>>,
+    pub body: Id::<Expr>,
+    pub span: Span,
+}
+
+pub enum Lit {
+    /// `value` holds the low 64 bits and `high` the rest, up to 128 bits
+    /// (a larger literal is an error later, as there is no 128-bit type).
+    Int { value: u64, high: u64, suffix: Option::<Symbol> },
+    /// The value is the source text at the literal's span.
+    Float { suffix: Option::<Symbol> },
+    Bool(bool),
+    Char(char),
+    Str { value: Symbol, fmt: FmtString },
+}
+
+/// A string literal read as a format string.
+pub enum FmtString {
+    Pieces(List::<FmtPiece>),
+    /// Not a valid format string: the message and where.
+    Invalid(Symbol, Span),
+}
+
+pub enum FmtPiece {
+    Text(Symbol),
+    Hole(Id::<Expr>, FmtSpec),
+}
+
+pub enum FmtSpec {
+    Show,
+    Debugged,
+}
+
+// ===================================================================== patterns
+
+pub struct Pat {
+    pub kind: PatKind,
+    pub span: Span,
+}
+
+pub enum PatKind {
+    Wild,
+    Binding { is_mut: bool, name: Ident },
+    Lit(Lit, bool),
+    Range { lo: Lit, lo_neg: bool, hi: Lit, hi_neg: bool, inclusive: bool },
+    Tuple(List::<Id::<Pat>>),
+    TupleStruct { path: Path, pats: List::<Id::<Pat>> },
+    Struct { path: Path, fields: List::<FieldPat>, rest: bool },
+    Path(Path),
+    Or(List::<Id::<Pat>>),
+    Rest,
+    MacCall(MacCall),
+}
+
+pub struct FieldPat {
+    pub name: Ident,
+    pub pat: Id::<Pat>,
+}
+
+// ===================================================================== the tree
+
+/// A parsed file: every node, in arenas, and the file's items.
+pub struct Ast {
+    pub names: Interner,
+    pub items: Arena::<Item>,
+    pub item_ids: Arena::<Id::<Item>>,
+    pub exprs: Arena::<Expr>,
+    pub expr_ids: Arena::<Id::<Expr>>,
+    pub pats: Arena::<Pat>,
+    pub pat_ids: Arena::<Id::<Pat>>,
+    pub tys: Arena::<Ty>,
+    pub ty_ids: Arena::<Id::<Ty>>,
+    pub blocks: Arena::<Block>,
+    pub stmts: Arena::<Stmt>,
+    pub paths: Arena::<Path>,
+    pub segments: Arena::<PathSegment>,
+    pub idents: Arena::<Ident>,
+    pub attrs: Arena::<Attr>,
+    pub metas: Arena::<Meta>,
+    pub generic_params: Arena::<GenericParam>,
+    pub params: Arena::<Param>,
+    pub tuple_fields: Arena::<TupleField>,
+    pub field_decls: Arena::<FieldDecl>,
+    pub variants: Arena::<VariantDecl>,
+    pub use_trees: Arena::<UseTree>,
+    pub fn_ty_params: Arena::<FnTyParam>,
+    pub arms: Arena::<Arm>,
+    pub field_inits: Arena::<FieldInit>,
+    pub field_pats: Arena::<FieldPat>,
+    pub closure_params: Arena::<ClosureParam>,
+    pub fmt_pieces: Arena::<FmtPiece>,
+    pub tokens: Arena::<TokenTree>,
+    pub macro_rules: Arena::<MacroRule>,
+    /// The file's items.
+    pub file: List::<Id::<Item>>,
+}
+
+impl Ast {
+    pub fn new(): Ast {
+        return Ast {
+            names: Interner::new(),
+            items: Arena::new(),
+            item_ids: Arena::new(),
+            exprs: Arena::new(),
+            expr_ids: Arena::new(),
+            pats: Arena::new(),
+            pat_ids: Arena::new(),
+            tys: Arena::new(),
+            ty_ids: Arena::new(),
+            blocks: Arena::new(),
+            stmts: Arena::new(),
+            paths: Arena::new(),
+            segments: Arena::new(),
+            idents: Arena::new(),
+            attrs: Arena::new(),
+            metas: Arena::new(),
+            generic_params: Arena::new(),
+            params: Arena::new(),
+            tuple_fields: Arena::new(),
+            field_decls: Arena::new(),
+            variants: Arena::new(),
+            use_trees: Arena::new(),
+            fn_ty_params: Arena::new(),
+            arms: Arena::new(),
+            field_inits: Arena::new(),
+            field_pats: Arena::new(),
+            closure_params: Arena::new(),
+            fmt_pieces: Arena::new(),
+            tokens: Arena::new(),
+            macro_rules: Arena::new(),
+            file: List::empty(),
+        };
+    }
+
+    /// The text of a name or interned string.
+    pub fn text(&self, s: Symbol): str {
+        return self.names.resolve(s);
+    }
+
+    /// Whether the path is one segment without generic arguments.
+    pub fn is_single(&self, p: Path): bool {
+        if p.segments.len() != 1 {
+            return false;
+        }
+        return self.segments.list(p.segments)[0].args.is_none();
+    }
+
+    /// The last segment of a path.
+    pub fn last_segment(&self, p: Path): PathSegment {
+        let segs = self.segments.list(p.segments);
+        return segs[segs.len() - 1];
+    }
+}
+
+// ===================================================================== dump
+
+/// `s` quoted, with `\\`, `"`, `\n`, `\r`, `\t` and other control
+/// characters (`\u{..}`) escaped, as `ln_ast::dump::escape` in Rust.
+pub fn escape(s: str): String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        let n = c as u32;
+        if c == '\\' {
+            out.push_str("\\\\");
+        } else if c == '"' {
+            out.push_str("\\\"");
+        } else if c == '\n' {
+            out.push_str("\\n");
+        } else if c == '\r' {
+            out.push_str("\\r");
+        } else if c == '\t' {
+            out.push_str("\\t");
+        } else if n < 0x20 || n == 0x7f {
+            out.push_str("\\u{");
+            push_hex(&mut out, n);
+            out.push('}');
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('"');
+    return out;
+}
+
+/// `n` in lowercase hexadecimal, without leading zeros.
+fn push_hex(out: &mut String, n: u32) {
+    let digits = "0123456789abcdef".as_bytes();
+    let mut shift: u32 = 28;
+    let mut started = false;
+    loop {
+        let d = (n >> shift) & 15;
+        if d != 0 || started || shift == 0 {
+            started = true;
+            out.push(digits[d as usize] as char);
+        }
+        if shift == 0 {
+            break;
+        }
+        shift -= 4;
+    }
+}
+
+/// The 128-bit number `high * 2^64 + low` in decimal.
+pub fn u128_decimal(high: u64, low: u64): String {
+    let (mut hi, mut lo) = (high, low);
+    let mut digits: [u8; -..+] = [];
+    loop {
+        // Divide (hi, lo) by 10, 32 bits at a time below the high word.
+        let r0 = hi % 10;
+        hi = hi / 10;
+        let t1 = (r0 << 32) | (lo >> 32);
+        let (q1, r1) = (t1 / 10, t1 % 10);
+        let t2 = (r1 << 32) | (lo & 0xffffffff);
+        let (q2, r2) = (t2 / 10, t2 % 10);
+        lo = (q1 << 32) | q2;
+        digits.push(b'0' + r2 as u8);
+        if hi == 0 && lo == 0 {
+            break;
+        }
+    }
+    let mut out = String::new();
+    let mut i = digits.len();
+    while i > 0 {
+        i -= 1;
+        out.push(digits[i] as char);
+    }
+    return out;
+}
+
+fn at(s: Span): String {
+    let mut out = String::new();
+    out.write("@{s.lo}..{s.hi}");
+    return out;
+}
+
+fn ident(a: &Ast, i: Ident): String {
+    let mut out = String::new();
+    out.write("{a.text(i.name)}{at(i.span)}");
+    return out;
+}
+
+fn mode(m: ParamMode): str {
+    return match m {
+        ParamMode::Take => "take",
+        ParamMode::Borrow => "borrow",
+        ParamMode::InOut => "inout",
+    };
+}
+
+fn delim(d: Delim): str {
+    return match d {
+        Delim::Paren => "paren",
+        Delim::Bracket => "bracket",
+        Delim::Brace => "brace",
+    };
+}
+
+fn flag(on: bool, text: str): str {
+    if on {
+        return text;
+    }
+    return "";
+}
+
+/// Start a line at depth `d`.
+fn ind(o: &mut String, d: usize) {
+    let mut i: usize = 0;
+    while i < d {
+        o.push_str("  ");
+        i += 1;
+    }
+}
+
+/// The dump of the file's items.
+pub fn dump(a: &Ast, o: &mut String) {
+    for it in a.item_ids.list(a.file) {
+        item(a, o, 0, it);
+    }
+}
+
+fn item(a: &Ast, o: &mut String, d: usize, id: Id::<Item>) {
+    let it = a.items.get(id);
+    let p = flag(it.is_pub, " pub");
+    ind(o, d);
+    o.write("item{p} {at(it.span)}\n");
+    attrs(a, o, d + 1, it.attrs);
+    item_kind(a, o, d + 1, it.kind);
+}
+
+fn attrs(a: &Ast, o: &mut String, d: usize, l: List::<Attr>) {
+    for at_ in a.attrs.list(l) {
+        ind(o, d);
+        o.write("attr {at(at_.span)}\n");
+        meta(a, o, d + 1, at_.meta);
+    }
+}
+
+fn meta(a: &Ast, o: &mut String, d: usize, m: Meta) {
+    ind(o, d);
+    match m {
+        Meta::Word(i) => o.write("word {ident(a, i)}\n"),
+        Meta::NameValue(i, v) => o.write("name_value {ident(a, i)} {escape(a.text(v))}\n"),
+        Meta::Nested(i, ms) => {
+            o.write("list {ident(a, i)}\n");
+            for x in a.metas.list(ms) {
+                meta(a, o, d + 1, x);
+            }
+        }
+    }
+}
+
+fn items(a: &Ast, o: &mut String, d: usize, l: List::<Id::<Item>>) {
+    for it in a.item_ids.list(l) {
+        item(a, o, d, it);
+    }
+}
+
+fn item_kind(a: &Ast, o: &mut String, d: usize, k: ItemKind) {
+    match k {
+        ItemKind::Fn(f) => {
+            let (u, v) = (flag(f.is_unsafe, " unsafe"), flag(f.variadic, " variadic"));
+            ind(o, d);
+            o.write("fn {ident(a, f.name)}{u}{v} sig{at(f.sig_span)}\n");
+            generics(a, o, d + 1, f.generics);
+            for p in a.params.list(f.params) {
+                param(a, o, d + 1, p);
+            }
+            if let Some(r) = f.ret {
+                ind(o, d + 1);
+                o.push_str("ret\n");
+                ty(a, o, d + 2, r);
+            }
+            if let Some(b) = f.body {
+                block(a, o, d + 1, b);
+            }
+        }
+        ItemKind::Struct(s) => {
+            ind(o, d);
+            o.write("struct {ident(a, s.name)}\n");
+            generics(a, o, d + 1, s.generics);
+            variant_data(a, o, d + 1, s.kind);
+        }
+        ItemKind::Enum(e) => {
+            ind(o, d);
+            o.write("enum {ident(a, e.name)}\n");
+            generics(a, o, d + 1, e.generics);
+            for v in a.variants.list(e.variants) {
+                ind(o, d + 1);
+                o.write("variant {ident(a, v.name)} {at(v.span)}\n");
+                attrs(a, o, d + 2, v.attrs);
+                variant_data(a, o, d + 2, v.data);
+            }
+        }
+        ItemKind::Trait(t) => {
+            ind(o, d);
+            o.write("trait {ident(a, t.name)}\n");
+            generics(a, o, d + 1, t.generics);
+            ind(o, d + 1);
+            o.push_str("supertraits\n");
+            for p in a.paths.list(t.supertraits) {
+                path(a, o, d + 2, p);
+            }
+            items(a, o, d + 1, t.items);
+        }
+        ItemKind::Impl(i) => {
+            ind(o, d);
+            o.write("impl{flag(i.negative, NEGATIVE)}\n");
+            generics(a, o, d + 1, i.generics);
+            if let Some(t) = i.trait_ref {
+                ind(o, d + 1);
+                o.push_str("trait\n");
+                path(a, o, d + 2, t);
+            }
+            ind(o, d + 1);
+            o.push_str("self\n");
+            ty(a, o, d + 2, i.self_ty);
+            items(a, o, d + 1, i.items);
+        }
+        ItemKind::Use(u) => use_tree(a, o, d, u),
+        ItemKind::Mod(m) => {
+            ind(o, d);
+            match m.items {
+                Some(l) => {
+                    o.write("mod {ident(a, m.name)}\n");
+                    items(a, o, d + 1, l);
+                }
+                None => o.write("mod {ident(a, m.name)} external\n"),
+            }
+        }
+        ItemKind::Const(c) => {
+            ind(o, d);
+            o.write("const {ident(a, c.name)}\n");
+            ty(a, o, d + 1, c.ty);
+            expr(a, o, d + 1, c.value);
+        }
+        ItemKind::Static(s) => {
+            ind(o, d);
+            o.write("static{flag(s.is_mut, MUT)} {ident(a, s.name)}\n");
+            ty(a, o, d + 1, s.ty);
+            expr(a, o, d + 1, s.value);
+        }
+        ItemKind::Extern(e) => {
+            ind(o, d);
+            match e.abi {
+                Some(s) => o.write("extern {escape(a.text(s))}\n"),
+                None => o.push_str("extern -\n"),
+            }
+            items(a, o, d + 1, e.items);
+        }
+        ItemKind::TypeAlias(t) => {
+            ind(o, d);
+            o.write("type {ident(a, t.name)}\n");
+            generics(a, o, d + 1, t.generics);
+            ty(a, o, d + 1, t.ty);
+        }
+        ItemKind::Macro(m) => {
+            ind(o, d);
+            o.write("macro {ident(a, m.name)}\n");
+            for r in a.macro_rules.list(m.rules) {
+                ind(o, d + 1);
+                o.write("rule {at(r.span)}\n");
+                ind(o, d + 2);
+                o.push_str("matcher\n");
+                tokens(a, o, d + 3, r.matcher);
+                ind(o, d + 2);
+                o.push_str("body\n");
+                tokens(a, o, d + 3, r.body);
+            }
+        }
+        ItemKind::MacCall(m) => mac_call(a, o, d, m),
+    }
+}
+
+const MUT: str = " mut";
+const NEGATIVE: str = " negative";
+const INCLUSIVE: str = " inclusive";
+const NEG: str = " neg";
+
+fn generics(a: &Ast, o: &mut String, d: usize, g: Generics) {
+    ind(o, d);
+    o.write("generics {at(g.span)}\n");
+    for p in a.generic_params.list(g.params) {
+        ind(o, d + 1);
+        o.write("param {ident(a, p.name)}\n");
+        for b in a.paths.list(p.bounds) {
+            path(a, o, d + 2, b);
+        }
+    }
+}
+
+fn param(a: &Ast, o: &mut String, d: usize, p: Param) {
+    let mut kind = String::new();
+    match p.kind {
+        ParamKind::SelfParam => kind.push_str("self"),
+        ParamKind::Named(i) => kind.push_str(ident(a, i).as_str()),
+        ParamKind::Wild => kind.push_str("_"),
+    }
+    let (m, b) = (flag(p.is_mut, " mut"), flag(p.self_bang, " bang"));
+    ind(o, d);
+    o.write("param {mode(p.mode)}{m}{b} {kind} {at(p.span)}\n");
+    if let Some(t) = p.ty {
+        ty(a, o, d + 1, t);
+    }
+}
+
+fn variant_data(a: &Ast, o: &mut String, d: usize, v: VariantData) {
+    ind(o, d);
+    match v {
+        VariantData::Unit => o.push_str("unit\n"),
+        VariantData::Tuple(fs) => {
+            o.push_str("tuple\n");
+            for f in a.tuple_fields.list(fs) {
+                ind(o, d + 1);
+                o.write("field{flag(f.is_pub, PUB)}\n");
+                ty(a, o, d + 2, f.ty);
+            }
+        }
+        VariantData::Named(fs) => {
+            o.push_str("named\n");
+            for f in a.field_decls.list(fs) {
+                ind(o, d + 1);
+                o.write("field{flag(f.is_pub, PUB)} {ident(a, f.name)} {at(f.span)}\n");
+                attrs(a, o, d + 2, f.attrs);
+                ty(a, o, d + 2, f.ty);
+            }
+        }
+    }
+}
+
+const PUB: str = " pub";
+
+fn use_tree(a: &Ast, o: &mut String, d: usize, u: UseTree) {
+    let mut prefix = String::new();
+    let mut first = true;
+    for i in a.idents.list(u.prefix) {
+        if !first {
+            prefix.push(' ');
+        }
+        first = false;
+        prefix.push_str(ident(a, i).as_str());
+    }
+    ind(o, d);
+    o.write("use [{prefix}] {at(u.span)}");
+    match u.kind {
+        UseKind::Simple(None) => o.push_str(" simple\n"),
+        UseKind::Simple(Some(r)) => o.write(" as {ident(a, r)}\n"),
+        UseKind::Glob => o.push_str(" glob\n"),
+        UseKind::Nested(ts) => {
+            o.push_str(" nested\n");
+            for t in a.use_trees.list(ts) {
+                use_tree(a, o, d + 1, t);
+            }
+        }
+    }
+}
+
+// ===================================================================== macros
+
+fn mac_call(a: &Ast, o: &mut String, d: usize, m: MacCall) {
+    ind(o, d);
+    o.write("mac_call {delim(m.delim)} {at(m.span)}\n");
+    path(a, o, d + 1, m.path);
+    tokens(a, o, d + 1, m.tokens);
+}
+
+fn tokens(a: &Ast, o: &mut String, d: usize, l: List::<TokenTree>) {
+    for t in a.tokens.list(l) {
+        ind(o, d);
+        match t {
+            TokenTree::Token(tt) => o.write("tt {tt.kind:?} {at(tt.span)}\n"),
+            TokenTree::Group { delim: dl, open, close, trees } => {
+                o.write("group {delim(dl)} @{open.lo}..{close.hi}\n");
+                tokens(a, o, d + 1, trees);
+            }
+        }
+    }
+}
+
+// ===================================================================== paths & types
+
+fn path(a: &Ast, o: &mut String, d: usize, p: Path) {
+    ind(o, d);
+    o.write("path {at(p.span)}\n");
+    for s in a.segments.list(p.segments) {
+        ind(o, d + 1);
+        match s.args {
+            None => o.write("seg {ident(a, s.ident)}\n"),
+            Some(args) => {
+                o.write("seg {ident(a, s.ident)} args\n");
+                for t in a.ty_ids.list(args) {
+                    ty(a, o, d + 2, t);
+                }
+            }
+        }
+    }
+}
+
+fn ty(a: &Ast, o: &mut String, d: usize, id: Id::<Ty>) {
+    let t = a.tys.get(id);
+    let sp = at(t.span);
+    ind(o, d);
+    match t.kind {
+        TyKind::Path(p) => {
+            o.write("ty path {sp}\n");
+            path(a, o, d + 1, p);
+        }
+        TyKind::Array(e, size) => {
+            let s = match size {
+                ArraySize::Fixed(_) => "fixed",
+                ArraySize::Inferred => "inferred",
+                ArraySize::Grow => "grow",
+                ArraySize::GrowShrink => "growshrink",
+                ArraySize::Slice => "slice",
+                ArraySize::SliceMut => "slicemut",
+            };
+            o.write("ty array {s} {sp}\n");
+            ty(a, o, d + 1, e);
+            if let ArraySize::Fixed(n) = size {
+                expr(a, o, d + 1, n);
+            }
+        }
+        TyKind::DynArray(e) => {
+            o.write("ty dyn_array {sp}\n");
+            ty(a, o, d + 1, e);
+        }
+        TyKind::Bang(e) => {
+            o.write("ty bang {sp}\n");
+            ty(a, o, d + 1, e);
+        }
+        TyKind::Ptr { is_mut, inner } => {
+            o.write("ty ptr{flag(is_mut, MUT)} {sp}\n");
+            ty(a, o, d + 1, inner);
+        }
+        TyKind::Tuple(ts) => {
+            o.write("ty tuple {sp}\n");
+            for x in a.ty_ids.list(ts) {
+                ty(a, o, d + 1, x);
+            }
+        }
+        TyKind::Fn { params, ret } => {
+            o.write("ty fn {sp}\n");
+            for p in a.fn_ty_params.list(params) {
+                ind(o, d + 1);
+                o.write("fn_param {mode(p.mode)}\n");
+                ty(a, o, d + 2, p.ty);
+            }
+            if let Some(r) = ret {
+                ind(o, d + 1);
+                o.push_str("ret\n");
+                ty(a, o, d + 2, r);
+            }
+        }
+        TyKind::Never => o.write("ty never {sp}\n"),
+        TyKind::Infer => o.write("ty infer {sp}\n"),
+        TyKind::MacCall(m) => {
+            o.write("ty mac_call {sp}\n");
+            mac_call(a, o, d + 1, m);
+        }
+        TyKind::ImplTrait(bs) => {
+            o.write("ty impl {sp}\n");
+            for b in a.paths.list(bs) {
+                path(a, o, d + 1, b);
+            }
+        }
+    }
+}
+
+// ===================================================================== statements & expressions
+
+fn block(a: &Ast, o: &mut String, d: usize, id: Id::<Block>) {
+    let b = a.blocks.get(id);
+    ind(o, d);
+    o.write("block {at(b.span)}\n");
+    for s in a.stmts.list(b.stmts) {
+        stmt(a, o, d + 1, s);
+    }
+    if let Some(t) = b.tail {
+        ind(o, d + 1);
+        o.push_str("tail\n");
+        expr(a, o, d + 2, t);
+    }
+}
+
+fn stmt(a: &Ast, o: &mut String, d: usize, s: Stmt) {
+    let sp = at(s.span);
+    ind(o, d);
+    match s.kind {
+        StmtKind::Let { pat: p, ty: t, init } => {
+            o.write("stmt let {sp}\n");
+            pat(a, o, d + 1, p);
+            if let Some(t) = t {
+                ind(o, d + 1);
+                o.push_str("ty\n");
+                ty(a, o, d + 2, t);
+            }
+            if let Some(e) = init {
+                ind(o, d + 1);
+                o.push_str("init\n");
+                expr(a, o, d + 2, e);
+            }
+        }
+        StmtKind::Expr(e) => {
+            o.write("stmt expr {sp}\n");
+            expr(a, o, d + 1, e);
+        }
+        StmtKind::Item(it) => {
+            o.write("stmt item {sp}\n");
+            item(a, o, d + 1, it);
+        }
+    }
+}
+
+fn opt_symbol(a: &Ast, s: Option::<Symbol>): str {
+    return match s {
+        Some(x) => a.text(x),
+        None => "-",
+    };
+}
+
+fn lit(a: &Ast, o: &mut String, d: usize, l: Lit) {
+    ind(o, d);
+    match l {
+        Lit::Int { value, high, suffix } => {
+            if high == 0 {
+                o.write("int {value} {opt_symbol(a, suffix)}\n");
+            } else {
+                o.write("int {u128_decimal(high, value)} {opt_symbol(a, suffix)}\n");
+            }
+        }
+        Lit::Float { suffix } => o.write("float {opt_symbol(a, suffix)}\n"),
+        Lit::Bool(b) => o.write("bool {b}\n"),
+        Lit::Char(c) => {
+            let n = c as u32;
+            o.write("char {n}\n");
+        }
+        Lit::Str { value, fmt } => {
+            o.write("str {escape(a.text(value))}\n");
+            match fmt {
+                FmtString::Pieces(ps) => {
+                    for p in a.fmt_pieces.list(ps) {
+                        ind(o, d + 1);
+                        match p {
+                            FmtPiece::Text(t) => o.write("text {escape(a.text(t))}\n"),
+                            FmtPiece::Hole(e, spec) => {
+                                let s = match spec {
+                                    FmtSpec::Debugged => "debug",
+                                    FmtSpec::Show => "display",
+                                };
+                                o.write("hole {s}\n");
+                                expr(a, o, d + 2, e);
+                            }
+                        }
+                    }
+                }
+                FmtString::Invalid(msg, sp) => {
+                    ind(o, d + 1);
+                    o.write("fmt_err {escape(a.text(msg))} {at(sp)}\n");
+                }
+            }
+        }
+    }
+}
+
+fn opt(a: &Ast, o: &mut String, d: usize, label: str, e: Option::<Id::<Expr>>) {
+    if let Some(x) = e {
+        ind(o, d);
+        o.push_str(label);
+        o.push('\n');
+        expr(a, o, d + 1, x);
+    }
+}
+
+fn exprs(a: &Ast, o: &mut String, d: usize, l: List::<Id::<Expr>>) {
+    for x in a.expr_ids.list(l) {
+        expr(a, o, d, x);
+    }
+}
+
+fn expr(a: &Ast, o: &mut String, d: usize, id: Id::<Expr>) {
+    let e = a.exprs.get(id);
+    let sp = at(e.span);
+    let c = d + 1;
+    ind(o, d);
+    match e.kind {
+        ExprKind::Lit(l) => {
+            o.write("expr lit {sp}\n");
+            lit(a, o, c, l);
+        }
+        ExprKind::Path(p) => {
+            o.write("expr path {sp}\n");
+            path(a, o, c, p);
+        }
+        ExprKind::Unary(op, x) => {
+            let name = match op {
+                UnOp::Neg => "neg",
+                UnOp::Not => "not",
+                UnOp::Deref => "deref",
+            };
+            o.write("expr unary {name} {sp}\n");
+            expr(a, o, c, x);
+        }
+        ExprKind::Borrow { mutable, expr: x } => {
+            o.write("expr borrow{flag(mutable, MUT)} {sp}\n");
+            expr(a, o, c, x);
+        }
+        ExprKind::Binary(op, l, r) => {
+            o.write("expr binary {op.as_str()} {sp}\n");
+            expr(a, o, c, l);
+            expr(a, o, c, r);
+        }
+        ExprKind::Assign(l, r) => {
+            o.write("expr assign {sp}\n");
+            expr(a, o, c, l);
+            expr(a, o, c, r);
+        }
+        ExprKind::AssignOp(op, l, r) => {
+            o.write("expr assign_op {op.as_str()} {sp}\n");
+            expr(a, o, c, l);
+            expr(a, o, c, r);
+        }
+        ExprKind::Call(f, args) => {
+            o.write("expr call {sp}\n");
+            expr(a, o, c, f);
+            exprs(a, o, c, args);
+        }
+        ExprKind::MethodCall { recv, name, generics: g, args } => {
+            o.write("expr method {ident(a, name)} {sp}\n");
+            expr(a, o, c, recv);
+            if let Some(ts) = g {
+                ind(o, c);
+                o.push_str("generics\n");
+                for t in a.ty_ids.list(ts) {
+                    ty(a, o, c + 1, t);
+                }
+            }
+            exprs(a, o, c, args);
+        }
+        ExprKind::Field(x, name) => {
+            o.write("expr field {ident(a, name)} {sp}\n");
+            expr(a, o, c, x);
+        }
+        ExprKind::TupleField(x, i, isp) => {
+            o.write("expr tuple_field {i}{at(isp)} {sp}\n");
+            expr(a, o, c, x);
+        }
+        ExprKind::Index(l, r) => {
+            o.write("expr index {sp}\n");
+            expr(a, o, c, l);
+            expr(a, o, c, r);
+        }
+        ExprKind::Range { start, end, inclusive } => {
+            o.write("expr range{flag(inclusive, INCLUSIVE)} {sp}\n");
+            opt(a, o, c, "start", start);
+            opt(a, o, c, "end", end);
+        }
+        ExprKind::Array(es) => {
+            o.write("expr array {sp}\n");
+            exprs(a, o, c, es);
+        }
+        ExprKind::ArrayRepeat(v, n) => {
+            o.write("expr array_repeat {sp}\n");
+            expr(a, o, c, v);
+            expr(a, o, c, n);
+        }
+        ExprKind::Tuple(es) => {
+            o.write("expr tuple {sp}\n");
+            exprs(a, o, c, es);
+        }
+        ExprKind::StructLit { path: p, fields } => {
+            o.write("expr struct {sp}\n");
+            path(a, o, c, p);
+            for f in a.field_inits.list(fields) {
+                ind(o, c);
+                o.write("field_init {ident(a, f.name)} {at(f.span)}\n");
+                if let Some(v) = f.value {
+                    expr(a, o, c + 1, v);
+                }
+            }
+        }
+        ExprKind::Block(b) => {
+            o.write("expr block {sp}\n");
+            block(a, o, c, b);
+        }
+        ExprKind::Unsafe(b) => {
+            o.write("expr unsafe {sp}\n");
+            block(a, o, c, b);
+        }
+        ExprKind::If { cond, then, else_ } => {
+            o.write("expr if {sp}\n");
+            expr(a, o, c, cond);
+            block(a, o, c, then);
+            opt(a, o, c, "else", else_);
+        }
+        ExprKind::IfLet { pat: p, scrut, then, else_ } => {
+            o.write("expr if_let {sp}\n");
+            pat(a, o, c, p);
+            expr(a, o, c, scrut);
+            block(a, o, c, then);
+            opt(a, o, c, "else", else_);
+        }
+        ExprKind::Match { scrut, arms } => {
+            o.write("expr match {sp}\n");
+            expr(a, o, c, scrut);
+            for arm in a.arms.list(arms) {
+                ind(o, c);
+                o.write("arm {at(arm.span)}\n");
+                pat(a, o, c + 1, arm.pat);
+                if let Some(g) = arm.guard {
+                    ind(o, c + 1);
+                    o.push_str("guard\n");
+                    expr(a, o, c + 2, g);
+                }
+                expr(a, o, c + 1, arm.body);
+            }
+        }
+        ExprKind::While { cond, body } => {
+            o.write("expr while {sp}\n");
+            expr(a, o, c, cond);
+            block(a, o, c, body);
+        }
+        ExprKind::WhileLet { pat: p, scrut, body } => {
+            o.write("expr while_let {sp}\n");
+            pat(a, o, c, p);
+            expr(a, o, c, scrut);
+            block(a, o, c, body);
+        }
+        ExprKind::Loop(b) => {
+            o.write("expr loop {sp}\n");
+            block(a, o, c, b);
+        }
+        ExprKind::For { pat: p, iter, body } => {
+            o.write("expr for {sp}\n");
+            pat(a, o, c, p);
+            expr(a, o, c, iter);
+            block(a, o, c, body);
+        }
+        ExprKind::Break(v) => {
+            o.write("expr break {sp}\n");
+            opt(a, o, c, "value", v);
+        }
+        ExprKind::Continue => o.write("expr continue {sp}\n"),
+        ExprKind::Return(v) => {
+            o.write("expr return {sp}\n");
+            opt(a, o, c, "value", v);
+        }
+        ExprKind::Cast(x, t) => {
+            o.write("expr cast {sp}\n");
+            expr(a, o, c, x);
+            ty(a, o, c, t);
+        }
+        ExprKind::Paren(x) => {
+            o.write("expr paren {sp}\n");
+            expr(a, o, c, x);
+        }
+        ExprKind::Try(x) => {
+            o.write("expr try {sp}\n");
+            expr(a, o, c, x);
+        }
+        ExprKind::MacCall(m) => {
+            o.write("expr mac_call {sp}\n");
+            mac_call(a, o, c, m);
+        }
+        ExprKind::Closure(cl) => {
+            o.write("expr closure{flag(cl.is_move, MOVE)} {sp}\n");
+            for p in a.closure_params.list(cl.params) {
+                let mut name = String::new();
+                match p.name {
+                    Some(i) => name.push_str(ident(a, i).as_str()),
+                    None => name.push('_'),
+                }
+                let m = match p.mode {
+                    Some(x) => mode(x),
+                    None => "-",
+                };
+                ind(o, c);
+                o.write("closure_param{flag(p.is_mut, MUT)} {name} {m} {at(p.span)}\n");
+                if let Some(t) = p.ty {
+                    ty(a, o, c + 1, t);
+                }
+            }
+            if let Some(r) = cl.ret {
+                ind(o, c);
+                o.push_str("ret\n");
+                ty(a, o, c + 1, r);
+            }
+            expr(a, o, c, cl.body);
+        }
+        ExprKind::Error => o.write("expr error {sp}\n"),
+    }
+}
+
+const MOVE: str = " move";
+
+// ===================================================================== patterns
+
+fn pats(a: &Ast, o: &mut String, d: usize, l: List::<Id::<Pat>>) {
+    for x in a.pat_ids.list(l) {
+        pat(a, o, d, x);
+    }
+}
+
+fn pat(a: &Ast, o: &mut String, d: usize, id: Id::<Pat>) {
+    let p = a.pats.get(id);
+    let sp = at(p.span);
+    let c = d + 1;
+    ind(o, d);
+    match p.kind {
+        PatKind::Wild => o.write("pat wild {sp}\n"),
+        PatKind::Binding { is_mut, name } => o.write("pat binding{flag(is_mut, MUT)} {ident(a, name)} {sp}\n"),
+        PatKind::Lit(l, neg) => {
+            o.write("pat lit{flag(neg, NEG)} {sp}\n");
+            lit(a, o, c, l);
+        }
+        PatKind::Range { lo, lo_neg, hi, hi_neg, inclusive } => {
+            o.write("pat range{flag(inclusive, INCLUSIVE)} {sp}\n");
+            ind(o, c);
+            o.write("lo{flag(lo_neg, NEG)}\n");
+            lit(a, o, c + 1, lo);
+            ind(o, c);
+            o.write("hi{flag(hi_neg, NEG)}\n");
+            lit(a, o, c + 1, hi);
+        }
+        PatKind::Tuple(ps) => {
+            o.write("pat tuple {sp}\n");
+            pats(a, o, c, ps);
+        }
+        PatKind::TupleStruct { path: pt, pats: ps } => {
+            o.write("pat tuple_struct {sp}\n");
+            path(a, o, c, pt);
+            pats(a, o, c, ps);
+        }
+        PatKind::Struct { path: pt, fields, rest } => {
+            o.write("pat struct{flag(rest, REST)} {sp}\n");
+            path(a, o, c, pt);
+            for f in a.field_pats.list(fields) {
+                ind(o, c);
+                o.write("field_pat {ident(a, f.name)}\n");
+                pat(a, o, c + 1, f.pat);
+            }
+        }
+        PatKind::Path(pt) => {
+            o.write("pat path {sp}\n");
+            path(a, o, c, pt);
+        }
+        PatKind::Or(ps) => {
+            o.write("pat or {sp}\n");
+            pats(a, o, c, ps);
+        }
+        PatKind::Rest => o.write("pat rest {sp}\n"),
+        PatKind::MacCall(m) => {
+            o.write("pat mac_call {sp}\n");
+            mac_call(a, o, c, m);
+        }
+    }
+}
+
+const REST: str = " rest";

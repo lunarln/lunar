@@ -5,6 +5,7 @@
 
 pub use ln_diag::Span;
 
+pub mod dump;
 pub mod pretty;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

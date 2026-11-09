@@ -1,0 +1,576 @@
+// Items: functions, structs, enums, traits, impls, uses, modules, ...
+
+use core::arena::{Id, List};
+use ln_ast::*;
+use ln_lexer::{NumKind, Token as T};
+use crater::{Parser, PResult, Named, Expected, Code};
+use crater::lit::unescape;
+
+/// Tokens that can begin an item (for recovery and statement dispatch).
+pub fn is_item_start(t: T): bool {
+    return match t {
+        T::Fn | T::Struct | T::Enum | T::Trait | T::Impl | T::Use | T::Mod | T::Const | T::Static | T::Extern | T::Type | T::Pub | T::Hash | T::Macro => true,
+        _ => false,
+    };
+}
+
+impl Parser {
+    pub fn items_until_brace(&mut self): PResult::<List::<Id::<Item>>> {
+        self.expect(T::LBrace)?;
+        let mut items: [Id::<Item>; ..+] = [];
+        loop {
+            if self.eat(T::RBrace) {
+                break;
+            }
+            if self.at_eof() {
+                return Err(self.error_expected());
+            }
+            match self.item() {
+                Ok(i) => items.push(i),
+                Err(_) => self.recover_item(),
+            }
+        }
+        return Ok(self.ast.item_ids.add_list(items[..]));
+    }
+
+    /// Skip to the next plausible item start.
+    pub fn recover_item(&mut self) {
+        // Always make progress.
+        if !self.at_eof() {
+            let t = self.bump();
+            if t.kind == T::LBrace {
+                self.recover_until([T::RBrace][..]);
+                self.eat(T::RBrace);
+            }
+        }
+        let stop = [
+            T::Fn, T::Struct, T::Enum, T::Trait, T::Impl, T::Use, T::Mod, T::Const, T::Static, T::Extern, T::Type, T::Pub, T::Hash, T::Macro, T::Unsafe, T::RBrace,
+        ];
+        self.recover_until(stop[..]);
+    }
+
+    pub fn at_item_start(&mut self): bool {
+        return match self.peek() {
+            Some(T::Unsafe) => self.nth_at(1, T::Fn),
+            Some(t) => is_item_start(t),
+            None => false,
+        };
+    }
+
+    /// Attributes, including doc comments (as `#[doc = "..."]`), before
+    /// and between `#[...]`s.
+    pub fn attrs(&mut self): PResult::<List::<Attr>> {
+        let mut out: [Attr; ..+] = [];
+        loop {
+            self.doc_attrs_into(&mut out);
+            if !self.at(T::Hash) {
+                return Ok(self.ast.attrs.add_list(out[..]));
+            }
+            let start = self.start();
+            self.bump();
+            self.expect(T::LBracket)?;
+            let meta = self.meta_full()?;
+            self.expect(T::RBracket)?;
+            out.push(Attr { meta, span: self.span_from(start) });
+        }
+    }
+
+    /// The doc comments directly before the current token, as `doc`
+    /// attributes: `/// text` is `#[doc = "text"]`, one per line.
+    pub fn doc_attrs_into(&mut self, out: &mut [Attr; ..+]) {
+        let t = match self.current() {
+            Some(t) => t,
+            None => return,
+        };
+        let run = match self.docs.remove(t.start) {
+            Some(r) => r,
+            None => return,
+        };
+        let doc = self.intern("doc");
+        let mut k: u32 = 0;
+        while k < run.count {
+            let span = self.doc_spans[(run.first + k) as usize];
+            let raw = self.text_of(span.lo, span.hi);
+            let mut text = if raw.starts_with("///") { raw[3..] } else { raw };
+            while text.ends_with("\r") {
+                text = text[..text.len() - 1];
+            }
+            if text.starts_with(" ") {
+                text = text[1..];
+            }
+            let value = self.intern(text);
+            out.push(Attr { meta: Meta::NameValue(Ident { name: doc, span }, value), span });
+            k += 1;
+        }
+    }
+
+    fn meta_name(&mut self): PResult::<Ident> {
+        // Attribute names may be keywords such as `unsafe`.
+        let t = match self.current() {
+            Some(t) => t,
+            None => return Err(self.error_expected_named(Named::AttributeName)),
+        };
+        if t.kind != T::Ident && !word_like(self.tok_text(t)) {
+            return Err(self.error_expected_named(Named::AttributeName));
+        }
+        self.bump();
+        return Ok(self.tok_ident(t));
+    }
+
+    pub fn item(&mut self): PResult::<Id::<Item>> {
+        let start = self.start();
+        let attrs = self.attrs()?;
+        let is_pub = self.eat(T::Pub);
+        let kind = match self.peek() {
+            Some(T::Fn) => ItemKind::Fn(self.fn_decl(false)?),
+            Some(T::Unsafe) if self.nth_at(1, T::Fn) => {
+                self.bump();
+                ItemKind::Fn(self.fn_decl(true)?)
+            }
+            Some(T::Struct) => ItemKind::Struct(self.struct_decl()?),
+            Some(T::Enum) => ItemKind::Enum(self.enum_decl()?),
+            Some(T::Trait) => ItemKind::Trait(self.trait_decl()?),
+            Some(T::Impl) => ItemKind::Impl(self.impl_decl()?),
+            Some(T::Use) => {
+                self.bump();
+                let tree = self.use_tree()?;
+                self.expect_item_semi("`use` declaration")?;
+                ItemKind::Use(tree)
+            }
+            Some(T::Mod) => {
+                self.bump();
+                let name = self.ident()?;
+                let items = if self.at(T::LBrace) {
+                    Some(self.items_until_brace()?)
+                } else {
+                    self.expect_item_semi("module declaration")?;
+                    None
+                };
+                ItemKind::Mod(ModDecl { name, items })
+            }
+            Some(T::Const) => {
+                self.bump();
+                let name = self.ident()?;
+                self.expect(T::Colon)?;
+                let ty = self.ty()?;
+                self.expect(T::Eq)?;
+                let value = self.expr()?;
+                self.expect_item_semi("constant")?;
+                ItemKind::Const(ConstDecl { name, ty, value })
+            }
+            Some(T::Static) => {
+                self.bump();
+                let is_mut = self.eat(T::Mut);
+                let name = self.ident()?;
+                self.expect(T::Colon)?;
+                let ty = self.ty()?;
+                self.expect(T::Eq)?;
+                let value = self.expr()?;
+                self.expect_item_semi("static")?;
+                ItemKind::Static(StaticDecl { name, is_mut, ty, value })
+            }
+            Some(T::Extern) => {
+                self.bump();
+                let abi = if self.at(T::Str) {
+                    let t = self.bump();
+                    let raw = self.tok_text(t);
+                    Some(self.intern(raw[1..raw.len() - 1]))
+                } else {
+                    None
+                };
+                let items = self.items_until_brace()?;
+                ItemKind::Extern(ExternBlock { abi, items })
+            }
+            Some(T::Type) => {
+                self.bump();
+                let name = self.ident()?;
+                let generics = self.generics_decl()?;
+                self.expect(T::Eq)?;
+                let ty = self.ty()?;
+                self.expect_item_semi("type alias")?;
+                ItemKind::TypeAlias(TypeAlias { name, generics, ty })
+            }
+            Some(T::Macro) => ItemKind::Macro(self.macro_def()?),
+            // `path!(...)` in item position.
+            Some(T::Ident | T::Crater | T::SelfValue | T::Super) => {
+                let path = self.path_ty_style()?;
+                if !self.at_mac_bang() {
+                    self.expect_note(Expected::Named(Named::Item));
+                    return Err(self.error_expected());
+                }
+                let call = self.mac_call(path)?;
+                match call.delim {
+                    Delim::Brace => {}
+                    _ => self.expect_item_semi("macro invocation")?,
+                }
+                ItemKind::MacCall(call)
+            }
+            _ => {
+                self.expect_note(Expected::Named(Named::Item));
+                return Err(self.error_expected());
+            }
+        };
+        return Ok(self.ast.items.add(Item { attrs, is_pub, kind, span: self.span_from(start) }));
+    }
+
+    /// `::<T: A + B, U>` after a declaration name (or after `impl`).
+    pub fn generics_decl(&mut self): PResult::<Generics> {
+        let start = self.start();
+        if !(self.at(T::PathSep) && self.nth_at(1, T::LAngle)) {
+            return Ok(Generics { params: List::empty(), span: Span::new(start, start) });
+        }
+        self.bump();
+        self.bump();
+        let mut params: [GenericParam; ..+] = [];
+        loop {
+            if self.eat(T::RAngle) {
+                break;
+            }
+            let name = self.ident()?;
+            let mut bounds: List::<Path> = List::empty();
+            if self.eat(T::Colon) {
+                bounds = self.bounds()?;
+            }
+            params.push(GenericParam { name, bounds });
+            if !self.eat(T::Comma) {
+                self.expect(T::RAngle)?;
+                break;
+            }
+        }
+        return Ok(Generics { params: self.ast.generic_params.add_list(params[..]), span: self.span_from(start) });
+    }
+
+    /// `A + B::<C> + D`
+    pub fn bounds(&mut self): PResult::<List::<Path>> {
+        let mut out: [Path; ..+] = [self.bound()?];
+        while self.eat(T::Plus) {
+            out.push(self.bound()?);
+        }
+        return Ok(self.ast.paths.add_list(out[..]));
+    }
+
+    /// A trait in a bound. `Fn(A, &B): R` (and `FnMut`, `FnOnce`, or any
+    /// path followed by a parameter list) is the trait with the signature
+    /// `fn(A, &B): R` as its argument.
+    pub fn bound(&mut self): PResult::<Path> {
+        let mut path = self.path_ty_style()?;
+        if self.at(T::LParen) {
+            let start = self.start();
+            let kind = self.fn_sig_tail()?;
+            let sig = self.add_ty(kind, self.span_from(start));
+            path.span = path.span.to(self.ast.tys.get(sig).span);
+            // The signature becomes the last segment's argument.
+            let mut segs: [PathSegment; ..+] = [];
+            segs.extend(self.ast.segments.list(path.segments));
+            let n = segs.len();
+            segs[n - 1].args = Some(self.ast.ty_ids.add_list([sig][..]));
+            path.segments = self.ast.segments.add_list(segs[..]);
+        }
+        return Ok(path);
+    }
+
+    fn fn_decl(&mut self, is_unsafe: bool): PResult::<FnDecl> {
+        let sig_start = self.start();
+        self.expect(T::Fn)?;
+        let name = self.ident()?;
+        let generics = self.generics_decl()?;
+        self.expect(T::LParen)?;
+        let mut params: [Param; ..+] = [];
+        let mut variadic = false;
+        loop {
+            if self.eat(T::RParen) {
+                break;
+            }
+            if self.eat(T::DotDotDot) {
+                variadic = true;
+                self.expect(T::RParen)?;
+                break;
+            }
+            match self.param() {
+                Ok(p) => params.push(p),
+                Err(_) => self.recover_until([T::Comma, T::RParen][..]),
+            }
+            if !self.eat(T::Comma) {
+                self.expect(T::RParen)?;
+                break;
+            }
+        }
+        let ret = if self.eat(T::Colon) { Some(self.ret_ty()?) } else { None };
+        let sig_span = self.span_from(sig_start);
+        let body = if self.eat(T::Semi) { None } else { Some(self.block()?) };
+        let params = self.ast.params.add_list(params[..]);
+        return Ok(FnDecl { name, generics, params, ret, body, is_unsafe, variadic, sig_span });
+    }
+
+    fn param(&mut self): PResult::<Param> {
+        let start = self.start();
+        // Receivers: `&self`, `&mut self`, `&mut !self`.
+        let ref_self = self.at(T::Amp) && match self.nth(1) {
+            Some(T::SelfValue) => true,
+            Some(T::Mut) => self.nth(2) == Some(T::SelfValue) || (self.nth(2) == Some(T::Bang) && self.nth(3) == Some(T::SelfValue)),
+            _ => false,
+        };
+        if ref_self {
+            self.bump();
+            let mode = if self.eat(T::Mut) { ParamMode::InOut } else { ParamMode::Borrow };
+            let self_bang = self.eat(T::Bang);
+            self.expect(T::SelfValue)?;
+            return Ok(Param { is_mut: false, mode, kind: ParamKind::SelfParam, ty: None, self_bang, span: self.span_from(start) });
+        }
+        let is_mut = self.eat(T::Mut);
+        if self.eat(T::SelfValue) {
+            let ty = if self.eat(T::Colon) { Some(self.ty()?) } else { None };
+            return Ok(Param { is_mut, mode: ParamMode::Take, kind: ParamKind::SelfParam, ty, self_bang: false, span: self.span_from(start) });
+        }
+        let kind = if self.eat(T::Placeholder) { ParamKind::Wild } else { ParamKind::Named(self.ident()?) };
+        self.expect(T::Colon)?;
+        // `x: &T` borrows, `x: &mut T` is in-out, `x: T` takes ownership.
+        let mode = if self.eat(T::Amp) { if self.eat(T::Mut) { ParamMode::InOut } else { ParamMode::Borrow } } else { ParamMode::Take };
+        let ty = self.ty()?;
+        return Ok(Param { is_mut, mode, kind, ty: Some(ty), self_bang: false, span: self.span_from(start) });
+    }
+
+    fn struct_decl(&mut self): PResult::<StructDecl> {
+        self.expect(T::Struct)?;
+        let name = self.ident()?;
+        let generics = self.generics_decl()?;
+        let kind = if self.at(T::LParen) {
+            let d = self.tuple_fields()?;
+            self.expect_item_semi("tuple struct")?;
+            d
+        } else if self.at(T::LBrace) {
+            self.named_fields()?
+        } else {
+            self.expect_item_semi("unit struct")?;
+            VariantData::Unit
+        };
+        return Ok(StructDecl { name, generics, kind });
+    }
+
+    fn tuple_fields(&mut self): PResult::<VariantData> {
+        self.expect(T::LParen)?;
+        let mut out: [TupleField; ..+] = [];
+        loop {
+            if self.eat(T::RParen) {
+                break;
+            }
+            let is_pub = self.eat(T::Pub);
+            out.push(TupleField { is_pub, ty: self.ty()? });
+            if !self.eat(T::Comma) {
+                self.expect(T::RParen)?;
+                break;
+            }
+        }
+        return Ok(VariantData::Tuple(self.ast.tuple_fields.add_list(out[..])));
+    }
+
+    fn named_fields(&mut self): PResult::<VariantData> {
+        self.expect(T::LBrace)?;
+        let mut out: [FieldDecl; ..+] = [];
+        loop {
+            if self.eat(T::RBrace) {
+                break;
+            }
+            let mut docs: [Attr; ..+] = [];
+            self.doc_attrs_into(&mut docs);
+            let attrs = self.ast.attrs.add_list(docs[..]);
+            let start = self.start();
+            let is_pub = self.eat(T::Pub);
+            let name = self.ident()?;
+            self.expect(T::Colon)?;
+            let ty = self.ty()?;
+            out.push(FieldDecl { attrs, is_pub, name, ty, span: self.span_from(start) });
+            if !self.eat(T::Comma) {
+                self.expect(T::RBrace)?;
+                break;
+            }
+        }
+        return Ok(VariantData::Named(self.ast.field_decls.add_list(out[..])));
+    }
+
+    fn enum_decl(&mut self): PResult::<EnumDecl> {
+        self.expect(T::Enum)?;
+        let name = self.ident()?;
+        let generics = self.generics_decl()?;
+        self.expect(T::LBrace)?;
+        let mut variants: [VariantDecl; ..+] = [];
+        loop {
+            if self.eat(T::RBrace) {
+                break;
+            }
+            // Doc comments, and attributes for derives such as `#[default]`.
+            let attrs = self.attrs()?;
+            let start = self.start();
+            let vname = self.ident()?;
+            let data = if self.at(T::LParen) {
+                self.tuple_fields()?
+            } else if self.at(T::LBrace) {
+                self.named_fields()?
+            } else {
+                VariantData::Unit
+            };
+            variants.push(VariantDecl { attrs, name: vname, data, span: self.span_from(start) });
+            if !self.eat(T::Comma) {
+                self.expect(T::RBrace)?;
+                break;
+            }
+        }
+        return Ok(EnumDecl { name, generics, variants: self.ast.variants.add_list(variants[..]) });
+    }
+
+    fn trait_decl(&mut self): PResult::<TraitDecl> {
+        self.expect(T::Trait)?;
+        let name = self.ident()?;
+        let generics = self.generics_decl()?;
+        let supertraits = if self.eat(T::Colon) { self.bounds()? } else { List::empty() };
+        let items = self.items_until_brace()?;
+        return Ok(TraitDecl { name, generics, supertraits, items });
+    }
+
+    fn impl_decl(&mut self): PResult::<ImplDecl> {
+        self.expect(T::Impl)?;
+        let generics = self.generics_decl()?;
+        let negative = self.eat(T::Bang);
+        let first = self.ty()?;
+        let first_ty = self.ast.tys.get(first);
+        if self.eat(T::For) {
+            let trait_ref = match first_ty.kind {
+                TyKind::Path(p) => p,
+                _ => return Err(self.error_at(first_ty.span.lo, first_ty.span.hi, "expected a trait path before `for`")),
+            };
+            let self_ty = self.ty()?;
+            let items = self.items_until_brace()?;
+            return Ok(ImplDecl { generics, negative, trait_ref: Some(trait_ref), self_ty, items });
+        }
+        if negative {
+            return Err(self.error_at(first_ty.span.lo, first_ty.span.hi, "negative impls must name a trait: `impl !Trait for Type`"));
+        }
+        let items = self.items_until_brace()?;
+        return Ok(ImplDecl { generics, negative, trait_ref: None, self_ty: first, items });
+    }
+
+    fn use_tree(&mut self): PResult::<UseTree> {
+        let start = self.start();
+        let mut prefix: [Ident; ..+] = [];
+        loop {
+            if self.at(T::Star) {
+                self.bump();
+                let p = self.ast.idents.add_list(prefix[..]);
+                return Ok(UseTree { prefix: p, kind: UseKind::Glob, span: self.span_from(start) });
+            }
+            if self.at(T::LBrace) {
+                self.bump();
+                let mut nested: [UseTree; ..+] = [];
+                loop {
+                    if self.eat(T::RBrace) {
+                        break;
+                    }
+                    nested.push(self.use_tree()?);
+                    if !self.eat(T::Comma) {
+                        self.expect(T::RBrace)?;
+                        break;
+                    }
+                }
+                let p = self.ast.idents.add_list(prefix[..]);
+                let n = self.ast.use_trees.add_list(nested[..]);
+                return Ok(UseTree { prefix: p, kind: UseKind::Nested(n), span: self.span_from(start) });
+            }
+            prefix.push(self.path_segment_ident()?);
+            if !self.eat(T::PathSep) {
+                break;
+            }
+        }
+        let rename = if self.eat(T::As) { Some(self.ident()?) } else { None };
+        let p = self.ast.idents.add_list(prefix[..]);
+        return Ok(UseTree { prefix: p, kind: UseKind::Simple(rename), span: self.span_from(start) });
+    }
+
+    /// An identifier or one of the path keywords (`crater`, `self`,
+    /// `super`, `Self`).
+    pub fn path_segment_ident(&mut self): PResult::<Ident> {
+        match self.peek() {
+            Some(t) if t == T::Ident || t.is_path_keyword() => {
+                let tok = self.bump();
+                return Ok(self.tok_ident(tok));
+            }
+            _ => {
+                self.expect_note(Expected::Tok(T::Ident));
+                return Err(self.error_expected());
+            }
+        }
+    }
+
+    // ===================================================================== attributes
+
+    fn meta_list(&mut self): PResult::<List::<Meta>> {
+        self.expect(T::LParen)?;
+        let mut out: [Meta; ..+] = [];
+        loop {
+            if self.eat(T::RParen) {
+                break;
+            }
+            out.push(self.meta_full()?);
+            if !self.eat(T::Comma) {
+                self.expect(T::RParen)?;
+                break;
+            }
+        }
+        return Ok(self.ast.metas.add_list(out[..]));
+    }
+
+    /// Attribute contents: `name`, `name = value`, `name(meta, ...)`.
+    pub fn meta_full(&mut self): PResult::<Meta> {
+        let name = self.meta_name()?;
+        if self.eat(T::Eq) {
+            let t = match self.peek() {
+                Some(T::Str | T::Number(NumKind::Int) | T::Ident) => self.bump(),
+                _ => return Err(self.error_expected_named(Named::AttributeValue)),
+            };
+            let raw = self.tok_text(t);
+            let v = if t.kind == T::Str {
+                match unescape(raw[1..raw.len() - 1]) {
+                    Ok(s) => self.intern(s.as_str()),
+                    Err(_) => self.intern(""),
+                }
+            } else {
+                self.intern(raw)
+            };
+            return Ok(Meta::NameValue(name, v));
+        }
+        if self.at(T::LParen) {
+            let list = self.meta_list()?;
+            return Ok(Meta::Nested(name, list));
+        }
+        return Ok(Meta::Word(name));
+    }
+
+    /// The `;` that ends an item such as `use`, `const` or `struct S;`.
+    /// When the next token starts another item (or closes the enclosing
+    /// block, or ends the file), the `;` was simply forgotten:
+    /// `syntax::missing_semi`, and parsing goes on.
+    fn expect_item_semi(&mut self, what: str): PResult::<()> {
+        if self.eat(T::Semi) {
+            return Ok(());
+        }
+        if self.at_item_start() || self.at(T::RBrace) || self.at_eof() {
+            let at = self.prev_end();
+            let mut m = String::new();
+            m.write("expected `;` after {what}");
+            self.diag(Code::MissingSemi, Span::new(at, at), m.as_str());
+            return Ok(());
+        }
+        self.expect(T::Semi)?;
+        return Ok(());
+    }
+}
+
+/// Whether `s` is made of ASCII letters, digits and `_` (a keyword used as
+/// an attribute name).
+fn word_like(s: str): bool {
+    for c in s.bytes() {
+        if !((c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'_') {
+            return false;
+        }
+    }
+    return true;
+}

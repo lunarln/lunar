@@ -1,0 +1,686 @@
+// Parser for the Lunar programming language, written in Lunar: a port of
+// the Rust `ln-parser` crate (crates/ln-parser), including the token cursor
+// of `ln-parse-kit`. It builds an `ln_ast::Ast` and reports the same
+// syntax errors, which crates/ln-driver/tests/selfhost.rs checks over every
+// program.
+//
+// The cursor's arrays only grow (shrinking a field needs `&mut !self`
+// throughout): a format string's holes are lexed into tokens appended after
+// the file's, parsed with the cursor's `limit` moved over them, and the
+// errors of such a sub-parse are marked dead instead of removed.
+
+mod expr;
+mod item;
+mod lit;
+mod macros;
+mod pat;
+mod ty;
+
+use core::arena::{Id, List};
+use core::collections::HashMap;
+use core::intern::Symbol;
+use ln_ast::*;
+use ln_lexer::{LexError, LexErrorKind, NumKind, Spanned, Token as T};
+
+/// A token: its kind and byte range.
+pub struct Tok {
+    pub kind: T,
+    pub start: u32,
+    pub end: u32,
+}
+
+/// The error codes of syntax errors.
+#[derive(Eq)]
+pub enum Code {
+    UnexpectedToken,
+    UnknownChar,
+    Unterminated,
+    BadEscape,
+    BadNumber,
+    MissingSemi,
+    BadChar,
+    ConflictMarker,
+}
+
+impl Code {
+    pub fn name(self): str {
+        return match self {
+            Code::UnexpectedToken => "syntax::unexpected_token",
+            Code::UnknownChar => "syntax::unknown_char",
+            Code::Unterminated => "syntax::unterminated",
+            Code::BadEscape => "syntax::bad_escape",
+            Code::BadNumber => "syntax::bad_number",
+            Code::MissingSemi => "syntax::missing_semi",
+            Code::BadChar => "syntax::bad_char",
+            Code::ConflictMarker => "syntax::conflict_marker",
+        };
+    }
+}
+
+/// A syntax error.
+pub struct Diag {
+    pub code: Code,
+    pub span: Span,
+    pub message: Symbol,
+    pub label: Option::<Symbol>,
+    /// False for the errors of a format hole's sub-parse, which become the
+    /// format string's own error instead.
+    live: bool,
+}
+
+/// What the parser was looking for when an error happened.
+#[derive(Eq)]
+enum Expected {
+    Tok(T),
+    Named(Named),
+}
+
+/// The syntactic categories named in "expected ..." errors.
+#[derive(Eq)]
+enum Named {
+    Expression,
+    Type,
+    Item,
+    Pattern,
+    Literal,
+    AttributeName,
+    AttributeValue,
+    Delimiter,
+    ArraySize,
+}
+
+impl Named {
+    fn text(self): str {
+        return match self {
+            Named::Expression => "expression",
+            Named::Type => "type",
+            Named::Item => "item",
+            Named::Pattern => "pattern",
+            Named::Literal => "literal",
+            Named::AttributeName => "attribute name",
+            Named::AttributeValue => "attribute value",
+            Named::Delimiter => "`(`, `[` or `{`",
+            Named::ArraySize => "array size (`N`, `_`, `&`, `&mut`, `..+` or `-..+`)",
+        };
+    }
+}
+
+/// A parse function's failure: it recorded an error and produced nothing.
+pub struct Fatal {}
+
+/// The result of a parse function.
+pub type PResult::<X> = Result::<X, Fatal>;
+
+/// Doc comments before a token: `count` spans from `first` in `doc_spans`.
+struct DocRun {
+    first: u32,
+    count: u32,
+}
+
+/// The parser: a token cursor and the tree being built.
+pub struct Parser {
+    src: str,
+    toks: [Tok; ..+],
+    pos: usize,
+    /// The end of the tokens being parsed (the file's, or a format hole's).
+    limit: usize,
+    /// The offset reported for "end of input".
+    eof: u32,
+    /// Expectations noted since the last consumed token: the first
+    /// `n_expected` of `expected`.
+    expected: [Expected; ..+],
+    n_expected: usize,
+    /// Guards against grammar bugs that make no progress.
+    fuel: u32,
+    /// Errors from the cursor (one per position) and from the grammar.
+    cursor_errors: [Diag; ..+],
+    diags: [Diag; ..+],
+    /// Doc comments, by the start of the token after them.
+    docs: HashMap::<u32, DocRun>,
+    doc_spans: [Span; ..+],
+    pub ast: Ast,
+}
+
+/// A parsed file and its syntax errors (sorted by position).
+pub struct Parsed {
+    pub ast: Ast,
+    pub diags: [Diag; ..+],
+}
+
+/// Parse a complete source file.
+pub fn parse_file(src: str): Parsed {
+    let mut p = Parser {
+        src,
+        toks: [],
+        pos: 0,
+        limit: 0,
+        eof: src.len() as u32,
+        expected: [],
+        n_expected: 0,
+        fuel: 1024,
+        cursor_errors: [],
+        diags: [],
+        docs: HashMap::new(),
+        doc_spans: [],
+        ast: Ast::new(),
+    };
+    // A half-merged file would only produce a cascade of syntax errors.
+    let conflicts = ln_lexer::conflict_markers(src);
+    if conflicts.len() > 0 {
+        for c in conflicts {
+            let end = if c.start.start + 7 < c.start.end { c.start.start + 7 } else { c.start.end };
+            p.diag(Code::ConflictMarker, Span::new(c.start.start as u32, end as u32), "encountered a version control conflict marker");
+        }
+        return p.finish();
+    }
+    p.lex_into(src, 0);
+    p.limit = p.toks.len();
+    let mut items: [Id::<Item>; ..+] = [];
+    while !p.at_eof() {
+        match p.item() {
+            Ok(i) => items.push(i),
+            Err(_) => p.recover_item(),
+        }
+    }
+    p.ast.file = p.ast.item_ids.add_list(items[..]);
+    return p.finish();
+}
+
+// ===================================================================== lexing
+
+/// Remove the tokens overlapping `start..end`.
+fn drop_overlapping(toks: &mut [Spanned; -..+], start: usize, end: usize) {
+    let mut kept: [Spanned; -..+] = [];
+    for t in toks {
+        if t.range.end <= start || t.range.start >= end {
+            kept.push(t);
+        }
+    }
+    toks = kept;
+}
+
+/// Sort tokens by start (they are nearly sorted already).
+fn sort_tokens(toks: &mut [Spanned; -..+]) {
+    let mut i: usize = 1;
+    while i < toks.len() {
+        let mut j = i;
+        while j > 0 && toks[j - 1].range.start > toks[j].range.start {
+            let t = toks[j];
+            toks[j] = toks[j - 1];
+            toks[j - 1] = t;
+            j -= 1;
+        }
+        i += 1;
+    }
+}
+
+fn sort_errors(errs: &mut [LexError; -..+]) {
+    let mut i: usize = 1;
+    while i < errs.len() {
+        let mut j = i;
+        while j > 0 && errs[j - 1].range.start > errs[j].range.start {
+            let t = errs[j];
+            errs[j] = errs[j - 1];
+            errs[j - 1] = t;
+            j -= 1;
+        }
+        i += 1;
+    }
+}
+
+/// A malformed literal starting with the quote at `quote`: a byte literal
+/// (`b'ab'`) when the quote directly follows an identifier `b`, else a
+/// character literal. Returns where the literal starts and its token.
+fn with_byte_prefix(quote: usize, toks: &[Spanned; -..+]): (usize, T) {
+    if quote > 0 {
+        for t in toks {
+            if t.token == T::Ident && t.range.start == quote - 1 && t.range.end == quote {
+                return (quote - 1, T::Byte);
+            }
+        }
+    }
+    return (quote, T::Char);
+}
+
+/// The lexer's `Char` token only matches well-formed literals, so `'ab'`
+/// and `''` come out as stray quotes around other tokens. Turn a `'` that
+/// is closed later on the same line back into one `Char` token, so the
+/// parser reports `syntax::bad_char` once for the whole literal.
+fn rejoin_char_literals(src: str, toks: &mut [Spanned; -..+], errs: &mut [LexError; -..+]) {
+    let bytes = src.as_bytes();
+    let mut i: usize = 0;
+    while i < errs.len() {
+        let quote = errs[i].range.start;
+        let mut end: usize = 0;
+        let mut j = quote + 1;
+        while quote < bytes.len() && bytes[quote] == b'\'' && j < bytes.len() {
+            let c = bytes[j];
+            if c == b'\n' {
+                break;
+            }
+            if c == b'\\' {
+                j += 2;
+            } else if c == b'\'' {
+                end = j + 1;
+                break;
+            } else {
+                j += 1;
+            }
+        }
+        if end == 0 {
+            i += 1;
+            continue;
+        }
+        let (start, token) = with_byte_prefix(quote, toks);
+        drop_overlapping(toks, start, end);
+        // An error inside the literal may also have swallowed text after
+        // it: lex that text again.
+        let mut kept: [LexError; -..+] = [];
+        let mut leftover: [ln_lexer::Range; -..+] = [];
+        for e in errs {
+            let inside = e.range.start >= start && e.range.start < end;
+            if inside && e.range.end > end {
+                leftover.push(ln_lexer::Range { start: end, end: e.range.end });
+            }
+            if !inside {
+                kept.push(e);
+            }
+        }
+        errs = kept;
+        toks.push(Spanned { token, range: ln_lexer::Range { start, end } });
+        for r in leftover {
+            let (more, more_errs) = ln_lexer::lex(src[r.start..r.end]);
+            for t in more {
+                toks.push(Spanned { token: t.token, range: ln_lexer::Range { start: t.range.start + r.start, end: t.range.end + r.start } });
+            }
+            for e in more_errs {
+                errs.push(LexError { range: ln_lexer::Range { start: e.range.start + r.start, end: e.range.end + r.start }, kind: e.kind });
+            }
+        }
+        sort_tokens(toks);
+        sort_errors(errs);
+    }
+}
+
+fn ends_unclosed_char(c: u8): bool {
+    return c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' || c == b';' || c == b',' || c == b')' || c == b']' || c == b'}' || c == b'\'';
+}
+
+/// An unclosed character literal (`'a;`) is already reported by the lexer.
+/// Put a `Char` token in its place, covering the rest of the word, so the
+/// parser sees a complete expression instead of reporting a second error.
+fn placeholder_for_unclosed_chars(src: str, toks: &mut [Spanned; -..+], errs: &[LexError; -..+]) {
+    let bytes = src.as_bytes();
+    for e in errs {
+        if e.kind != LexErrorKind::Invalid || e.range.start >= bytes.len() || bytes[e.range.start] != b'\'' {
+            continue;
+        }
+        let quote = e.range.start;
+        let mut end = quote + 1;
+        while end < bytes.len() && !ends_unclosed_char(bytes[end]) {
+            end += 1;
+        }
+        let (start, token) = with_byte_prefix(quote, toks);
+        drop_overlapping(toks, start, end);
+        toks.push(Spanned { token, range: ln_lexer::Range { start, end } });
+    }
+    sort_tokens(toks);
+}
+
+impl Parser {
+    /// Lex `text`, which sits at `offset` in the file, appending its tokens
+    /// (doc comments go to `docs`) and reporting its lexical errors.
+    fn lex_into(&mut self, text: str, offset: u32) {
+        let (mut toks, mut errs) = ln_lexer::lex(text);
+        rejoin_char_literals(text, &mut toks, &mut errs);
+        placeholder_for_unclosed_chars(text, &mut toks, &errs);
+        let mut pending_first = self.doc_spans.len() as u32;
+        let mut pending: u32 = 0;
+        for s in toks {
+            let (start, end) = (s.range.start as u32 + offset, s.range.end as u32 + offset);
+            if s.token == T::DocComment {
+                self.doc_spans.push(Span::new(start, end));
+                pending += 1;
+                continue;
+            }
+            if pending > 0 {
+                self.docs.insert(start, DocRun { first: pending_first, count: pending });
+            }
+            pending = 0;
+            pending_first = self.doc_spans.len() as u32;
+            self.toks.push(Tok { kind: s.token, start, end });
+        }
+        for e in errs {
+            let span = Span::new(e.range.start as u32 + offset, e.range.end as u32 + offset);
+            let t = text[e.range.start..e.range.end];
+            if e.kind == LexErrorKind::UnterminatedComment {
+                self.diag(Code::Unterminated, Span::new(span.lo, span.lo + 2), "unterminated block comment");
+            } else if t.starts_with("\"") {
+                self.diag(Code::Unterminated, span, "unterminated string literal");
+            } else if t.starts_with("'") {
+                self.diag(Code::Unterminated, span, "unterminated character literal");
+            } else {
+                let mut m = String::new();
+                m.write("unknown character(s) `{t}`");
+                self.diag(Code::UnknownChar, span, m.as_str());
+            }
+        }
+    }
+
+    // ===================================================================== diagnostics
+
+    /// Report an error from the grammar.
+    fn diag(&mut self, code: Code, span: Span, message: str) {
+        let m = self.ast.names.intern(message);
+        self.diags.push(Diag { code, span, message: m, label: None, live: true });
+    }
+
+    /// An error from the cursor: at most one per position, so a failure
+    /// does not cascade.
+    fn cursor_error(&mut self, span: Span, message: str, label: Option::<Symbol>) {
+        let n = self.cursor_errors.len();
+        if n > 0 && self.cursor_errors[n - 1].live && self.cursor_errors[n - 1].span.lo == span.lo {
+            return;
+        }
+        let m = self.ast.names.intern(message);
+        self.cursor_errors.push(Diag { code: Code::UnexpectedToken, span, message: m, label, live: true });
+    }
+
+    /// Every live error, sorted by position (grammar errors before cursor
+    /// errors at the same position, as in the Rust parser).
+    fn finish(self): Parsed {
+        let mut out: [Diag; ..+] = [];
+        for d in self.diags {
+            if d.live {
+                out.push(d);
+            }
+        }
+        for d in self.cursor_errors {
+            if d.live {
+                out.push(d);
+            }
+        }
+        let mut i: usize = 1;
+        while i < out.len() {
+            let mut j = i;
+            while j > 0 && out[j - 1].span.lo > out[j].span.lo {
+                let t = out[j];
+                out[j] = out[j - 1];
+                out[j - 1] = t;
+                j -= 1;
+            }
+            i += 1;
+        }
+        return Parsed { ast: self.ast, diags: out };
+    }
+
+    // ===================================================================== cursor
+
+    /// Kind of the token `n` ahead of the current one.
+    fn nth(&mut self, n: usize): Option::<T> {
+        self.fuel -= 1;
+        if self.fuel == 0 {
+            panic("parser made no progress (grammar bug)");
+        }
+        if self.pos + n < self.limit {
+            return Some(self.toks[self.pos + n].kind);
+        }
+        return None;
+    }
+
+    fn peek(&mut self): Option::<T> {
+        return self.nth(0);
+    }
+
+    fn current(&self): Option::<Tok> {
+        if self.pos < self.limit {
+            return Some(self.toks[self.pos]);
+        }
+        return None;
+    }
+
+    fn position(&self): usize {
+        return self.pos;
+    }
+
+    fn at_eof(&self): bool {
+        return self.pos >= self.limit;
+    }
+
+    /// Whether the current token is `k`; notes `k` as expected.
+    fn at(&mut self, k: T): bool {
+        if self.nth(0) == Some(k) {
+            return true;
+        }
+        self.expect_note(Expected::Tok(k));
+        return false;
+    }
+
+    /// Whether token `n` ahead is `k` (not noted as expected).
+    fn nth_at(&mut self, n: usize, k: T): bool {
+        return self.nth(n) == Some(k);
+    }
+
+    /// Whether tokens `n` and `n + 1` ahead touch.
+    fn adjacent(&self, n: usize): bool {
+        if self.pos + n + 1 < self.limit {
+            return self.toks[self.pos + n].end == self.toks[self.pos + n + 1].start;
+        }
+        return false;
+    }
+
+    /// Start of the current token (or the end of input).
+    fn pos_start(&self): u32 {
+        return match self.current() {
+            Some(t) => t.start,
+            None => self.eof,
+        };
+    }
+
+    /// End of the previously consumed token.
+    fn prev_end(&self): u32 {
+        if self.pos == 0 {
+            return 0;
+        }
+        return self.toks[self.pos - 1].end;
+    }
+
+    fn bump(&mut self): Tok {
+        if self.pos >= self.limit {
+            panic("bump past end of input");
+        }
+        let t = self.toks[self.pos];
+        self.pos += 1;
+        self.n_expected = 0;
+        self.fuel = 1024;
+        return t;
+    }
+
+    fn eat(&mut self, k: T): bool {
+        if self.at(k) {
+            self.bump();
+            return true;
+        }
+        return false;
+    }
+
+    fn expect(&mut self, k: T): PResult::<Tok> {
+        if self.at(k) {
+            return Ok(self.bump());
+        }
+        return Err(self.error_expected());
+    }
+
+    fn expect_note(&mut self, e: Expected) {
+        let mut i: usize = 0;
+        while i < self.n_expected {
+            if self.expected[i] == e {
+                return;
+            }
+            i += 1;
+        }
+        if self.n_expected < self.expected.len() {
+            self.expected[self.n_expected] = e;
+        } else {
+            self.expected.push(e);
+        }
+        self.n_expected += 1;
+    }
+
+    /// Record "expected ..., found ..." at the current token, from every
+    /// expectation noted since the last consumed token.
+    fn error_expected(&mut self): Fatal {
+        let mut names = String::new();
+        let mut count: usize = 0;
+        let mut last: str = "";
+        let mut i: usize = 0;
+        while i < self.n_expected {
+            let name = match self.expected[i] {
+                Expected::Tok(t) => t.describe(),
+                Expected::Named(n) => n.text(),
+            };
+            i += 1;
+            if count > 0 && name == last {
+                continue;
+            }
+            if count > 0 {
+                names.push_str(", ");
+            }
+            names.push_str(name);
+            last = name;
+            count += 1;
+        }
+        self.n_expected = 0;
+        let mut exp = String::new();
+        if count == 0 {
+            exp.push_str("something else");
+        } else if count == 1 {
+            exp.push_str(names.as_str());
+        } else {
+            exp.write("one of {names}");
+        }
+        let mut msg = String::new();
+        let mut span = Span::new(self.eof, self.eof);
+        match self.current() {
+            Some(t) => {
+                let text = self.tok_text(t);
+                if t.kind == T::Ident {
+                    msg.write("expected {exp}, found `{text}`");
+                } else {
+                    msg.write("expected {exp}, found {t.kind.describe()}");
+                }
+                span = Span::new(t.start, t.end);
+            }
+            None => msg.write("expected {exp}, found end of file"),
+        }
+        let mut label = String::new();
+        label.write("expected {exp}");
+        let l = self.ast.names.intern(label.as_str());
+        self.cursor_error(span, msg.as_str(), Some(l));
+        return Fatal {};
+    }
+
+    fn error_expected_named(&mut self, what: Named): Fatal {
+        self.expect_note(Expected::Named(what));
+        return self.error_expected();
+    }
+
+    /// Record an error over `start..end`.
+    fn error_at(&mut self, start: u32, end: u32, message: str): Fatal {
+        self.cursor_error(Span::new(start, end), message, None);
+        return Fatal {};
+    }
+
+    /// Skip tokens until one in `stop` is current (not consumed) or input
+    /// ends. Bracketed groups are skipped whole, and an unbalanced closer
+    /// stops recovery (it belongs to an enclosing construct).
+    fn recover_until(&mut self, stop: [T; &]) {
+        let mut depth: [T; -..+] = [];
+        while self.pos < self.limit {
+            let k = self.toks[self.pos].kind;
+            if depth.len() == 0 && stop.contains(k) {
+                return;
+            }
+            if k == T::LParen {
+                depth.push(T::RParen);
+            } else if k == T::LBracket {
+                depth.push(T::RBracket);
+            } else if k == T::LBrace {
+                depth.push(T::RBrace);
+            } else if depth.len() > 0 && depth[depth.len() - 1] == k {
+                depth.pop();
+            } else if depth.len() == 0 && (k == T::RParen || k == T::RBracket || k == T::RBrace) {
+                return;
+            }
+            self.bump();
+        }
+    }
+
+    // ===================================================================== helpers
+
+    fn text_of(&self, start: u32, end: u32): str {
+        return self.src[start as usize..end as usize];
+    }
+
+    fn tok_text(&self, t: Tok): str {
+        return self.src[t.start as usize..t.end as usize];
+    }
+
+    fn tok_span(&self, t: Tok): Span {
+        return Span::new(t.start, t.end);
+    }
+
+    /// From `start` to the end of the last consumed token.
+    fn span_from(&self, start: u32): Span {
+        let end = self.prev_end();
+        return Span::new(start, if end > start { end } else { start });
+    }
+
+    fn start(&self): u32 {
+        return self.pos_start();
+    }
+
+    fn intern(&mut self, s: str): Symbol {
+        return self.ast.names.intern(s);
+    }
+
+    fn tok_ident(&mut self, t: Tok): Ident {
+        let text = self.src[t.start as usize..t.end as usize];
+        let name = self.ast.names.intern(text);
+        return Ident { name, span: Span::new(t.start, t.end) };
+    }
+
+    fn ident(&mut self): PResult::<Ident> {
+        let t = self.expect(T::Ident)?;
+        return Ok(self.tok_ident(t));
+    }
+
+    /// Tokens `a` and `b` are next and touch (`>` `>` forming `>>`).
+    fn at_glued(&mut self, a: T, b: T): bool {
+        return self.nth_at(0, a) && self.nth_at(1, b) && self.adjacent(0);
+    }
+
+    fn at_glued3(&mut self, a: T, b: T, c: T): bool {
+        return self.at_glued(a, b) && self.nth_at(2, c) && self.adjacent(1);
+    }
+
+    fn add_expr(&mut self, kind: ExprKind, span: Span): Id::<Expr> {
+        return self.ast.exprs.add(Expr { kind, span });
+    }
+
+    fn add_ty(&mut self, kind: TyKind, span: Span): Id::<Ty> {
+        return self.ast.tys.add(Ty { kind, span });
+    }
+
+    fn add_pat(&mut self, kind: PatKind, span: Span): Id::<Pat> {
+        return self.ast.pats.add(Pat { kind, span });
+    }
+}
+
+/// The text of a parse's errors, as the selfhost test prints them:
+/// `error <code> @<lo>..<hi> "<message>"`.
+pub fn dump_diags(p: &Parsed, o: &mut String) {
+    for d in p.diags {
+        o.write("error {d.code.name()} @{d.span.lo}..{d.span.hi} {escape(p.ast.text(d.message))}\n");
+    }
+}

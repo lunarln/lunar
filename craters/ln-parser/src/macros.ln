@@ -1,0 +1,107 @@
+// Macro syntax: token trees, `macro` definitions and `path!(...)` calls.
+
+use core::arena::{Id, List};
+use ln_ast::*;
+use ln_lexer::Token as T;
+use crater::{Parser, PResult, Named, Expected};
+
+/// A delimited group of token trees.
+struct Group {
+    delim: Delim,
+    open: Span,
+    close: Span,
+    trees: List::<TokenTree>,
+}
+
+impl Parser {
+    /// A `!` directly followed by a delimiter: after a path, a macro call.
+    pub fn at_mac_bang(&mut self): bool {
+        return self.at(T::Bang) && match self.nth(1) {
+            Some(T::LParen | T::LBracket | T::LBrace) => true,
+            _ => false,
+        };
+    }
+
+    /// The rest of `path!(...)`, after the path.
+    pub fn mac_call(&mut self, path: Path): PResult::<MacCall> {
+        let start = path.span.lo;
+        self.expect(T::Bang)?;
+        let g = self.delimited()?;
+        return Ok(MacCall { path, delim: g.delim, tokens: g.trees, span: self.span_from(start) });
+    }
+
+    /// A delimited group of token trees; the current token opens it.
+    fn delimited(&mut self): PResult::<Group> {
+        let (delim, close) = match self.peek() {
+            Some(T::LParen) => (Delim::Paren, T::RParen),
+            Some(T::LBracket) => (Delim::Bracket, T::RBracket),
+            Some(T::LBrace) => (Delim::Brace, T::RBrace),
+            _ => return Err(self.error_expected_named(Named::Delimiter)),
+        };
+        let open = self.bump();
+        let mut trees: [TokenTree; ..+] = [];
+        loop {
+            let k = self.peek();
+            if k == Some(close) {
+                let c = self.bump();
+                let l = self.ast.tokens.add_list(trees[..]);
+                return Ok(Group { delim, open: self.tok_span(open), close: self.tok_span(c), trees: l });
+            }
+            match k {
+                // A closer that does not match, or the end of the input.
+                None | Some(T::RParen | T::RBracket | T::RBrace) => {
+                    self.expect(close)?;
+                    panic("expect fails on a different token");
+                }
+                _ => trees.push(self.token_tree()?),
+            }
+        }
+    }
+
+    fn token_tree(&mut self): PResult::<TokenTree> {
+        match self.peek() {
+            Some(T::LParen | T::LBracket | T::LBrace) => {
+                let g = self.delimited()?;
+                return Ok(TokenTree::Group { delim: g.delim, open: g.open, close: g.close, trees: g.trees });
+            }
+            _ => {}
+        }
+        let t = self.bump();
+        return Ok(TokenTree::Token(Tt { kind: t.kind, span: self.tok_span(t) }));
+    }
+
+    /// `macro name(matcher) { body }`, or several rules:
+    /// `macro name { (matcher) => { body }, ... }`.
+    pub fn macro_def(&mut self): PResult::<MacroDef> {
+        self.expect(T::Macro)?;
+        let name = self.ident()?;
+        let mut rules: [MacroRule; ..+] = [];
+        if self.at(T::LParen) {
+            let start = self.start();
+            let matcher = self.delimited()?;
+            if !self.at(T::LBrace) {
+                self.expect_note(Expected::Tok(T::LBrace));
+                return Err(self.error_expected());
+            }
+            let body = self.delimited()?;
+            rules.push(MacroRule { matcher: matcher.trees, body: body.trees, span: self.span_from(start) });
+            return Ok(MacroDef { name, rules: self.ast.macro_rules.add_list(rules[..]) });
+        }
+        self.expect(T::LBrace)?;
+        loop {
+            if self.eat(T::RBrace) {
+                break;
+            }
+            let start = self.start();
+            let matcher = self.delimited()?;
+            self.expect(T::FatArrow)?;
+            let body = self.delimited()?;
+            rules.push(MacroRule { matcher: matcher.trees, body: body.trees, span: self.span_from(start) });
+            if !self.eat(T::Comma) && !self.eat(T::Semi) {
+                self.expect(T::RBrace)?;
+                break;
+            }
+        }
+        return Ok(MacroDef { name, rules: self.ast.macro_rules.add_list(rules[..]) });
+    }
+}

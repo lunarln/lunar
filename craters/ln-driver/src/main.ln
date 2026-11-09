@@ -1,19 +1,35 @@
-// The driver of the Lunar-written compiler. For now it only runs the lexer:
-// `ln-driver FILE...` prints the tokens of each file (see `ln_lexer::dump`),
-// which crates/ln-driver/tests/selfhost.rs compares with the Rust lexer.
+// The driver of the Lunar-written compiler. For now it runs one stage over
+// each file named on the command line and prints the result, which
+// crates/ln-driver/tests/selfhost.rs compares with the Rust compiler's:
+//
+//     ln-driver FILE...           the tokens (`ln_lexer::dump`)
+//     ln-driver --parse FILE...   the syntax tree and syntax errors
+//                                 (`ln_ast::dump`, `ln_parser::dump_diags`)
 
 use std::env;
 use std::fs;
 
 fn main() {
-    let mut out = String::new();
     let mut i: usize = 1;
+    let mut parse = false;
+    if env::arg_count() > 1 && env::arg(1).unwrap() == "--parse" {
+        parse = true;
+        i = 2;
+    }
     while i < env::arg_count() {
         let path = env::arg(i).unwrap();
         match fs::read_to_string(path) {
             Ok(text) => {
+                let mut out = String::new();
                 out.write("== {path}\n");
-                ln_lexer::dump(text.as_str(), &mut out);
+                if parse {
+                    let parsed = ln_parser::parse_file(text.as_str());
+                    ln_ast::dump(&parsed.ast, &mut out);
+                    ln_parser::dump_diags(&parsed, &mut out);
+                } else {
+                    ln_lexer::dump(text.as_str(), &mut out);
+                }
+                std::io::write_str(out.as_str());
             }
             Err(e) => {
                 eprintln("ln-driver: {path}: {e}");
@@ -22,5 +38,4 @@ fn main() {
         }
         i += 1;
     }
-    std::io::write_str(out.as_str());
 }

@@ -1,0 +1,206 @@
+// Patterns for `let`, `match`, `for`, `if let` and `while let`.
+
+use core::arena::{Id, List};
+use ln_ast::*;
+use ln_lexer::Token as T;
+use crater::{Parser, PResult, Named, Expected};
+
+/// A literal pattern part: the literal, and whether it is negated.
+struct LitPart {
+    lit: Lit,
+    neg: bool,
+}
+
+/// Whether an identifier names a binding (lowercase or `_` first) rather
+/// than a unit variant, struct or constant.
+fn binding_like(text: str): bool {
+    let b = text.as_bytes();
+    if b.len() == 0 {
+        return false;
+    }
+    let c = b[0];
+    if c == b'_' || (c >= b'a' && c <= b'z') {
+        return true;
+    }
+    if c < 128 {
+        return false;
+    }
+    // A non-ASCII first letter: lowercase if it has an uppercase form.
+    return match text.chars().next() {
+        Some(ch) => is_lowercase(ch),
+        None => false,
+    };
+}
+
+/// Lowercase letters outside ASCII (Latin-1, Greek and Cyrillic; enough for
+/// identifiers seen in practice).
+pub fn is_lowercase(c: char): bool {
+    let n = c as u32;
+    if n < 128 {
+        return n >= 97 && n <= 122;
+    }
+    return (n >= 0xdf && n <= 0xff && n != 0xf7) || (n >= 0x3b1 && n <= 0x3c9) || (n >= 0x430 && n <= 0x45f);
+}
+
+pub fn is_uppercase(c: char): bool {
+    let n = c as u32;
+    if n < 128 {
+        return n >= 65 && n <= 90;
+    }
+    return (n >= 0xc0 && n <= 0xde && n != 0xd7) || (n >= 0x391 && n <= 0x3a9) || (n >= 0x400 && n <= 0x42f);
+}
+
+impl Parser {
+    /// A pattern, including top-level `a | b` alternatives.
+    pub fn pat(&mut self): PResult::<Id::<Pat>> {
+        let start = self.start();
+        self.eat(T::Pipe);
+        let first = self.pat_single()?;
+        if !self.at(T::Pipe) {
+            return Ok(first);
+        }
+        let mut alts: [Id::<Pat>; ..+] = [first];
+        while self.eat(T::Pipe) {
+            alts.push(self.pat_single()?);
+        }
+        let l = self.ast.pat_ids.add_list(alts[..]);
+        return Ok(self.add_pat(PatKind::Or(l), self.span_from(start)));
+    }
+
+    fn lit_pat_part(&mut self): PResult::<Option::<LitPart>> {
+        let neg = self.at(T::Minus) && match self.nth(1) {
+            Some(T::Number(_)) => true,
+            _ => false,
+        };
+        if neg {
+            self.bump();
+        }
+        return match self.peek() {
+            Some(T::Number(_) | T::Str | T::Char | T::Byte | T::True | T::False) => {
+                let lit = self.literal()?;
+                Ok(Some(LitPart { lit, neg }))
+            }
+            _ => Ok(None),
+        };
+    }
+
+    /// A literal pattern part, or an "expected literal" error.
+    fn lit_pat_required(&mut self): PResult::<LitPart> {
+        return match self.lit_pat_part()? {
+            Some(l) => Ok(l),
+            None => Err(self.error_expected_named(Named::Literal)),
+        };
+    }
+
+    fn pat_single(&mut self): PResult::<Id::<Pat>> {
+        let start = self.start();
+        let kind = match self.peek() {
+            Some(T::Placeholder) => {
+                self.bump();
+                PatKind::Wild
+            }
+            Some(T::DotDot) => {
+                self.bump();
+                PatKind::Rest
+            }
+            Some(T::Mut) => {
+                self.bump();
+                PatKind::Binding { is_mut: true, name: self.ident()? }
+            }
+            Some(T::Minus | T::Number(_) | T::Str | T::Char | T::Byte | T::True | T::False) => {
+                let lo = self.lit_pat_required()?;
+                if self.at(T::DotDotEq) || self.at(T::DotDot) {
+                    let inclusive = self.bump().kind == T::DotDotEq;
+                    let hi = self.lit_pat_required()?;
+                    PatKind::Range { lo: lo.lit, lo_neg: lo.neg, hi: hi.lit, hi_neg: hi.neg, inclusive }
+                } else {
+                    PatKind::Lit(lo.lit, lo.neg)
+                }
+            }
+            Some(T::LParen) => {
+                self.bump();
+                let mut ps: [Id::<Pat>; ..+] = [];
+                let mut trailing = false;
+                loop {
+                    if self.eat(T::RParen) {
+                        break;
+                    }
+                    ps.push(self.pat()?);
+                    trailing = self.eat(T::Comma);
+                    if !trailing {
+                        self.expect(T::RParen)?;
+                        break;
+                    }
+                }
+                if ps.len() == 1 && !trailing {
+                    let only = ps[0];
+                    let is_rest = match self.ast.pats.get(only).kind {
+                        PatKind::Rest => true,
+                        _ => false,
+                    };
+                    if !is_rest {
+                        return Ok(only);
+                    }
+                }
+                PatKind::Tuple(self.ast.pat_ids.add_list(ps[..]))
+            }
+            Some(T::Ident | T::SelfType | T::Crater | T::Super) => {
+                let path = self.path_ty_style()?;
+                if self.at_mac_bang() {
+                    PatKind::MacCall(self.mac_call(path)?)
+                } else if self.at(T::LParen) {
+                    self.bump();
+                    let mut ps: [Id::<Pat>; ..+] = [];
+                    loop {
+                        if self.eat(T::RParen) {
+                            break;
+                        }
+                        ps.push(self.pat()?);
+                        if !self.eat(T::Comma) {
+                            self.expect(T::RParen)?;
+                            break;
+                        }
+                    }
+                    PatKind::TupleStruct { path, pats: self.ast.pat_ids.add_list(ps[..]) }
+                } else if self.at(T::LBrace) {
+                    self.bump();
+                    let mut fields: [FieldPat; ..+] = [];
+                    let mut rest = false;
+                    loop {
+                        if self.eat(T::RBrace) {
+                            break;
+                        }
+                        if self.eat(T::DotDot) {
+                            rest = true;
+                            self.expect(T::RBrace)?;
+                            break;
+                        }
+                        let fstart = self.start();
+                        let is_mut = self.eat(T::Mut);
+                        let name = self.ident()?;
+                        let p = if !is_mut && self.eat(T::Colon) {
+                            self.pat()?
+                        } else {
+                            self.add_pat(PatKind::Binding { is_mut, name }, self.span_from(fstart))
+                        };
+                        fields.push(FieldPat { name, pat: p });
+                        if !self.eat(T::Comma) {
+                            self.expect(T::RBrace)?;
+                            break;
+                        }
+                    }
+                    PatKind::Struct { path, fields: self.ast.field_pats.add_list(fields[..]), rest }
+                } else if self.ast.is_single(path) && binding_like(self.ast.text(self.ast.last_segment(path).ident.name)) {
+                    PatKind::Binding { is_mut: false, name: self.ast.last_segment(path).ident }
+                } else {
+                    PatKind::Path(path)
+                }
+            }
+            _ => {
+                self.expect_note(Expected::Named(Named::Pattern));
+                return Err(self.error_expected());
+            }
+        };
+        return Ok(self.add_pat(kind, self.span_from(start)));
+    }
+}
