@@ -1,5 +1,7 @@
 # Lunar
 
+[![CI](https://github.com/WorriedArrow/lunar/actions/workflows/ci.yml/badge.svg)](https://github.com/WorriedArrow/lunar/actions/workflows/ci.yml)
+
 Lunar is a compiled systems language with Rust-like syntax and a
 [Goose](https://github.com/aardappel/goose/wiki)-inspired memory model:
 there is no heap and no garbage collector. Every owning array lives on its
