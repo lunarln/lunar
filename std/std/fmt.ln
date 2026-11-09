@@ -49,3 +49,15 @@ impl Display for f32 {
         write_f64(out, self as f64);
     }
 }
+
+impl core::fmt::Debug for f64 {
+    fn debug(&self, out: &mut String) {
+        write_f64(out, self);
+    }
+}
+
+impl core::fmt::Debug for f32 {
+    fn debug(&self, out: &mut String) {
+        write_f64(out, self as f64);
+    }
+}

@@ -368,7 +368,8 @@ impl P<'_, '_, '_> {
             if self.k.eat(T::RBrace) {
                 break;
             }
-            let docs = self.doc_attrs();
+            // Doc comments, and attributes for derives such as `#[default]`.
+            let attrs = self.attrs()?;
             let start = self.start();
             let vname = self.ident()?;
             let data = if self.k.at(T::LParen) {
@@ -378,7 +379,7 @@ impl P<'_, '_, '_> {
             } else {
                 VariantData::Unit
             };
-            variants.push(VariantDecl { attrs: docs, name: vname, data, span: self.span_from(start) });
+            variants.push(VariantDecl { attrs, name: vname, data, span: self.span_from(start) });
             if !self.k.eat(T::Comma) {
                 self.k.expect(T::RBrace)?;
                 break;

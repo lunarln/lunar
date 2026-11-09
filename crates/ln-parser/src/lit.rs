@@ -1,7 +1,7 @@
 //! Literal decoding: numbers, escapes, and format-string pieces.
 
 use crate::{IdGen, parse_expr_at};
-use ln_ast::{FmtPiece, FmtString, Span};
+use ln_ast::{FmtPiece, FmtSpec, FmtString, Span};
 use ln_diag::FileId;
 
 const INT_SUFFIXES: &[&str] = &["i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize"];
@@ -147,6 +147,44 @@ pub(crate) fn unescape_byte(raw: &str) -> Result<u8, (String, Option<String>)> {
     }
 }
 
+/// Split a format hole into its expression and format spec: `p:?` is `p`
+/// with `Debug`. The spec starts at the first `:` outside brackets,
+/// strings and character literals that is not part of `::`; no expression
+/// contains such a `:` (Lunar has no ternary and no type ascription).
+fn split_spec(inner: &str) -> Result<(&str, FmtSpec), String> {
+    let b = inner.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            // Skip string and character literals (`':'`, `"a:b"`).
+            q @ (b'"' | b'\'') => {
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b':' if depth == 0 => {
+                if b.get(i + 1) == Some(&b':') {
+                    i += 2;
+                    continue;
+                }
+                let spec = inner[i + 1..].trim();
+                return match spec {
+                    "?" => Ok((&inner[..i], FmtSpec::Debug)),
+                    "" => Err("empty format spec after `:`; write `{x:?}` for `Debug`, or `{x}` for `Display`".into()),
+                    s => Err(format!("unknown format spec `{s}`; the only one is `?` (`{{x:?}}` uses `Debug`)")),
+                };
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok((inner, FmtSpec::Display))
+}
+
 /// Interpret a string literal body (`raw`, between the quotes, starting at
 /// byte `offset` of `file`) as a format string: `{expr}` holes, `{{`/`}}`
 /// escapes.
@@ -220,8 +258,12 @@ pub(crate) fn parse_format(raw: &str, offset: u32, file: FileId, ids: &mut IdGen
                 if inner.trim().is_empty() {
                     return FmtString::Err("empty `{}` in format string: put an expression inside, e.g. `{x}`".into(), span_at(open, j));
                 }
+                let (inner, spec) = match split_spec(inner) {
+                    Ok(x) => x,
+                    Err(m) => return FmtString::Err(m, span_at(open, j)),
+                };
                 match parse_expr_at(inner, offset + open as u32 + 1, file, ids) {
-                    Ok(e) => pieces.push(FmtPiece::Expr(Box::new(e))),
+                    Ok(e) => pieces.push(FmtPiece::Expr(Box::new(e), spec)),
                     Err(diags) => {
                         let msg = diags.first().map(|d| d.message.clone()).unwrap_or_default();
                         return FmtString::Err(format!("invalid expression in format string: {msg}"), span_at(open, j));

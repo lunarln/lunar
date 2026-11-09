@@ -100,3 +100,192 @@ impl Display for String {
         out.push_str(self.as_str());
     }
 }
+
+// ===================================================================== Debug
+
+/// Types that can be shown for debugging, with `{x:?}`: values roughly as
+/// they would be written in source, with strings quoted and escaped.
+#[lang = "debug"]
+pub trait Debug {
+    fn debug(&self, out: &mut String);
+}
+
+impl Debug for u8 { fn debug(&self, out: &mut String) { write_u64(out, self as u64); } }
+impl Debug for u16 { fn debug(&self, out: &mut String) { write_u64(out, self as u64); } }
+impl Debug for u32 { fn debug(&self, out: &mut String) { write_u64(out, self as u64); } }
+impl Debug for u64 { fn debug(&self, out: &mut String) { write_u64(out, self); } }
+impl Debug for usize { fn debug(&self, out: &mut String) { write_u64(out, self as u64); } }
+impl Debug for i8 { fn debug(&self, out: &mut String) { write_i64(out, self as i64); } }
+impl Debug for i16 { fn debug(&self, out: &mut String) { write_i64(out, self as i64); } }
+impl Debug for i32 { fn debug(&self, out: &mut String) { write_i64(out, self as i64); } }
+impl Debug for i64 { fn debug(&self, out: &mut String) { write_i64(out, self); } }
+impl Debug for isize { fn debug(&self, out: &mut String) { write_i64(out, self as i64); } }
+
+impl Debug for bool {
+    fn debug(&self, out: &mut String) {
+        out.push_str(if self { "true" } else { "false" });
+    }
+}
+
+impl Debug for char {
+    fn debug(&self, out: &mut String) {
+        out.push('\'');
+        escape_char(out, self, '\'');
+        out.push('\'');
+    }
+}
+
+impl Debug for str {
+    fn debug(&self, out: &mut String) {
+        out.push('"');
+        for c in self.chars() {
+            escape_char(out, c, '"');
+        }
+        out.push('"');
+    }
+}
+
+impl Debug for String {
+    fn debug(&self, out: &mut String) {
+        self.as_str().debug(out);
+    }
+}
+
+impl Debug for () {
+    fn debug(&self, out: &mut String) {
+        out.push_str("()");
+    }
+}
+
+/// `c` as it is written inside a quoted literal.
+fn escape_char(out: &mut String, c: char, quote: char) {
+    if c == '\n' {
+        out.push_str("\\n");
+    } else if c == '\t' {
+        out.push_str("\\t");
+    } else if c == '\r' {
+        out.push_str("\\r");
+    } else if c == '\0' {
+        out.push_str("\\0");
+    } else if c == '\\' {
+        out.push_str("\\\\");
+    } else if c == quote {
+        out.push('\\');
+        out.push(c);
+    } else {
+        out.push(c);
+    }
+}
+
+// ===================================================================== derives
+
+/// `#[derive(Debug)]`: `Point { x: 1, y: 2 }`, `Pair(1, 2)`, `Unit`, and
+/// for enums `Number(Int)`, `Line { from: 1, to: 2 }`, `Dot`. Every field
+/// must implement `Debug`; an enum's fields must also be `Dull`.
+#[derive_macro]
+pub macro Debug {
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics { $(,)? }) => {
+        impl $g.bound(Debug) Debug for $n $g.args {
+            fn debug(&self, out: &mut String) {
+                out.push_str(${stringify($n)});
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics { $($(#[$fm:meta])* $fv:vis $f:ident: $ft:ty),* $(,)? }) => {
+        impl $g.bound(Debug) Debug for $n $g.args {
+            fn debug(&self, out: &mut String) {
+                out.push_str(${stringify($n)});
+                out.push_str(" { ");
+                $(
+                    if ${index()} > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(${stringify($f)});
+                    out.push_str(": ");
+                    self.$f.debug(out);
+                )*
+                out.push_str(" }");
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics ($($(#[$fm:meta])* $fv:vis $ft:ty),* $(,)?);) => {
+        impl $g.bound(Debug) Debug for $n $g.args {
+            fn debug(&self, out: &mut String) {
+                out.push_str(${stringify($n)});
+                out.push('(');
+                $(
+                    if ${index()} > 0 {
+                        out.push_str(", ");
+                    }
+                    self.${index()}.debug(out);
+                    ${ignore($ft)}
+                )*
+                out.push(')');
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics;) => {
+        impl $g.bound(Debug) Debug for $n $g.args {
+            fn debug(&self, out: &mut String) {
+                out.push_str(${stringify($n)});
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis enum $n:ident $g:generics {
+        $($(#[$vm:meta])* $var:ident $(($($vt:ty),* $(,)?))? $({$($vf:ident: $vft:ty),* $(,)?})?),* $(,)?
+    }) => {
+        impl $g.bound(Debug) Debug for $n $g.args {
+            fn debug(&self, out: &mut String) {
+                match self {
+                    $(
+                        $n::$var $(($(${concat(a, index())} ${ignore($vt)}),*))? $({$($vf: ${concat(a_, $vf)}),*})? => {
+                            out.push_str(${stringify($var)});
+                            $(
+                                out.push('(');
+                                $(
+                                    if ${index()} > 0 {
+                                        out.push_str(", ");
+                                    }
+                                    ${concat(a, index())}.debug(out);
+                                    ${ignore($vt)}
+                                )*
+                                out.push(')');
+                            )?
+                            $(
+                                out.push_str(" { ");
+                                $(
+                                    if ${index()} > 0 {
+                                        out.push_str(", ");
+                                    }
+                                    out.push_str(${stringify($vf)});
+                                    out.push_str(": ");
+                                    ${concat(a_, $vf)}.debug(out);
+                                )*
+                                out.push_str(" }");
+                            )?
+                        }
+                    )*
+                }
+            }
+        }
+    },
+}
+
+/// `#[derive(Display)]`, for enums whose variants have no fields: each
+/// shows as its name. How anything else is shown is a choice to make by
+/// hand.
+#[derive_macro]
+pub macro Display {
+    ($(#[$m:meta])* $v:vis enum $n:ident { $($(#[$vm:meta])* $var:ident),* $(,)? }) => {
+        impl Display for $n {
+            fn fmt(&self, out: &mut String) {
+                out.push_str(match self {
+                    $($n::$var => ${stringify($var)}),*
+                });
+            }
+        }
+    },
+    ($($rest:tt)*) => {
+        ${error("`#[derive(Display)]` only works on enums whose variants have no fields; implement `Display` by hand to choose how this is shown")}
+    },
+}

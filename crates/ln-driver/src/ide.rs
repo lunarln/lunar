@@ -702,7 +702,7 @@ fn walk_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
         K::Break { value: Some(v), .. } | K::Return(Some(v)) => walk_expr(v, f),
         K::FmtArgs(pieces) => {
             for p in pieces {
-                if let FmtPiece::Arg(x) = p {
+                if let FmtPiece::Arg(x, _) = p {
                     walk_expr(x, f);
                 }
             }

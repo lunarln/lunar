@@ -7,7 +7,7 @@ use inkwell::intrinsics::Intrinsic;
 use inkwell::types::BasicMetadataTypeEnum;
 use inkwell::values::{BasicMetadataValueEnum, FunctionValue, IntValue, PointerValue};
 use inkwell::{FloatPredicate, IntPredicate};
-use ln_ast::{BinOp, UnOp};
+use ln_ast::{BinOp, FmtSpec, UnOp};
 use ln_diag::Span;
 use ln_sema::defs::{DefId, ParamMode};
 use ln_sema::thir::*;
@@ -677,7 +677,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         let mut arg_vals = Vec::new();
         let mut arg_tys = Vec::new();
         for p in pieces {
-            if let FmtPiece::Arg(e) = p {
+            if let FmtPiece::Arg(e, _) = p {
                 arg_vals.push(tri!(self.value(e)));
                 arg_tys.push(self.t(&e.ty));
             }
@@ -714,9 +714,6 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         cg.b.position_at_end(entry);
         let env = f.get_nth_param(0).unwrap().into_pointer_value();
         let out = f.get_nth_param(1).unwrap().into_pointer_value();
-        let display = cg.p.lang_item("display").ok_or("missing lang item `display`")?;
-        let push = cg.p.def(cg.p.lang_item("ds_grow").ok_or("missing lang item `ds_grow`")?).name.clone();
-        let _ = push;
         let mut ai = 0;
         for p in pieces {
             match p {
@@ -724,20 +721,25 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                     let sv = cg.const_str(s);
                     thunk_extend(cg, f, out, sv.into())?;
                 }
-                FmtPiece::Arg(_) => {
+                FmtPiece::Arg(_, spec) => {
+                    let (lang, method, name) = match spec {
+                        FmtSpec::Display => ("display", "fmt", "Display"),
+                        FmtSpec::Debug => ("debug", "debug", "Debug"),
+                    };
+                    let trait_id = cg.p.lang_item(lang).ok_or_else(|| format!("missing lang item `{lang}`"))?;
                     let t = &arg_tys[ai];
                     let fp = cg.b.build_struct_gep(env_ty, env, ai as u32, "").unwrap();
                     let lt = cg.llty(t);
                     let v = cg.b.build_load(lt, fp, "").unwrap();
-                    let tr = TraitRef { trait_id: display, args: vec![] };
-                    match cg.p.resolve_method(&tr, t, "fmt", &[]) {
+                    let tr = TraitRef { trait_id, args: vec![] };
+                    match cg.p.resolve_method(&tr, t, method, &[]) {
                         Some(MethodImpl::Fn { def, args }) => {
                             let callee = cg.instance(def, &args);
                             // `fmt(&self, ..)` takes the value's address.
                             let recv = if cg.p.param_by_ref(def, 0) { fp.into() } else { v.into() };
                             cg.b.build_call(callee, &[recv, out.into()], "").unwrap();
                         }
-                        _ => return Err(format!("no `Display` implementation for `{}`", cg.p.ty_str(t))),
+                        _ => return Err(format!("no `{name}` implementation for `{}`", cg.p.ty_str(t))),
                     }
                     ai += 1;
                 }

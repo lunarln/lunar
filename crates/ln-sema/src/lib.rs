@@ -237,6 +237,11 @@ pub(crate) struct Sema<'a> {
 
 impl<'a> Sema<'a> {
     pub(crate) fn err(&mut self, d: Diagnostic) {
+        // Lints are about code someone wrote by hand; inside a macro's
+        // expansion the caller could not act on them.
+        if !d.is_error() && self.p.expansion_sites.contains_key(&d.span.file) {
+            return;
+        }
         self.diags.push(d);
     }
 }

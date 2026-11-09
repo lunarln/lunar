@@ -346,7 +346,7 @@ impl<'p> Cx<'p, '_> {
             ExprKind::FmtArgs(pieces) => pieces
                 .iter()
                 .flat_map(|p| match p {
-                    FmtPiece::Arg(x) => self.arg_roots(x),
+                    FmtPiece::Arg(x, _) => self.arg_roots(x),
                     FmtPiece::Text(_) => Roots::new(),
                 })
                 .collect(),
@@ -855,7 +855,7 @@ impl<'p> Cx<'p, '_> {
                 None => LiveSet::new(),
             },
             K::FmtArgs(pieces) => pieces.iter().rev().fold(after, |l, p| match p {
-                FmtPiece::Arg(x) => self.live(x, l),
+                FmtPiece::Arg(x, _) => self.live(x, l),
                 FmtPiece::Text(_) => l,
             }),
         }
@@ -952,7 +952,7 @@ pub(crate) fn visit_children(e: &Expr, f: &mut dyn FnMut(&Expr)) {
         }
         K::FmtArgs(pieces) => {
             for p in pieces {
-                if let FmtPiece::Arg(x) = p {
+                if let FmtPiece::Arg(x, _) = p {
                     f(x);
                 }
             }
@@ -1255,7 +1255,7 @@ impl Moves<'_, '_, '_> {
             }
             K::FmtArgs(pieces) => {
                 for p in pieces {
-                    if let FmtPiece::Arg(x) = p {
+                    if let FmtPiece::Arg(x, _) = p {
                         self.expr(x, st);
                     }
                 }

@@ -1,4 +1,6 @@
-// Names available in every module without a `use`.
+// Names available in every module without a `use`. Importing a trait also
+// imports its derive macro (they share a path: `#[derive(Eq)]`), and
+// importing `assert` / `assert_eq` also imports `assert!` / `assert_eq!`.
 
 pub use crater::ptr::Dull;
 pub use crater::option::Option::{self, Some, None};
@@ -6,8 +8,8 @@ pub use crater::result::Result::{self, Ok, Err};
 pub use crater::cmp::{Eq, Ord, Ordering};
 pub use crater::clone::Clone;
 pub use crater::default::Default;
-pub use crater::fmt::Display;
+pub use crater::fmt::{Display, Debug};
 pub use crater::iter::Iterator;
 pub use std::io::{print, println, eprint, eprintln};
 pub use std::process::panic;
-pub use std::test::{assert, assert_eq};
+pub use std::test::{assert, assert_eq, assert_ne};

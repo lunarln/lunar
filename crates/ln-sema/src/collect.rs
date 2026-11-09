@@ -269,6 +269,16 @@ impl<'a> Sema<'a> {
                 self.bind(module, Ns::Type, &key(&e.name), id, item.is_pub, e.name.span);
                 let mut variants = Vec::new();
                 for (i, v) in e.variants.iter().enumerate() {
+                    for a in &v.attrs {
+                        let ok =
+                            matches!(&a.meta, ast::Meta::NameValue(n, _) if n.name == "doc") || matches!(&a.meta, ast::Meta::Word(n) if n.name == "default");
+                        if !ok {
+                            self.err(
+                                Diagnostic::error(syntax::BAD_ATTRIBUTE, a.span, format!("unknown attribute `{}` on an enum variant", a.meta.name().name))
+                                    .with_note("variants take doc comments and `#[default]` (used by `#[derive(Default)]`)"),
+                            );
+                        }
+                    }
                     let vid = self.new_def(&v.name.name, DefKind::Variant, Some(module), v.name.span, AstRef::Variant(v));
                     let vd = &mut self.p.defs[vid.0 as usize];
                     vd.parent = Some(id);

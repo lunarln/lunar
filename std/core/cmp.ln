@@ -9,6 +9,11 @@ pub enum Ordering {
 #[lang = "eq"]
 pub trait Eq {
     fn eq(&self, other: &Self): bool;
+
+    /// `!=`.
+    fn ne(&self, other: &Self): bool {
+        return !self.eq(other);
+    }
 }
 
 /// Total ordering, used by `<`, `<=`, `>` and `>=`.
@@ -74,4 +79,146 @@ pub fn min::<T: Ord + Dull>(a: T, b: T): T {
 pub fn max::<T: Ord + Dull>(a: T, b: T): T {
     if b > a { return b; }
     return a;
+}
+
+impl crater::fmt::Debug for Ordering {
+    fn debug(&self, out: &mut String) {
+        self.fmt(out);
+    }
+}
+
+// ===================================================================== derives
+
+/// `#[derive(Eq)]`: equal when every field is equal; for enums, the same
+/// variant with equal fields (an enum's fields must also be `Dull`).
+#[derive_macro]
+pub macro Eq {
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics { $($(#[$fm:meta])* $fv:vis $f:ident: $ft:ty),* $(,)? }) => {
+        impl $g.bound(Eq) Eq for $n $g.args {
+            fn eq(&self, other: &Self): bool {
+                return true $(&& self.$f == other.$f)*;
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics ($($(#[$fm:meta])* $fv:vis $ft:ty),* $(,)?);) => {
+        impl $g.bound(Eq) Eq for $n $g.args {
+            fn eq(&self, other: &Self): bool {
+                return true $(&& self.${index()} == other.${index()} ${ignore($ft)})*;
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics;) => {
+        impl $g.bound(Eq) Eq for $n $g.args {
+            fn eq(&self, other: &Self): bool {
+                return true;
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis enum $n:ident $g:generics {
+        $($(#[$vm:meta])* $var:ident $(($($vt:ty),* $(,)?))? $({$($vf:ident: $vft:ty),* $(,)?})?),* $(,)?
+    }) => {
+        impl $g.bound(Eq) Eq for $n $g.args {
+            fn eq(&self, other: &Self): bool {
+                return variant_index(self) == variant_index(other) && match self {
+                    $(
+                        $n::$var $(($(${concat(a, index())} ${ignore($vt)}),*))? $({$($vf: ${concat(a_, $vf)}),*})? => match other {
+                            $n::$var $(($(${concat(b, index())} ${ignore($vt)}),*))? $({$($vf: ${concat(b_, $vf)}),*})? => {
+                                true
+                                $($(&& ${concat(a, index())} == ${concat(b, index())} ${ignore($vt)})*)?
+                                $($(&& ${concat(a_, $vf)} == ${concat(b_, $vf)})*)?
+                            }
+                            _ => false,
+                        },
+                    )*
+                };
+            }
+        }
+
+        fn variant_index $g (x: &$n $g.args): usize {
+            return match x {
+                $($n::$var $((.. ${ignore($vt)}))? $({ .. ${ignore($vf)} })? => ${index()}),*
+            };
+        }
+    },
+}
+
+/// `#[derive(Ord)]`: compares field by field in declaration order; enums
+/// first by variant (in declaration order), then by fields. Needs `Eq` too.
+#[derive_macro]
+pub macro Ord {
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics { $($(#[$fm:meta])* $fv:vis $f:ident: $ft:ty),* $(,)? }) => {
+        impl $g.bound(Ord) Ord for $n $g.args {
+            fn cmp(&self, other: &Self): Ordering {
+                $(
+                    let c = self.$f.cmp(&other.$f);
+                    if c != Ordering::Equal {
+                        return c;
+                    }
+                )*
+                return Ordering::Equal;
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics ($($(#[$fm:meta])* $fv:vis $ft:ty),* $(,)?);) => {
+        impl $g.bound(Ord) Ord for $n $g.args {
+            fn cmp(&self, other: &Self): Ordering {
+                $(
+                    let c = self.${index()}.cmp(&other.${index()});
+                    if c != Ordering::Equal {
+                        return c;
+                    }
+                    ${ignore($ft)}
+                )*
+                return Ordering::Equal;
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics;) => {
+        impl $g.bound(Ord) Ord for $n $g.args {
+            fn cmp(&self, other: &Self): Ordering {
+                return Ordering::Equal;
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis enum $n:ident $g:generics {
+        $($(#[$vm:meta])* $var:ident $(($($vt:ty),* $(,)?))? $({$($vf:ident: $vft:ty),* $(,)?})?),* $(,)?
+    }) => {
+        impl $g.bound(Ord) Ord for $n $g.args {
+            fn cmp(&self, other: &Self): Ordering {
+                let (i, j) = (variant_index(self), variant_index(other));
+                if i != j {
+                    return i.cmp(&j);
+                }
+                return match self {
+                    $(
+                        $n::$var $(($(${concat(a, index())} ${ignore($vt)}),*))? $({$($vf: ${concat(a_, $vf)}),*})? => match other {
+                            $n::$var $(($(${concat(b, index())} ${ignore($vt)}),*))? $({$($vf: ${concat(b_, $vf)}),*})? => {
+                                $($(
+                                    let c = ${concat(a, index())}.cmp(&${concat(b, index())});
+                                    if c != Ordering::Equal {
+                                        return c;
+                                    }
+                                    ${ignore($vt)}
+                                )*)?
+                                $($(
+                                    let c = ${concat(a_, $vf)}.cmp(&${concat(b_, $vf)});
+                                    if c != Ordering::Equal {
+                                        return c;
+                                    }
+                                )*)?
+                                Ordering::Equal
+                            }
+                            _ => Ordering::Equal,
+                        },
+                    )*
+                };
+            }
+        }
+
+        fn variant_index $g (x: &$n $g.args): usize {
+            return match x {
+                $($n::$var $((.. ${ignore($vt)}))? $({ .. ${ignore($vf)} })? => ${index()}),*
+            };
+        }
+    },
 }

@@ -117,7 +117,8 @@ impl Arg {
 #[derive(Clone, Debug)]
 pub enum FmtPiece {
     Text(String),
-    Arg(Expr),
+    /// A value, shown with `Display` or (for `{x:?}`) `Debug`.
+    Arg(Expr, ln_ast::FmtSpec),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

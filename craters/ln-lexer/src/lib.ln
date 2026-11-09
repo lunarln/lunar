@@ -10,11 +10,13 @@
 // is expected.
 
 /// Classification of a numeric literal.
+#[derive(Debug, Eq)]
 pub enum NumKind {
     Int,
     Float,
 }
 
+#[derive(Debug, Eq)]
 pub enum Token {
     // ----- delimiters -----
     LParen,
@@ -122,23 +124,27 @@ pub enum Token {
 }
 
 /// A byte range in the source: `start..end`.
+#[derive(Debug, Eq)]
 pub struct Range {
     pub start: usize,
     pub end: usize,
 }
 
 /// A lexed token and its byte range in the source.
+#[derive(Debug, Eq)]
 pub struct Spanned {
     pub token: Token,
     pub range: Range,
 }
 
 /// A character sequence the lexer could not understand.
+#[derive(Debug, Eq)]
 pub struct LexError {
     pub range: Range,
     pub kind: LexErrorKind,
 }
 
+#[derive(Debug, Eq)]
 pub enum LexErrorKind {
     /// Characters that start no token (or a malformed literal).
     Invalid,
@@ -540,6 +546,7 @@ fn is_hex(c: u8): bool {
 /// A version control conflict region left in a file by an unfinished merge
 /// or rebase. Each field is the byte range of a marker line (without its
 /// newline).
+#[derive(Debug, Eq)]
 pub struct Conflict {
     /// `<<<<<<< ours`
     pub start: Range,
@@ -744,123 +751,19 @@ impl Token {
         };
     }
 
-    /// The token's name as `ln-lexer` prints it (Rust's `Debug` form).
-    pub fn name(self): str {
-        return match self {
-            Token::LParen => "LParen",
-            Token::RParen => "RParen",
-            Token::LBracket => "LBracket",
-            Token::RBracket => "RBracket",
-            Token::LBrace => "LBrace",
-            Token::RBrace => "RBrace",
-            Token::LAngle => "LAngle",
-            Token::RAngle => "RAngle",
-            Token::Le => "Le",
-            Token::Shl => "Shl",
-            Token::ShlEq => "ShlEq",
-            Token::PathSep => "PathSep",
-            Token::Colon => "Colon",
-            Token::Semi => "Semi",
-            Token::Comma => "Comma",
-            Token::Dot => "Dot",
-            Token::DotDot => "DotDot",
-            Token::DotDotEq => "DotDotEq",
-            Token::DotDotDot => "DotDotDot",
-            Token::EqEq => "EqEq",
-            Token::BangEq => "BangEq",
-            Token::Eq => "Eq",
-            Token::FatArrow => "FatArrow",
-            Token::Arrow => "Arrow",
-            Token::Bang => "Bang",
-            Token::AmpAmp => "AmpAmp",
-            Token::Amp => "Amp",
-            Token::AmpEq => "AmpEq",
-            Token::PipePipe => "PipePipe",
-            Token::Pipe => "Pipe",
-            Token::PipeEq => "PipeEq",
-            Token::Caret => "Caret",
-            Token::CaretEq => "CaretEq",
-            Token::Plus => "Plus",
-            Token::PlusEq => "PlusEq",
-            Token::Minus => "Minus",
-            Token::MinusEq => "MinusEq",
-            Token::Star => "Star",
-            Token::StarEq => "StarEq",
-            Token::Slash => "Slash",
-            Token::SlashEq => "SlashEq",
-            Token::Percent => "Percent",
-            Token::PercentEq => "PercentEq",
-            Token::Tilde => "Tilde",
-            Token::Question => "Question",
-            Token::Hash => "Hash",
-            Token::At => "At",
-            Token::Dollar => "Dollar",
-            Token::Placeholder => "Placeholder",
-            Token::As => "As",
-            Token::Break => "Break",
-            Token::Const => "Const",
-            Token::Continue => "Continue",
-            Token::Crater => "Crater",
-            Token::Else => "Else",
-            Token::Enum => "Enum",
-            Token::Extern => "Extern",
-            Token::False => "False",
-            Token::Fn => "Fn",
-            Token::For => "For",
-            Token::If => "If",
-            Token::Impl => "Impl",
-            Token::In => "In",
-            Token::Let => "Let",
-            Token::Loop => "Loop",
-            Token::Macro => "Macro",
-            Token::Match => "Match",
-            Token::Mod => "Mod",
-            Token::Mut => "Mut",
-            Token::Pub => "Pub",
-            Token::Return => "Return",
-            Token::SelfValue => "SelfValue",
-            Token::SelfType => "SelfType",
-            Token::Static => "Static",
-            Token::Struct => "Struct",
-            Token::Super => "Super",
-            Token::Trait => "Trait",
-            Token::True => "True",
-            Token::Type => "Type",
-            Token::Unsafe => "Unsafe",
-            Token::Use => "Use",
-            Token::While => "While",
-            Token::Ident => "Ident",
-            Token::Number(NumKind::Int) => "Number(Int)",
-            Token::Number(NumKind::Float) => "Number(Float)",
-            Token::Str => "Str",
-            Token::Char => "Char",
-            Token::Byte => "Byte",
-            Token::DocComment => "DocComment",
-            Token::BlockComment => "BlockComment",
-        };
-    }
-}
-
-impl LexErrorKind {
-    /// The kind's name as `ln-lexer` prints it.
-    pub fn name(self): str {
-        return match self {
-            LexErrorKind::Invalid => "Invalid",
-            LexErrorKind::UnterminatedComment => "UnterminatedComment",
-        };
-    }
 }
 
 /// Everything the lexer finds in `src`, one per line, in the format
-/// crates/ln-driver/tests/selfhost.rs compares against `ln-lexer`:
-/// `Ident 0 3`, `error Invalid 4 5`, `conflict 0..12 - 20..27 40..53`.
+/// crates/ln-driver/tests/selfhost.rs compares against `ln-lexer` (whose
+/// `Debug` output the derived `Debug` matches): `Ident 0 3`,
+/// `error Invalid 4 5`, `conflict 0..12 - 20..27 40..53`.
 pub fn dump(src: str, out: &mut String) {
     let (toks, errs) = lex(src);
     for t in toks {
-        out.write("{t.token.name()} {t.range.start} {t.range.end}\n");
+        out.write("{t.token:?} {t.range.start} {t.range.end}\n");
     }
     for e in errs {
-        out.write("error {e.kind.name()} {e.range.start} {e.range.end}\n");
+        out.write("error {e.kind:?} {e.range.start} {e.range.end}\n");
     }
     for c in conflict_markers(src) {
         out.write("conflict {c.start.start}..{c.start.end}");
@@ -880,97 +783,90 @@ fn dump_range(r: Option::<Range>, out: &mut String) {
 
 // ===================================================================== tests
 
-/// The token names of `src`, space-separated; there must be no errors.
+/// The tokens of `src`, as their `Debug` names separated by spaces; there
+/// must be no errors.
 fn kinds(src: str): String {
     let (toks, errs) = lex(src);
-    std::test::assert_eq(&errs.len(), &0, "lex errors");
+    assert_eq!(errs.len(), 0, "lex errors");
     let mut out = String::new();
     for t in toks {
         if !out.is_empty() {
             out.push(' ');
         }
-        out.push_str(t.token.name());
+        out.write("{t.token:?}");
     }
     return out;
 }
 
 #[test]
 fn numbers_and_ranges() {
-    std::test::assert_eq(&kinds("0..200").as_str(), &"Number(Int) DotDot Number(Int)", "range");
-    std::test::assert_eq(&kinds("0.").as_str(), &"Number(Float)", "trailing dot");
-    std::test::assert_eq(&kinds("[0.; 8]").as_str(), &"LBracket Number(Float) Semi Number(Int) RBracket", "float in array");
-    std::test::assert_eq(
-        &kinds("1.5e3 2e-1 7u8 1f32 0xffu8").as_str(),
-        &"Number(Float) Number(Float) Number(Int) Number(Float) Number(Int)",
-        "exponents and suffixes",
-    );
-    std::test::assert_eq(&kinds("x.0").as_str(), &"Ident Dot Number(Int)", "tuple field");
-    std::test::assert_eq(&kinds("1.max").as_str(), &"Number(Int) Dot Ident", "method on an integer");
+    assert_eq!(kinds("0..200").as_str(), "Number(Int) DotDot Number(Int)");
+    assert_eq!(kinds("0.").as_str(), "Number(Float)");
+    assert_eq!(kinds("[0.; 8]").as_str(), "LBracket Number(Float) Semi Number(Int) RBracket");
+    assert_eq!(kinds("1.5e3 2e-1 7u8 1f32 0xffu8").as_str(), "Number(Float) Number(Float) Number(Int) Number(Float) Number(Int)");
+    assert_eq!(kinds("x.0").as_str(), "Ident Dot Number(Int)");
+    assert_eq!(kinds("1.max").as_str(), "Number(Int) Dot Ident");
 }
 
 #[test]
 fn array_types() {
-    std::test::assert_eq(&kinds("[T; -..+]").as_str(), &"LBracket Ident Semi Minus DotDot Plus RBracket", "growable");
-    std::test::assert_eq(&kinds("![T; &mut]").as_str(), &"Bang LBracket Ident Semi Amp Mut RBracket", "mutable slice");
+    assert_eq!(kinds("[T; -..+]").as_str(), "LBracket Ident Semi Minus DotDot Plus RBracket");
+    assert_eq!(kinds("![T; &mut]").as_str(), "Bang LBracket Ident Semi Amp Mut RBracket");
 }
 
 #[test]
 fn comments_and_strings() {
-    std::test::assert_eq(&kinds("/* a /* b */ c */ x // y\n\"s\\\"{x}\" 'a' '\\n'").as_str(), &"Ident Str Char Char", "comments");
-    std::test::assert_eq(&kinds("b'a' b'\\xff' b 'c' b2'd'").as_str(), &"Byte Byte Ident Char Ident Char", "bytes");
+    assert_eq!(kinds("/* a /* b */ c */ x // y\n\"s\\\"{x}\" 'a' '\\n'").as_str(), "Ident Str Char Char");
+    assert_eq!(kinds("b'a' b'\\xff' b 'c' b2'd'").as_str(), "Byte Byte Ident Char Ident Char");
 }
 
 #[test]
 fn doc_comments() {
-    std::test::assert_eq(&kinds("/// docs\nfn").as_str(), &"DocComment Fn", "docs");
-    std::test::assert_eq(&kinds("///\nx").as_str(), &"DocComment Ident", "empty docs");
-    std::test::assert_eq(&kinds("//// not docs\n// nor this\nx").as_str(), &"Ident", "not docs");
+    assert_eq!(kinds("/// docs\nfn").as_str(), "DocComment Fn");
+    assert_eq!(kinds("///\nx").as_str(), "DocComment Ident");
+    assert_eq!(kinds("//// not docs\n// nor this\nx").as_str(), "Ident");
     let (toks, _) = lex("/// a b\n");
-    std::test::assert_eq(&toks[0].range.start, &0, "doc start");
-    std::test::assert_eq(&toks[0].range.end, &7, "doc end");
+    assert_eq!(toks[0].range, Range { start: 0, end: 7 });
 }
 
 #[test]
 fn generics_do_not_fuse_closers() {
-    std::test::assert_eq(&kinds("A::<B::<C>>").as_str(), &"Ident PathSep LAngle Ident PathSep LAngle Ident RAngle RAngle", "closers");
+    assert_eq!(kinds("A::<B::<C>>").as_str(), "Ident PathSep LAngle Ident PathSep LAngle Ident RAngle RAngle");
 }
 
 #[test]
 fn macros() {
-    std::test::assert_eq(
-        &kinds("macro m($x:expr) { $($x),* }").as_str(),
-        &"Macro Ident LParen Dollar Ident Colon Ident RParen LBrace Dollar LParen Dollar Ident RParen Comma Star RBrace",
-        "macro definition",
+    assert_eq!(
+        kinds("macro m($x:expr) { $($x),* }").as_str(),
+        "Macro Ident LParen Dollar Ident Colon Ident RParen LBrace Dollar LParen Dollar Ident RParen Comma Star RBrace",
     );
-    std::test::assert_eq(&kinds("vec![1] macros").as_str(), &"Ident Bang LBracket Number(Int) RBracket Ident", "invocation");
+    assert_eq!(kinds("vec![1] macros").as_str(), "Ident Bang LBracket Number(Int) RBracket Ident");
 }
 
 #[test]
 fn unterminated_block_comment() {
     let (toks, errs) = lex("a /* x /* y */ b");
-    std::test::assert_eq(&toks.len(), &1, "only `a`");
-    std::test::assert_eq(&errs.len(), &1, "one error");
-    std::test::assert_eq(&errs[0].range.start, &2, "from the `/*`");
-    std::test::assert_eq(&errs[0].range.end, &16, "to the end");
-    std::test::assert_eq(&errs[0].kind.name(), &"UnterminatedComment", "kind");
+    assert_eq!(toks.len(), 1);
+    assert_eq!(errs.len(), 1);
+    assert_eq!(errs[0], LexError { range: Range { start: 2, end: 16 }, kind: LexErrorKind::UnterminatedComment });
     let (_, errs) = lex("a /* x /* y */ b */ c");
-    std::test::assert_eq(&errs.len(), &0, "closed");
+    assert_eq!(errs.len(), 0);
 }
 
 #[test]
 fn conflict_markers_found_only_at_line_start() {
     let src = "fn f() {\n<<<<<<< HEAD\n    1\n=======\n    2\n>>>>>>> topic\n}\n";
     let c = conflict_markers(src);
-    std::test::assert_eq(&c.len(), &1, "one conflict");
-    std::test::assert_eq(&src[c[0].start.start..c[0].start.end], &"<<<<<<< HEAD", "start");
+    assert_eq!(c.len(), 1);
+    assert_eq!(src[c[0].start.start..c[0].start.end], "<<<<<<< HEAD");
     let mid = c[0].mid.unwrap();
-    std::test::assert_eq(&src[mid.start..mid.end], &"=======", "mid");
+    assert_eq!(src[mid.start..mid.end], "=======");
     let end = c[0].end.unwrap();
-    std::test::assert_eq(&src[end.start..end.end], &">>>>>>> topic", "end");
+    assert_eq!(src[end.start..end.end], ">>>>>>> topic");
     // CRLF line endings.
-    std::test::assert_eq(&conflict_markers("fn f() {\r\n<<<<<<< HEAD\r\n    1\r\n=======\r\n    2\r\n>>>>>>> topic\r\n}\r\n").len(), &1, "CRLF");
+    assert_eq!(conflict_markers("fn f() {\r\n<<<<<<< HEAD\r\n    1\r\n=======\r\n    2\r\n>>>>>>> topic\r\n}\r\n").len(), 1);
     // Not markers: indented, too many characters, inside an expression.
-    std::test::assert_eq(&conflict_markers("  <<<<<<< x\n========\na <<<<<<< b\n").len(), &0, "not markers");
+    assert_eq!(conflict_markers("  <<<<<<< x\n========\na <<<<<<< b\n").len(), 0);
     // A stray marker on its own is still reported.
-    std::test::assert_eq(&conflict_markers("x\n>>>>>>> other\n").len(), &1, "stray marker");
+    assert_eq!(conflict_markers("x\n>>>>>>> other\n").len(), 1);
 }

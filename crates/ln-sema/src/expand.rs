@@ -332,7 +332,13 @@ fn render(toks: &[Tt]) -> (String, Vec<u32>, Ctxs) {
 fn match_frag(kind: Frag, input: &[TokenTree]) -> Option<(usize, Fragment)> {
     let take = |n: usize, params| Some((n, Fragment { kind, trees: input[..n].to_vec(), params }));
     match kind {
-        Frag::Tt => input.first().and(take(1, Vec::new())),
+        Frag::Tt => {
+            if input.is_empty() {
+                None
+            } else {
+                take(1, Vec::new())
+            }
+        }
         Frag::Ident => match input.first()? {
             TokenTree::Token(t) if t.kind == T::Ident => take(1, Vec::new()),
             _ => None,
@@ -461,6 +467,8 @@ struct Transcriber<'b> {
     mark: SyntaxCtx,
     call: Span,
     out: &'b mut Vec<Tt>,
+    /// The index of each enclosing repetition, innermost last.
+    indices: Vec<usize>,
 }
 
 impl Transcriber<'_> {
@@ -468,10 +476,94 @@ impl Transcriber<'_> {
         self.out.push(Tt { ctx: self.mark, ..t.clone() });
     }
 
+    /// The text of a `${concat(...)}` part: an identifier, a literal, an
+    /// `ident` or `lit` variable, or `index()`.
+    fn concat_part(&self, args: &[TokenTree], i: &mut usize, b: &Bindings) -> Result<String, MacroError> {
+        let bad = |span: Span| (mc::BAD_MATCHER, span, "`${concat(...)}` takes identifiers, literals, `$x` variables and `index()`".to_string());
+        match (&args[*i], args.get(*i + 1)) {
+            (TokenTree::Token(d), Some(TokenTree::Token(n))) if d.kind == T::Dollar => {
+                *i += 2;
+                match b.get(&n.text) {
+                    Some(Bound::Frag(f)) if f.trees.len() == 1 => match &f.trees[0] {
+                        TokenTree::Token(t) => Ok(t.text.trim_matches('"').to_string()),
+                        g => Err(bad(g.span())),
+                    },
+                    _ => Err((mc::BAD_MATCHER, n.span, format!("`${}` in `${{concat(...)}}` must be a single matched identifier or literal", n.text))),
+                }
+            }
+            (TokenTree::Token(n), Some(TokenTree::Group { delim: Delim::Paren, trees, .. })) if n.text == "index" && trees.is_empty() => {
+                *i += 2;
+                self.indices
+                    .last()
+                    .map(|k| k.to_string())
+                    .ok_or_else(|| (mc::REPETITION, n.span, "`index()` is only meaningful inside a repetition".to_string()))
+            }
+            (TokenTree::Token(t), _) if matches!(t.kind, T::Ident | T::Number(_) | T::Str) => {
+                *i += 1;
+                Ok(t.text.trim_matches('"').to_string())
+            }
+            (t, _) => Err(bad(t.span())),
+        }
+    }
+
+    /// A metavariable expression `${name(args)}`: `index()`, `ignore($x)`,
+    /// `concat(...)`, `stringify(...)` or `error("...")`.
+    fn meta_expr(&mut self, group: &TokenTree, b: &Bindings) -> Result<(), MacroError> {
+        let TokenTree::Group { trees, open, .. } = group else { unreachable!("called on a brace group") };
+        let (Some(TokenTree::Token(name)), Some(TokenTree::Group { delim: Delim::Paren, trees: args, .. }), None) = (trees.first(), trees.get(1), trees.get(2))
+        else {
+            return Err((mc::BAD_MATCHER, *open, "write a metavariable expression as `${name(...)}`".into()));
+        };
+        let (mark, call) = (self.mark, self.call);
+        match name.text.as_str() {
+            "index" => {
+                let k = self.indices.last().ok_or_else(|| (mc::REPETITION, name.span, "`${index()}` is only meaningful inside a repetition".to_string()))?;
+                self.out.push(made(T::Number(ln_lexer::NumKind::Int), &k.to_string(), call, mark));
+            }
+            "ignore" => {}
+            "concat" => {
+                let mut text = String::new();
+                let mut i = 0;
+                while i < args.len() {
+                    text.push_str(&self.concat_part(args, &mut i, b)?);
+                    if matches!(args.get(i), Some(TokenTree::Token(t)) if t.kind == T::Comma) {
+                        i += 1;
+                    }
+                }
+                if !(text.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
+                    return Err((mc::BAD_MATCHER, name.span, format!("`${{concat(...)}}` made `{text}`, which is not an identifier")));
+                }
+                self.out.push(made(T::Ident, &text, call, mark));
+            }
+            "stringify" => {
+                let mut toks = Vec::new();
+                Transcriber { mark, call, out: &mut toks, indices: self.indices.clone() }.body(args, b)?;
+                let trees: Vec<TokenTree> = toks.into_iter().map(TokenTree::Token).collect();
+                let text = ast::pretty::tokens(&trees);
+                self.out.push(made(T::Str, &format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\"")), call, mark));
+            }
+            "error" => {
+                let msg = match args.as_slice() {
+                    [TokenTree::Token(t)] if t.kind == T::Str => t.text.trim_matches('"').replace("\\\"", "\""),
+                    _ => return Err((mc::BAD_MATCHER, name.span, "write `${error(\"message\")}`".into())),
+                };
+                return Err((mc::ERROR, call, msg));
+            }
+            other => {
+                return Err((mc::BAD_MATCHER, name.span, format!("unknown metavariable expression `{other}`; use index, ignore, concat, stringify or error")));
+            }
+        }
+        Ok(())
+    }
+
     fn body(&mut self, body: &[TokenTree], b: &Bindings) -> Result<(), MacroError> {
         let mut i = 0;
         while i < body.len() {
             match &body[i] {
+                TokenTree::Token(t) if t.kind == T::Dollar && matches!(body.get(i + 1), Some(TokenTree::Group { delim: Delim::Brace, .. })) => {
+                    self.meta_expr(&body[i + 1], b)?;
+                    i += 2;
+                }
                 TokenTree::Token(t) if t.kind == T::Dollar => match body.get(i + 1) {
                     Some(TokenTree::Token(n)) => {
                         let frag = match b.get(&n.text) {
@@ -506,7 +598,7 @@ impl Transcriber<'_> {
                                 };
                                 i += 3;
                                 let mut bound = Vec::new();
-                                Transcriber { mark: self.mark, call: self.call, out: &mut bound }.body(trees, b)?;
+                                Transcriber { mark: self.mark, call: self.call, out: &mut bound, indices: self.indices.clone() }.body(trees, b)?;
                                 self.generics(frag, Some(bound));
                             }
                             _ => self.fragment(frag),
@@ -548,7 +640,10 @@ impl Transcriber<'_> {
                                     ib.insert(n.clone(), v[k].clone());
                                 }
                             }
-                            self.body(inner, &ib)?;
+                            self.indices.push(k);
+                            let r = self.body(inner, &ib);
+                            self.indices.pop();
+                            r?;
                         }
                     }
                     _ => return Err((mc::BAD_MATCHER, t.span, "`$` must be followed by a matched name or a repetition `$( ... )`".into())),
@@ -731,10 +826,14 @@ impl<'a> Sema<'a> {
             }
         }
         let Some((body, bindings)) = found else {
-            self.err(
+            let d = if derive {
+                Diagnostic::error(mc::NO_MATCH, call, format!("`#[derive({name})]` does not apply to this item"))
+                    .with_note(format!("no rule of the derive macro `{name}` matches it"))
+            } else {
                 Diagnostic::error(mc::NO_MATCH, call, format!("no rule of `{name}!` matches these tokens"))
-                    .with_note(format!("`{name}!` has {n} rule{}; each is tried in order", if n == 1 { "" } else { "s" })),
-            );
+                    .with_note(format!("`{name}!` has {n} rule{}; each is tried in order", if n == 1 { "" } else { "s" }))
+            };
+            self.err(d);
             return None;
         };
         let AstRef::Macro(m) = self.asts[def.0 as usize] else { return None };
@@ -744,8 +843,10 @@ impl<'a> Sema<'a> {
         if kind == ExpansionKind::Expr {
             toks.push(made(T::LBrace, "{", Span::DUMMY, mark));
         }
-        if let Err((code, span, msg)) = (Transcriber { mark, call, out: &mut toks }).body(body, &bindings) {
-            self.err(Diagnostic::error(code, span, msg).with_secondary(call, format!("in this expansion of `{name}!`")));
+        if let Err((code, span, msg)) = (Transcriber { mark, call, out: &mut toks, indices: Vec::new() }).body(body, &bindings) {
+            let d = Diagnostic::error(code, span, msg);
+            // A macro's own `${error(..)}` is already reported at the call.
+            self.err(if span == call { d } else { d.with_secondary(call, format!("in this expansion of `{name}!`")) });
             return None;
         }
         if kind == ExpansionKind::Expr {

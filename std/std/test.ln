@@ -1,5 +1,6 @@
 // Helpers for `#[test]` functions. A failing assertion panics, which fails
-// the test.
+// the test. The macros (`assert_eq!(a, b)`) lend their arguments and
+// describe the assertion themselves; the functions are what they call.
 
 pub fn assert(cond: bool, msg: str) {
     if !cond {
@@ -7,14 +8,44 @@ pub fn assert(cond: bool, msg: str) {
     }
 }
 
-pub fn assert_eq::<T: Eq + core::fmt::Display>(left: &T, right: &T, msg: str) {
+pub fn assert_eq::<T: Eq + core::fmt::Debug>(left: &T, right: &T, msg: str) {
     if !(left == right) {
-        panic("assertion failed: {msg}\n  left: {left}\n right: {right}");
+        panic("assertion failed: {msg}\n  left: {left:?}\n right: {right:?}");
     }
 }
 
-pub fn assert_ne::<T: Eq + core::fmt::Display>(left: &T, right: &T, msg: str) {
+pub fn assert_ne::<T: Eq + core::fmt::Debug>(left: &T, right: &T, msg: str) {
     if left == right {
-        panic("assertion failed: {msg}\n  both: {left}");
+        panic("assertion failed: {msg}\n  both: {left:?}");
     }
+}
+
+/// `assert!(cond)` or `assert!(cond, "message")`.
+pub macro assert {
+    ($cond:expr $(,)?) => {
+        crater::test::assert($cond, ${stringify($cond)})
+    },
+    ($cond:expr, $msg:expr $(,)?) => {
+        crater::test::assert($cond, $msg)
+    },
+}
+
+/// `assert_eq!(left, right)` or `assert_eq!(left, right, "message")`.
+pub macro assert_eq {
+    ($left:expr, $right:expr $(,)?) => {
+        crater::test::assert_eq(&$left, &$right, ${stringify($left == $right)})
+    },
+    ($left:expr, $right:expr, $msg:expr $(,)?) => {
+        crater::test::assert_eq(&$left, &$right, $msg)
+    },
+}
+
+/// `assert_ne!(left, right)` or `assert_ne!(left, right, "message")`.
+pub macro assert_ne {
+    ($left:expr, $right:expr $(,)?) => {
+        crater::test::assert_ne(&$left, &$right, ${stringify($left != $right)})
+    },
+    ($left:expr, $right:expr, $msg:expr $(,)?) => {
+        crater::test::assert_ne(&$left, &$right, $msg)
+    },
 }

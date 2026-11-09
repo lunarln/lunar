@@ -95,7 +95,12 @@ impl<'a> Sema<'a> {
                     // Lints on a function with borrow errors would only add
                     // noise (and may be wrong about code that will change).
                     if !is_std && self.diags.error_count() == errs_before {
-                        crate::borrowck::lint(&b, &mut self.diags);
+                        let mut lints = ln_diag::Diagnostics::new();
+                        crate::borrowck::lint(&b, &mut lints);
+                        // Through `err`, which drops lints inside expansions.
+                        for d in lints.into_vec() {
+                            self.err(d);
+                        }
                     }
                 }
                 self.p.bodies.insert(id, b);
@@ -883,7 +888,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             K::Coerce { expr, .. } => self.zonk_expr(expr),
             K::FmtArgs(pieces) => {
                 for p in pieces {
-                    if let thir::FmtPiece::Arg(x) = p {
+                    if let thir::FmtPiece::Arg(x, _) = p {
                         self.zonk_expr(x);
                     }
                 }

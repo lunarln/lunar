@@ -1,0 +1,7 @@
+false true true Version { major: 0, minor: 0 }
+true Pair(0, 0) true
+Mid true Mid
+true false true true
+Line { from: 1, to: 2 }
+true Named { name: "x", n: 1 } Named { name: "", n: 0 }
+[1, 2, 3] Some(4) 2.5

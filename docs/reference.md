@@ -379,7 +379,7 @@ alone lists every code. The explanations are the files in
 
 * `core::ptr::Dull`, `core::ops`, `core::cmp::{Eq, Ord, Ordering, min, max}`,
   `core::clone::Clone`, `core::default::Default`,
-  `core::fmt::{Display, write, format}`, `core::option::Option`,
+  `core::fmt::{Display, Debug, write, format}`, `core::option::Option`,
   `core::result::Result`, `core::iter::Iterator`, `core::num::{Int, Float}`,
   `core::mem::{size_of, align_of, swap}`, `core::intrinsics`.
 * Methods on slices (`len`, `get`, `first`, `last`, `contains`, `index_of`,
@@ -396,9 +396,20 @@ alone lists every code. The explanations are the files in
   path, returning `Result::<_, io::Error>`; `read_to_string` fails with
   `ErrorKind::InvalidData` on text that is not UTF-8,
   `std::math` (`pow`, `min`, `max`, `clamp`, float functions),
-  `std::test::{assert, assert_eq, assert_ne}`,
+  `std::test::{assert, assert_eq, assert_ne}` (functions taking `&T`, and
+  the macros `assert!(c)`, `assert_eq!(a, b)`, `assert_ne!(a, b)`, which
+  lend their arguments and describe the assertion),
   `std::process::{exit, abort, panic}`, `std::env::{arg_count, arg}`.
 * The prelude provides `Dull`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`,
-  `Eq`, `Ord`, `Ordering`, `Clone`, `Default`, `Display`, `Iterator`,
-  `print`, `println`, `eprint`, `eprintln`, `panic`, `assert` and
-  `assert_eq`.
+  `Eq`, `Ord`, `Ordering`, `Clone`, `Default`, `Display`, `Debug`,
+  `Iterator`, `print`, `println`, `eprint`, `eprintln`, `panic`, `assert`,
+  `assert_eq` and `assert_ne`, with the derives and macros of the same
+  names.
+* Format strings: `{x}` uses `Display`, `{x:?}` uses `Debug` (strings and
+  characters quoted and escaped, arrays as `[1, 2]`, derived types as
+  `Point { x: 1, y: 2 }`).
+* Derives in `core`: `#[derive(Eq, Ord, Debug, Clone, Default)]` on structs
+  and enums (`Default` uses the variant marked `#[default]`), and
+  `#[derive(Display)]` on enums whose variants have no fields. They are
+  ordinary macros (`core/cmp.ln`, `core/fmt.ln`, ...), not built into the
+  compiler.

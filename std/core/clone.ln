@@ -5,3 +5,47 @@
 pub trait Clone {
     fn clone(&self): Self;
 }
+
+/// `#[derive(Clone)]`: clones every field. (Dull types are cloned natively
+/// and need no derive.) An enum's fields must be `Dull`.
+#[derive_macro]
+pub macro Clone {
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics { $($(#[$fm:meta])* $fv:vis $f:ident: $ft:ty),* $(,)? }) => {
+        impl $g.bound(Clone) Clone for $n $g.args {
+            fn clone(&self): Self {
+                return $n { $($f: self.$f.clone()),* };
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics ($($(#[$fm:meta])* $fv:vis $ft:ty),* $(,)?);) => {
+        impl $g.bound(Clone) Clone for $n $g.args {
+            fn clone(&self): Self {
+                return $n($(self.${index()}.clone() ${ignore($ft)}),*);
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics;) => {
+        impl $g.bound(Clone) Clone for $n $g.args {
+            fn clone(&self): Self {
+                return $n;
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis enum $n:ident $g:generics {
+        $($(#[$vm:meta])* $var:ident $(($($vt:ty),* $(,)?))? $({$($vf:ident: $vft:ty),* $(,)?})?),* $(,)?
+    }) => {
+        impl $g.bound(Clone) Clone for $n $g.args {
+            fn clone(&self): Self {
+                return match self {
+                    $(
+                        $n::$var $(($(${concat(a, index())} ${ignore($vt)}),*))? $({$($vf: ${concat(a_, $vf)}),*})? => {
+                            $n::$var
+                            $(($(${concat(a, index())}.clone() ${ignore($vt)}),*))?
+                            $({$($vf: ${concat(a_, $vf)}.clone()),*})?
+                        }
+                    )*
+                };
+            }
+        }
+    },
+}

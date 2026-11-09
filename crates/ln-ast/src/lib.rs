@@ -285,7 +285,8 @@ pub struct EnumDecl {
 
 #[derive(Clone, Debug)]
 pub struct VariantDecl {
-    /// Doc comments (`doc` attributes); variants take no other attributes.
+    /// Doc comments (`doc` attributes) and `#[default]` (for the `Default`
+    /// derive).
     pub attrs: Vec<Attr>,
     pub name: Ident,
     pub data: VariantData,
@@ -693,7 +694,15 @@ pub enum FmtString {
 #[derive(Clone, Debug)]
 pub enum FmtPiece {
     Text(String),
-    Expr(Box<Expr>),
+    Expr(Box<Expr>, FmtSpec),
+}
+
+/// How a format hole shows its value: `{x}` with `Display`, `{x:?}` with
+/// `Debug`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FmtSpec {
+    Display,
+    Debug,
 }
 
 // ===================================================================== patterns

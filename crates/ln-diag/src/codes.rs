@@ -112,6 +112,7 @@ codes! {
         RECURSION_LIMIT = "recursion_limit",
         DERIVE_OUTPUT = "derive_output",
         NOT_SUPPORTED = "not_supported",
+        ERROR = "error",
     }
     unsafe_ ("unsafe") => {
         OUTSIDE_UNSAFE = "outside_unsafe",

@@ -9,3 +9,53 @@ impl Default for String {
         return String::new();
     }
 }
+
+/// `#[derive(Default)]`: every field's default; for an enum, the variant
+/// marked `#[default]`, which must have no fields.
+#[derive_macro]
+pub macro Default {
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics { $($(#[$fm:meta])* $fv:vis $f:ident: $ft:ty),* $(,)? }) => {
+        impl $g.bound(Default) Default for $n $g.args {
+            fn default(): Self {
+                return $n { $($f: Default::default()),* };
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics ($($(#[$fm:meta])* $fv:vis $ft:ty),* $(,)?);) => {
+        impl $g.bound(Default) Default for $n $g.args {
+            fn default(): Self {
+                return $n($(Default::default() ${ignore($ft)}),*);
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics;) => {
+        impl $g.bound(Default) Default for $n $g.args {
+            fn default(): Self {
+                return $n;
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis enum $n:ident $g:generics { $($variants:tt)* }) => {
+        impl $g.bound(Default) Default for $n $g.args {
+            fn default(): Self {
+                return default_variant!($n; $($variants)*);
+            }
+        }
+    },
+}
+
+/// The variant of enum `$n` marked `#[default]`, from the enum's variants.
+macro default_variant {
+    ($n:ident; #[default] $(#[$m:meta])* $var:ident $(, $($rest:tt)*)?) => {
+        $n::$var
+    },
+    ($n:ident; #[$m:meta] $($rest:tt)*) => {
+        default_variant!($n; $($rest)*)
+    },
+    ($n:ident; $var:ident $(($($f:tt)*))? $({$($g:tt)*})? $(, $($rest:tt)*)?) => {
+        default_variant!($n; $($($rest)*)?)
+    },
+    ($n:ident;) => {
+        ${error("`#[derive(Default)]` on an enum needs one variant marked `#[default]`")}
+    },
+}

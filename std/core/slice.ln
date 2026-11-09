@@ -290,3 +290,47 @@ impl::<T: Dull> Clone for [T; -..+] {
         return out;
     }
 }
+
+/// `[1, 2, 3]`, each element with `Debug`.
+fn debug_items::<T: Dull + crater::fmt::Debug>(items: [T; &], out: &mut String) {
+    out.push('[');
+    let mut first = true;
+    for x in items {
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        x.debug(out);
+    }
+    out.push(']');
+}
+
+impl::<T: Dull + crater::fmt::Debug> crater::fmt::Debug for [T; &] {
+    fn debug(&self, out: &mut String) {
+        debug_items(self, out);
+    }
+}
+
+impl::<T: Dull + crater::fmt::Debug> crater::fmt::Debug for [T; &mut] {
+    fn debug(&self, out: &mut String) {
+        debug_items(self[..], out);
+    }
+}
+
+impl::<T: Dull + crater::fmt::Debug> crater::fmt::Debug for [T] {
+    fn debug(&self, out: &mut String) {
+        debug_items(self[..], out);
+    }
+}
+
+impl::<T: Dull + crater::fmt::Debug> crater::fmt::Debug for [T; ..+] {
+    fn debug(&self, out: &mut String) {
+        debug_items(self[..], out);
+    }
+}
+
+impl::<T: Dull + crater::fmt::Debug> crater::fmt::Debug for [T; -..+] {
+    fn debug(&self, out: &mut String) {
+        debug_items(self[..], out);
+    }
+}

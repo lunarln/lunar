@@ -495,17 +495,22 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             }
         };
         let display = lang_trait_ref(&self.s.p, "display");
+        let debug = lang_trait_ref(&self.s.p, "debug");
         let mut out = Vec::new();
         for p in pieces {
             match p {
                 ast::FmtPiece::Text(t) => out.push(FmtPiece::Text(t.clone())),
-                ast::FmtPiece::Expr(e) => {
+                ast::FmtPiece::Expr(e, spec) => {
                     let v = self.check_expr_borrow(e, None);
                     let v = self.auto_read_bang(v);
-                    if let Some(d) = &display {
-                        self.oblige(v.ty.clone(), d.clone(), e.span);
+                    let tr = match spec {
+                        ast::FmtSpec::Display => &display,
+                        ast::FmtSpec::Debug => &debug,
+                    };
+                    if let Some(t) = tr {
+                        self.oblige(v.ty.clone(), t.clone(), e.span);
                     }
-                    out.push(FmtPiece::Arg(v));
+                    out.push(FmtPiece::Arg(v, *spec));
                 }
             }
         }
@@ -596,7 +601,8 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             BinOp::Shl => ("shl", "shl"),
             BinOp::Shr => ("shr", "shr"),
             BinOp::Eq => ("eq", "eq"),
-            BinOp::Ne => ("eq", "ne"),
+            // `a != b` is `!(a == b)` (see `check_binary`).
+            BinOp::Ne => ("eq", "eq"),
             BinOp::Lt => ("ord", "lt"),
             BinOp::Le => ("ord", "le"),
             BinOp::Gt => ("ord", "gt"),

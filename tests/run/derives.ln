@@ -1,0 +1,52 @@
+#[derive(Eq, Ord, Debug, Clone, Default)]
+struct Version {
+    major: u32,
+    minor: u32,
+}
+
+#[derive(Eq, Ord, Debug, Clone, Default)]
+struct Pair(i32, i32);
+
+#[derive(Eq, Ord, Debug, Clone, Default)]
+struct Unit;
+
+#[derive(Eq, Ord, Debug, Clone, Default, Display)]
+enum Level {
+    Low,
+    #[default]
+    Mid,
+    High,
+}
+
+#[derive(Eq, Ord, Debug, Clone)]
+enum Shape {
+    Dot,
+    Circle(i32),
+    Line { from: i32, to: i32 },
+}
+
+#[derive(Eq, Debug, Default)]
+struct Named {
+    name: String,
+    n: i32,
+}
+
+fn main() {
+    let a = Version { major: 1, minor: 2 };
+    let b = Version { major: 1, minor: 3 };
+    println("{a == b} {a < b} {a == a.clone()} {Version::default():?}");
+    println("{Pair(1, 2) < Pair(1, 3)} {Pair::default():?} {Unit == Unit}");
+    println("{Level::default()} {Level::Low < Level::High} {Level::Mid:?}");
+    let s = Shape::Line { from: 1, to: 2 };
+    println("{s == Shape::Line { from: 1, to: 2 }} {s == Shape::Dot} {Shape::Circle(3) < Shape::Circle(4)} {Shape::Dot < s}");
+    println("{s.clone():?}");
+    let x = Named { name: String::from("x"), n: 1 };
+    let y = Named { name: String::from("x"), n: 1 };
+    println("{x == y} {x:?} {Named::default():?}");
+    assert_eq!(a.major, 1);
+    assert!(a < b);
+    assert_ne!(a, b, "versions differ");
+    let v: [i32; -..+] = [1, 2, 3];
+    let o: Option::<i32> = Some(4);
+    println("{v:?} {o:?} {2.5:?}");
+}

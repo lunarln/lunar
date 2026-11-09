@@ -622,7 +622,7 @@ fn hover_layouts_match_codegen() {
             }
             ExprKind::FmtArgs(pieces) => {
                 for x in pieces {
-                    if let FmtPiece::Arg(x) = x {
+                    if let FmtPiece::Arg(x, _) = x {
                         collect(x, out, p);
                     }
                 }

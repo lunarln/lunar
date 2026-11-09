@@ -66,3 +66,16 @@ impl::<T: crater::fmt::Display + Dull> crater::fmt::Display for Option::<T> {
         }
     }
 }
+
+impl::<T: crater::fmt::Debug + Dull> crater::fmt::Debug for Option::<T> {
+    fn debug(&self, out: &mut String) {
+        match self {
+            Option::Some(v) => {
+                out.push_str("Some(");
+                v.debug(out);
+                out.push(')');
+            }
+            Option::None => out.push_str("None"),
+        }
+    }
+}

@@ -1,10 +1,10 @@
 # Macros and derive
 
-Status: decided 2026-11-09. Sections 1 to 6 are implemented (the macro
-engine, hygiene, the macro namespace, expansion in every position,
-derives); sections 7 and 8 (`Debug`, `{x:?}` and the derives in `core`) are
-next. Not yet supported: items in a macro expanded in expression position
-(`macro::not_supported`).
+Status: decided and implemented 2026-11-09. Not yet supported: items in a
+macro expanded in expression position (`macro::not_supported`), and paths
+inside `#[derive(...)]` (name derives you have imported: `#[derive(Eq)]`).
+Derived `Eq`, `Ord`, `Debug` and `Clone` on enums bind each variant's
+fields, so those fields must be `Dull` (as for `core`'s own `Option`).
 
 The goal is that **no trait is derived by the compiler**. `Eq`, `Debug`,
 `Display`, `Clone`, `Default` and `Ord` are derived by ordinary macros
@@ -200,6 +200,22 @@ parameter list `::<T: A + B, U>` or nothing, and has projections:
 | `$g` | `::<T: Dull, U>` | nothing |
 | `$g.args` | `::<T, U>` | nothing |
 | `$g.bound(Eq)` | `::<T: Dull + Eq, U: Eq>` | nothing |
+
+## 6b. Metavariable expressions
+
+As in Rust, `${...}` in a body computes tokens instead of copying them.
+Derives need them to name and count fields:
+
+| Expression | Expands to |
+|---|---|
+| `${index()}` | the index of the innermost repetition, as an integer literal (`self.${index()}` is `self.0`, `self.1`, ...) |
+| `${ignore($x)}` | nothing; a repetition that uses it repeats once per match of `$x` |
+| `${concat(a, index())}` | one identifier made of identifiers, literals, `$x` (an `ident` or `lit`) and `index()`: `a0`, `a1` |
+| `${stringify(...)}` | a string literal of the tokens: `${stringify($n)}` is `"Point"` |
+| `${error("message")}` | nothing; the expansion fails with `macro::error` and the message |
+
+Identifiers made by `${concat(...)}` belong to the expansion (they are
+hygienic like the rest of the body).
 
 ## 7. Debug and `{x:?}`
 
