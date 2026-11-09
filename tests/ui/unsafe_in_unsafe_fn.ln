@@ -1,0 +1,8 @@
+// error: unsafe::in_unsafe_fn
+unsafe fn danger(p: *i32): i32 {
+    return *p;
+}
+fn main() {
+    let x = unsafe { danger(core::ptr::null()) };
+    let y = danger(core::ptr::null());
+}

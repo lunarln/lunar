@@ -1,0 +1,4 @@
+// error: type::bang_outside_param
+fn main() {
+    let x: ![i32; -..+] = [];
+}

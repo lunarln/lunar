@@ -1,0 +1,6 @@
+// error: borrow::use_after_move
+fn main() {
+    let a: [i32; ..+] = [1, 2];
+    let b = a;
+    let c = a;
+}

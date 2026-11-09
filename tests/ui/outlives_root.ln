@@ -1,0 +1,9 @@
+// error: borrow::outlives_root
+fn main() {
+    let mut outer: [u8; &] = [];
+    {
+        let inner: [u8; 3] = [1, 2, 3];
+        outer = inner[..];
+    }
+    println("{outer[0]}");
+}

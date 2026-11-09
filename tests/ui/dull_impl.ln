@@ -1,0 +1,5 @@
+// error: trait::dull_impl
+struct Foo { x: i32 }
+impl Dull for Foo {}
+impl !Dull for Foo {}
+fn main() {}
