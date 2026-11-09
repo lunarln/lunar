@@ -197,6 +197,11 @@ pub enum Token {
     /// `b'a'`: a `u8`.
     #[regex(r#"b'([^'\\\n]|\\[^\n][^'\n]*)'"#)]
     Byte,
+    /// `/// text`: documentation for the item that follows. Exactly three
+    /// slashes; `////` is an ordinary comment. The parser attaches it to the
+    /// next item as `#[doc = "text"]`.
+    #[regex(r"///([^/\n][^\n]*)?", priority = 10, allow_greedy = true)]
+    DocComment,
     #[token("/*", lex_block_comment)]
     BlockComment,
 }
@@ -485,6 +490,7 @@ impl Token {
             Str => "string literal",
             Char => "character literal",
             Byte => "byte literal",
+            DocComment => "doc comment",
             BlockComment => "comment",
         }
     }
@@ -531,6 +537,16 @@ mod tests {
         use Token::*;
         assert_eq!(kinds("/* a /* b */ c */ x // y\n\"s\\\"{x}\" 'a' '\\n'"), vec![Ident, Str, Char, Char]);
         assert_eq!(kinds("b'a' b'\\xff' b 'c' b2'd'"), vec![Byte, Byte, Ident, Char, Ident, Char]);
+    }
+
+    #[test]
+    fn doc_comments() {
+        use Token::*;
+        assert_eq!(kinds("/// docs\nfn"), vec![DocComment, Fn]);
+        assert_eq!(kinds("///\nx"), vec![DocComment, Ident]);
+        assert_eq!(kinds("//// not docs\n// nor this\nx"), vec![Ident]);
+        let (toks, _) = lex("/// a b\n");
+        assert_eq!(toks[0].range, 0..7);
     }
 
     #[test]

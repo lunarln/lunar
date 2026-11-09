@@ -13,9 +13,24 @@ pub fn largest::<T: Dull + Ord, U>(items: [T; &], extra: &mut U): T {
 
 #[test] fn adds() {}
 
+/// Two values.
+//// Not documentation.
 struct Pair::<A: Dull, B: Dull + Named> {
+    /// The first.
     pub a: A,
     b: [B; -..+],
+}
+
+/// The largest item.
+#[inline]
+/// Assumes there is one.
+fn largest_doc(x: i32): i32 { return x; }
+
+enum Shape {
+    /// A single point.
+    Dot,
+    Line { /// From here.
+        from: i32, to: i32 },
 }
 
 impl::<A: Dull, B: Dull + Named> Pair::<A, B> {
@@ -65,10 +80,26 @@ fn functions_are_printed_without_attributes() {
 }
 
 #[test]
+fn doc_comments_come_from_the_syntax_tree() {
+    let h = hover_at("largest_doc", 0, 0);
+    assert!(h.ends_with("\n\n---\n\nThe largest item.\nAssumes there is one."), "{h}");
+    let h = hover_at("Pair", 0, 0);
+    assert!(h.ends_with("\n\n---\n\nTwo values."), "a `////` comment is not documentation: {h}");
+    let h = hover_at("pub a", 0, 4);
+    assert!(h.ends_with("\n\n---\n\nThe first."), "{h}");
+    let h = hover_at("Dot", 0, 0);
+    assert!(h.ends_with("\n\n---\n\nA single point."), "{h}");
+    let h = hover_at("from:", 0, 0);
+    assert!(h.ends_with("\n\n---\n\nFrom here."), "{h}");
+    let h = hover_at("Shape", 0, 0);
+    assert!(!h.contains("---"), "no docs: {h}");
+}
+
+#[test]
 fn types_and_methods() {
     let h = hover_at("Pair", 0, 0);
     assert!(h.contains("struct Pair::<A: Dull, B: Dull + Named> {\n    pub a: A,\n    b: [B; -..+],\n}"), "{h}");
-    let h = hover_at("first", 0, 0);
+    let h = hover_at("fn first", 0, 3);
     assert!(h.contains("impl::<A: Dull, B: Dull + Named> Pair::<A, B>\npub fn first(&self): A"), "{h}");
     let h = hover_at("name", 0, 0);
     assert!(h.contains("trait Named\nfn name(&self): str"), "{h}");

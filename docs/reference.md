@@ -3,6 +3,9 @@
 ## 1. Lexical structure
 
 * Comments: `// line`, `/* block */` (block comments nest).
+* Doc comments: `/// text` (exactly three slashes) documents the item,
+  enum variant or struct field that follows; it is the attribute
+  `#[doc = "text"]`, one per line. Elsewhere it is an ordinary comment.
 * Identifiers: `[a-zA-Z_][a-zA-Z0-9_]*`. `_` alone is the placeholder.
 * Keywords: `as break const continue crater else enum extern false fn for if
   impl in let loop match mod mut pub return self Self static struct super

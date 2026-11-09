@@ -37,6 +37,19 @@ pub struct Attr {
     pub span: Span,
 }
 
+/// The documentation in `attrs`: the `doc` attributes (from `///` comments
+/// or `#[doc = "..."]`), one line each.
+pub fn doc_text(attrs: &[Attr]) -> String {
+    attrs
+        .iter()
+        .filter_map(|a| match &a.meta {
+            Meta::NameValue(name, text) if name.name == "doc" => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Attribute contents: `name`, `name = "value"`, or `name(meta, ...)`.
 #[derive(Clone, Debug)]
 pub enum Meta {
@@ -158,6 +171,8 @@ pub struct TupleField {
 
 #[derive(Clone, Debug)]
 pub struct FieldDecl {
+    /// Doc comments (`doc` attributes); fields take no other attributes.
+    pub attrs: Vec<Attr>,
     pub is_pub: bool,
     pub name: Ident,
     pub ty: Ty,
@@ -173,6 +188,8 @@ pub struct EnumDecl {
 
 #[derive(Clone, Debug)]
 pub struct VariantDecl {
+    /// Doc comments (`doc` attributes); variants take no other attributes.
+    pub attrs: Vec<Attr>,
     pub name: Ident,
     pub data: VariantData,
     pub span: Span,

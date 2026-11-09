@@ -67,9 +67,7 @@ fn ref_at(p: &Program, file: FileId, offset: u32) -> Option<(Span, RefTarget)> {
         if let DefData::Adt(adt) = &d.data {
             for (vi, v) in adt.variants.iter().enumerate() {
                 for (fi, f) in v.fields.iter().enumerate() {
-                    // Field spans cover `name: Type`; only the name counts.
-                    let name = Span::new(f.span.file, f.span.start, f.span.start + f.name.len() as u32);
-                    consider(name, RefTarget::Field { adt: id, variant: vi, field: fi });
+                    consider(f.span, RefTarget::Field { adt: id, variant: vi, field: fi });
                 }
             }
         }
@@ -101,7 +99,28 @@ enum Decl<'a> {
         abi: Option<&'a str>,
     },
     Variant(&'a ast::VariantDecl),
+    Field(&'a ast::FieldDecl),
     Param(&'a ast::GenericParam),
+}
+
+impl Decl<'_> {
+    /// Its documentation, from its `doc` attributes.
+    fn docs(&self) -> String {
+        match self {
+            Decl::Item { item, .. } => ast::doc_text(&item.attrs),
+            Decl::Variant(v) => ast::doc_text(&v.attrs),
+            Decl::Field(f) => ast::doc_text(&f.attrs),
+            Decl::Param(_) => String::new(),
+        }
+    }
+}
+
+/// The named field declared at `name` in `data`, if any.
+fn field_in(data: &ast::VariantData, name: Span) -> Option<Decl<'_>> {
+    match data {
+        ast::VariantData::Named(fs) => fs.iter().find(|f| f.name.span == name).map(Decl::Field),
+        _ => None,
+    }
 }
 
 fn find_decl(a: &Analysis, name: Span) -> Option<Decl<'_>> {
@@ -133,9 +152,11 @@ fn decl_in_item<'a>(item: &'a ast::Item, name: Span, parent: Option<&'a ast::Ite
             })
         }),
         K::Struct(s) if s.name.span == name => Some(here),
-        K::Struct(s) => params(&s.generics),
+        K::Struct(s) => params(&s.generics).or_else(|| field_in(&s.kind, name)),
         K::Enum(e) if e.name.span == name => Some(here),
-        K::Enum(e) => params(&e.generics).or_else(|| e.variants.iter().find(|v| v.name.span == name).map(Decl::Variant)),
+        K::Enum(e) => {
+            params(&e.generics).or_else(|| e.variants.iter().find_map(|v| if v.name.span == name { Some(Decl::Variant(v)) } else { field_in(&v.data, name) }))
+        }
         K::Trait(t) if t.name.span == name => Some(here),
         K::Trait(t) => params(&t.generics).or_else(|| decl_in_items(&t.items, name, Some(item), None)),
         K::Impl(i) => params(&i.generics).or_else(|| decl_in_items(&i.items, name, Some(item), None)),
@@ -169,7 +190,9 @@ pub fn hover(a: &Analysis, file: FileId, offset: u32) -> Option<(Span, String)> 
                 let offset = if data.is_enum { None } else { p.field_offsets(adt, &[]).map(|o| o[field]) };
                 let layout = layout_comment(p.layout_of(&f.ty), offset);
                 let vis = if f.is_pub { "pub " } else { "" };
-                format!("{}\n\n```lunar\n{layout}{vis}{}: {}\n```", code_block(&owner), f.name, p.ty_str(&f.ty))
+                let mut text = format!("{}\n\n```lunar\n{layout}{vis}{}: {}\n```", code_block(&owner), f.name, p.ty_str(&f.ty));
+                push_docs(&mut text, find_decl(a, f.span).map(|d| d.docs()).unwrap_or_default());
+                text
             }
             RefTarget::Local { body, local } => {
                 let l = p.bodies.get(&body)?.local(local);
@@ -209,7 +232,6 @@ pub fn hover(a: &Analysis, file: FileId, offset: u32) -> Option<(Span, String)> 
 /// Declaration (printed from the AST), container path and doc comments of a
 /// definition.
 fn describe_def(a: &Analysis, p: &Program, d: DefId) -> String {
-    let map = &a.map;
     let info = p.def(d);
     // Like rust-analyzer: the container path, then the declaration (with the
     // memory layout as a comment for types, and the enclosing `impl` or
@@ -230,6 +252,7 @@ fn describe_def(a: &Analysis, p: &Program, d: DefId) -> String {
             pretty::item(item, abi)
         }
         Some(Decl::Variant(v)) => pretty::variant(v),
+        Some(Decl::Field(f)) => format!("{}: {}", f.name.name, pretty::ty(&f.ty)),
         Some(Decl::Param(g)) => pretty::generic_param(g),
         None => info.name.clone(),
     };
@@ -253,12 +276,16 @@ fn describe_def(a: &Analysis, p: &Program, d: DefId) -> String {
         out.push_str("\n\n");
     }
     out.push_str(&code_block(&decl));
-    let docs = if info.span.is_dummy() { String::new() } else { doc_comment(map, info.span) };
+    push_docs(&mut out, found.map(|f| f.docs()).unwrap_or_default());
+    out
+}
+
+/// Append documentation below a hover's code, as rust-analyzer does.
+fn push_docs(out: &mut String, docs: String) {
     if !docs.is_empty() {
         out.push_str("\n\n---\n\n");
         out.push_str(&docs);
     }
-    out
 }
 
 fn code_block(code: &str) -> String {
@@ -581,25 +608,6 @@ super::helper();
         "false" => r#"A value of type `bool` representing logical **false**."#,
         _ => return None,
     })
-}
-
-/// `///` lines directly above the item declared at `name` (attributes skipped).
-fn doc_comment(map: &SourceMap, name: Span) -> String {
-    let text = &map.get(name.file).text;
-    let line_start = text[..name.start as usize].rfind('\n').map_or(0, |i| i + 1);
-    let mut lines = Vec::new();
-    for line in text[..line_start].lines().rev() {
-        let t = line.trim();
-        if let Some(doc) = t.strip_prefix("///") {
-            lines.push(doc.strip_prefix(' ').unwrap_or(doc).to_string());
-        } else if t.starts_with("#[") {
-            continue;
-        } else {
-            break;
-        }
-    }
-    lines.reverse();
-    lines.join("\n")
 }
 
 // ===================================================================== THIR walk

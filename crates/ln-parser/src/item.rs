@@ -64,9 +64,15 @@ impl P<'_, '_, '_> {
         }
     }
 
+    /// Attributes, including doc comments (as `#[doc = "..."]`), before and
+    /// between `#[...]`s.
     pub(crate) fn attrs(&mut self) -> PResult<Vec<Attr>> {
         let mut out = Vec::new();
-        while self.k.at(T::Hash) {
+        loop {
+            out.extend(self.doc_attrs());
+            if !self.k.at(T::Hash) {
+                return Ok(out);
+            }
             let start = self.start();
             self.k.bump();
             self.k.expect(T::LBracket)?;
@@ -74,7 +80,23 @@ impl P<'_, '_, '_> {
             self.k.expect(T::RBracket)?;
             out.push(Attr { meta, span: self.span_from(start) });
         }
-        Ok(out)
+    }
+
+    /// The doc comments directly before the current token, as `doc`
+    /// attributes: `/// text` is `#[doc = "text"]`, one per line.
+    pub(crate) fn doc_attrs(&mut self) -> Vec<Attr> {
+        let Some(t) = self.k.current() else { return Vec::new() };
+        let Some(lines) = self.docs.remove(&t.start) else { return Vec::new() };
+        lines
+            .into_iter()
+            .map(|(start, end)| {
+                let raw = self.text_of(start, end);
+                let text = raw.strip_prefix("///").unwrap_or(raw).trim_end_matches('\r');
+                let text = text.strip_prefix(' ').unwrap_or(text);
+                let span = ln_diag::Span::new(self.file, start, end);
+                Attr { meta: Meta::NameValue(Ident::new("doc", span), text.to_string()), span }
+            })
+            .collect()
     }
 
     fn meta_name(&mut self) -> PResult<Ident> {
@@ -306,12 +328,13 @@ impl P<'_, '_, '_> {
             if self.k.eat(T::RBrace) {
                 break;
             }
+            let docs = self.doc_attrs();
             let start = self.start();
             let is_pub = self.k.eat(T::Pub);
             let name = self.ident()?;
             self.k.expect(T::Colon)?;
             let ty = self.ty()?;
-            out.push(FieldDecl { is_pub, name, ty, span: self.span_from(start) });
+            out.push(FieldDecl { attrs: docs, is_pub, name, ty, span: self.span_from(start) });
             if !self.k.eat(T::Comma) {
                 self.k.expect(T::RBrace)?;
                 break;
@@ -330,6 +353,7 @@ impl P<'_, '_, '_> {
             if self.k.eat(T::RBrace) {
                 break;
             }
+            let docs = self.doc_attrs();
             let start = self.start();
             let vname = self.ident()?;
             let data = if self.k.at(T::LParen) {
@@ -339,7 +363,7 @@ impl P<'_, '_, '_> {
             } else {
                 VariantData::Unit
             };
-            variants.push(VariantDecl { name: vname, data, span: self.span_from(start) });
+            variants.push(VariantDecl { attrs: docs, name: vname, data, span: self.span_from(start) });
             if !self.k.eat(T::Comma) {
                 self.k.expect(T::RBrace)?;
                 break;

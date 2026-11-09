@@ -393,7 +393,7 @@ impl<'a> Sema<'a> {
                         self.err(Diagnostic::error(name::DUPLICATE, f.name.span, format!("field `{}` is declared twice", f.name.name)));
                     }
                     let ty = self.lower_ty(cx, &f.ty, TyPos::Other);
-                    out.push(FieldDef { name: f.name.name.clone(), ty, is_pub: f.is_pub, span: f.span });
+                    out.push(FieldDef { name: f.name.name.clone(), ty, is_pub: f.is_pub, span: f.name.span });
                 }
                 (CtorKind::Named, out)
             }

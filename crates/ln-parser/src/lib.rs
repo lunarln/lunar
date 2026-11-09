@@ -46,8 +46,8 @@ pub fn parse_file(src: &str, file: FileId, ids: &mut IdGen) -> (File, Vec<Diagno
         let diags = conflicts.iter().map(|c| conflict_diag(src, file, c)).collect();
         return (File { items: Vec::new(), span: Span::new(file, 0, src.len() as u32) }, diags);
     }
-    let (toks, diags) = lex_with_offset(src, 0, file);
-    let mut p = P::new(src, 0, &toks, file, ids, src.len() as u32);
+    let (toks, docs, diags) = lex_with_offset(src, 0, file);
+    let mut p = P::new(src, 0, &toks, docs, file, ids, src.len() as u32);
     p.diags = diags;
     let items = p.items_until_eof();
     let file_ast = File { items, span: Span::new(file, 0, src.len() as u32) };
@@ -58,9 +58,9 @@ pub fn parse_file(src: &str, file: FileId, ids: &mut IdGen) -> (File, Vec<Diagno
 /// Parse a single expression from `src`, whose first byte sits at `offset` in
 /// file `file`. Used for format-string interpolation holes.
 pub(crate) fn parse_expr_at(src: &str, offset: u32, file: FileId, ids: &mut IdGen) -> Result<Expr, Vec<Diagnostic>> {
-    let (toks, mut diags) = lex_with_offset(src, offset, file);
+    let (toks, docs, mut diags) = lex_with_offset(src, offset, file);
     let eof = offset + src.len() as u32;
-    let mut p = P::new(src, offset, &toks, file, ids, eof);
+    let mut p = P::new(src, offset, &toks, docs, file, ids, eof);
     let e = p.expr();
     if e.is_ok() && !p.k.at_eof() {
         let _ = p.k.error_expected();
@@ -189,11 +189,31 @@ fn with_byte_prefix(quote: usize, toks: &[ln_lexer::Spanned]) -> (usize, Token) 
     if prefixed { (quote - 1, Token::Byte) } else { (quote, Token::Char) }
 }
 
-fn lex_with_offset(src: &str, offset: u32, file: FileId) -> (Vec<Tok<Token>>, Vec<Diagnostic>) {
+/// Doc comments, by the start of the token that follows them (where an item
+/// that they document would start).
+pub(crate) type Docs = std::collections::HashMap<u32, Vec<(u32, u32)>>;
+
+fn lex_with_offset(src: &str, offset: u32, file: FileId) -> (Vec<Tok<Token>>, Docs, Vec<Diagnostic>) {
     let (mut toks, mut errs) = ln_lexer::lex(src);
     rejoin_char_literals(src, &mut toks, &mut errs);
     placeholder_for_unclosed_chars(src, &mut toks, &errs);
-    let toks = toks.into_iter().map(|s| Tok::new(s.token, s.range.start as u32 + offset, s.range.end as u32 + offset)).collect();
+    // Doc comments leave the token stream; `P::attrs` attaches them to the
+    // item they precede, and anywhere else they are plain comments.
+    let mut docs = Docs::new();
+    let mut pending = Vec::new();
+    let mut out = Vec::with_capacity(toks.len());
+    for s in toks {
+        let (start, end) = (s.range.start as u32 + offset, s.range.end as u32 + offset);
+        if s.token == Token::DocComment {
+            pending.push((start, end));
+            continue;
+        }
+        if !pending.is_empty() {
+            docs.insert(start, std::mem::take(&mut pending));
+        }
+        out.push(Tok::new(s.token, start, end));
+    }
+    let toks = out;
     let diags = errs
         .into_iter()
         .map(|e| {
@@ -216,7 +236,7 @@ fn lex_with_offset(src: &str, offset: u32, file: FileId) -> (Vec<Tok<Token>>, Ve
             Diagnostic::error(code, span, msg)
         })
         .collect();
-    (toks, diags)
+    (toks, docs, diags)
 }
 
 /// Delimiter pairs for error recovery.
@@ -231,11 +251,13 @@ pub(crate) struct P<'s, 't, 'i> {
     pub(crate) file: FileId,
     pub(crate) ids: &'i mut IdGen,
     pub(crate) diags: Vec<Diagnostic>,
+    /// Doc comments not yet attached to an item.
+    pub(crate) docs: Docs,
 }
 
 impl<'s, 't, 'i> P<'s, 't, 'i> {
-    fn new(src: &'s str, base: u32, toks: &'t [Tok<Token>], file: FileId, ids: &'i mut IdGen, eof: u32) -> Self {
-        Self { k: ln_parse_kit::Parser::new(toks, eof), src, base, file, ids, diags: Vec::new() }
+    fn new(src: &'s str, base: u32, toks: &'t [Tok<Token>], docs: Docs, file: FileId, ids: &'i mut IdGen, eof: u32) -> Self {
+        Self { k: ln_parse_kit::Parser::new(toks, eof), src, base, file, ids, diags: Vec::new(), docs }
     }
 
     fn finish(mut self) -> Vec<Diagnostic> {

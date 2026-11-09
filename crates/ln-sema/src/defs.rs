@@ -173,6 +173,7 @@ pub struct FieldDef {
     pub name: String,
     pub ty: Ty,
     pub is_pub: bool,
+    /// The field's name (its type, for tuple fields).
     pub span: Span,
 }
 
