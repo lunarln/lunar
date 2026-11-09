@@ -1,0 +1,176 @@
+// Hashing, for hash maps and interners. One fixed, fast hasher (in the
+// style of FxHash): good for compiler-like workloads, but not resistant to
+// inputs chosen to collide.
+
+/// Accumulates values into a 64-bit hash.
+pub struct Hasher {
+    state: u64,
+}
+
+const SEED: u64 = 0x517cc1b727220a95;
+
+impl Hasher {
+    pub fn new(): Hasher {
+        return Hasher { state: 0 };
+    }
+
+    /// Mix one 64-bit word in.
+    pub fn write_u64(&mut self, x: u64) {
+        let rotated = (self.state << 5) | (self.state >> 59);
+        self.state = (rotated ^ x).wrapping_mul(SEED);
+    }
+
+    /// Mix bytes in, eight at a time, then their count (so that `"ab", "c"`
+    /// and `"a", "bc"` hash differently).
+    pub fn write_bytes(&mut self, bytes: [u8; &]) {
+        let n = bytes.len();
+        let mut word: u64 = 0;
+        let mut shift: u64 = 0;
+        for b in bytes {
+            word = word | ((b as u64) << shift);
+            shift += 8;
+            if shift == 64 {
+                self.write_u64(word);
+                word = 0;
+                shift = 0;
+            }
+        }
+        if shift > 0 {
+            self.write_u64(word);
+        }
+        self.write_u64(n as u64);
+    }
+
+    pub fn finish(&self): u64 {
+        return self.state;
+    }
+}
+
+/// Types that can be hashed. Values that are equal (`Eq`) must hash
+/// equally. `#[derive(Hash)]` hashes every field.
+pub trait Hash {
+    fn hash(&self, h: &mut Hasher);
+}
+
+/// The hash of `value` with a fresh `Hasher`.
+pub fn hash_of::<T: Hash>(value: &T): u64 {
+    let mut h = Hasher::new();
+    value.hash(&mut h);
+    return h.finish();
+}
+
+impl Hash for u8 { fn hash(&self, h: &mut Hasher) { h.write_u64(self as u64); } }
+impl Hash for u16 { fn hash(&self, h: &mut Hasher) { h.write_u64(self as u64); } }
+impl Hash for u32 { fn hash(&self, h: &mut Hasher) { h.write_u64(self as u64); } }
+impl Hash for u64 { fn hash(&self, h: &mut Hasher) { h.write_u64(self); } }
+impl Hash for usize { fn hash(&self, h: &mut Hasher) { h.write_u64(self as u64); } }
+impl Hash for i8 { fn hash(&self, h: &mut Hasher) { h.write_u64(self as u64); } }
+impl Hash for i16 { fn hash(&self, h: &mut Hasher) { h.write_u64(self as u64); } }
+impl Hash for i32 { fn hash(&self, h: &mut Hasher) { h.write_u64(self as u64); } }
+impl Hash for i64 { fn hash(&self, h: &mut Hasher) { h.write_u64(self as u64); } }
+impl Hash for isize { fn hash(&self, h: &mut Hasher) { h.write_u64(self as u64); } }
+impl Hash for bool { fn hash(&self, h: &mut Hasher) { h.write_u64(self as u64); } }
+impl Hash for char { fn hash(&self, h: &mut Hasher) { h.write_u64(self as u64); } }
+impl Hash for () { fn hash(&self, h: &mut Hasher) {} }
+
+impl Hash for str {
+    fn hash(&self, h: &mut Hasher) {
+        h.write_bytes(self.as_bytes());
+    }
+}
+
+impl Hash for String {
+    fn hash(&self, h: &mut Hasher) {
+        h.write_bytes(self.as_bytes());
+    }
+}
+
+impl::<A: Hash, B: Hash> Hash for (A, B) {
+    fn hash(&self, h: &mut Hasher) {
+        self.0.hash(h);
+        self.1.hash(h);
+    }
+}
+
+impl::<A: Hash, B: Hash, C: Hash> Hash for (A, B, C) {
+    fn hash(&self, h: &mut Hasher) {
+        self.0.hash(h);
+        self.1.hash(h);
+        self.2.hash(h);
+    }
+}
+
+impl::<T: Dull + Hash> Hash for Option::<T> {
+    fn hash(&self, h: &mut Hasher) {
+        match self {
+            Some(v) => {
+                h.write_u64(1);
+                v.hash(h);
+            }
+            None => h.write_u64(0),
+        }
+    }
+}
+
+impl::<T: Dull + Hash> Hash for [T; &] {
+    fn hash(&self, h: &mut Hasher) {
+        for x in self {
+            x.hash(h);
+        }
+        h.write_u64(self.len() as u64);
+    }
+}
+
+impl Hash for crater::cmp::Ordering {
+    fn hash(&self, h: &mut Hasher) {
+        h.write_u64(match self {
+            crater::cmp::Ordering::Less => 0,
+            crater::cmp::Ordering::Equal => 1,
+            crater::cmp::Ordering::Greater => 2,
+        });
+    }
+}
+
+// ===================================================================== derive
+
+/// `#[derive(Hash)]`: hashes every field in order; for enums, the variant
+/// first.
+#[derive_macro]
+pub macro Hash {
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics { $($(#[$fm:meta])* $fv:vis $f:ident: $ft:ty),* $(,)? }) => {
+        impl $g.bound(Hash) Hash for $n $g.args {
+            fn hash(&self, h: &mut crater::hash::Hasher) {
+                $(self.$f.hash(h);)*
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics ($($(#[$fm:meta])* $fv:vis $ft:ty),* $(,)?);) => {
+        impl $g.bound(Hash) Hash for $n $g.args {
+            fn hash(&self, h: &mut crater::hash::Hasher) {
+                $(self.${index()}.hash(h); ${ignore($ft)})*
+            }
+        }
+    },
+    ($(#[$m:meta])* $v:vis struct $n:ident $g:generics;) => {
+        impl $g.bound(Hash) Hash for $n $g.args {
+            fn hash(&self, h: &mut crater::hash::Hasher) {}
+        }
+    },
+    ($(#[$m:meta])* $v:vis enum $n:ident $g:generics {
+        $($(#[$vm:meta])* $var:ident $(($($vt:ty),* $(,)?))? $({$($vf:ident: $vft:ty),* $(,)?})?),* $(,)?
+    }) => {
+        impl $g.bound(Hash) Hash for $n $g.args {
+            fn hash(&self, h: &mut crater::hash::Hasher) {
+                match self {
+                    $(
+                        $n::$var $(($(${concat(a, index())} ${ignore($vt)}),*))? $({$($vf: ${concat(a_, $vf)}),*})? => {
+                            h.write_u64(${index()});
+                            $($(${concat(a, index())}.hash(h); ${ignore($vt)})*)?
+                            $($(${concat(a_, $vf)}.hash(h);)*)?
+                        }
+                    )*
+                }
+            }
+        }
+    },
+}

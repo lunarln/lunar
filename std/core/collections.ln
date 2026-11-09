@@ -1,0 +1,470 @@
+// Hash maps. Keys and values are Dull, like array items. `HashMap` is
+// unordered; `OrderedHashMap` iterates in insertion order (for
+// deterministic output). Changing a value in place goes through a closure:
+// `m.update(k, |v| v + 1)`.
+
+use crater::hash::{Hash, Hasher, hash_of};
+
+/// One slot of a table: empty, or a key with its value and hash.
+enum Slot::<K: Dull, V: Dull> {
+    Empty,
+    Full(u64, K, V),
+}
+
+fn is_full::<K: Dull, V: Dull>(s: Slot::<K, V>): bool {
+    return match s {
+        Slot::Full(..) => true,
+        Slot::Empty => false,
+    };
+}
+
+/// An unordered map from `K` to `V` (open addressing, linear probing).
+pub struct HashMap::<K: Dull + Hash + Eq, V: Dull> {
+    /// A power of two in length (or empty).
+    slots: [Slot::<K, V>; ..+],
+    len: usize,
+}
+
+impl::<K: Dull + Hash + Eq, V: Dull> HashMap::<K, V> {
+    pub fn new(): HashMap::<K, V> {
+        return HashMap { slots: [], len: 0 };
+    }
+
+    pub fn len(&self): usize {
+        return self.len;
+    }
+
+    pub fn is_empty(&self): bool {
+        return self.len == 0;
+    }
+
+    /// The slot holding `k`, or the empty slot where it would go. The
+    /// table must not be empty.
+    fn find(&self, k: K, hash: u64): usize {
+        let mask = self.slots.len() - 1;
+        let mut i = (hash as usize) & mask;
+        loop {
+            match self.slots[i] {
+                Slot::Empty => return i,
+                Slot::Full(h, key, _) => {
+                    if h == hash && key == k {
+                        return i;
+                    }
+                }
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Double the table (to 8 slots at first) and reinsert everything.
+    fn grow(&mut self) {
+        let cap = if self.slots.len() == 0 { 8 } else { self.slots.len() * 2 };
+        let mask = cap - 1;
+        let mut table: [Slot::<K, V>; ..+] = [Slot::Empty; cap];
+        for s in self.slots {
+            if let Slot::Full(h, _, _) = s {
+                let mut i = (h as usize) & mask;
+                while is_full(table[i]) {
+                    i = (i + 1) & mask;
+                }
+                table[i] = s;
+            }
+        }
+        self.slots = table;
+    }
+
+    /// Set the value for `k`; returns the value it replaced.
+    pub fn insert(&mut self, k: K, v: V): Option::<V> {
+        if (self.len + 1) * 4 > self.slots.len() * 3 {
+            self.grow();
+        }
+        let h = hash_of(&k);
+        let i = self.find(k, h);
+        let old = match self.slots[i] {
+            Slot::Full(_, _, old) => Some(old),
+            Slot::Empty => None,
+        };
+        if old.is_none() {
+            self.len += 1;
+        }
+        self.slots[i] = Slot::Full(h, k, v);
+        return old;
+    }
+
+    /// A copy of the value for `k`.
+    pub fn get(&self, k: K): Option::<V> {
+        if self.len == 0 {
+            return None;
+        }
+        let i = self.find(k, hash_of(&k));
+        return match self.slots[i] {
+            Slot::Full(_, _, v) => Some(v),
+            Slot::Empty => None,
+        };
+    }
+
+    /// The value for `k`, or `default` if there is none.
+    pub fn get_or(&self, k: K, default: V): V {
+        return match self.get(k) {
+            Some(v) => v,
+            None => default,
+        };
+    }
+
+    pub fn contains(&self, k: K): bool {
+        return self.get(k).is_some();
+    }
+
+    /// Replace the value for `k` with what `f` makes of it. Returns false
+    /// (and does not call `f`) if there is no value for `k`.
+    pub fn update::<F: FnOnce(V): V>(&mut self, k: K, f: F): bool {
+        if self.len == 0 {
+            return false;
+        }
+        let h = hash_of(&k);
+        let i = self.find(k, h);
+        return match self.slots[i] {
+            Slot::Full(_, _, v) => {
+                self.slots[i] = Slot::Full(h, k, f(v));
+                true
+            }
+            Slot::Empty => false,
+        };
+    }
+
+    /// Remove `k`; returns its value.
+    pub fn remove(&mut self, k: K): Option::<V> {
+        if self.len == 0 {
+            return None;
+        }
+        let i = self.find(k, hash_of(&k));
+        let old = match self.slots[i] {
+            Slot::Full(_, _, v) => v,
+            Slot::Empty => return None,
+        };
+        // Shift later entries of the probe run back over the hole, so
+        // lookups never need tombstones.
+        let cap = self.slots.len();
+        let mask = cap - 1;
+        let mut hole = i;
+        let mut j = (i + 1) & mask;
+        loop {
+            match self.slots[j] {
+                Slot::Empty => break,
+                Slot::Full(h, _, _) => {
+                    let ideal = (h as usize) & mask;
+                    if ((j + cap - ideal) & mask) >= ((j + cap - hole) & mask) {
+                        self.slots[hole] = self.slots[j];
+                        hole = j;
+                    }
+                }
+            }
+            j = (j + 1) & mask;
+        }
+        self.slots[hole] = Slot::Empty;
+        self.len -= 1;
+        return Some(old);
+    }
+
+    /// Every key and value, in no particular order.
+    pub fn iter(&self): impl Iterator::<(K, V)> {
+        return Entries { slots: self.slots[..], i: 0 };
+    }
+
+    /// Every key, in no particular order.
+    pub fn keys(&self): impl Iterator::<K> {
+        return Keys { slots: self.slots[..], i: 0 };
+    }
+
+    /// Every value, in no particular order.
+    pub fn values(&self): impl Iterator::<V> {
+        return Values { slots: self.slots[..], i: 0 };
+    }
+}
+
+impl::<K: Dull + Hash + Eq + Debug, V: Dull + Debug> Debug for HashMap::<K, V> {
+    fn debug(&self, out: &mut String) {
+        debug_entries(self.iter(), out);
+    }
+}
+
+/// `{k: v, ...}`.
+fn debug_entries::<K: Dull + Debug, V: Dull + Debug, I: Iterator::<(K, V)>>(mut it: I, out: &mut String) {
+    out.push('{');
+    let mut first = true;
+    for (k, v) in it {
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        k.debug(out);
+        out.push_str(": ");
+        v.debug(out);
+    }
+    out.push('}');
+}
+
+struct Entries::<K: Dull, V: Dull> {
+    slots: [Slot::<K, V>; &],
+    i: usize,
+}
+
+impl::<K: Dull, V: Dull> Iterator::<(K, V)> for Entries::<K, V> {
+    fn next(&mut self): Option::<(K, V)> {
+        while self.i < self.slots.len() {
+            let s = self.slots[self.i];
+            self.i += 1;
+            if let Slot::Full(_, k, v) = s {
+                return Some((k, v));
+            }
+        }
+        return None;
+    }
+}
+
+struct Keys::<K: Dull, V: Dull> {
+    slots: [Slot::<K, V>; &],
+    i: usize,
+}
+
+impl::<K: Dull, V: Dull> Iterator::<K> for Keys::<K, V> {
+    fn next(&mut self): Option::<K> {
+        while self.i < self.slots.len() {
+            let s = self.slots[self.i];
+            self.i += 1;
+            if let Slot::Full(_, k, _) = s {
+                return Some(k);
+            }
+        }
+        return None;
+    }
+}
+
+struct Values::<K: Dull, V: Dull> {
+    slots: [Slot::<K, V>; &],
+    i: usize,
+}
+
+impl::<K: Dull, V: Dull> Iterator::<V> for Values::<K, V> {
+    fn next(&mut self): Option::<V> {
+        while self.i < self.slots.len() {
+            let s = self.slots[self.i];
+            self.i += 1;
+            if let Slot::Full(_, _, v) = s {
+                return Some(v);
+            }
+        }
+        return None;
+    }
+}
+
+// ===================================================================== ordered
+
+/// One entry of an `OrderedHashMap`, in insertion order.
+struct Entry::<K: Dull, V: Dull> {
+    hash: u64,
+    key: K,
+    value: V,
+}
+
+/// A map from `K` to `V` that iterates in insertion order: the entries in
+/// a dense array, with a hash table of their positions.
+pub struct OrderedHashMap::<K: Dull + Hash + Eq, V: Dull> {
+    entries: [Entry::<K, V>; -..+],
+    /// Entry position + 1 per slot (0 = empty); a power of two in length.
+    table: [u32; ..+],
+}
+
+impl::<K: Dull + Hash + Eq, V: Dull> OrderedHashMap::<K, V> {
+    pub fn new(): OrderedHashMap::<K, V> {
+        return OrderedHashMap { entries: [], table: [] };
+    }
+
+    pub fn len(&self): usize {
+        return self.entries.len();
+    }
+
+    pub fn is_empty(&self): bool {
+        return self.entries.len() == 0;
+    }
+
+    /// The table slot for `k`: holding its entry, or empty.
+    fn slot(&self, k: K, hash: u64): usize {
+        let mask = self.table.len() - 1;
+        let mut i = (hash as usize) & mask;
+        loop {
+            let e = self.table[i];
+            if e == 0 {
+                return i;
+            }
+            let entry = self.entries[(e - 1) as usize];
+            if entry.hash == hash && entry.key == k {
+                return i;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Rebuild the table for the current entries, with room to grow.
+    fn rebuild(&mut self) {
+        let mut cap = 8;
+        while (self.entries.len() + 1) * 4 > cap * 3 {
+            cap *= 2;
+        }
+        let mask = cap - 1;
+        let mut table: [u32; ..+] = [0; cap];
+        let mut pos: u32 = 0;
+        for e in self.entries {
+            pos += 1;
+            let mut i = (e.hash as usize) & mask;
+            while table[i] != 0 {
+                i = (i + 1) & mask;
+            }
+            table[i] = pos;
+        }
+        self.table = table;
+    }
+
+    /// Set the value for `k`; returns the value it replaced. A new key goes
+    /// last; a replaced value keeps its key's place.
+    pub fn insert(&mut self, k: K, v: V): Option::<V> {
+        if (self.entries.len() + 1) * 4 > self.table.len() * 3 {
+            self.rebuild();
+        }
+        let h = hash_of(&k);
+        let i = self.slot(k, h);
+        let e = self.table[i];
+        if e != 0 {
+            let at = (e - 1) as usize;
+            let old = self.entries[at].value;
+            self.entries[at].value = v;
+            return Some(old);
+        }
+        self.entries.push(Entry { hash: h, key: k, value: v });
+        self.table[i] = self.entries.len() as u32;
+        return None;
+    }
+
+    /// A copy of the value for `k`.
+    pub fn get(&self, k: K): Option::<V> {
+        if self.entries.len() == 0 {
+            return None;
+        }
+        let e = self.table[self.slot(k, hash_of(&k))];
+        if e == 0 {
+            return None;
+        }
+        return Some(self.entries[(e - 1) as usize].value);
+    }
+
+    /// The value for `k`, or `default` if there is none.
+    pub fn get_or(&self, k: K, default: V): V {
+        return match self.get(k) {
+            Some(v) => v,
+            None => default,
+        };
+    }
+
+    pub fn contains(&self, k: K): bool {
+        return self.get(k).is_some();
+    }
+
+    /// Replace the value for `k` with what `f` makes of it. Returns false
+    /// (and does not call `f`) if there is no value for `k`.
+    pub fn update::<F: FnOnce(V): V>(&mut self, k: K, f: F): bool {
+        if self.entries.len() == 0 {
+            return false;
+        }
+        let e = self.table[self.slot(k, hash_of(&k))];
+        if e == 0 {
+            return false;
+        }
+        let at = (e - 1) as usize;
+        self.entries[at].value = f(self.entries[at].value);
+        return true;
+    }
+
+    /// Remove `k`, keeping the order of the others; returns its value.
+    /// Takes time proportional to the map's size.
+    pub fn remove(&mut !self, k: K): Option::<V> {
+        if self.entries.len() == 0 {
+            return None;
+        }
+        let e = self.table[self.slot(k, hash_of(&k))];
+        if e == 0 {
+            return None;
+        }
+        let old = self.entries.remove((e - 1) as usize);
+        self.rebuild();
+        return Some(old.value);
+    }
+
+    /// Every key and value, in insertion order.
+    pub fn iter(&self): impl Iterator::<(K, V)> {
+        return OrderedEntries { entries: self.entries[..], i: 0 };
+    }
+
+    /// Every key, in insertion order.
+    pub fn keys(&self): impl Iterator::<K> {
+        return OrderedKeys { entries: self.entries[..], i: 0 };
+    }
+
+    /// Every value, in insertion order.
+    pub fn values(&self): impl Iterator::<V> {
+        return OrderedValues { entries: self.entries[..], i: 0 };
+    }
+}
+
+impl::<K: Dull + Hash + Eq + Debug, V: Dull + Debug> Debug for OrderedHashMap::<K, V> {
+    fn debug(&self, out: &mut String) {
+        debug_entries(self.iter(), out);
+    }
+}
+
+struct OrderedEntries::<K: Dull, V: Dull> {
+    entries: [Entry::<K, V>; &],
+    i: usize,
+}
+
+impl::<K: Dull, V: Dull> Iterator::<(K, V)> for OrderedEntries::<K, V> {
+    fn next(&mut self): Option::<(K, V)> {
+        if self.i == self.entries.len() {
+            return None;
+        }
+        let e = self.entries[self.i];
+        self.i += 1;
+        return Some((e.key, e.value));
+    }
+}
+
+struct OrderedKeys::<K: Dull, V: Dull> {
+    entries: [Entry::<K, V>; &],
+    i: usize,
+}
+
+impl::<K: Dull, V: Dull> Iterator::<K> for OrderedKeys::<K, V> {
+    fn next(&mut self): Option::<K> {
+        if self.i == self.entries.len() {
+            return None;
+        }
+        let e = self.entries[self.i];
+        self.i += 1;
+        return Some(e.key);
+    }
+}
+
+struct OrderedValues::<K: Dull, V: Dull> {
+    entries: [Entry::<K, V>; &],
+    i: usize,
+}
+
+impl::<K: Dull, V: Dull> Iterator::<V> for OrderedValues::<K, V> {
+    fn next(&mut self): Option::<V> {
+        if self.i == self.entries.len() {
+            return None;
+        }
+        let e = self.entries[self.i];
+        self.i += 1;
+        return Some(e.value);
+    }
+}

@@ -1,0 +1,150 @@
+// core::arena, core::hash, core::collections and core::intern.
+
+use core::arena::{Arena, Id, List};
+use core::collections::{HashMap, OrderedHashMap};
+use core::hash::hash_of;
+use core::intern::{Interner, Symbol};
+
+// A tree in arenas: nodes linked by handles, children as packed lists.
+#[derive(Debug)]
+enum Expr {
+    Int(i64),
+    Neg(Id::<Expr>),
+    Add(Id::<Expr>, Id::<Expr>),
+    Sum(List::<Id::<Expr>>),
+}
+
+struct Tree {
+    exprs: Arena::<Expr>,
+    lists: Arena::<Id::<Expr>>,
+}
+
+impl Tree {
+    fn eval(&self, e: Id::<Expr>): i64 {
+        return match self.exprs.get(e) {
+            Expr::Int(n) => n,
+            Expr::Neg(x) => -self.eval(x),
+            Expr::Add(a, b) => self.eval(a) + self.eval(b),
+            Expr::Sum(items) => {
+                let mut total = 0;
+                for x in self.lists.list(items) {
+                    total += self.eval(x);
+                }
+                total
+            }
+        };
+    }
+}
+
+#[derive(Eq, Hash, Debug)]
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+#[derive(Eq, Hash, Debug)]
+enum Shape {
+    Dot,
+    Circle(i32),
+    Rect { w: i32, h: i32 },
+}
+
+fn main() {
+    // Arena
+    let mut t = Tree { exprs: Arena::new(), lists: Arena::new() };
+    let one = t.exprs.add(Expr::Int(1));
+    let two = t.exprs.add(Expr::Int(2));
+    let sum = t.exprs.add(Expr::Add(one, two));
+    let neg = t.exprs.add(Expr::Neg(sum));
+    let items = t.lists.add_list([one, two, sum, neg][..]);
+    let all = t.exprs.add(Expr::Sum(items));
+    println("eval: {t.eval(sum)} {t.eval(neg)} {t.eval(all)}");
+    t.exprs.set(one, Expr::Int(10));
+    t.exprs.update(two, |e| match e {
+        Expr::Int(n) => Expr::Int(n * 100),
+        other => other,
+    });
+    println("after set/update: {t.eval(sum)}");
+    t.exprs.view_mut(one)[0] = Expr::Int(5);
+    println("after view_mut: {t.eval(sum)} {t.exprs.get(one):?}");
+    println("ids: {one:?} {all:?}, {t.exprs.len()} exprs, list {items:?} of {items.len()}");
+    let mut count = 0;
+    for id in t.exprs.ids() {
+        if let Expr::Int(_) = t.exprs.get(id) {
+            count += 1;
+        }
+    }
+    println("ints: {count}");
+
+    // Hash
+    let p = Point { x: 1, y: 2 };
+    let q = Point { x: 1, y: 2 };
+    let r = Point { x: 2, y: 1 };
+    println("hash eq: {hash_of(&p) == hash_of(&q)} {hash_of(&p) == hash_of(&r)}");
+    let c3 = Shape::Circle(3);
+    let c4 = Shape::Circle(4);
+    println("enum hash: {hash_of(&c3) == hash_of(&Shape::Circle(3))} {hash_of(&c3) == hash_of(&c4)}");
+    let (ab, ab2, ba) = ("ab", "ab", "ba");
+    println("str hash: {hash_of(&ab) == hash_of(&ab2)} {hash_of(&ab) == hash_of(&ba)}");
+
+    // HashMap
+    let mut m: HashMap::<i32, i32> = HashMap::new();
+    for i in 0..100 {
+        m.insert(i, i * i);
+    }
+    println("len {m.len()}, 7 -> {m.get(7):?}, 100 -> {m.get(100):?}");
+    println("replace: {m.insert(7, -1):?} now {m.get(7):?}");
+    for i in 0..50 {
+        m.remove(i * 2);
+    }
+    println("after removing evens: len {m.len()}, 3 -> {m.get(3):?}, 4 -> {m.get(4):?}, contains 99: {m.contains(99)}");
+    m.update(3, |v| v + 1000);
+    println("updated 3: {m.get(3):?}, update missing: {m.update(4, |v| v)}");
+    let mut total = 0;
+    for (k, v) in m.iter() {
+        total += k + v;
+    }
+    let mut keys = 0;
+    for k in m.keys() {
+        keys += k;
+    }
+    println("sum of entries {total}, of keys {keys}");
+
+    let mut shapes: HashMap::<Shape, i32> = HashMap::new();
+    shapes.insert(Shape::Dot, 1);
+    shapes.insert(Shape::Rect { w: 2, h: 3 }, 6);
+    println("shapes: {shapes.get(Shape::Rect { w: 2, h: 3 }):?} {shapes.get(Shape::Rect { w: 3, h: 2 }):?}");
+
+    // OrderedHashMap
+    let mut o: OrderedHashMap::<i32, bool> = OrderedHashMap::new();
+    o.insert(30, true);
+    o.insert(10, false);
+    o.insert(20, true);
+    o.insert(10, true);
+    println("ordered: {o:?}");
+    o.remove(30);
+    o.insert(5, false);
+    println("ordered: {o:?} len {o.len()}");
+
+    // Interner
+    let mut names = Interner::new();
+    let a = names.intern("alpha");
+    let b = names.intern("beta");
+    let a2 = names.intern("alpha");
+    println("symbols: {a == a2} {a == b} {names.resolve(b)} {names.len()}");
+    let (beta, gamma) = ("beta", "gamma");
+    println("get: {names.get(beta).is_some()} {names.get(gamma).is_some()}");
+    let mut word_counts: OrderedHashMap::<Symbol, i32> = OrderedHashMap::new();
+    let text = "the cat and the dog and the bird";
+    for w in text.split(" ") {
+        let s = names.intern(w);
+        if !word_counts.update(s, |n| n + 1) {
+            word_counts.insert(s, 1);
+        }
+    }
+    let mut line = String::new();
+    for (s, n) in word_counts.iter() {
+        line.write("{names.resolve(s)}={n} ");
+    }
+    println("{line}");
+}

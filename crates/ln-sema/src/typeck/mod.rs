@@ -736,8 +736,100 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         self.obligations.push((ty, tr, span));
     }
 
+    /// Learn types from trait bounds: where a bound with unknown types can
+    /// only be met one way (by one impl, or one bound in scope), take that
+    /// way's types. `I: Iterator::<(K, V)>` with `I` known gives `K` and
+    /// `V`; a returned `Ids::<_>` promised as `impl Iterator::<Id::<T>>`
+    /// gives its parameter.
+    pub(crate) fn infer_from_bounds(&mut self) {
+        let mut goals: Vec<(Ty, TraitRef)> = self.obligations.iter().map(|(t, tr, _)| (t.clone(), tr.clone())).collect();
+        for (i, v, _) in &self.opaque_vars {
+            if let Some(o) = self.s.p.opaques.get(&(self.def, *i)) {
+                goals.extend(o.bounds.iter().map(|b| (v.clone(), b.clone())));
+            }
+        }
+        for _ in 0..4 {
+            let mut progress = false;
+            for (ty, tr) in &goals {
+                let t = self.resolve(ty);
+                let tr = TraitRef { trait_id: tr.trait_id, args: tr.args.iter().map(|a| self.resolve(a)).collect() };
+                if !t.has_infer() && !tr.args.iter().any(Ty::has_infer) {
+                    continue;
+                }
+                progress |= self.meet_unique_way(&t, &tr);
+            }
+            if !progress {
+                break;
+            }
+        }
+    }
+
+    /// If exactly one bound in scope or impl can make `t: tr` hold, unify
+    /// with it; returns whether that taught anything.
+    fn meet_unique_way(&mut self, t: &Ty, tr: &TraitRef) -> bool {
+        // Each way: the self type and trait arguments it has.
+        let mut ways: Vec<(Ty, Vec<Ty>)> = Vec::new();
+        let sm = self.shallow(t);
+        if !matches!(sm, Ty::Infer(_)) {
+            for p in self.known_preds(&sm) {
+                if p.trait_ref.trait_id == tr.trait_id {
+                    ways.push((p.ty.clone(), p.trait_ref.args.clone()));
+                }
+            }
+        }
+        let snapshot = (self.vars.clone(), self.lens.clone());
+        let mut fits = Vec::new();
+        for (wty, wargs) in ways {
+            let ok = self.unify(&wty, t) && wargs.len() == tr.args.len() && wargs.iter().zip(&tr.args).all(|(a, b)| self.unify(a, b));
+            (self.vars, self.lens) = snapshot.clone();
+            if ok {
+                fits.push((wty, wargs));
+            }
+        }
+        let mut impl_fit: Option<DefId> = None;
+        let mut impl_count = 0;
+        for imp in self.s.p.impls.clone() {
+            let DefData::Impl(d) = &self.s.p.def(imp).data else { continue };
+            let Some(itr) = &d.trait_ref else { continue };
+            if itr.trait_id != tr.trait_id || d.negative {
+                continue;
+            }
+            let (self_ty, itr, n) = (d.self_ty.clone(), itr.clone(), d.generics.count());
+            let fresh: Vec<Ty> = (0..n).map(|_| self.new_var(Span::DUMMY)).collect();
+            let ok = self.unify(&self_ty.subst(&fresh), t)
+                && itr.args.len() == tr.args.len()
+                && itr.args.iter().zip(&tr.args).all(|(a, b)| self.unify(&a.subst(&fresh), b));
+            (self.vars, self.lens) = snapshot.clone();
+            if ok {
+                impl_count += 1;
+                impl_fit = Some(imp);
+            }
+        }
+        if fits.len() + impl_count != 1 {
+            return false;
+        }
+        let before = (self.resolve(t), tr.args.iter().map(|a| self.resolve(a)).collect::<Vec<_>>());
+        if let Some((wty, wargs)) = fits.pop() {
+            self.unify(&wty, t);
+            for (a, b) in wargs.iter().zip(&tr.args) {
+                self.unify(a, b);
+            }
+        } else if let Some(imp) = impl_fit {
+            let d = self.s.p.impl_data(imp).clone();
+            let itr = d.trait_ref.clone().unwrap();
+            let fresh: Vec<Ty> = (0..d.generics.count()).map(|_| self.new_var(Span::DUMMY)).collect();
+            self.unify(&d.self_ty.subst(&fresh), t);
+            for (a, b) in itr.args.iter().zip(&tr.args) {
+                self.unify(&a.subst(&fresh), b);
+            }
+        }
+        let after = (self.resolve(t), tr.args.iter().map(|a| self.resolve(a)).collect::<Vec<_>>());
+        before != after
+    }
+
     /// Resolve remaining inference, check deferred obligations and literals.
     fn finish(&mut self) {
+        self.infer_from_bounds();
         for i in 0..self.vars.len() {
             if let Var::Unbound(k, _) = self.vars[i] {
                 match k {

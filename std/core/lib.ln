@@ -17,3 +17,7 @@ pub mod mem;
 pub mod slice;
 pub mod str;
 pub mod string;
+pub mod hash;
+pub mod arena;
+pub mod collections;
+pub mod intern;

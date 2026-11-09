@@ -1,0 +1,19 @@
+eval: 3 -3 3
+after set/update: 210
+after view_mut: 205 Int(5)
+ids: #0 #4, 5 exprs, list #0+4 of 4
+ints: 2
+hash eq: true false
+enum hash: true false
+str hash: true false
+len 100, 7 -> Some(49), 100 -> None
+replace: Some(49) now Some(-1)
+after removing evens: len 50, 3 -> Some(9), 4 -> None, contains 99: true
+updated 3: Some(1009), update missing: false
+sum of entries 170100, of keys 2500
+shapes: Some(6) None
+ordered: {30: true, 10: true, 20: true}
+ordered: {10: true, 20: true, 5: false} len 3
+symbols: true false beta 2
+get: true false
+the=3 cat=1 and=2 dog=1 bird=1 

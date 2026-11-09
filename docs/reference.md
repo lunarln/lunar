@@ -416,11 +416,25 @@ alone lists every code. The explanations are the files in
   `core::fmt::{Display, Debug, write, format}`, `core::option::Option`,
   `core::result::Result`, `core::iter::Iterator`, `core::num::{Int, Float}`,
   `core::mem::{size_of, align_of, swap}`, `core::intrinsics`.
+* `core::ops::{Fn, FnMut, FnOnce}` (see Closures).
+* `core::hash::{Hash, Hasher, hash_of}`: one fixed fast hasher, `Hash` for
+  the primitives, `str`, `String`, tuples, `Option` and slices, and
+  `#[derive(Hash)]`.
+* `core::collections::{HashMap, OrderedHashMap}`: maps from Dull keys
+  (`Hash + Eq`) to Dull values, with `insert` (returns the old value),
+  `get` (a copy), `get_or`, `contains`, `remove`, `len`, `update(k, |v| ..)`
+  and `iter`/`keys`/`values`. `OrderedHashMap` iterates in insertion order.
+* `core::arena::{Arena, Id, List}`: items of one type in one growable
+  array, reached by typed handles (`add`, `get`, `set`, `update`, `view`,
+  `view_mut`, `ids`); `add_list`/`list` store runs of items, such as a
+  node's children. Trees are built from these.
+* `core::intern::{Interner, Symbol}`: `intern(s)`, `get(s)`, `resolve(sym)`.
 * Methods on slices (`len`, `get`, `first`, `last`, `contains`, `index_of`,
   `fill`, `swap`, `reverse`, `sort`, `to_dyn`, `to_grow`), growable arrays
   (`push`, `extend`, `reserve`), shrinkable arrays (`pop`, `truncate`,
   `clear`, `remove`, `insert`), `str` (`len`, `as_bytes`, `chars`, `bytes`,
-  `find`, `contains`, `starts_with`, `ends_with`, `trim`, `parse_i64`,
+  `find`, `contains`, `starts_with`, `ends_with`, `trim`, `split`, `lines`,
+  `parse_i64`,
   `to_string`, and `str::from_utf8(bytes): Option::<str>`) and `String` (`new`, `from`, `push`, `push_str`, `write`,
   `as_str`, `len`, `clear`, `truncate`, `pop`).
 * `std::io::{print, println, eprint, eprintln, write_str, read_line}`, and
@@ -435,14 +449,15 @@ alone lists every code. The explanations are the files in
   lend their arguments and describe the assertion),
   `std::process::{exit, abort, panic}`, `std::env::{arg_count, arg}`.
 * The prelude provides `Dull`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`,
-  `Eq`, `Ord`, `Ordering`, `Clone`, `Default`, `Display`, `Debug`,
-  `Iterator`, `print`, `println`, `eprint`, `eprintln`, `panic`, `assert`,
+  `Eq`, `Ord`, `Ordering`, `Clone`, `Default`, `Display`, `Debug`, `Hash`,
+  `Iterator`, `Fn`, `FnMut`, `FnOnce`, `print`, `println`, `eprint`,
+  `eprintln`, `panic`, `assert`,
   `assert_eq` and `assert_ne`, with the derives and macros of the same
   names.
 * Format strings: `{x}` uses `Display`, `{x:?}` uses `Debug` (strings and
   characters quoted and escaped, arrays as `[1, 2]`, derived types as
   `Point { x: 1, y: 2 }`).
-* Derives in `core`: `#[derive(Eq, Ord, Debug, Clone, Default)]` on structs
+* Derives in `core`: `#[derive(Eq, Ord, Debug, Clone, Default, Hash)]` on structs
   and enums (`Default` uses the variant marked `#[default]`), and
   `#[derive(Display)]` on enums whose variants have no fields. They are
   ordinary macros (`core/cmp.ln`, `core/fmt.ln`, ...), not built into the

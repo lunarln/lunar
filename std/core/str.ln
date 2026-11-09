@@ -67,6 +67,18 @@ impl str {
         return None;
     }
 
+    /// The pieces between occurrences of `sep` (an empty `sep` gives the
+    /// whole text once).
+    pub fn split(self, sep: str): impl Iterator::<str> {
+        return Split { rest: self, sep, done: false };
+    }
+
+    /// The lines, without their `\n` (or `\r\n`) endings.
+    pub fn lines(self): impl Iterator::<str> {
+        let text = if self.ends_with("\n") { self[..self.len() - 1] } else { self };
+        return Lines { inner: Split { rest: text, sep: "\n", done: self.len() == 0 } };
+    }
+
     /// Without leading and trailing ASCII whitespace.
     pub fn trim(self): str {
         let b = self.as_bytes();
@@ -211,6 +223,50 @@ impl Iterator::<u8> for Bytes {
         let v = b[self.pos];
         self.pos += 1;
         return Some(v);
+    }
+}
+
+/// The pieces of a `str` between separators (`str::split`).
+struct Split {
+    rest: str,
+    sep: str,
+    done: bool,
+}
+
+impl Iterator::<str> for Split {
+    fn next(&mut self): Option::<str> {
+        if self.done {
+            return None;
+        }
+        if self.sep.is_empty() {
+            self.done = true;
+            return Some(self.rest);
+        }
+        return match self.rest.find(self.sep) {
+            Some(i) => {
+                let piece = self.rest[..i];
+                self.rest = self.rest[i + self.sep.len()..];
+                Some(piece)
+            }
+            None => {
+                self.done = true;
+                Some(self.rest)
+            }
+        };
+    }
+}
+
+/// The lines of a `str` (`str::lines`).
+struct Lines {
+    inner: Split,
+}
+
+impl Iterator::<str> for Lines {
+    fn next(&mut self): Option::<str> {
+        return match self.inner.next() {
+            Some(line) => Some(if line.ends_with("\r") { line[..line.len() - 1] } else { line }),
+            None => None,
+        };
     }
 }
 

@@ -1,0 +1,194 @@
+// Arenas: the items of one type in one growable array, linked by typed
+// handles. Trees and graphs are built from them (docs/design/
+// trees-and-collections.md): growth never moves items, a link is a 4-byte
+// index, and a list of children is a packed run in an arena of handles.
+//
+//     let mut exprs: Arena::<Expr> = Arena::new();
+//     let one = exprs.add(Expr::Int(1));
+//     let sum = exprs.add(Expr::Add(one, one));
+
+use crater::hash::{Hash, Hasher};
+
+/// A handle to an item of an `Arena::<T>`: its index, labelled with the
+/// item type, so an `Id::<Stmt>` cannot be used where an `Id::<Expr>` is
+/// expected. Handles are not tied to the arena that made them.
+pub struct Id::<T> {
+    index: u32,
+}
+
+impl::<T> Id::<T> {
+    /// The handle of the item at `index`.
+    pub fn from_index(index: usize): Id::<T> {
+        return Id { index: index as u32 };
+    }
+
+    pub fn index(self): usize {
+        return self.index as usize;
+    }
+}
+
+impl::<T> Eq for Id::<T> {
+    fn eq(&self, other: &Self): bool {
+        return self.index == other.index;
+    }
+}
+
+impl::<T> Ord for Id::<T> {
+    fn cmp(&self, other: &Self): Ordering {
+        if self.index < other.index {
+            return Ordering::Less;
+        }
+        if self.index > other.index {
+            return Ordering::Greater;
+        }
+        return Ordering::Equal;
+    }
+}
+
+impl::<T> Hash for Id::<T> {
+    fn hash(&self, h: &mut Hasher) {
+        h.write_u64(self.index as u64);
+    }
+}
+
+impl::<T> Debug for Id::<T> {
+    fn debug(&self, out: &mut String) {
+        out.write("#{self.index}");
+    }
+}
+
+/// A run of consecutive items of an `Arena::<T>` (made by `add_list`), such
+/// as the children of a node in an arena of handles.
+pub struct List::<T> {
+    start: u32,
+    len: u32,
+}
+
+impl::<T> List::<T> {
+    /// The list with no items.
+    pub fn empty(): List::<T> {
+        return List { start: 0, len: 0 };
+    }
+
+    pub fn len(self): usize {
+        return self.len as usize;
+    }
+
+    pub fn is_empty(self): bool {
+        return self.len == 0;
+    }
+}
+
+impl::<T> Eq for List::<T> {
+    fn eq(&self, other: &Self): bool {
+        return self.start == other.start && self.len == other.len;
+    }
+}
+
+impl::<T> Hash for List::<T> {
+    fn hash(&self, h: &mut Hasher) {
+        h.write_u64(self.start as u64);
+        h.write_u64(self.len as u64);
+    }
+}
+
+impl::<T> Debug for List::<T> {
+    fn debug(&self, out: &mut String) {
+        out.write("#{self.start}+{self.len}");
+    }
+}
+
+/// Items of type `T`, each reached by its `Id::<T>`.
+pub struct Arena::<T: Dull> {
+    items: [T; ..+],
+}
+
+impl::<T: Dull> Arena::<T> {
+    pub fn new(): Arena::<T> {
+        return Arena { items: [] };
+    }
+
+    /// Add an item; returns its handle.
+    pub fn add(&mut self, value: T): Id::<T> {
+        let i = self.items.len();
+        self.items.push(value);
+        return Id { index: i as u32 };
+    }
+
+    /// A copy of the item.
+    pub fn get(&self, id: Id::<T>): T {
+        return self.items[id.index as usize];
+    }
+
+    /// Replace the item.
+    pub fn set(&mut self, id: Id::<T>, value: T) {
+        self.items[id.index as usize] = value;
+    }
+
+    /// Replace the item with what `f` makes of it.
+    pub fn update::<F: FnOnce(T): T>(&mut self, id: Id::<T>, f: F) {
+        let i = id.index as usize;
+        self.items[i] = f(self.items[i]);
+    }
+
+    /// The item, as a one-item slice.
+    pub fn view(&self, id: Id::<T>): [T; &] {
+        let i = id.index as usize;
+        return self.items[i..i + 1];
+    }
+
+    /// The item, as a one-item slice to change in place.
+    pub fn view_mut(&mut self, id: Id::<T>): [T; &mut] {
+        let i = id.index as usize;
+        return self.items[i..i + 1];
+    }
+
+    /// Add `items` as one run; returns it as a list.
+    pub fn add_list(&mut self, items: [T; &]): List::<T> {
+        let start = self.items.len();
+        self.items.extend(items);
+        return List { start: start as u32, len: items.len() as u32 };
+    }
+
+    /// The items of a list made by `add_list`.
+    pub fn list(&self, l: List::<T>): [T; &] {
+        let start = l.start as usize;
+        return self.items[start..start + l.len as usize];
+    }
+
+    /// The number of items.
+    pub fn len(&self): usize {
+        return self.items.len();
+    }
+
+    pub fn is_empty(&self): bool {
+        return self.items.len() == 0;
+    }
+
+    /// Every item, in the order they were added.
+    pub fn items(&self): [T; &] {
+        return self.items[..];
+    }
+
+    /// The handles of every item, in the order they were added.
+    pub fn ids(&self): impl Iterator::<Id::<T>> {
+        return Ids { next: 0, end: self.items.len() as u32 };
+    }
+}
+
+/// The handles `next..end`.
+struct Ids::<T> {
+    next: u32,
+    end: u32,
+}
+
+impl::<T> Iterator::<Id::<T>> for Ids::<T> {
+    fn next(&mut self): Option::<Id::<T>> {
+        if self.next == self.end {
+            return None;
+        }
+        let id = Id { index: self.next };
+        self.next += 1;
+        return Some(id);
+    }
+}

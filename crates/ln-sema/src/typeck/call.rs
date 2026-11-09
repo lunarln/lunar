@@ -746,6 +746,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 self.require_unsafe(recv.span, "accessing a `static mut`");
             }
         }
+        if self.is_unbound_var(&r.ty) {
+            // Perhaps a bound says what it is.
+            self.infer_from_bounds();
+        }
         let rt = self.default_var(&r.ty);
         let rt = self.resolve(rt.strip_bang());
         if rt.is_error() {

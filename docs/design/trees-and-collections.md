@@ -1,8 +1,7 @@
 # Trees and collections
 
-Status: decided 2026-11-09, not built yet. Build order: closures
-([closures.md](closures.md)), then these collections, then the parser in
-`craters/`.
+Status: built (2026-11-09): `core::arena`, `core::hash`,
+`core::collections` and `core::intern`. Next: the parser in `craters/`.
 
 ## The problem
 

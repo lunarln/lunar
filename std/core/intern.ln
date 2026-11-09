@@ -1,0 +1,105 @@
+// String interning: each distinct text gets a `Symbol`, so comparing names
+// is comparing integers. The texts are stored once, end to end in one
+// `String`.
+
+use crater::hash::{Hash, Hasher, hash_of};
+use crater::collections::HashMap;
+
+/// An interned text: an index into the `Interner` that made it.
+pub struct Symbol {
+    index: u32,
+}
+
+impl Symbol {
+    pub fn index(self): usize {
+        return self.index as usize;
+    }
+}
+
+impl Eq for Symbol {
+    fn eq(&self, other: &Self): bool {
+        return self.index == other.index;
+    }
+}
+
+impl Hash for Symbol {
+    fn hash(&self, h: &mut Hasher) {
+        h.write_u64(self.index as u64);
+    }
+}
+
+impl Debug for Symbol {
+    fn debug(&self, out: &mut String) {
+        out.write("Symbol({self.index})");
+    }
+}
+
+/// Where a symbol's text is in `Interner::text`.
+struct Span {
+    start: u32,
+    len: u32,
+}
+
+/// Maps texts to symbols and back.
+pub struct Interner {
+    text: String,
+    spans: [Span; ..+],
+    /// For each text's hash, the newest symbol with that hash.
+    by_hash: HashMap::<u64, u32>,
+    /// For each symbol, the previous symbol with the same hash, plus one
+    /// (0: none).
+    same_hash: [u32; ..+],
+}
+
+impl Interner {
+    pub fn new(): Interner {
+        return Interner { text: String::new(), spans: [], by_hash: HashMap::new(), same_hash: [] };
+    }
+
+    /// The symbol for `s`, if it has been interned.
+    pub fn get(&self, s: str): Option::<Symbol> {
+        let h = hash_of(&s);
+        let mut next = match self.by_hash.get(h) {
+            Some(i) => i + 1,
+            None => 0,
+        };
+        while next != 0 {
+            let i = next - 1;
+            let sym = Symbol { index: i };
+            if self.resolve(sym) == s {
+                return Some(sym);
+            }
+            next = self.same_hash[i as usize];
+        }
+        return None;
+    }
+
+    /// The symbol for `s`, interning it if it is new.
+    pub fn intern(&mut self, s: str): Symbol {
+        if let Some(sym) = self.get(s) {
+            return sym;
+        }
+        let h = hash_of(&s);
+        let index = self.spans.len() as u32;
+        self.spans.push(Span { start: self.text.len() as u32, len: s.len() as u32 });
+        self.text.push_str(s);
+        let prev = match self.by_hash.insert(h, index) {
+            Some(p) => p + 1,
+            None => 0,
+        };
+        self.same_hash.push(prev);
+        return Symbol { index };
+    }
+
+    /// The text of a symbol this interner made.
+    pub fn resolve(&self, sym: Symbol): str {
+        let sp = self.spans[sym.index as usize];
+        let start = sp.start as usize;
+        return self.text[start..start + sp.len as usize];
+    }
+
+    /// The number of distinct texts.
+    pub fn len(&self): usize {
+        return self.spans.len();
+    }
+}

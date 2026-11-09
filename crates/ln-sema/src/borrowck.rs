@@ -302,6 +302,13 @@ impl<'p> Cx<'p, '_> {
 
     /// Roots of a borrow of `place` (slicing it, passing an owner handle).
     fn borrow_roots(&self, place: &Expr) -> Roots {
+        // Slicing a view stored in a field (`self.rest[i..]`): the data lives
+        // wherever that view points, not in the struct holding it.
+        if let ExprKind::Field { .. } = place.kind
+            && self.is_view_container(&place.ty)
+        {
+            return self.value_roots_of_place(place);
+        }
         match &place.kind {
             ExprKind::Local(l) => {
                 if self.is_view_container(&self.local(*l).ty) {
