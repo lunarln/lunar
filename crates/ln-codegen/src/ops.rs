@@ -221,8 +221,10 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         let cp = self.struct_field(ht.into(), h, 2);
         let len = self.cg.b.build_load(self.cg.usize_ty(), lp, "len").unwrap().into_int_value();
         let cap = self.cg.b.build_load(self.cg.usize_ty(), cp, "cap").unwrap().into_int_value();
-        let need = self.cg.b.build_int_add(len, extra, "need").unwrap();
-        let full = self.cg.b.build_int_compare(IntPredicate::UGT, need, cap, "").unwrap();
+        // `extra > cap - len` rather than `len + extra > cap`: `extra` may be
+        // user-controlled and the addition could wrap (`len <= cap` always).
+        let room = self.cg.b.build_int_sub(cap, len, "room").unwrap();
+        let full = self.cg.b.build_int_compare(IntPredicate::UGT, extra, room, "").unwrap();
         let grow = self.block_named("grow");
         let done = self.block_named("grown");
         self.cg.b.build_conditional_branch(full, grow, done).unwrap();
@@ -714,8 +716,8 @@ fn thunk_extend<'ctx>(cg: &mut Cg<'ctx, '_>, f: FunctionValue<'ctx>, out: Pointe
     let cp = cg.b.build_struct_gep(ht, out, 2, "").unwrap();
     let len = cg.b.build_load(cg.usize_ty(), lp, "").unwrap().into_int_value();
     let cap = cg.b.build_load(cg.usize_ty(), cp, "").unwrap().into_int_value();
-    let need = cg.b.build_int_add(len, n, "").unwrap();
-    let full = cg.b.build_int_compare(IntPredicate::UGT, need, cap, "").unwrap();
+    let room = cg.b.build_int_sub(cap, len, "").unwrap();
+    let full = cg.b.build_int_compare(IntPredicate::UGT, n, room, "").unwrap();
     let grow = cg.ctx.append_basic_block(f, "grow");
     let done = cg.ctx.append_basic_block(f, "grown");
     cg.b.build_conditional_branch(full, grow, done).unwrap();

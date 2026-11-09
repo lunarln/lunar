@@ -1,0 +1,7 @@
+// fatal: data stack overflow
+fn main() {
+    let mut a: [u32; ..+] = [1, 2, 3];
+    a.reserve(18446744073709551615 - std::env::arg_count() + 1);
+    a.push(4);
+    println("len = {a.len()}");
+}

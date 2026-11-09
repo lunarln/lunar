@@ -1,0 +1,17 @@
+// Arrays of zero-sized items: no memory is needed, but lengths still count.
+
+struct Unit;
+
+fn main() {
+    let mut a: [Unit; -..+] = [];
+    for _ in 0..5 {
+        a.push(Unit);
+    }
+    println("units = {a.len()}");
+    a.pop();
+    println("units = {a.len()}");
+    let mut b: [(); ..+] = [];
+    b.push(());
+    b.push(());
+    println("units = {b.len()}");
+}

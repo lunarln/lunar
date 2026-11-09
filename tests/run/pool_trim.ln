@@ -1,0 +1,20 @@
+// Freed data stacks go back to a pool with their memory beyond 1 MiB
+// returned to the OS; reusing a trimmed stack must commit it again.
+
+fn fill(round: u64): u64 {
+    let mut big: [u64; ..+] = [];
+    for i in 0..1000000 {
+        big.push(i + round);
+    }
+    let mut sum: u64 = 0;
+    for x in big[..] {
+        sum += x;
+    }
+    return sum;
+}
+
+fn main() {
+    for round in 0..3 {
+        println("round {round}: {fill(round)}");
+    }
+}

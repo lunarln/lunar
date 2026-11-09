@@ -1,0 +1,9 @@
+// fatal: data stack overflow
+//
+// 2^61 eight-byte items: the byte count is exactly 2^64, which used to wrap
+// to 0 in release builds and hand out no memory at all.
+fn main() {
+    let n: usize = 2305843009213693952 + std::env::arg_count() - 1;
+    let a: [i64] = [7; n];
+    println("len = {a.len()}");
+}

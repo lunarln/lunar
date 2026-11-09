@@ -6,6 +6,8 @@
 //   exit(code: i32): !
 //   reserve(size: usize): *mut u8       (address space, not yet usable)
 //   commit(base: *mut u8, size: usize)  (make the first `size` bytes usable)
+//   decommit(base: *mut u8, size: usize) (return those pages to the OS,
+//                                          keeping the address space)
 //   release(base: *mut u8, size: usize)
 
 #[cfg(windows)]

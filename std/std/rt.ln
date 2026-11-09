@@ -18,6 +18,11 @@ const RESERVE: usize = 8589934592;
 const CHUNK: usize = 65536;
 const HEADER: usize = 64;
 const POOL_SIZE: usize = 64;
+/// Committed bytes (including the header) a pooled stack may keep; anything
+/// beyond is returned to the OS on free, so one huge array does not leave
+/// its peak memory parked in the pool.
+const RETAIN: usize = 1048576;
+const MAX_USIZE: usize = 18446744073709551615;
 
 /// Freed stacks (base addresses) available for reuse.
 static mut POOL: [usize; 64] = [0; 64];
@@ -65,12 +70,31 @@ fn acquire(): *mut u8 {
     }
 }
 
+fn stack_overflow(): ! {
+    sys::write(2, "fatal: data stack overflow (array exceeds 8 GiB)\n".as_bytes());
+    sys::exit(134);
+}
+
 /// Grow the array behind `handle` so it can hold `len + additional`
 /// elements of `elem_size` bytes.
+///
+/// The size computation must not wrap even in release builds (where `+` and
+/// `*` wrap): `additional` comes straight from user code (`reserve`,
+/// `[v; n]`), and a wrapped byte count would hand out too little memory.
 #[lang = "ds_grow"]
 fn ds_grow(handle: *mut RawArr, elem_size: usize, additional: usize) {
     unsafe {
         let mut a = intrinsics::ptr_read(handle);
+        if elem_size == 0 {
+            // Zero-sized items need no memory; any length fits.
+            a.cap = MAX_USIZE;
+            intrinsics::ptr_write(handle, a);
+            return;
+        }
+        // `a.len * elem_size <= RESERVE`, so this subtraction cannot wrap.
+        if additional > (RESERVE - HEADER) / elem_size - a.len {
+            stack_overflow();
+        }
         if a.ptr as usize == 0 {
             let base = acquire();
             a.ptr = intrinsics::ptr_offset_mut(base, HEADER as isize);
@@ -85,10 +109,10 @@ fn ds_grow(handle: *mut RawArr, elem_size: usize, additional: usize) {
                 want = need;
             }
             // Round up to whole chunks (including the header).
-            let total = (want + HEADER + CHUNK - 1) / CHUNK * CHUNK;
+            let mut total = (want + HEADER + CHUNK - 1) / CHUNK * CHUNK;
             if total > RESERVE {
-                sys::write(2, "fatal: data stack overflow (array exceeds 8 GiB)\n".as_bytes());
-                sys::exit(134);
+                // Doubling overshot, but `need` itself fits (checked above).
+                total = RESERVE;
             }
             sys::commit(base, total);
             header.committed = total - HEADER;
@@ -108,6 +132,14 @@ fn ds_free(ptr: *mut u8) {
     unsafe {
         let base = intrinsics::ptr_offset_mut(ptr, 0 - (HEADER as isize));
         if POOL_LEN < POOL_SIZE {
+            let h = base as *mut Header;
+            let mut header = intrinsics::ptr_read(h);
+            let total = header.committed + HEADER;
+            if total > RETAIN {
+                sys::decommit(intrinsics::ptr_offset_mut(base, RETAIN as isize), total - RETAIN);
+                header.committed = RETAIN - HEADER;
+                intrinsics::ptr_write(h, header);
+            }
             POOL[POOL_LEN] = base as usize;
             POOL_LEN += 1;
         } else {

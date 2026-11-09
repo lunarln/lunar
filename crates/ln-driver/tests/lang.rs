@@ -127,3 +127,27 @@ fn emit_llvm_prints_ir() {
         assert!(ir.contains("define") && ir.contains("@main"), "unexpected IR (release={release}):\n{ir}");
     }
 }
+
+/// `tests/fatal/*.ln`: must compile, then exit with a failure status (not a
+/// crash) printing the `// fatal:` message, in debug and release builds.
+#[test]
+fn fatal_tests_fail_cleanly() {
+    let mut failures = Vec::new();
+    for f in ln_files(&root().join("tests/fatal")) {
+        let src = std::fs::read_to_string(&f).unwrap();
+        let expected = src.lines().find_map(|l| l.trim().strip_prefix("// fatal:")).map(str::trim).expect("missing `// fatal:` line");
+        for release in [false, true] {
+            let mut cmd = lunar();
+            cmd.arg("run").arg(&f);
+            if release {
+                cmd.arg("--release");
+            }
+            let out = cmd.output().unwrap();
+            let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+            if out.status.code() != Some(134) || !stderr.contains(expected) {
+                failures.push(format!("{} (release={release}): expected exit 134 and `{expected}`, got {:?}:\n{stderr}", f.display(), out.status.code()));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
