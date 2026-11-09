@@ -37,8 +37,18 @@ pub fn write_std_to(dir: &Path) -> std::io::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         if std::fs::read_to_string(&path).ok().as_deref() != Some(text) {
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let mut perm = meta.permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                perm.set_readonly(false);
+                std::fs::set_permissions(&path, perm)?;
+            }
             std::fs::write(&path, text)?;
         }
+        // A copy: make accidental edits fail instead of silently doing nothing.
+        let mut perm = std::fs::metadata(&path)?.permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&path, perm)?;
     }
     Ok(())
 }

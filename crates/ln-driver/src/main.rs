@@ -60,7 +60,11 @@ enum Cmd {
         args: Vec<String>,
     },
     /// Run the language server (LSP over stdio), for editors.
-    Lsp,
+    Lsp {
+        /// Accepted for compatibility with LSP clients; stdio is the only transport.
+        #[arg(long, hide = true)]
+        stdio: bool,
+    },
     /// Compile and run the `#[test]` functions in a program.
     Test {
         file: PathBuf,
@@ -129,7 +133,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Cmd::Lsp => match ln_driver::lsp::run() {
+        Cmd::Lsp { .. } => match ln_driver::lsp::run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: language server failed: {e}");

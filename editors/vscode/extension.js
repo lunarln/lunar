@@ -1,7 +1,7 @@
 // Lunar for VS Code: starts `lunar lsp` and connects it to .ln files.
 
 const vscode = require("vscode");
-const { LanguageClient, TransportKind } = require("vscode-languageclient/node");
+const { LanguageClient } = require("vscode-languageclient/node");
 
 /** @type {LanguageClient | undefined} */
 let client;
@@ -9,7 +9,9 @@ let client;
 function createClient() {
   const config = vscode.workspace.getConfiguration("lunar");
   const command = config.get("server.path") || "lunar";
-  const run = { command, args: ["lsp"], transport: TransportKind.stdio };
+  // No `transport`: stdio is the default, and naming it makes the client
+  // append `--stdio` to the arguments.
+  const run = { command, args: ["lsp"] };
   return new LanguageClient(
     "lunar",
     "Lunar Language Server",

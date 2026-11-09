@@ -236,7 +236,8 @@ mod lsp {
         std::fs::write(&file, "").unwrap(); // the editor buffer, not the disk, must be analyzed
         let uri = uri_of(&file);
 
-        let mut child = lunar().arg("lsp").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        // `--stdio` is what vscode-languageclient appends.
+        let mut child = lunar().args(["lsp", "--stdio"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
         let mut c = Client { stdin: child.stdin.take().unwrap(), stdout: BufReader::new(child.stdout.take().unwrap()), next_id: 0, notes: Vec::new() };
         let init = c.request("initialize", json!({ "processId": null, "rootUri": null, "capabilities": {} }));
         assert_eq!(init["capabilities"]["hoverProvider"], json!(true));
