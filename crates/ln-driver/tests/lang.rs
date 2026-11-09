@@ -426,7 +426,8 @@ fn reported_codes(stderr: &str) -> Vec<String> {
 
 /// For every explanation, the erroneous example reports exactly its code and
 /// the fixed example checks without any diagnostics. Examples marked
-/// ```lunar,ignore are skipped.
+/// ```lunar,ignore are skipped, and so are `toml` and `text` examples (for
+/// manifest diagnostics, which are tested in tests/project.rs).
 #[test]
 fn explanation_examples_check() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("explain");
@@ -440,10 +441,10 @@ fn explanation_examples_check() {
         for (heading, bad) in [("## Erroneous example", true), ("## Fixed", false)] {
             let Some((info, src)) = example(&md, heading) else { continue };
             match info.as_str() {
-                "lunar,ignore" => continue,
+                "lunar,ignore" | "toml" | "text" => continue,
                 "lunar" => {}
                 other => {
-                    failures.push(format!("{code}: `{heading}` block must be ```lunar or ```lunar,ignore, not ```{other}"));
+                    failures.push(format!("{code}: `{heading}` block must be ```lunar, ```lunar,ignore, ```toml or ```text, not ```{other}"));
                     continue;
                 }
             }

@@ -9,7 +9,6 @@ code is reported when:
 
 * two members have the same package `name`; names must be unique in a
   workspace;
-* a listed member is not a package (its `lunar.toml` has no `[package]`);
 * `-p <name>` names no member of the workspace;
 * `lunar run` is run at the workspace root and several members have a
   program; pick one with `-p <name>`.

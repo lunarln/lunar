@@ -57,11 +57,16 @@ struct Server {
     file_root: HashMap<PathBuf, PathBuf>,
     /// URIs with published diagnostics, per crate root (to clear them later).
     published: HashMap<PathBuf, HashSet<Url>>,
+    /// The URI the client used for each file it opened, by path key. Paths
+    /// are canonicalized on the way in (`C:\Users\ABCDEF~1` and
+    /// `C:\Users\abcdefgh` are one file), but replies must use the client's
+    /// spelling or it will not recognize the document.
+    uris: Uris,
 }
 
 impl Server {
     fn new() -> Result<Self, Error> {
-        Ok(Server { open: HashMap::new(), crates: HashMap::new(), file_root: HashMap::new(), published: HashMap::new() })
+        Ok(Server { open: HashMap::new(), crates: HashMap::new(), file_root: HashMap::new(), published: HashMap::new(), uris: Uris::default() })
     }
 
     fn main_loop(&mut self, conn: &Connection) -> Result<(), Error> {
@@ -104,6 +109,7 @@ impl Server {
             DidOpenTextDocument::METHOD => {
                 let p: lsp_types::DidOpenTextDocumentParams = serde_json::from_value(n.params)?;
                 let Some(path) = to_path(&p.text_document.uri) else { return Ok(None) };
+                self.uris.0.insert(path_key(&path), p.text_document.uri);
                 self.open.insert(path_key(&path), p.text_document.text);
                 Ok(Some(path))
             }
@@ -199,12 +205,12 @@ impl Server {
             if let Some(file) = file
                 && let Some(list) = per_file.get_mut(&file)
             {
-                list.push(to_lsp_diag(&analysis, d));
+                list.push(to_lsp_diag(&analysis, d, &self.uris));
             }
         }
         let mut now = HashSet::new();
         for (id, path) in &files {
-            if let Ok(uri) = Url::from_file_path(path) {
+            if let Some(uri) = self.uris.of(path) {
                 now.insert(uri.clone());
                 publish(conn, uri, per_file.remove(id).unwrap_or_default())?;
             }
@@ -267,7 +273,7 @@ impl Server {
         let p: lsp_types::GotoDefinitionParams = serde_json::from_value(req.params)?;
         let tp = p.text_document_position_params;
         let Some((a, file, offset)) = self.locate(&tp.text_document.uri, tp.position) else { return Ok(None) };
-        Ok(ide::definition(a, file, offset).and_then(|span| location(a, span)).map(GotoDefinitionResponse::Scalar))
+        Ok(ide::definition(a, file, offset).and_then(|span| location(a, span, &self.uris)).map(GotoDefinitionResponse::Scalar))
     }
 }
 
@@ -275,8 +281,34 @@ fn error_response(id: RequestId, code: ErrorCode, msg: String) -> Response {
     Response::new_err(id, code as i32, msg)
 }
 
+/// The canonical path of a document, so that the same file always has the
+/// same path (on Windows: long names instead of 8.3 short ones, consistent
+/// drive letters), matching the canonical paths projects use.
 fn to_path(uri: &Url) -> Option<PathBuf> {
-    uri.to_file_path().ok()
+    let p = uri.to_file_path().ok()?;
+    Some(canonical_or_same(p))
+}
+
+/// Client URIs by path key; see `Server::uris`.
+#[derive(Default)]
+struct Uris(HashMap<PathBuf, Url>);
+
+impl Uris {
+    /// The URI to send the client for `path`: the one it opened the file
+    /// with, or one made from the path for files it has not opened.
+    fn of(&self, path: &Path) -> Option<Url> {
+        self.0.get(&path_key(path)).cloned().or_else(|| Url::from_file_path(path).ok())
+    }
+}
+
+fn canonical_or_same(p: PathBuf) -> PathBuf {
+    match std::fs::canonicalize(&p) {
+        Ok(c) => {
+            let s = c.to_string_lossy().into_owned();
+            PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
+        }
+        Err(_) => p,
+    }
 }
 
 fn range(a: &Analysis, span: Span) -> Range {
@@ -321,11 +353,11 @@ fn std_module_path(rel: &str) -> String {
     p.replace('/', "::")
 }
 
-fn location(a: &Analysis, span: Span) -> Option<Location> {
+fn location(a: &Analysis, span: Span, uris: &Uris) -> Option<Location> {
     let f = a.map.get(span.file);
     let uri = match std_rel_path(f) {
         Some(rel) => Url::parse(&format!("{STD_SCHEME}:{}", std_module_path(&rel))).ok()?,
-        None => Url::from_file_path(f.path.as_ref()?).ok()?,
+        None => uris.of(f.path.as_ref()?)?,
     };
     Some(Location::new(uri, range(a, span)))
 }
@@ -343,7 +375,7 @@ fn std_source_request(req: Request) -> Result<serde_json::Value, Error> {
     Ok(serde_json::Value::String(text.to_string()))
 }
 
-fn to_lsp_diag(a: &Analysis, d: &Diagnostic) -> lsp_types::Diagnostic {
+fn to_lsp_diag(a: &Analysis, d: &Diagnostic, uris: &Uris) -> lsp_types::Diagnostic {
     let mut message = d.message.clone();
     if let Some(l) = &d.primary_label {
         message.push_str(&format!(" ({l})"));
@@ -358,7 +390,7 @@ fn to_lsp_diag(a: &Analysis, d: &Diagnostic) -> lsp_types::Diagnostic {
         .labels
         .iter()
         .filter(|l| !l.span.is_dummy())
-        .filter_map(|l| Some(DiagnosticRelatedInformation { location: location(a, l.span)?, message: l.message.clone() }))
+        .filter_map(|l| Some(DiagnosticRelatedInformation { location: location(a, l.span, uris)?, message: l.message.clone() }))
         .collect();
     let r = if d.span.is_dummy() { Range::default() } else { range(a, d.span) };
     lsp_types::Diagnostic {
@@ -381,35 +413,50 @@ fn publish(conn: &Connection, uri: Url, diagnostics: Vec<lsp_types::Diagnostic>)
     Ok(())
 }
 
-/// Analyze `root` as the crater it is in its project (`src/main.ln`,
-/// `src/lib.ln` or `tests/*.ln`, with their dependencies), or on its own if
-/// it isn't one. A broken manifest is reported on the file, which is then
-/// analyzed alone.
+/// Analyze `root` as the crater it is in its package (`src/main.ln`,
+/// `src/lib.ln` or `tests/*.ln`, with their dependencies, in the package's
+/// workspace), or on its own if it isn't one. A manifest error is reported
+/// where it is in `lunar.toml`, and the file is then analyzed alone.
 fn analyze_in_project(root: &Path, opts: &AnalyzeOptions) -> Analysis {
-    let Some(dir) = root.parent().and_then(project::find_project) else { return analyze_with(root, opts) };
-    let key = path_key(root);
-    let is = |p: Option<PathBuf>| p.is_some_and(|p| path_key(&p) == key);
-    let manifest = match project::Manifest::load(&dir) {
-        Ok(m) => m,
-        Err(e) => return with_project_error(analyze_with(root, opts), e),
-    };
-    let target = if is(manifest.main_root()) {
-        Target::Main
-    } else if is(manifest.lib_root()) {
-        Target::Lib
-    } else if manifest.test_files().iter().any(|t| path_key(t) == key) {
-        Target::TestFile(root.to_path_buf())
-    } else {
+    let Some(parent) = root.parent() else { return analyze_with(root, opts) };
+    if project::find_project(parent).is_none() {
         return analyze_with(root, opts);
+    }
+    let graph = match project::find_workspace(parent).and_then(|ws| project::resolve(ws, false, &mut |_| {})) {
+        Ok(g) => g,
+        Err(e) => return with_project_error(analyze_with(root, opts), &e),
     };
-    match project::resolve(&dir, false, &mut |_| {}).and_then(|g| project::craters(&g, &target)) {
+    // The member package whose crater this file is. Members are canonical
+    // paths, so compare against the canonical form (on Windows this also
+    // turns 8.3 short names like `OCS12_~1` into long ones).
+    let canon = std::fs::canonicalize(root).map(|c| {
+        let s = c.to_string_lossy().into_owned();
+        PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
+    });
+    let key = path_key(canon.as_deref().unwrap_or(root));
+    let is = |p: Option<PathBuf>| p.is_some_and(|p| path_key(&p) == key);
+    let found = (0..graph.members).find_map(|i| {
+        let m = &graph.packages[i].manifest;
+        if is(m.main_root()) {
+            Some((i, Target::Main))
+        } else if is(m.lib_root()) {
+            Some((i, Target::Lib))
+        } else if m.test_files().iter().any(|t| path_key(t) == key) {
+            Some((i, Target::TestFile(root.to_path_buf())))
+        } else {
+            None
+        }
+    });
+    let Some((pkg, target)) = found else { return analyze_with(root, opts) };
+    match project::craters(&graph, pkg, &target) {
         Ok(craters) => analyze_craters(&craters, opts),
-        Err(e) => with_project_error(analyze_with(root, opts), e),
+        Err(e) => with_project_error(analyze_with(root, opts), &e),
     }
 }
 
-fn with_project_error(mut a: Analysis, e: String) -> Analysis {
-    a.diags.push(Diagnostic::error(ln_diag::codes::build::IO, Span::DUMMY, format!("{}: {e}", project::MANIFEST)));
+fn with_project_error(mut a: Analysis, e: &project::ProjectError) -> Analysis {
+    let d = e.to_diagnostic(&mut a.map);
+    a.diags.push(d);
     a
 }
 

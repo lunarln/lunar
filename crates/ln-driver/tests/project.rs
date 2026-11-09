@@ -118,9 +118,86 @@ fn manifest_errors() {
     let out = fails(&app, &home, &["build"]);
     assert!(out.contains("package name `App` is not valid"), "{out}");
 
+    // Errors carry their code and point into the manifest.
+    assert!(out.contains("err(manifest::bad_name)") && out.contains("lunar.toml:2"), "{out}");
+    std::fs::write(&manifest, "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nmissing = { path = \"../missing\" }\n").unwrap();
+    let out = fails(&app, &home, &["build"]);
+    assert!(out.contains("err(manifest::not_found)") && out.contains("lunar.toml:6"), "{out}");
+    std::fs::write(&manifest, "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nlib2 = { path = \"../lib2\", git = \"x\" }\n").unwrap();
+    let out = fails(&app, &home, &["build"]);
+    assert!(out.contains("err(manifest::bad_dependency)"), "{out}");
+    std::fs::write(&manifest, "[package]\nname = \"app\"\nversion = \"one\"\n").unwrap();
+    let out = fails(&app, &home, &["build"]);
+    assert!(out.contains("err(manifest::bad_version)"), "{out}");
+    std::fs::write(&manifest, "[package\nname = \"app\"\n").unwrap();
+    let out = fails(&app, &home, &["build"]);
+    assert!(out.contains("err(manifest::parse)"), "{out}");
+
+    // A library has no program to run.
+    let out = fails(&w.join("lib2"), &home, &["run"]);
+    assert!(out.contains("err(manifest::no_target)"), "{out}");
+
     // Outside any project, commands without a file explain what they need.
     let out = fails(&w, &home, &["build"]);
     assert!(out.contains("no `lunar.toml`"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&w);
+}
+
+#[test]
+fn workspaces() {
+    let w = scratch("workspace");
+    let home = w.join("home");
+    let ws = w.join("ws");
+    std::fs::create_dir_all(ws.join("crates")).unwrap();
+    std::fs::write(ws.join("lunar.toml"), "[workspace]\nmembers = [\"crates/*\", \"tool\"]\n").unwrap();
+    ok(&ws, &home, &["new", "tool"]);
+    ok(&ws.join("crates"), &home, &["new", "core-util", "--lib"]);
+    ok(&ws.join("crates"), &home, &["new", "app"]);
+    std::fs::write(
+        ws.join("crates/core-util/src/lib.ln"),
+        "pub fn twice(x: i32): i32 {\n    return x * 2;\n}\n\n#[test]\nfn doubles() {\n    std::test::assert_eq(twice(2), 4, \"twice\");\n}\n",
+    )
+    .unwrap();
+    ok(&ws.join("crates/app"), &home, &["add", "core-util", "--path", "../core-util"]);
+    std::fs::write(ws.join("crates/app/src/main.ln"), "fn main() {\n    println(\"app {core_util::twice(21)}\");\n}\n").unwrap();
+    std::fs::write(ws.join("tool/src/main.ln"), "fn main() {\n    println(\"tool\");\n}\n").unwrap();
+
+    // At the root, several members have programs: `run` needs `-p`.
+    let out = fails(&ws, &home, &["run"]);
+    assert!(out.contains("err(manifest::workspace)") && out.contains("-p"), "{out}");
+    let out = ok(&ws, &home, &["run", "-p", "app"]);
+    assert!(out.contains("app 42\n"), "{out}");
+    let out = fails(&ws, &home, &["run", "-p", "nope"]);
+    assert!(out.contains("err(manifest::workspace)"), "{out}");
+
+    // In a member, commands act on that member; output and lock are shared.
+    let out = ok(&ws.join("tool"), &home, &["run"]);
+    assert!(out.contains("tool\n"), "{out}");
+    ok(&ws, &home, &["build"]);
+    let exe = if cfg!(windows) { ".exe" } else { "" };
+    for name in ["app", "tool"] {
+        assert!(ws.join(format!("target/debug/{name}{exe}")).is_file(), "{name} built at the workspace root");
+    }
+    // Members are not locked (they are part of the workspace), so path-only
+    // workspaces have no lockfile at all, and members never get their own.
+    assert!(!ws.join("lunar.lock").exists() && !ws.join("crates/app/lunar.lock").exists());
+    assert!(!ws.join("crates/app/target").exists());
+
+    // `test` at the root tests every member.
+    let out = ok(&ws, &home, &["test"]);
+    assert!(out.contains("doubles"), "{out}");
+
+    // Member names must be unique.
+    std::fs::write(ws.join("tool/lunar.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap();
+    let out = fails(&ws, &home, &["build"]);
+    assert!(out.contains("err(manifest::workspace)"), "{out}");
+    std::fs::write(ws.join("tool/lunar.toml"), "[package]\nname = \"tool\"\nversion = \"0.1.0\"\n").unwrap();
+
+    // A listed member must exist, and the error points at it.
+    std::fs::write(ws.join("lunar.toml"), "[workspace]\nmembers = [\"crates/*\", \"tool\", \"gone\"]\n").unwrap();
+    let out = fails(&ws.join("tool"), &home, &["build"]);
+    assert!(out.contains("err(manifest::not_found)") && out.contains("`gone`"), "{out}");
 
     let _ = std::fs::remove_dir_all(&w);
 }

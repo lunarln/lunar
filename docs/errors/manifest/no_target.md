@@ -3,8 +3,9 @@
 A package can have a program, `src/main.ln`, a library, `src/lib.ln`, or
 both. This code is reported when the one a command needs is missing:
 
-* `lunar build` and `lunar run` build the program, so the package must
-  have `src/main.ln`;
+* `lunar run` runs the program, so the package must have `src/main.ln`
+  (`lunar build` on a library-only package type-checks the library
+  instead);
 * a dependency is used through its library, so the depended-on package
   must have `src/lib.ln`.
 

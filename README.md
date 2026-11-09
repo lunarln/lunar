@@ -112,6 +112,23 @@ records the exact commit of every git dependency. Registry dependencies
 (`json = "1.2"`) are parsed, but the registry is not available yet. Git
 checkouts are cached in `~/.lunar` (or `$LUNAR_HOME`).
 
+A workspace groups packages that are built together. Its members share one
+`lunar.lock` and one `target/` at the workspace root, and depend on each
+other by `path`:
+
+```toml
+# lunar.toml at the workspace root (it may also have a [package])
+[workspace]
+members = ["crates/*", "tools/gen"]
+```
+
+Inside a member, commands act on that member; at the root they act on every
+member. `-p <name>` picks one member from anywhere in the workspace:
+`lunar run -p app`, `lunar test -p parser`.
+
+Manifest problems are reported like compiler errors, pointing into
+`lunar.toml` with a `manifest::...` code that `lunar explain` describes.
+
 Given a file, commands work on that file alone:
 
 ```text

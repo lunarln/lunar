@@ -7,9 +7,9 @@ into `_` (`my-util` is `use my_util::...;`), so the key must make a valid
 path segment.
 
 The dependency keys `core`, `std`, `crater`, `self` and `super` are
-reserved: they already mean something at the start of a path. Give such a
-dependency another key, and name the package it refers to with
-`package = "..."`.
+reserved: they already mean something at the start of a path. Package
+names `core`, `std` and `crater` are reserved too, since a package's crater
+takes its name.
 
 ## Erroneous example
 

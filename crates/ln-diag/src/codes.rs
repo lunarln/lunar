@@ -120,4 +120,18 @@ codes! {
         NO_MAIN = "no_main",
         MISSING_LANG_ITEM = "missing_lang_item",
     }
+    manifest ("manifest") => {
+        PARSE = "parse",
+        BAD_NAME = "bad_name",
+        BAD_VERSION = "bad_version",
+        BAD_DEPENDENCY = "bad_dependency",
+        NOT_FOUND = "not_found",
+        WRONG_PACKAGE = "wrong_package",
+        VERSION_MISMATCH = "version_mismatch",
+        REGISTRY_UNAVAILABLE = "registry_unavailable",
+        GIT = "git",
+        NO_TARGET = "no_target",
+        WORKSPACE = "workspace",
+        LOCK = "lock",
+    }
 }
