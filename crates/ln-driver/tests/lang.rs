@@ -311,8 +311,14 @@ mod lsp {
         assert!(text.contains("pub fn println("), "std source: {text:.200}");
         // ...and hover works inside it.
         let line = text.lines().position(|l| l.contains("pub fn println(")).unwrap() as u32;
-        let h = c.request("textDocument/hover", json!({ "textDocument": { "uri": target }, "position": { "line": line, "character": 8 } }));
-        assert!(h["contents"]["value"].as_str().unwrap_or_default().contains("fn println("), "hover in std: {h:#?}");
+        // VS Code sends these URIs percent-encoded: both forms must work.
+        let encoded = target.replace("::", "%3A%3A");
+        for uri in [&target, &encoded] {
+            let t = c.request("lunar/stdSource", json!({ "uri": uri }));
+            assert!(t.as_str().unwrap_or_default().contains("pub fn println("), "std source for {uri}: {t:#?}");
+            let h = c.request("textDocument/hover", json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": 8 } }));
+            assert!(h["contents"]["value"].as_str().unwrap_or_default().contains("fn println("), "hover in {uri}: {h:#?}");
+        }
 
         // Fixing the error clears it.
         let fixed = src.replace("undefined_name", "n as i32");

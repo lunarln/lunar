@@ -65,7 +65,8 @@ const stdProvider = {
       return "// The Lunar language server is not running.\n";
     }
     try {
-      return await client.sendRequest("lunar/stdSource", { uri: uri.toString() });
+      // `true`: don't percent-encode (`core::slice`, not `core%3A%3Aslice`).
+      return await client.sendRequest("lunar/stdSource", { uri: uri.toString(true) });
     } catch (e) {
       return `// Could not load ${uri.path}: ${e.message ?? e}\n`;
     }

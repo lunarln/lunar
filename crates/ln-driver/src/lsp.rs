@@ -217,7 +217,8 @@ impl Server {
     fn locate(&self, uri: &Url, pos: Position) -> Option<(&Analysis, FileId, u32)> {
         if uri.scheme() == STD_SCHEME {
             // Any analysis has the same standard library.
-            let module = uri.path();
+            let module = std_module_of(uri);
+            let module = module.as_str();
             let (a, file) = self.crates.values().find_map(|(_, a)| {
                 let id = a.map.files().find(|(_, f)| std_rel_path(f).is_some_and(|r| std_module_path(&r) == module)).map(|(id, _)| id)?;
                 Some((a, id))
@@ -287,6 +288,27 @@ fn std_rel_path(f: &ln_diag::SourceFile) -> Option<String> {
     f.name.strip_prefix("<std>/").map(str::to_string)
 }
 
+/// The module path of a `lunar-std:` URI. Clients may percent-encode it
+/// (VS Code sends `lunar-std:core%3A%3Aslice`), so decode it first.
+fn std_module_of(uri: &Url) -> String {
+    let raw = uri.path().as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if raw[i] == b'%'
+            && let (Some(h), Some(l)) = (raw.get(i + 1).and_then(|b| hex(*b)), raw.get(i + 2).and_then(|b| hex(*b)))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(raw[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).trim_start_matches('/').to_string()
+}
+
 /// `core/string.ln` -> `core::string`, `std/lib.ln` -> `std`,
 /// `std/sys/mod.ln` -> `std::sys`.
 fn std_module_path(rel: &str) -> String {
@@ -310,7 +332,8 @@ fn std_source_request(req: Request) -> Result<serde_json::Value, Error> {
     if url.scheme() != STD_SCHEME {
         return Err(format!("not a `{STD_SCHEME}:` URI: {uri}").into());
     }
-    let module = url.path();
+    let module = std_module_of(&url);
+    let module = module.as_str();
     let text = crate::std_files().find(|(rel, _)| std_module_path(rel) == module).map(|(_, text)| text);
     let text = text.ok_or_else(|| format!("no standard library module `{module}`"))?;
     Ok(serde_json::Value::String(text.to_string()))
