@@ -1,6 +1,7 @@
 //! Definition tables: every item in every crate gets a [`DefId`].
 
 use crate::ty::{TraitRef, Ty};
+pub use ln_ast::ParamMode;
 use ln_diag::Span;
 use std::collections::HashMap;
 
@@ -131,8 +132,11 @@ pub enum Abi {
 pub struct Param {
     pub name: String,
     pub ty: Ty,
-    /// `mut` parameter: passed by reference (in-out).
+    pub mode: ParamMode,
+    /// `x: &mut T`: passed by reference (in-out). Same as `mode == InOut`.
     pub inout: bool,
+    /// `mut x: T`: an owned parameter the function may change.
+    pub mutable: bool,
     pub is_self: bool,
     pub span: Span,
 }

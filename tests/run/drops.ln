@@ -13,7 +13,7 @@ fn make(i: u32): Named {
     return Named { name: String::from("item"), tags: t };
 }
 
-fn consume_len(n: Named): usize {
+fn consume_len(n: &Named): usize {
     return n.name.len() + n.tags.len();
 }
 

@@ -31,11 +31,11 @@ Put the method in a trait and implement the trait for `i32`:
 
 ```lunar
 trait Double {
-    fn double(self): i32;
+    fn double(&self): i32;
 }
 
 impl Double for i32 {
-    fn double(self): i32 {
+    fn double(&self): i32 {
         return self * 2;
     }
 }

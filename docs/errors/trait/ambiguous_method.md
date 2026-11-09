@@ -15,23 +15,23 @@ exactly one method.
 
 ```lunar
 trait Walk {
-    fn go(self): i32;
+    fn go(&self): i32;
 }
 
 trait Swim {
-    fn go(self): i32;
+    fn go(&self): i32;
 }
 
 struct Duck;
 
 impl Walk for Duck {
-    fn go(self): i32 {
+    fn go(&self): i32 {
         return 1;
     }
 }
 
 impl Swim for Duck {
-    fn go(self): i32 {
+    fn go(&self): i32 {
         return 2;
     }
 }
@@ -48,23 +48,23 @@ Say which trait's method to call:
 
 ```lunar
 trait Walk {
-    fn go(self): i32;
+    fn go(&self): i32;
 }
 
 trait Swim {
-    fn go(self): i32;
+    fn go(&self): i32;
 }
 
 struct Duck;
 
 impl Walk for Duck {
-    fn go(self): i32 {
+    fn go(&self): i32 {
         return 1;
     }
 }
 
 impl Swim for Duck {
-    fn go(self): i32 {
+    fn go(&self): i32 {
         return 2;
     }
 }

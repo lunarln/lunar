@@ -27,7 +27,7 @@ struct Inbox {
     messages: [i32; ..+],
 }
 
-fn take_all(inbox: Inbox): [i32; ..+] {
+fn take_all(inbox: &Inbox): [i32; ..+] {
     return inbox.messages;
 }
 
@@ -48,7 +48,7 @@ struct Inbox {
     messages: [i32; ..+],
 }
 
-fn take_all(inbox: Inbox): [i32; ..+] {
+fn take_all(inbox: &Inbox): [i32; ..+] {
     return inbox.messages.clone();
 }
 

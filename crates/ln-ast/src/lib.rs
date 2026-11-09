@@ -102,11 +102,28 @@ pub struct FnDecl {
 
 #[derive(Clone, Debug)]
 pub struct Param {
+    /// `mut x: T` / `mut self`: an owned parameter the function may change.
     pub is_mut: bool,
+    pub mode: ParamMode,
     pub kind: ParamKind,
-    /// `None` only for a bare `self` / `mut self`.
+    /// `None` only for a bare `self` (in any mode).
     pub ty: Option<Ty>,
+    /// `&mut !self`: the receiver may be shrunk.
+    pub self_bang: bool,
     pub span: Span,
+}
+
+/// How a parameter is passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParamMode {
+    /// `x: T`, `self`: the function takes ownership (the caller's value is
+    /// moved, or copied if it is Dull).
+    Take,
+    /// `x: &T`, `&self`: borrowed; the caller keeps ownership.
+    Borrow,
+    /// `x: &mut T`, `&mut self`: in-out; the caller passes a mutable place
+    /// and sees the changes.
+    InOut,
 }
 
 #[derive(Clone, Debug)]

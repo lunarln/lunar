@@ -1,32 +1,32 @@
 // error: trait::conflicting_impl
 trait Speak {
-    fn speak(self): i32;
+    fn speak(&self): i32;
 }
 
 struct Dog;
 
 impl Speak for Dog {
-    fn speak(self): i32 { return 1; }
+    fn speak(&self): i32 { return 1; }
 }
 
 impl Speak for Dog {
-    fn speak(self): i32 { return 2; }
+    fn speak(&self): i32 { return 2; }
 }
 
 impl::<T: Dull> Speak for [T; 4] {
-    fn speak(self): i32 { return 3; }
+    fn speak(&self): i32 { return 3; }
 }
 
 impl Speak for [i32; 4] {
-    fn speak(self): i32 { return 4; }
+    fn speak(&self): i32 { return 4; }
 }
 
 impl::<T: Dull> Speak for (T, String) {
-    fn speak(self): i32 { return 5; }
+    fn speak(&self): i32 { return 5; }
 }
 
 impl Speak for (String, String) {
-    fn speak(self): i32 { return 6; }
+    fn speak(&self): i32 { return 6; }
 }
 
 fn main() {}

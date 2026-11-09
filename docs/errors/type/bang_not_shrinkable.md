@@ -17,7 +17,7 @@ struct Log {
     lines: [i32; ..+],
 }
 
-fn add(mut log: !Log, line: i32) {
+fn add(log: &mut !Log, line: i32) {
     log.lines.push(line);
 }
 
@@ -37,7 +37,7 @@ struct Log {
     lines: [i32; ..+],
 }
 
-fn add(mut log: Log, line: i32) {
+fn add(log: &mut Log, line: i32) {
     log.lines.push(line);
 }
 

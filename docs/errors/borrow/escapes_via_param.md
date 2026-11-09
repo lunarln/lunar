@@ -13,7 +13,7 @@ variable of the callee.
 ## Erroneous example
 
 ```lunar
-fn pick_name(mut out: str) {
+fn pick_name(out: &mut str) {
     let name: String = String::from("lunar");
     out = name.as_str();
 }
@@ -31,7 +31,7 @@ Pass an owning value in-out and write into it, so the caller owns the
 result:
 
 ```lunar
-fn pick_name(mut out: String) {
+fn pick_name(out: &mut String) {
     out.push_str("lunar");
 }
 

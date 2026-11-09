@@ -22,7 +22,7 @@ struct Point {
     y: i32,
 }
 
-fn show::<T: Display>(value: T) {
+fn show::<T: Display>(value: &T) {
     println("{value}");
 }
 
@@ -42,12 +42,12 @@ struct Point {
 }
 
 impl Display for Point {
-    fn fmt(self, mut out: String) {
+    fn fmt(&self, out: &mut String) {
         out.write("({self.x}, {self.y})");
     }
 }
 
-fn show::<T: Display>(value: T) {
+fn show::<T: Display>(value: &T) {
     println("{value}");
 }
 

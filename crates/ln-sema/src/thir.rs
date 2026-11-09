@@ -18,7 +18,9 @@ pub struct LoopId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalKind {
     /// Function parameter number `index`.
-    Param { index: usize, inout: bool, bang: bool },
+    /// `owned`: the function took ownership (`x: T`), so the parameter is
+    /// a local it owns, not a borrow of the caller's value.
+    Param { index: usize, inout: bool, bang: bool, owned: bool },
     /// `let` binding or pattern binding.
     Let,
     /// Compiler temporary.

@@ -12,16 +12,16 @@ impl::<T: Dull> Stack::<T> {
         return Stack { items: [] };
     }
 
-    fn push(mut self, x: T) {
+    fn push(&mut self, x: T) {
         self.items.push(x);
     }
 
     // `self` is marked `!` so the stack's array may shrink.
-    fn pop(mut self: !Self): Option::<T> {
+    fn pop(&mut !self): Option::<T> {
         return self.items.pop();
     }
 
-    fn len(self): usize {
+    fn len(&self): usize {
         return self.items.len();
     }
 }
@@ -32,7 +32,7 @@ struct Countdown {
 }
 
 impl Iterator::<u32> for Countdown {
-    fn next(mut self): Option::<u32> {
+    fn next(&mut self): Option::<u32> {
         if self.n == 0 {
             return None;
         }
@@ -47,7 +47,7 @@ enum ParseError {
 }
 
 impl Display for ParseError {
-    fn fmt(self, mut out: String) {
+    fn fmt(&self, out: &mut String) {
         match self {
             ParseError::Empty => out.push_str("empty input"),
             ParseError::Bad(b) => out.write("bad byte {b}"),
@@ -81,7 +81,7 @@ fn show(r: Result::<u32, ParseError>) {
 }
 
 // `!` arrays can be passed where plain arrays are expected.
-fn total(a: [i64; -..+]): i64 {
+fn total(a: &[i64; -..+]): i64 {
     let mut t: i64 = 0;
     for x in a {
         t += x;
@@ -89,7 +89,7 @@ fn total(a: [i64; -..+]): i64 {
     return t;
 }
 
-fn drain_total(mut a: ![i64; -..+]): i64 {
+fn drain_total(a: &mut ![i64; -..+]): i64 {
     let t = total(a);
     a.clear();
     return t;

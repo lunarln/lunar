@@ -132,7 +132,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let mut params = Vec::new();
         for (i, p) in fd.sig.params.iter().enumerate() {
             let bang = matches!(p.ty, Ty::Bang(_));
-            let id = fcx.new_local(&p.name, p.ty.clone(), p.inout, LocalKind::Param { index: i, inout: p.inout, bang }, p.span, 0);
+            let owned = p.mode == crate::defs::ParamMode::Take;
+            let mutable = p.inout || (owned && p.mutable);
+            let id = fcx.new_local(&p.name, p.ty.clone(), mutable, LocalKind::Param { index: i, inout: p.inout, bang, owned }, p.span, 0);
             if p.name != "_" {
                 fcx.bind_name(&p.name, id);
             }
@@ -617,7 +619,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             let n = local.name.clone();
             let sp = local.span;
             d = match local.kind {
-                LocalKind::Param { .. } => d.with_help(format!("declare the parameter as `mut {n}` to pass it in-out")),
+                LocalKind::Param { owned: true, .. } => {
+                    d.with_help(format!("declare it `mut {n}` to change this function's own copy, or `{n}: &mut ...` to change the caller's"))
+                }
+                LocalKind::Param { .. } => d.with_help(format!("declare it `{n}: &mut ...` to pass it in-out")),
                 _ => d.with_help(format!("declare it with `let mut {n}`")),
             };
             d = d.with_secondary(sp, format!("`{n}` declared here"));

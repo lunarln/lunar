@@ -3,6 +3,6 @@ struct Log {
     lines: [i32; ..+],
 }
 
-fn f(mut l: !Log) {}
+fn f(l: &mut !Log) {}
 
 fn main() {}

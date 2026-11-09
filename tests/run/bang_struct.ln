@@ -5,7 +5,7 @@ struct Stack {
     name: str,
 }
 
-fn drain(mut s: !Stack): i32 {
+fn drain(s: &mut !Stack): i32 {
     let mut total = 0;
     loop {
         match s.items.pop() {

@@ -3,5 +3,5 @@
 /// by copying their data onto a fresh data stack.
 #[lang = "clone"]
 pub trait Clone {
-    fn clone(self): Self;
+    fn clone(&self): Self;
 }

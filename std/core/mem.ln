@@ -7,7 +7,7 @@ pub fn align_of::<T>(): usize {
 }
 
 /// Swap two Dull values in place.
-pub fn swap::<T: Dull>(mut a: T, mut b: T) {
+pub fn swap::<T: Dull>(a: &mut T, b: &mut T) {
     let t = a;
     a = b;
     b = t;

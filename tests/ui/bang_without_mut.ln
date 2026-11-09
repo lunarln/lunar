@@ -1,5 +1,5 @@
 // error: type::bang_without_mut
-fn f(s: ![i32; -..+]) {
+fn f(s: &![i32; -..+]) {
     let _ = s.len();
 }
 

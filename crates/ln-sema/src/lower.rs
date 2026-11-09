@@ -6,7 +6,7 @@ use crate::resolve::ModRes;
 use crate::ty::{ArrKind, IntTy, TraitRef, Ty};
 use crate::{AstRef, Sema};
 use ln_ast as ast;
-use ln_diag::{Diagnostic, Span, codes::name, codes::syntax, codes::trait_, codes::ty as tyc};
+use ln_diag::{Diagnostic, Span, codes::lint, codes::name, codes::syntax, codes::trait_, codes::ty as tyc};
 
 /// A check that needs complete ADT information.
 pub(crate) struct Deferred {
@@ -21,6 +21,8 @@ pub(crate) struct Deferred {
 pub(crate) enum DeferKind {
     ArrayElem,
     Bang,
+    /// `x: &T` where `T` might be Dull (a pointless borrow).
+    NeedlessBorrow,
 }
 
 /// Where a type appears.
@@ -445,21 +447,39 @@ impl<'a> Sema<'a> {
             };
             let ty = match &p.ty {
                 Some(t) => self.lower_ty(&cx, t, TyPos::Param),
-                None => cx.self_ty.clone().unwrap_or(Ty::Error),
+                None => {
+                    let t = cx.self_ty.clone().unwrap_or(Ty::Error);
+                    if p.self_bang { Ty::Bang(Box::new(t)) } else { t }
+                }
             };
             if is_extern {
                 self.check_ffi_ty(&ty, p.span);
             }
-            if matches!(ty, Ty::Bang(_)) && !p.is_mut {
-                let what = if is_self { "self".to_string() } else { pname.clone() };
+            if matches!(ty, Ty::Bang(_)) && p.mode != ast::ParamMode::InOut {
+                let fix = if is_self { "&mut !self".to_string() } else { format!("{pname}: &mut {}", self.p.ty_str(&ty)) };
                 self.err(
-                    Diagnostic::error(tyc::BANG_WITHOUT_MUT, p.span, format!("`!` parameter `{what}` is not `mut`"))
+                    Diagnostic::error(tyc::BANG_WITHOUT_MUT, p.span, format!("`!` parameter `{}` is not `&mut`", if is_self { "self" } else { &pname }))
                         .with_label("this function could never shrink it")
-                        .with_note("`!` marks an argument the function may shrink, and shrinking is mutation")
-                        .with_help(format!("declare it `mut {what}`")),
+                        .with_note("`!` marks an argument the function may shrink in place, so it must be passed in-out")
+                        .with_help(format!("declare it `{fix}`")),
                 );
             }
-            params.push(Param { name: pname, ty, inout: p.is_mut, is_self, span: p.span });
+            // Trait methods and their impls must keep the trait's modes.
+            let in_trait_item = parent.is_some_and(|pd| match &self.p.defs[pd.0 as usize].data {
+                DefData::Impl(d) => d.trait_ref.is_some(),
+                DefData::Trait(_) => true,
+                _ => false,
+            });
+            if p.mode == ast::ParamMode::Borrow && !is_self && !is_extern && !in_trait_item {
+                self.deferred.push(Deferred {
+                    kind: DeferKind::NeedlessBorrow,
+                    ty: ty.clone(),
+                    env: cx.env.clone(),
+                    span: p.span,
+                    generics_span: f.generics.span,
+                });
+            }
+            params.push(Param { name: pname, ty, mode: p.mode, inout: p.mode == ast::ParamMode::InOut, mutable: p.is_mut, is_self, span: p.span });
         }
         let (ret, ret_span) = match &f.ret {
             Some(t) => (self.lower_ty(&cx, t, TyPos::Other), t.span),
@@ -770,6 +790,16 @@ impl<'a> Sema<'a> {
                         );
                     }
                 }
+                DeferKind::NeedlessBorrow => {
+                    let inner = d.ty.strip_bang();
+                    if self.p.is_dull(inner, &d.env) {
+                        let s = self.p.ty_str(inner);
+                        self.err(
+                            Diagnostic::warning(lint::NEEDLESS_BORROW, d.span, format!("borrowing `{s}` is pointless: it is Dull, so it is copied anyway"))
+                                .with_help(format!("take it by value: `: {s}`")),
+                        );
+                    }
+                }
             }
         }
     }
@@ -980,10 +1010,14 @@ impl<'a> Sema<'a> {
         }
         for (tp, ip) in tf.sig.params.iter().zip(&imf.sig.params) {
             let want = tp.ty.subst(&args);
-            if want != ip.ty || tp.inout != ip.inout {
+            if want != ip.ty || tp.mode != ip.mode {
                 let (w, g) = (self.p.ty_str(&want), self.p.ty_str(&ip.ty));
-                let wm = if tp.inout { "mut " } else { "" };
-                let gm = if ip.inout { "mut " } else { "" };
+                let prefix = |m: ast::ParamMode| match m {
+                    ast::ParamMode::Take => "",
+                    ast::ParamMode::Borrow => "&",
+                    ast::ParamMode::InOut => "&mut ",
+                };
+                let (wm, gm) = (prefix(tp.mode), prefix(ip.mode));
                 self.err(
                     Diagnostic::error(trait_::SIGNATURE, ip.span, format!("parameter type mismatch with trait: expected `{wm}{w}`, found `{gm}{g}`"))
                         .with_secondary(tp.span, "trait parameter declared here"),

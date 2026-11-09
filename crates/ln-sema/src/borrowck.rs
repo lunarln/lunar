@@ -78,6 +78,30 @@ pub fn lint(body: &Body, diags: &mut Diagnostics) {
         visit_children(e, &mut |c| walk(c, used, mutated));
     }
     visit_block(&body.block, &mut |e| walk(e, &mut used, &mut mutated));
+    // `mut x: T` is the function's own copy. Changing it without ever reading
+    // it back almost always means the caller's variable was meant to change
+    // (`x: &mut T`, which was spelled `mut x: T` before parameters took
+    // ownership by default).
+    for (i, l) in body.locals.iter().enumerate() {
+        let id = LocalId(i as u32);
+        if !matches!(l.kind, LocalKind::Param { owned: true, .. }) || !l.mutable || l.name.starts_with('_') || l.span.is_dummy() {
+            continue;
+        }
+        if mutated.contains(&id) && !used.contains(&id) {
+            diags.push(
+                Diagnostic::warning(lint::MUT_PARAM_NOT_READ, l.span, format!("parameter `{}` is changed, but the new value is never used", l.name))
+                    .with_label("this is the function's own copy")
+                    .with_note("changes to a `mut` parameter do not reach the caller")
+                    .with_help(format!("to change the caller's variable, take it in-out: `{}: &mut ...`", l.name)),
+            );
+        } else if !mutated.contains(&id) {
+            diags.push(
+                Diagnostic::warning(lint::UNUSED_MUT, l.span, format!("parameter `{}` does not need to be mutable", l.name))
+                    .with_label("never mutated")
+                    .with_help("remove the `mut`"),
+            );
+        }
+    }
     for (i, l) in body.locals.iter().enumerate() {
         let id = LocalId(i as u32);
         if l.kind != LocalKind::Let || l.name.starts_with('_') || l.name.starts_with('<') || l.span.is_dummy() {
@@ -409,7 +433,9 @@ impl<'p> Cx<'p, '_> {
         for r in roots {
             let ok = match r {
                 Root::Local(l) => match self.local(l).kind {
-                    LocalKind::Param { inout, .. } => inout || self.p.has_owner(&self.local(l).ty),
+                    // A view into a borrowed (or in-out) owner points into the
+                    // caller's value; an owned parameter is freed on return.
+                    LocalKind::Param { inout, owned, .. } => !owned && (inout || self.p.has_owner(&self.local(l).ty)),
                     _ => false,
                 },
                 Root::Temp => false,
@@ -418,11 +444,15 @@ impl<'p> Cx<'p, '_> {
                 let n = self.root_name(r);
                 let mut d = Diagnostic::error(borrow::ESCAPES_FUNCTION, span, format!("cannot return a view of {n}, which is freed when the function returns"));
                 if let Root::Local(l) = r
-                    && let LocalKind::Param { .. } = self.local(l).kind
+                    && let LocalKind::Param { owned, .. } = self.local(l).kind
                 {
-                    d = d
-                        .with_note(format!("{n} is passed by value, so it is a copy owned by this function"))
-                        .with_help("take a slice parameter or an owning array instead");
+                    d = if owned && self.p.has_owner(&self.local(l).ty) {
+                        d.with_note(format!("this function takes ownership of {n}, so it is freed when the function returns"))
+                            .with_help("borrow the parameter instead (`: &T`), or return the owner itself")
+                    } else {
+                        d.with_note(format!("{n} is passed by value, so it is a copy owned by this function"))
+                            .with_help("take a slice parameter or a borrowed owner (`: &T`) instead")
+                    };
                 }
                 self.err(d);
             }
@@ -461,7 +491,7 @@ impl<'p> Cx<'p, '_> {
                     let roots = self.value_roots(value);
                     match self.place_root(place) {
                         Some(Root::Local(l)) => {
-                            if let LocalKind::Param { .. } = self.local(l).kind {
+                            if let LocalKind::Param { owned: false, .. } = self.local(l).kind {
                                 if !roots.is_empty() && self.reported.insert((value.span, 9)) {
                                     let n = self.local(l).name.clone();
                                     self.err(
@@ -607,7 +637,7 @@ impl<'p> Cx<'p, '_> {
             return None;
         }
         let l = self.local(root);
-        if let LocalKind::Param { bang: false, .. } = l.kind {
+        if let LocalKind::Param { bang: false, owned: false, .. } = l.kind {
             let n = l.name.clone();
             let ty = self.p.ty_str(&l.ty);
             let ls = l.span;
@@ -615,7 +645,7 @@ impl<'p> Cx<'p, '_> {
                 self.err(
                     Diagnostic::error(borrow::SHRINK_NOT_OWNER, span, format!("only the owner of `{n}` can mark it as shrinkable (`!`)"))
                         .with_secondary(ls, format!("`{n}` is a parameter, so its caller owns it"))
-                        .with_help(format!("declare the parameter as `mut {n}: !{ty}` so callers know it may shrink")),
+                        .with_help(format!("declare the parameter as `{n}: &mut !{ty}` so callers know it may shrink")),
                 );
             }
             return None;
@@ -1055,13 +1085,13 @@ impl Moves<'_, '_, '_> {
         match self.cx.place_root(place) {
             Some(Root::Local(l)) => {
                 let local = self.cx.local(l);
-                if let LocalKind::Param { .. } = local.kind {
+                if let LocalKind::Param { owned: false, .. } = local.kind {
                     let n = local.name.clone();
                     if self.cx.reported.insert((span, 3 << 28)) {
                         self.cx.err(
                             Diagnostic::error(borrow::MOVE_OUT_OF_BORROW, span, format!("cannot move out of parameter `{n}`"))
-                                .with_note("parameters are borrowed from the caller, so their owned data cannot be taken")
-                                .with_help("use `.clone()` to make an owned copy"),
+                                .with_note("this parameter is borrowed from the caller, so its owned data cannot be taken")
+                                .with_help(format!("take ownership instead (`{n}: T` rather than `{n}: &T`), or use `.clone()` to make an owned copy")),
                         );
                     }
                     return;
@@ -1099,11 +1129,27 @@ impl Moves<'_, '_, '_> {
         }
     }
 
+    /// Variables bound by `pat` are freshly initialized (in a loop, the
+    /// previous iteration may have moved them).
+    fn bind(&mut self, pat: &Pat, st: &mut MoveState) {
+        if let Some(s) = st {
+            walk_pat(pat, &mut |p| {
+                if let PatKind::Binding { local, .. } = p.kind {
+                    s.retain(|(l, _)| *l != local);
+                }
+            });
+        }
+    }
+
     fn block(&mut self, b: &Block, st: &mut MoveState) {
         for s in &b.stmts {
             match s {
-                Stmt::Let { init: Some(i), .. } => self.expr(i, st),
-                Stmt::Let { .. } => {}
+                Stmt::Let { pat, init, .. } => {
+                    if let Some(i) = init {
+                        self.expr(i, st);
+                    }
+                    self.bind(pat, st);
+                }
                 Stmt::Expr(e) => self.expr(e, st),
             }
         }
@@ -1216,6 +1262,7 @@ impl Moves<'_, '_, '_> {
                 for a in arms {
                     let mut s = st.clone();
                     self.pat_moves(scrut, &a.pat, &mut s);
+                    self.bind(&a.pat, &mut s);
                     if let Some(g) = &a.guard {
                         self.expr(g, &mut s);
                     }
@@ -1243,10 +1290,18 @@ impl Moves<'_, '_, '_> {
                 self.expr(end, st);
                 self.looped(*id, st, &mut |m, s| m.block(body, s), true);
             }
-            K::ForArray { array, body, id, .. } => {
+            K::ForArray { pat, array, body, id, .. } => {
                 self.place_inner(array, st);
                 self.check_use(array, st, array.span);
-                self.looped(*id, st, &mut |m, s| m.block(body, s), true);
+                self.looped(
+                    *id,
+                    st,
+                    &mut |m, s| {
+                        m.bind(pat, s);
+                        m.block(body, s);
+                    },
+                    true,
+                );
             }
             K::Break { id, value } => {
                 if let Some(v) = value {

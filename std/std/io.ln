@@ -37,7 +37,7 @@ pub fn write_str(s: str) {
 
 /// Read one line from standard input (without the trailing newline).
 /// Returns `false` at end of input.
-pub fn read_line(mut out: String): bool {
+pub fn read_line(out: &mut String): bool {
     let mut buf: [u8; 1] = [0];
     let mut got_any = false;
     loop {

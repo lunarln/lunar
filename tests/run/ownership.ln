@@ -1,0 +1,70 @@
+// Parameters that take ownership: the callee frees what it takes, the
+// caller's value is moved, and fields can be moved out of owned parameters.
+// The loops run far past the number of data stack slots, so a leak would
+// run out of slots and a double free would corrupt the free list.
+
+struct Person {
+    name: String,
+    tags: [u8; ..+],
+    age: u32,
+}
+
+impl Person {
+    fn new(name: String, age: u32): Person {
+        return Person { name, tags: [], age };
+    }
+
+    fn name(&self): str {
+        return self.name.as_str();
+    }
+
+    fn tag(&mut self, t: u8) {
+        self.tags.push(t);
+    }
+
+    fn into_name(self): String {
+        return self.name;
+    }
+}
+
+fn shout(mut s: String): String {
+    s.push_str("!");
+    return s;
+}
+
+fn consume(s: String): usize {
+    return s.len();
+}
+
+fn length(s: &String): usize {
+    return s.len();
+}
+
+fn main() {
+    // Moving into a constructor, borrowing, mutating, taking back out.
+    let mut p = Person::new(String::from("Ada"), 36);
+    p.tag(7);
+    println("{p.name()} {p.age} {p.tags.len()}");
+    let name = p.into_name();
+    println("{name}");
+
+    // A taken parameter changed and returned.
+    let loud = shout(name);
+    println("{loud} {length(loud)}");
+
+    // Many rounds: every String is taken and freed exactly once.
+    let mut total: usize = 0;
+    for i in 0..200000 {
+        let mut s = String::from("round ");
+        s.push_str("x");
+        if i % 2 == 0 {
+            total += consume(s);
+        } else {
+            let t = shout(s);
+            total += length(t);
+        }
+        let q = Person::new(String::from("q"), 1);
+        total += q.into_name().len();
+    }
+    println("{total}");
+}

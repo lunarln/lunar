@@ -21,7 +21,7 @@ function at all (for example a `static` or data behind a raw pointer).
 ## Erroneous example
 
 ```lunar
-fn drop_last(mut items: [i64; -..+]) {
+fn drop_last(items: &mut [i64; -..+]) {
     items.pop();
 }
 
@@ -37,7 +37,7 @@ fn main() {
 Declare the parameter `!` so callers know it may shrink:
 
 ```lunar
-fn drop_last(mut items: ![i64; -..+]) {
+fn drop_last(items: &mut ![i64; -..+]) {
     items.pop();
 }
 

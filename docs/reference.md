@@ -17,7 +17,7 @@
 ## 2. Items
 
 ```lunar
-pub fn name::<T: Bound + Other, U>(x: T, mut out: U): ReturnType { ... }
+pub fn name::<T: Bound + Other, U>(x: &T, out: &mut U): ReturnType { ... }
 unsafe fn raw(): i32 { ... }
 #[test] fn it_works() { ... }
 
@@ -27,7 +27,7 @@ struct Unit;
 
 enum Shape { Circle(f64), Rect { w: f64, h: f64 }, Empty }
 
-trait Show: Display { fn show(self): str; fn twice(self) { ... } }
+trait Show: Display { fn show(&self): str; fn twice(&self) { ... } }
 impl::<T: Dull> Show for Pair::<T> { ... }
 impl Point { fn new(): Point { ... } }
 
@@ -126,25 +126,26 @@ to 64 MiB in total.
   struct, enum or tuple containing one at any depth:
 
   ```lunar
-  fn clear_all(mut a: ![i32; -..+]) { ... }
-  fn drain(mut s: !Stack): i32 { ... }      // struct Stack { items: [i32; -..+] }
+  fn clear_all(a: &mut ![i32; -..+]) { ... }
+  fn drain(s: &mut !Stack): i32 { ... }      // struct Stack { items: [i32; -..+] }
 
   impl Stack {
-      fn pop(mut self: !Self): Option::<i32> { ... }   // a shrinking method
+      fn pop(&mut !self): Option::<i32> { ... }   // a shrinking method
   }
   ```
 
-  Methods that may shrink their receiver declare it `mut self: !Self`, as
+  Methods that may shrink their receiver declare it `&mut !self`, as
   `pop`, `truncate` and `clear` on `[T; -..+]` and `String` do. Calling
   such a method follows the same rules as passing the receiver to a `!`
   parameter.
-* `!` always comes with `mut`: shrinking is mutation, so a `!` parameter
-  without `mut` is `err(type::bang_without_mut)`. A `!` on a type with
+* `!` always comes with `&mut`: shrinking happens in place, so a `!`
+  parameter that is not in-out is `err(type::bang_without_mut)`. A `!` on a type with
   nothing shrinkable in it is `err(type::bang_not_shrinkable)`.
 * Passing a value to a `!` parameter (or calling a `!Self` method on it) is
   only allowed:
-  * for the value's **owner** (a local variable, or a parameter that is
-    itself declared `!`): `err(borrow::shrink_not_owner)` otherwise;
+  * for the value's **owner** (a local variable, a parameter that took
+    ownership, or a parameter that is itself declared `!`):
+    `err(borrow::shrink_not_owner)` otherwise;
   * when **no live view** points into the value: the compiler's liveness
     analysis reports `err(borrow::shrink_while_borrowed)` if a view is used
     after the shrink.
@@ -156,22 +157,52 @@ to 64 MiB in total.
 * Owners are freed when they go out of scope (also on `return`, `break`,
   `continue`). Moving out of a variable makes it unusable
   (`err(borrow::use_after_move)`).
-* Function parameters are **borrowed**: callees cannot move out of them
+* Parameters take ownership unless marked (see *Parameters* below). A
+  borrowed parameter cannot be moved out of
   (`err(borrow::move_out_of_borrow)`).
 * Views cannot outlive what they point into (`err(borrow::outlives_root)`)
   and cannot be returned when they point into the function's own locals
   (`err(borrow::escapes_function)`).
 
-### Mutation
+### Parameters
 
-`let` bindings are immutable, `let mut` bindings mutable. A `mut` parameter
-is **in-out**: the caller passes a mutable place and sees the changes.
+How a function receives each argument is part of its signature:
+
+| Parameter | Meaning |
+|---|---|
+| `x: T`, `self` | **takes ownership**: the caller's value is moved into the call (or copied, if it is Dull), and the function frees it |
+| `mut x: T`, `mut self` | the same, and the function may change its own value |
+| `x: &T`, `&self` | **borrows**: the caller keeps ownership; the function can read it but not keep or move it |
+| `x: &mut T`, `&mut self` | **in-out**: the caller passes a mutable place and sees the changes |
+| `x: &mut !T`, `&mut !self` | in-out and may be shrunk (see above) |
+
+Call sites look the same whatever the modes: `f(name)` moves, borrows or
+passes in-out depending on `f`'s signature, and using a moved variable
+afterwards is `err(borrow::use_after_move)`.
 
 ```lunar
-fn bump(mut x: i32) { x += 1; }
+fn new(name: String, age: u32): Person {   // keeps `name` without copying it
+    return Person { name, age };
+}
+fn len(s: &String): usize { return s.len(); }
+fn bump(x: &mut i32) { x += 1; }
+
 let mut n = 1;
 bump(n); // n == 2
 ```
+
+`&T` and `&mut T` exist only on parameters; they are modes, not types you
+can store. `str` and `[T; &]` are the first-class views. Borrowing a Dull
+type is pointless (`warn(lint::needless_borrow)`), and a `mut` parameter
+that is changed but never read again probably meant `&mut`
+(`warn(lint::mut_param_not_read)`).
+
+A function that takes ownership of owned values cannot be used as a
+function pointer: calls through pointers always borrow.
+
+### Mutation
+
+`let` bindings are immutable, `let mut` bindings mutable.
 
 ## 5. Expressions and statements
 

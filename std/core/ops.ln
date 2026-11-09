@@ -1,17 +1,17 @@
 // Operator traits. Primitive types implement them natively.
 
-#[lang = "add"] pub trait Add { fn add(self, rhs: Self): Self; }
-#[lang = "sub"] pub trait Sub { fn sub(self, rhs: Self): Self; }
-#[lang = "mul"] pub trait Mul { fn mul(self, rhs: Self): Self; }
-#[lang = "div"] pub trait Div { fn div(self, rhs: Self): Self; }
-#[lang = "rem"] pub trait Rem { fn rem(self, rhs: Self): Self; }
-#[lang = "neg"] pub trait Neg { fn neg(self): Self; }
-#[lang = "not"] pub trait Not { fn not(self): Self; }
-#[lang = "bitand"] pub trait BitAnd { fn bitand(self, rhs: Self): Self; }
-#[lang = "bitor"] pub trait BitOr { fn bitor(self, rhs: Self): Self; }
-#[lang = "bitxor"] pub trait BitXor { fn bitxor(self, rhs: Self): Self; }
-#[lang = "shl"] pub trait Shl { fn shl(self, rhs: Self): Self; }
-#[lang = "shr"] pub trait Shr { fn shr(self, rhs: Self): Self; }
+#[lang = "add"] pub trait Add { fn add(&self, rhs: &Self): Self; }
+#[lang = "sub"] pub trait Sub { fn sub(&self, rhs: &Self): Self; }
+#[lang = "mul"] pub trait Mul { fn mul(&self, rhs: &Self): Self; }
+#[lang = "div"] pub trait Div { fn div(&self, rhs: &Self): Self; }
+#[lang = "rem"] pub trait Rem { fn rem(&self, rhs: &Self): Self; }
+#[lang = "neg"] pub trait Neg { fn neg(&self): Self; }
+#[lang = "not"] pub trait Not { fn not(&self): Self; }
+#[lang = "bitand"] pub trait BitAnd { fn bitand(&self, rhs: &Self): Self; }
+#[lang = "bitor"] pub trait BitOr { fn bitor(&self, rhs: &Self): Self; }
+#[lang = "bitxor"] pub trait BitXor { fn bitxor(&self, rhs: &Self): Self; }
+#[lang = "shl"] pub trait Shl { fn shl(&self, rhs: &Self): Self; }
+#[lang = "shr"] pub trait Shr { fn shr(&self, rhs: &Self): Self; }
 
 /// A half-open range `start..end`.
 #[lang = "range"]
@@ -21,7 +21,7 @@ pub struct Range::<T> {
 }
 
 impl::<T: crater::num::Int> Iterator::<T> for Range::<T> {
-    fn next(mut self): Option::<T> {
+    fn next(&mut self): Option::<T> {
         if self.start < self.end {
             let v = self.start;
             self.start = self.start + T::one();

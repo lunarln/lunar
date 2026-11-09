@@ -19,7 +19,7 @@ struct fields, function signatures and generic code. For a generic parameter
 ## Erroneous example
 
 ```lunar
-fn count::<T>(items: [T; &]): usize {
+fn count::<T>(items: &[T; &]): usize {
     return items.len();
 }
 

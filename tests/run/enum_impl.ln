@@ -19,7 +19,7 @@ impl Shape {
         }
     }
 
-    fn scale(mut self, k: f64) {
+    fn scale(&mut self, k: f64) {
         match self {
             Shape::Circle(r) => { self = Shape::Circle(r * k); }
             Shape::Rect { w, h } => { self = Shape::Rect { w: w * k, h: h * k }; }
@@ -29,14 +29,14 @@ impl Shape {
 }
 
 trait Describe {
-    fn name(self): str;
-    fn describe(self) {
+    fn name(&self): str;
+    fn describe(&self) {
         println("a {self.name()}");
     }
 }
 
 impl Describe for Shape {
-    fn name(self): str {
+    fn name(&self): str {
         match self {
             Shape::Circle(_) => "circle",
             Shape::Rect { .. } => "rectangle",

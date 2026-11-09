@@ -1,5 +1,5 @@
 /// Values that produce a sequence of items; usable in `for` loops.
 #[lang = "iterator"]
 pub trait Iterator::<T> {
-    fn next(mut self): Option::<T>;
+    fn next(&mut self): Option::<T>;
 }

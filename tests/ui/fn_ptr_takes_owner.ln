@@ -1,0 +1,10 @@
+// error: type::not_callable
+fn consume(s: String): usize {
+    return s.len();
+}
+
+fn main() {
+    let f = consume;
+    let n = f(String::from("x"));
+    println("{n}");
+}

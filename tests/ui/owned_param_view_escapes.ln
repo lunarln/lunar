@@ -1,0 +1,9 @@
+// error: borrow::escapes_function
+fn first_word(s: String): str {
+    return s.as_str();
+}
+
+fn main() {
+    let w = first_word(String::from("hi there"));
+    println("{w}");
+}

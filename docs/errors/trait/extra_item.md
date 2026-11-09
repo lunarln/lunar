@@ -11,13 +11,13 @@ a method name or a method that was meant for an inherent impl.
 
 ```lunar
 trait Speak {
-    fn speak(self): str;
+    fn speak(&self): str;
 }
 
 struct Dog;
 
 impl Speak for Dog {
-    fn speak(self): str {
+    fn speak(&self): str {
         return "woof";
     }
 
@@ -35,13 +35,13 @@ Move `wag` into an inherent `impl Dog` block (or add it to the trait):
 
 ```lunar
 trait Speak {
-    fn speak(self): str;
+    fn speak(&self): str;
 }
 
 struct Dog;
 
 impl Speak for Dog {
-    fn speak(self): str {
+    fn speak(&self): str {
         return "woof";
     }
 }

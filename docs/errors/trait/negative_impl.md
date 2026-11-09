@@ -16,7 +16,7 @@ error.
 
 ```lunar
 trait Speak {
-    fn speak(self): str;
+    fn speak(&self): str;
 }
 
 struct Rock;
@@ -33,7 +33,7 @@ no `impl Speak for Rock`:
 
 ```lunar
 trait Speak {
-    fn speak(self): str;
+    fn speak(&self): str;
 }
 
 struct Rock;

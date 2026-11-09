@@ -76,6 +76,11 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 let slot = fc.alloca(lt, &local.name);
                 fc.cg.b.build_store(slot, param).unwrap();
                 fc.locals[l.0 as usize] = Some(slot);
+                // A parameter that took ownership is this function's to free
+                // (moving out of it zeroes the slot, making the drop a no-op).
+                if let LocalKind::Param { owned: true, .. } = local.kind {
+                    fc.register_cleanup(slot, ty.strip_bang());
+                }
             }
         }
         // Other locals.

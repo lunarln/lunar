@@ -435,8 +435,15 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 let fd = self.s.p.fn_data(def).clone();
                 let params: Vec<Ty> = fd.sig.params.iter().map(|p| p.ty.subst(&args)).collect();
                 let ret = fd.sig.ret.subst(&args);
-                if fd.sig.params.iter().any(|p| p.inout) || self.s.p.def(def).attrs.intrinsic {
-                    self.err(Diagnostic::error(tyc::NOT_CALLABLE, span, "functions with `mut` parameters or intrinsics cannot be used as function pointers"));
+                // Calls through a pointer borrow every argument, so the
+                // function must not take ownership of owned values.
+                let takes_owner = fd.sig.params.iter().any(|p| p.mode == ParamMode::Take && !self.s.p.is_copy(p.ty.strip_bang(), &self.env));
+                if fd.sig.params.iter().any(|p| p.inout) || takes_owner || self.s.p.def(def).attrs.intrinsic {
+                    self.err(Diagnostic::error(
+                        tyc::NOT_CALLABLE,
+                        span,
+                        "functions with `&mut` parameters, parameters that take ownership of owned values, or intrinsics cannot be used as function pointers",
+                    ));
                 }
                 self.oblige_preds(def, &args, span);
                 self.mk(ExprKind::FnRef { def, args }, Ty::FnPtr(params, Box::new(ret)), span)
@@ -468,7 +475,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let ct = self.shallow(&callee.ty);
         match ct {
             Ty::FnPtr(params, ret) => {
-                let sig: Vec<(Ty, bool)> = params.iter().map(|t| (t.clone(), false)).collect();
+                let sig: Vec<(Ty, ParamMode)> = params.iter().map(|t| (t.clone(), ParamMode::Borrow)).collect();
                 let a = self.check_args(&sig, false, args, span);
                 self.mk(ExprKind::Call { callee: Callee::Indirect(Box::new(callee)), args: a }, *ret, span)
             }
@@ -484,7 +491,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         match r {
             ValueRes::Fn { def, args: gargs } => {
                 let fd = self.s.p.fn_data(def).clone();
-                let sig: Vec<(Ty, bool)> = fd.sig.params.iter().map(|p| (p.ty.subst(&gargs), p.inout)).collect();
+                let sig: Vec<(Ty, ParamMode)> = fd.sig.params.iter().map(|p| (p.ty.subst(&gargs), p.mode)).collect();
                 let ret = fd.sig.ret.subst(&gargs);
                 if let Some(e) = expect {
                     // Help inference flow from the expected result.
@@ -512,7 +519,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 all.extend(trait_ref.args.iter().cloned());
                 all.extend(method_args.iter().cloned());
                 let fd = self.s.p.fn_data(def).clone();
-                let sig: Vec<(Ty, bool)> = fd.sig.params.iter().map(|p| (p.ty.subst(&all), p.inout)).collect();
+                let sig: Vec<(Ty, ParamMode)> = fd.sig.params.iter().map(|p| (p.ty.subst(&all), p.mode)).collect();
                 let ret = fd.sig.ret.subst(&all);
                 let a = self.check_args(&sig, false, args, span);
                 self.oblige_preds(def, &all, fspan);
@@ -561,18 +568,25 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         }
     }
 
-    /// Check call arguments against parameter types (`(type, inout)`).
-    pub(crate) fn check_args(&mut self, sig: &[(Ty, bool)], variadic: bool, args: &[ast::Expr], span: Span) -> Vec<Arg> {
+    /// Check call arguments against parameter types and modes.
+    pub(crate) fn check_args(&mut self, sig: &[(Ty, ParamMode)], variadic: bool, args: &[ast::Expr], span: Span) -> Vec<Arg> {
         if args.len() < sig.len() || (!variadic && args.len() > sig.len()) {
             self.err(Diagnostic::error(tyc::ARG_COUNT, span, format!("this function takes {} argument(s) but {} were supplied", sig.len(), args.len())));
         }
         let mut out = Vec::new();
         for (i, a) in args.iter().enumerate() {
             match sig.get(i) {
-                Some((pt, true)) => out.push(self.check_inout_arg(a, pt)),
-                Some((pt, false)) => {
+                Some((pt, ParamMode::InOut)) => out.push(self.check_inout_arg(a, pt)),
+                Some((pt, ParamMode::Borrow)) => {
                     let expect = pt.strip_bang().clone();
                     let v = self.check_expr_borrow(a, Some(&expect));
+                    let v = self.coerce_arg(v, &expect, a.span);
+                    out.push(Arg::Value(v));
+                }
+                Some((pt, ParamMode::Take)) => {
+                    // The value moves into the call (or is copied, if Dull).
+                    let expect = pt.strip_bang().clone();
+                    let v = self.check_expr(a, Some(&expect));
                     let v = self.coerce_arg(v, &expect, a.span);
                     out.push(Arg::Value(v));
                 }
@@ -591,7 +605,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let Some(place) = self.check_place(a) else {
             let v = self.check_expr(a, Some(pt));
             self.err(
-                Diagnostic::error(tyc::NOT_A_PLACE, a.span, "this argument is passed in-out (`mut` parameter) and must be a variable or field")
+                Diagnostic::error(tyc::NOT_A_PLACE, a.span, "this argument is passed in-out (`&mut` parameter) and must be a variable or field")
                     .with_help("bind the value with `let mut` first"),
             );
             let p = self.expr_as_place(v);
@@ -603,7 +617,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             self.require_unsafe(a.span, "accessing a `static mut`");
         }
         if !self.is_mutable_place(&place) && !place.ty.is_error() {
-            self.immutable_err(&place, a.span, "pass this as a `mut` argument");
+            self.immutable_err(&place, a.span, "pass this as a `&mut` argument");
         }
         let want = self.shallow(pt.strip_bang());
         let have = self.shallow(place.ty.strip_bang());
@@ -710,15 +724,15 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let mut all = pick.args.clone();
         let own = self.own_args(pick.def, generics, name.span);
         all.extend(own.iter().cloned());
-        let params: Vec<(Ty, bool)> = fd.sig.params.iter().map(|p| (p.ty.subst(&all), p.inout)).collect();
+        let params: Vec<(Ty, ParamMode)> = fd.sig.params.iter().map(|p| (p.ty.subst(&all), p.mode)).collect();
         let ret = fd.sig.ret.subst(&all);
         if fd.is_unsafe {
             let n = self.s.p.path_of(pick.def);
             self.require_unsafe(name.span, &format!("calling unsafe method `{n}`"));
         }
         // Receiver adjustment.
-        let (self_ty, self_inout) = params[0].clone();
-        let recv_arg = self.adjust_receiver(r, &rt, &step_ty, step_idx, &self_ty, self_inout, recv.span);
+        let (self_ty, self_mode) = params[0].clone();
+        let recv_arg = self.adjust_receiver(r, &rt, &step_ty, step_idx, &self_ty, self_mode, recv.span);
         let mut out = vec![recv_arg];
         out.extend(self.check_args(&params[1..], false, args, span));
         self.oblige_preds(pick.def, &all, name.span);
@@ -731,21 +745,23 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn adjust_receiver(&mut self, r: Expr, rt: &Ty, step: &Ty, step_idx: usize, self_ty: &Ty, inout: bool, span: Span) -> Arg {
+    fn adjust_receiver(&mut self, r: Expr, rt: &Ty, step: &Ty, step_idx: usize, self_ty: &Ty, mode: ParamMode, span: Span) -> Arg {
         let want = self.shallow(self_ty.strip_bang());
-        if inout {
+        if mode == ParamMode::InOut {
             if !self.is_mutable_place(&r) && !r.ty.is_error() {
-                self.immutable_err(&r, span, "call a method taking `mut self` on this value");
+                self.immutable_err(&r, span, "call a method taking `&mut self` on this value");
             }
             if step_idx > 0 && matches!(step, Ty::Array(_, k) if k.is_slice()) {
-                self.err(Diagnostic::error(tyc::MISMATCH, span, "cannot pass a slice view as `mut self`"));
+                self.err(Diagnostic::error(tyc::MISMATCH, span, "cannot pass a slice view as `&mut self`"));
             }
             let _ = self.unify(&want, step);
             return Arg::InOut(r);
         }
         let _ = self.unify(&want, step);
+        // A `self` receiver takes the value: it moves (or is copied, if Dull).
+        let read_mode = if mode == ParamMode::Take { ReadMode::Move } else { ReadMode::Borrow };
         if step_idx == 0 {
-            return Arg::Value(self.read(r, ReadMode::Borrow));
+            return Arg::Value(self.read(r, read_mode));
         }
         match (rt, step) {
             (Ty::Array(_, k), Ty::Array(_, sk)) if sk.is_slice() && !k.is_slice() => {
@@ -758,7 +774,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             (Ty::String, Ty::Str) => Arg::Value(self.mk(ExprKind::Coerce { kind: Coercion::StringToStr, expr: Box::new(r) }, Ty::Str, span)),
             _ => {
                 // Owner-to-owner kinds and `&mut` -> `&` share a layout.
-                let v = self.read(r, ReadMode::Borrow);
+                let v = self.read(r, read_mode);
                 Arg::Value(self.mk(ExprKind::Coerce { kind: Coercion::Weaken, expr: Box::new(v) }, step.clone(), span))
             }
         }

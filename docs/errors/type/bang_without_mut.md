@@ -11,7 +11,7 @@ function does not shrink the value, drop the `!` instead.
 ## Erroneous example
 
 ```lunar
-fn drop_last(s: ![i32; -..+]) {
+fn drop_last(s: &![i32; -..+]) {
     s.pop();
 }
 
@@ -27,7 +27,7 @@ fn main() {
 Declare the parameter `mut`:
 
 ```lunar
-fn drop_last(mut s: ![i32; -..+]) {
+fn drop_last(s: &mut ![i32; -..+]) {
     s.pop();
 }
 

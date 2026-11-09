@@ -8,36 +8,36 @@ pub enum Ordering {
 /// Equality, used by `==` and `!=`.
 #[lang = "eq"]
 pub trait Eq {
-    fn eq(self, other: Self): bool;
+    fn eq(&self, other: &Self): bool;
 }
 
 /// Total ordering, used by `<`, `<=`, `>` and `>=`.
 #[lang = "ord"]
 pub trait Ord: Eq {
-    fn cmp(self, other: Self): Ordering;
+    fn cmp(&self, other: &Self): Ordering;
 
-    fn lt(self, other: Self): bool {
+    fn lt(&self, other: &Self): bool {
         return match self.cmp(other) {
             Ordering::Less => true,
             _ => false,
         };
     }
 
-    fn le(self, other: Self): bool {
+    fn le(&self, other: &Self): bool {
         return match self.cmp(other) {
             Ordering::Greater => false,
             _ => true,
         };
     }
 
-    fn gt(self, other: Self): bool {
+    fn gt(&self, other: &Self): bool {
         return match self.cmp(other) {
             Ordering::Greater => true,
             _ => false,
         };
     }
 
-    fn ge(self, other: Self): bool {
+    fn ge(&self, other: &Self): bool {
         return match self.cmp(other) {
             Ordering::Less => false,
             _ => true,
@@ -46,7 +46,7 @@ pub trait Ord: Eq {
 }
 
 impl Eq for Ordering {
-    fn eq(self, other: Ordering): bool {
+    fn eq(&self, other: &Ordering): bool {
         return match (self, other) {
             (Ordering::Less, Ordering::Less) => true,
             (Ordering::Equal, Ordering::Equal) => true,
@@ -57,7 +57,7 @@ impl Eq for Ordering {
 }
 
 impl crater::fmt::Display for Ordering {
-    fn fmt(self, mut out: String) {
+    fn fmt(&self, out: &mut String) {
         out.push_str(match self {
             Ordering::Less => "Less",
             Ordering::Equal => "Equal",

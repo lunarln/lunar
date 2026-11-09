@@ -39,7 +39,7 @@ fn main() {
 struct Point { x: i32, y: i32 }
 
 impl Eq for Point {
-    fn eq(self, other: Point): bool {
+    fn eq(&self, other: &Point): bool {
         return self.x == other.x && self.y == other.y;
     }
 }

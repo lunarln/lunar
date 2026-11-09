@@ -6,7 +6,7 @@ enum Token {
 }
 
 /// Split `src` on spaces and classify each word.
-fn tokenize(src: str, mut out: [Token; ..+]): bool {
+fn tokenize(src: str, out: &mut [Token; ..+]): bool {
     let b = src.as_bytes();
     let mut i: usize = 0;
     while i < b.len() {
@@ -35,7 +35,7 @@ fn tokenize(src: str, mut out: [Token; ..+]): bool {
 }
 
 /// Evaluate; `stack` may shrink, so it is taken as `!`.
-fn eval(tokens: [Token; &], mut stack: ![f64; -..+]): Option::<f64> {
+fn eval(tokens: [Token; &], stack: &mut ![f64; -..+]): Option::<f64> {
     for t in tokens {
         match t {
             Token::Num(v) => stack.push(v),

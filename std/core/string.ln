@@ -14,29 +14,29 @@ impl String {
         return out;
     }
 
-    pub fn as_str(self): str {
+    pub fn as_str(&self): str {
         return intrinsics::string_as_str(self);
     }
 
-    pub fn as_bytes(self): [u8; &] {
+    pub fn as_bytes(&self): [u8; &] {
         return intrinsics::str_bytes(intrinsics::string_as_str(self));
     }
 
     /// Length in bytes.
-    pub fn len(self): usize {
+    pub fn len(&self): usize {
         return intrinsics::str_len(intrinsics::string_as_str(self));
     }
 
-    pub fn is_empty(self): bool {
+    pub fn is_empty(&self): bool {
         return self.len() == 0;
     }
 
-    pub fn push_str(mut self, s: str) {
+    pub fn push_str(&mut self, s: str) {
         intrinsics::string_push_str(self, s);
     }
 
     /// Append a character, UTF-8 encoded.
-    pub fn push(mut self, c: char) {
+    pub fn push(&mut self, c: char) {
         let cp = c as u32;
         let mut buf: [u8; 4] = [0; 4];
         let n: usize = if cp < 128 {
@@ -62,16 +62,16 @@ impl String {
     }
 
     /// Append formatted text: `s.write("x = {x}")`.
-    pub fn write(mut self, args: FmtArgs) {
+    pub fn write(&mut self, args: FmtArgs) {
         intrinsics::fmt_write(args, self);
     }
 
-    pub fn clear(mut self: !Self) {
+    pub fn clear(&mut !self) {
         intrinsics::string_truncate(self, 0);
     }
 
     /// Shorten to `len` bytes, which must be on a character boundary.
-    pub fn truncate(mut self: !Self, len: usize) {
+    pub fn truncate(&mut !self, len: usize) {
         if len < self.len() {
             let b = self.as_bytes()[len];
             if b >= 128 && b < 192 {
@@ -82,7 +82,7 @@ impl String {
     }
 
     /// Remove and return the last character.
-    pub fn pop(mut self: !Self): Option::<char> {
+    pub fn pop(&mut !self): Option::<char> {
         let n = self.len();
         if n == 0 {
             return None;
@@ -98,19 +98,19 @@ impl String {
 }
 
 impl Clone for String {
-    fn clone(self): String {
+    fn clone(&self): String {
         return String::from(self.as_str());
     }
 }
 
 impl Eq for String {
-    fn eq(self, other: String): bool {
+    fn eq(&self, other: &String): bool {
         return self.as_str() == other.as_str();
     }
 }
 
 impl Ord for String {
-    fn cmp(self, other: String): crater::cmp::Ordering {
+    fn cmp(&self, other: &String): crater::cmp::Ordering {
         return self.as_str().cmp(other.as_str());
     }
 }

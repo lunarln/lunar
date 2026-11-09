@@ -42,7 +42,7 @@ struct Money {
 }
 
 impl core::ops::Add for Money {
-    fn add(self, rhs: Money): Money {
+    fn add(&self, rhs: &Money): Money {
         return Money { cents: self.cents + rhs.cents };
     }
 }

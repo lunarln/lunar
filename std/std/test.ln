@@ -7,13 +7,13 @@ pub fn assert(cond: bool, msg: str) {
     }
 }
 
-pub fn assert_eq::<T: Eq + core::fmt::Display>(left: T, right: T, msg: str) {
+pub fn assert_eq::<T: Eq + core::fmt::Display>(left: &T, right: &T, msg: str) {
     if !(left == right) {
         panic("assertion failed: {msg}\n  left: {left}\n right: {right}");
     }
 }
 
-pub fn assert_ne::<T: Eq + core::fmt::Display>(left: T, right: T, msg: str) {
+pub fn assert_ne::<T: Eq + core::fmt::Display>(left: &T, right: &T, msg: str) {
     if left == right {
         panic("assertion failed: {msg}\n  both: {left}");
     }

@@ -31,9 +31,12 @@ fn main() {
 * **Array kinds**: `[T; 4]` (inline), `[T; _]` (inferred length), `[T]`
   (sized once, then frozen), `[T; ..+]` (grow-only), `[T; -..+]` (grow and
   shrink), `[T; &]` / `[T; &mut]` (slices).
+* **Parameter modes**: `x: T` takes ownership, `x: &T` borrows, `x: &mut T`
+  is in-out. Call sites look the same either way, and the compiler catches
+  any use of a moved value.
 * **`!` parameters**: functions that may shrink a value take it as
-  `mut x: !T` (`![i32; -..+]`, `!String`, or a struct containing one), and
-  shrinking methods take `mut self: !Self`. Only the owner can make that
+  `x: &mut !T` (`![i32; -..+]`, `!String`, or a struct containing one), and
+  shrinking methods take `&mut !self`. Only the owner can make that
   conversion, and only while no live view points into it. The compiler
   checks this.
 * **`Dull`**: a compiler-implemented trait for types without pointers or

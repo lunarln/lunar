@@ -38,7 +38,7 @@ struct Counter {
 }
 
 impl Counter {
-    fn increment(mut self) {
+    fn increment(&mut self) {
         self.n += 1;
     }
 }

@@ -21,13 +21,13 @@ is expected. This is reported for:
 
 ```lunar
 trait Shape {
-    fn area(self): f64;
+    fn area(&self): f64;
 }
 
 struct Square { side: f64 }
 
 impl Shape for Square {
-    fn area(self): f64 {
+    fn area(&self): f64 {
         return self.side * self.side;
     }
 }
@@ -47,18 +47,18 @@ The function takes a generic type bounded by the trait:
 
 ```lunar
 trait Shape {
-    fn area(self): f64;
+    fn area(&self): f64;
 }
 
 struct Square { side: f64 }
 
 impl Shape for Square {
-    fn area(self): f64 {
+    fn area(&self): f64 {
         return self.side * self.side;
     }
 }
 
-fn print_area::<S: Shape>(s: S) {
+fn print_area::<S: Shape>(s: &S) {
     println("{s.area()}");
 }
 

@@ -6,14 +6,14 @@ pub enum Option::<T> {
 }
 
 impl::<T> Option::<T> {
-    pub fn is_some(self): bool {
+    pub fn is_some(&self): bool {
         return match self {
             Option::Some(_) => true,
             Option::None => false,
         };
     }
 
-    pub fn is_none(self): bool {
+    pub fn is_none(&self): bool {
         return !self.is_some();
     }
 }
@@ -43,7 +43,7 @@ impl::<T: Dull> Option::<T> {
 }
 
 impl::<T: Eq + Dull> Eq for Option::<T> {
-    fn eq(self, other: Option::<T>): bool {
+    fn eq(&self, other: &Option::<T>): bool {
         return match self {
             Option::Some(a) => match other {
                 Option::Some(b) => a == b,
@@ -55,7 +55,7 @@ impl::<T: Eq + Dull> Eq for Option::<T> {
 }
 
 impl::<T: crater::fmt::Display + Dull> crater::fmt::Display for Option::<T> {
-    fn fmt(self, mut out: String) {
+    fn fmt(&self, out: &mut String) {
         match self {
             Option::Some(v) => {
                 out.push_str("Some(");

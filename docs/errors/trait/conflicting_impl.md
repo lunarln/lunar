@@ -26,19 +26,19 @@ Dull, so an impl for it conflicts with a blanket `impl::<T: Dull>`.
 
 ```lunar
 trait Speak {
-    fn speak(self): i32;
+    fn speak(&self): i32;
 }
 
 struct Dog;
 
 impl Speak for Dog {
-    fn speak(self): i32 {
+    fn speak(&self): i32 {
         return 1;
     }
 }
 
 impl Speak for Dog {
-    fn speak(self): i32 {
+    fn speak(&self): i32 {
         return 2;
     }
 }
@@ -52,13 +52,13 @@ Keep a single impl of `Speak` for `Dog`:
 
 ```lunar
 trait Speak {
-    fn speak(self): i32;
+    fn speak(&self): i32;
 }
 
 struct Dog;
 
 impl Speak for Dog {
-    fn speak(self): i32 {
+    fn speak(&self): i32 {
         return 1;
     }
 }

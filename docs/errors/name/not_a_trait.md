@@ -13,7 +13,7 @@ A common cause is a type and a trait with similar names, or writing
 ```lunar
 struct Printable;
 
-fn show::<T: Printable>(x: T) {}
+fn show::<T: Printable>(x: &T) {}
 
 fn main() {
     show(1);
@@ -26,16 +26,16 @@ The bound names a trait:
 
 ```lunar
 trait Printable {
-    fn print(self);
+    fn print(&self);
 }
 
 impl Printable for i32 {
-    fn print(self) {
+    fn print(&self) {
         println("{self}");
     }
 }
 
-fn show::<T: Printable>(x: T) {
+fn show::<T: Printable>(x: &T) {
     x.print();
 }
 

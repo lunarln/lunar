@@ -16,7 +16,7 @@ result. To pass a computed value, bind it with `let mut` first.
 ## Erroneous example
 
 ```lunar
-fn double(mut x: i32) {
+fn double(x: &mut i32) {
     x *= 2;
 }
 
@@ -30,7 +30,7 @@ fn main() {
 The argument is now a mutable variable, which also receives the result:
 
 ```lunar
-fn double(mut x: i32) {
+fn double(x: &mut i32) {
     x *= 2;
 }
 

@@ -106,6 +106,8 @@ codes! {
         IN_UNSAFE_FN = "in_unsafe_fn",
     }
     lint ("lint") => {
+        NEEDLESS_BORROW = "needless_borrow",
+        MUT_PARAM_NOT_READ = "mut_param_not_read",
         UNUSED_VARIABLE = "unused_variable",
         UNREACHABLE = "unreachable",
         UNUSED_MUT = "unused_mut",

@@ -15,7 +15,7 @@ as `Type::name(...)`.
 struct Counter { n: i32 }
 
 impl Counter {
-    fn add(amount: i32, mut self) {
+    fn add(amount: i32, &mut self) {
         self.n += amount;
     }
 }
@@ -35,7 +35,7 @@ fn main() {
 struct Counter { n: i32 }
 
 impl Counter {
-    fn add(mut self, amount: i32) {
+    fn add(&mut self, amount: i32) {
         self.n += amount;
     }
 }

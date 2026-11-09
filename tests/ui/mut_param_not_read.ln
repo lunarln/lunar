@@ -1,0 +1,10 @@
+// warning: lint::mut_param_not_read
+fn bump(mut x: i32) {
+    x += 1;
+}
+
+fn main() {
+    let n = 1;
+    bump(n);
+    println("{n}");
+}

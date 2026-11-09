@@ -15,8 +15,8 @@ method; a secondary label shows where the trait declares it.
 
 ```lunar
 trait Speak {
-    fn speak(self): str;
-    fn times(self): i32 {
+    fn speak(&self): str;
+    fn times(&self): i32 {
         return 1;
     }
 }
@@ -35,8 +35,8 @@ out:
 
 ```lunar
 trait Speak {
-    fn speak(self): str;
-    fn times(self): i32 {
+    fn speak(&self): str;
+    fn times(&self): i32 {
         return 1;
     }
 }
@@ -44,7 +44,7 @@ trait Speak {
 struct Dog;
 
 impl Speak for Dog {
-    fn speak(self): str {
+    fn speak(&self): str {
         return "woof";
     }
 }

@@ -120,7 +120,7 @@ pub struct Chars {
 }
 
 impl Iterator::<char> for Chars {
-    fn next(mut self): Option::<char> {
+    fn next(&mut self): Option::<char> {
         let b = self.s.as_bytes();
         if self.pos >= b.len() {
             return None;
@@ -153,7 +153,7 @@ pub struct Bytes {
 }
 
 impl Iterator::<u8> for Bytes {
-    fn next(mut self): Option::<u8> {
+    fn next(&mut self): Option::<u8> {
         let b = self.s.as_bytes();
         if self.pos >= b.len() {
             return None;

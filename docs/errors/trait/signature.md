@@ -19,7 +19,7 @@ two must match exactly. In particular `mut self` in the trait requires
 
 ```lunar
 trait Area {
-    fn area(self): f64;
+    fn area(&self): f64;
 }
 
 struct Square {
@@ -27,7 +27,7 @@ struct Square {
 }
 
 impl Area for Square {
-    fn area(self): f32 {
+    fn area(&self): f32 {
         return 1.0;
     }
 }
@@ -41,7 +41,7 @@ Make the impl's return type `f64`, as the trait declares:
 
 ```lunar
 trait Area {
-    fn area(self): f64;
+    fn area(&self): f64;
 }
 
 struct Square {
@@ -49,7 +49,7 @@ struct Square {
 }
 
 impl Area for Square {
-    fn area(self): f64 {
+    fn area(&self): f64 {
         return self.side * self.side;
     }
 }

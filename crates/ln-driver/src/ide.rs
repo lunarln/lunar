@@ -105,10 +105,15 @@ pub fn hover(a: &Analysis, file: FileId, offset: u32) -> Option<(Span, String)> 
             }
             RefTarget::Local { body, local } => {
                 let l = p.bodies.get(&body)?.local(local);
-                let kw = if matches!(l.kind, thir::LocalKind::Param { .. }) { "" } else { "let " };
-                let m = if l.mutable { "mut " } else { "" };
+                let mut_kw = if l.mutable { "mut " } else { "" };
+                let (before, mode) = match l.kind {
+                    thir::LocalKind::Param { inout: true, .. } => (String::new(), "&mut "),
+                    thir::LocalKind::Param { owned: false, .. } => (String::new(), "&"),
+                    thir::LocalKind::Param { .. } => (mut_kw.to_string(), ""),
+                    _ => (format!("let {mut_kw}"), ""),
+                };
                 let layout = layout_comment(p.layout_of(l.ty.strip_bang()), None);
-                format!("```lunar\n{layout}{kw}{m}{}: {}\n```", l.name, p.ty_str(&l.ty))
+                format!("```lunar\n{layout}{before}{}: {mode}{}\n```", l.name, p.ty_str(&l.ty))
             }
         };
         return Some((span, text));
@@ -243,7 +248,7 @@ fn keyword_doc(word: &str) -> Option<&'static str> {
         "fn" => {
             r#"A function or function pointer.
 
-Functions are the primary way code is executed. Parameters are borrowed unless declared `mut`, which makes them in-out. The return type follows `:`, and generic parameters use `::<>`.
+Functions are the primary way code is executed. A parameter `x: T` takes ownership of its argument, `x: &T` borrows it, and `x: &mut T` is in-out. The return type follows `:`, and generic parameters use `::<>`.
 
 ```lunar
 fn max::<T: Ord>(a: T, b: T): T {
@@ -263,12 +268,12 @@ let (a, b) = (1, 2);
 ```"#
         }
         "mut" => {
-            r#"A mutable binding or an in-out parameter.
+            r#"A mutable variable, parameter, or in-out parameter.
 
-On a `let`, `mut` allows the variable to be reassigned and its contents changed. On a parameter, `mut` makes it in-out: the caller passes a mutable place, and changes are visible to the caller after the call. A `!` parameter must also be `mut`.
+On a `let`, `mut` allows the variable to be reassigned and its contents changed. On a parameter that takes ownership (`mut x: T`, `mut self`), it lets the function change its own value; the caller does not see the change. As `&mut T` (or `&mut self`), the parameter is in-out: the caller passes a mutable place and sees the changes after the call. A `!` parameter must be `&mut`.
 
 ```lunar
-fn bump(mut x: i32) {
+fn bump(x: &mut i32) {
     x += 1;
 }
 
@@ -512,7 +517,7 @@ use std::io::println as say;
         "self" => {
             r#"The receiver of a method, or the current module.
 
-As a method's first parameter, `self` is the value the method is called on: `self` borrows it, `mut self` makes it in-out, and `mut self: !Self` may shrink it. In paths, `self::x` names an item of the current module."#
+As a method's first parameter, `self` is the value the method is called on: `self` takes ownership of it, `&self` borrows it, `&mut self` makes it in-out, and `&mut !self` may shrink it. In paths, `self::x` names an item of the current module."#
         }
         "Self" => r#"The implementing type within a `trait` or `impl` block, or within a type definition."#,
         "crater" => {

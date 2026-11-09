@@ -9,6 +9,7 @@ use inkwell::values::{BasicMetadataValueEnum, FunctionValue, IntValue, PointerVa
 use inkwell::{FloatPredicate, IntPredicate};
 use ln_ast::{BinOp, UnOp};
 use ln_diag::Span;
+use ln_sema::defs::ParamMode;
 use ln_sema::thir::*;
 use ln_sema::traits::MethodImpl;
 use ln_sema::ty::{ArrKind, FloatTy, IntTy, TraitRef, Ty};
@@ -25,19 +26,37 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         }
     }
 
+    /// Whether each parameter of `callee` takes ownership (`x: T`), so the
+    /// callee frees the argument. Calls through function pointers borrow.
+    fn takes_ownership(&self, callee: &Callee) -> Vec<bool> {
+        let def = match callee {
+            Callee::Fn { def, .. } | Callee::Intrinsic { def, .. } => Some(*def),
+            Callee::Trait { trait_ref, method, .. } => self.cg.p.trait_data(trait_ref.trait_id).methods.iter().find(|m| &m.name == method).map(|m| m.def),
+            Callee::Indirect(_) => None,
+        };
+        match def {
+            Some(d) => self.cg.p.fn_data(d).sig.params.iter().map(|p| p.mode == ParamMode::Take).collect(),
+            None => Vec::new(),
+        }
+    }
+
     pub fn call(&mut self, callee: &Callee, args: &[Arg], ret: &Ty, span: Span) -> Option<BV<'ctx>> {
         let indirect = match callee {
             Callee::Indirect(f) => Some(tri!(self.value(f)).into_pointer_value()),
             _ => None,
         };
+        let takes = self.takes_ownership(callee);
         let mut vals: Vec<BV<'ctx>> = Vec::new();
-        for a in args {
+        for (i, a) in args.iter().enumerate() {
             match a {
                 Arg::Value(e) => {
                     let v = tri!(self.value(e));
                     let ty = self.t(&e.ty);
-                    if self.cg.p.has_owner(&ty) && !Self::is_borrowed(e) {
-                        // An owned temporary passed by handle: dropped after the statement.
+                    let taken = takes.get(i).copied().unwrap_or(false);
+                    if self.cg.p.has_owner(&ty) && !Self::is_borrowed(e) && !taken {
+                        // An owned temporary lent to a borrowing parameter:
+                        // dropped after the statement. (A parameter that takes
+                        // ownership frees it itself.)
                         let tmp = self.alloca_for(&ty, "argtmp");
                         self.cg.b.build_store(tmp, v).unwrap();
                         self.register_cleanup(tmp, &ty);
