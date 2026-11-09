@@ -5,6 +5,7 @@ use crate::Analysis;
 use ln_diag::{FileId, SourceMap, Span};
 use ln_sema::defs::{DefData, DefId, DefKind};
 use ln_sema::thir::{self, Block, Expr, ExprKind, FmtPiece, Pat, PatKind, Stmt};
+use ln_sema::ty::Ty;
 use ln_sema::{Program, RefTarget};
 use std::path::Path;
 
@@ -93,21 +94,44 @@ pub fn hover(a: &Analysis, file: FileId, offset: u32) -> Option<(Span, String)> 
         let text = match target {
             RefTarget::Def(d) => describe_def(p, &a.map, d),
             RefTarget::Field { adt, variant, field } => {
-                let v = &p.adt(adt).variants[variant];
+                let data = p.adt(adt);
+                let v = &data.variants[variant];
                 let f = &v.fields[field];
-                let owner = if p.adt(adt).is_enum { p.path_of(v.def) } else { p.path_of(adt) };
-                format!("```lunar\n{owner}\n{}: {}\n```", f.name, p.ty_str(&f.ty))
+                let owner = if data.is_enum { p.path_of(v.def) } else { p.path_of(adt) };
+                let env = &data.generics.preds;
+                let mut facts = Vec::new();
+                if !data.is_enum
+                    && let Some(offsets) = p.field_offsets(adt, &[])
+                {
+                    facts.push(format!("offset {}", offsets[field]));
+                }
+                facts.extend(type_facts(p, &f.ty, env));
+                let vis = if f.is_pub { "pub " } else { "" };
+                format!("```lunar\n{owner}\n{vis}{}: {}\n```{}", f.name, p.ty_str(&f.ty), facts_block(&facts))
             }
             RefTarget::Local { body, local } => {
                 let l = p.bodies.get(&body)?.local(local);
+                let env = match &p.def(body).data {
+                    DefData::Fn(fd) => fd.generics.preds.clone(),
+                    _ => Vec::new(),
+                };
+                let mut facts = Vec::new();
                 let kw = match l.kind {
-                    thir::LocalKind::Param { .. } => "",
+                    thir::LocalKind::Param { inout, bang, .. } => {
+                        facts.push(param_role(p, &l.ty, inout, bang, &env));
+                        ""
+                    }
                     _ => "let ",
                 };
+                facts.extend(type_facts(p, &l.ty, &env));
                 let m = if l.mutable { "mut " } else { "" };
-                format!("```lunar\n{kw}{m}{}: {}\n```", l.name, p.ty_str(&l.ty))
+                format!("```lunar\n{kw}{m}{}: {}\n```{}", l.name, p.ty_str(&l.ty), facts_block(&facts))
             }
         };
+        return Some((span, text));
+    }
+    // Keywords explain themselves (rather than showing, say, `!` for `return`).
+    if let Some((span, text)) = keyword_hover(&a.map, file, offset) {
         return Some((span, text));
     }
     // Otherwise the type of the innermost expression under the cursor.
@@ -159,12 +183,155 @@ fn describe_def(p: &Program, map: &SourceMap, d: DefId) -> String {
     }
     out.push_str(&sig);
     out.push_str("\n```");
+    // Plain-text facts: attributes, parameter roles, layout.
+    let mut facts = Vec::new();
+    let attrs = if info.span.is_dummy() { Vec::new() } else { attributes(map, info.span) };
+    if !attrs.is_empty() {
+        facts.push(format!("attributes: {}", attrs.join(" ")));
+    }
+    match &info.data {
+        DefData::Fn(fd) => {
+            let env = &fd.generics.preds;
+            if fd.is_unsafe {
+                facts.push("unsafe to call: callers need an `unsafe` block".into());
+            }
+            for prm in &fd.sig.params {
+                let bang = matches!(prm.ty, Ty::Bang(_));
+                facts.push(format!("`{}`: {}", prm.name, param_role(p, &prm.ty, prm.inout, bang, env)));
+            }
+        }
+        DefData::Adt(adt) => {
+            let args: Vec<Ty> = adt.generics.names.iter().enumerate().map(|(i, n)| Ty::Param(i as u32, n.clone())).collect();
+            let ty = Ty::Adt(d, args);
+            facts.extend(type_facts(p, &ty, &adt.generics.preds));
+            if p.layout_of(&ty).is_none() && !adt.generics.names.is_empty() {
+                facts.push("size depends on its type arguments".into());
+            }
+        }
+        _ => {}
+    }
+    out.push_str(&facts_block(&facts));
     let docs = if info.span.is_dummy() { String::new() } else { doc_comment(map, info.span) };
     if !docs.is_empty() {
         out.push_str("\n\n---\n\n");
         out.push_str(&docs);
     }
     out
+}
+
+/// How a function treats an argument.
+fn param_role(p: &Program, ty: &Ty, inout: bool, bang: bool, env: &[ln_sema::defs::Pred]) -> String {
+    let inner = match ty {
+        Ty::Bang(t) => t.as_ref(),
+        t => t,
+    };
+    match (inout, bang) {
+        (true, true) => "in-out (`mut`), may be shrunk (`!`): only the owner can pass it, with no live views into it".into(),
+        (true, false) => "in-out (`mut`): the caller passes a mutable place and sees the changes".into(),
+        (false, _) if p.has_owner(inner) => "borrowed: the function cannot move out of it or keep it".into(),
+        (false, _) if p.is_copy(inner, env) => "copied".into(),
+        _ => "borrowed".into(),
+    }
+}
+
+/// Layout and value semantics of a type, as short plain-text facts.
+fn type_facts(p: &Program, ty: &Ty, env: &[ln_sema::defs::Pred]) -> Vec<String> {
+    let ty = match ty {
+        Ty::Bang(t) => t.as_ref(),
+        t => t,
+    };
+    let mut out = Vec::new();
+    if let Some(l) = p.layout_of(ty) {
+        out.push(format!("size {} bytes, align {}", l.size, l.align));
+    }
+    out.push(if p.is_dull(ty, env) { "Dull".into() } else { "pointy (not Dull)".into() });
+    if p.has_owner(ty) {
+        out.push("owning: moved, not copied".into());
+    } else if p.is_copy(ty, env) {
+        out.push("copied".into());
+    }
+    out
+}
+
+/// Plain-text facts below the code block, one per line.
+fn facts_block(facts: &[String]) -> String {
+    if facts.is_empty() {
+        return String::new();
+    }
+    // Two trailing spaces make a markdown line break.
+    format!("\n\n{}", facts.join("  \n"))
+}
+
+/// Attribute lines (`#[...]`) directly above the item declared at `name`.
+fn attributes(map: &SourceMap, name: Span) -> Vec<String> {
+    let text = &map.get(name.file).text;
+    let line_start = text[..name.start as usize].rfind('\n').map_or(0, |i| i + 1);
+    let mut out = Vec::new();
+    for line in text[..line_start].lines().rev() {
+        let t = line.trim();
+        if t.starts_with("#[") {
+            out.push(t.to_string());
+        } else if !t.starts_with("///") {
+            break;
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// Documentation for the keyword under the cursor, if any.
+fn keyword_hover(map: &SourceMap, file: FileId, offset: u32) -> Option<(Span, String)> {
+    let text = &map.get(file).text;
+    let (toks, _) = ln_lexer::lex(text);
+    let tok = toks.iter().find(|t| t.range.start as u32 <= offset && offset < t.range.end as u32)?;
+    let word = &text[tok.range.clone()];
+    let doc = keyword_doc(word)?;
+    Some((Span::new(file, tok.range.start as u32, tok.range.end as u32), format!("```lunar\n{word}\n```\n\n{doc}")))
+}
+
+fn keyword_doc(word: &str) -> Option<&'static str> {
+    Some(match word {
+        "fn" => {
+            "Declares a function. Parameters are borrowed unless declared `mut` (in-out); the return type follows `:`. Generics use `::<>`: `fn max::<T: Ord>(a: T, b: T): T`."
+        }
+        "let" => "Introduces a binding. `let` bindings are immutable; `let mut` makes them mutable. The type can usually be inferred: `let x: i32 = 1;`.",
+        "mut" => {
+            "On a `let`, makes the binding mutable. On a parameter, makes it **in-out**: the caller passes a mutable place and sees the changes. A `!` parameter must also be `mut`."
+        }
+        "return" => "Leaves the current function with a value (or `()`). The `return` expression itself has type `!`, so it fits anywhere a value is expected.",
+        "if" => "Conditional expression: `if cond { a } else { b }` has a value when both branches do.",
+        "else" => "The alternative branch of an `if`.",
+        "match" => "Pattern matching. Arms are checked in order and must cover every possible value (`err(type::non_exhaustive)` otherwise).",
+        "for" => "Loops over a range (`for i in 0..n`) or the elements of a Dull array or slice (`for x in arr`).",
+        "in" => "Separates the pattern from what a `for` loop iterates over.",
+        "while" => "Loops while a condition holds.",
+        "loop" => "Loops forever; leave with `break`, which can carry a value: `let x = loop { break 5; };`.",
+        "break" => "Leaves the innermost loop, optionally with a value for `loop`. Has type `!`.",
+        "continue" => "Skips to the next iteration of the innermost loop. Has type `!`.",
+        "struct" => {
+            "Declares a struct: named fields `struct P { x: i32 }`, a tuple struct `struct P(i32);` or a unit struct `struct P;`. Fields are private to the module unless `pub`."
+        }
+        "enum" => "Declares an enum: a value is exactly one of its variants. Variants can carry fields, and their fields are always public.",
+        "impl" => "Adds methods to a type (`impl T { ... }`) or implements a trait (`impl Tr for T { ... }`). Two impls of a trait may not overlap.",
+        "trait" => "Declares a trait: methods (optionally with default bodies) that types can implement. Supertraits: `trait A: B`.",
+        "type" => "Declares a type alias: `type Bytes = [u8; -..+];`.",
+        "mod" => "Declares a module, inline (`mod m { ... }`) or from a file (`mod m;` loads `m.ln` or `m/mod.ln`).",
+        "use" => "Imports names from another module: `use std::io::println;`, `use core::ops::{Add, Sub};`.",
+        "pub" => "Makes an item, field or method visible outside its module. Without it, items are private to their module and its children.",
+        "const" => "A compile-time constant: `const N: usize = 16;`. Its value is evaluated during compilation.",
+        "static" => "A global variable with a fixed address. `static mut` is mutable; reading or writing it requires `unsafe`.",
+        "unsafe" => {
+            "An `unsafe { }` block allows unsafe operations: calling `unsafe` or `extern` functions, dereferencing raw pointers, and using `static mut`. On a function, makes it unsafe to *call*; its body still needs `unsafe` blocks (hard error otherwise)."
+        }
+        "extern" => "Declares functions implemented elsewhere with the C ABI: `extern \"C\" { fn puts(s: *u8): i32; }`. Calling them requires `unsafe`.",
+        "as" => "Numeric and pointer casts (`x as u64`), and renaming imports (`use a::b as c;`).",
+        "self" => "The receiver of a method (`fn len(self)`, `fn push(mut self, ..)`, `fn pop(mut self: !Self)`), or the current module in paths (`self::x`).",
+        "Self" => "The type an `impl` or trait is for.",
+        "crate" => "The root module of the current crate: `crate::util::f`.",
+        "super" => "The parent module: `super::helper()`.",
+        "true" | "false" => "A `bool` value.",
+        _ => return None,
+    })
 }
 
 /// The declaration containing `name` (an identifier span), from the start

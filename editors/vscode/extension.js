@@ -17,7 +17,11 @@ function createClient() {
     "Lunar Language Server",
     { run, debug: run },
     {
-      documentSelector: [{ scheme: "file", language: "lunar" }],
+      documentSelector: [
+        { scheme: "file", language: "lunar" },
+        // The standard library, shown as virtual read-only documents.
+        { scheme: "lunar-std", language: "lunar" },
+      ],
       // Also resolves `lunar.trace.server`.
       outputChannelName: "Lunar Language Server",
     },
@@ -50,9 +54,34 @@ async function stop() {
   }
 }
 
+/**
+ * `lunar-std:/core/string.ln` documents: the standard library embedded in the
+ * compiler. They have no file on disk, so they are read-only and pathless;
+ * the text comes from the language server.
+ */
+const stdProvider = {
+  async provideTextDocumentContent(uri) {
+    if (!client) {
+      return "// The Lunar language server is not running.\n";
+    }
+    try {
+      return await client.sendRequest("lunar/stdSource", { uri: uri.toString() });
+    } catch (e) {
+      return `// Could not load ${uri.path}: ${e.message ?? e}\n`;
+    }
+  },
+};
+
 /** @param {vscode.ExtensionContext} context */
 async function activate(context) {
   context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider("lunar-std", stdProvider),
+    // `lunar-std:core::string` has no `.ln` extension to pick the language.
+    vscode.workspace.onDidOpenTextDocument((doc) => {
+      if (doc.uri.scheme === "lunar-std" && doc.languageId !== "lunar") {
+        vscode.languages.setTextDocumentLanguage(doc, "lunar");
+      }
+    }),
     vscode.commands.registerCommand("lunar.restartServer", async () => {
       await stop();
       await start();

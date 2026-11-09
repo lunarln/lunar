@@ -286,7 +286,15 @@ mod lsp {
         assert!(h["contents"]["value"].as_str().unwrap_or_default().contains("let total: i32"), "hover on local: {h:#?}");
         // The name in a declaration (line 5: `fn add`).
         let h = c.request("textDocument/hover", pos(5, 4));
-        assert!(h["contents"]["value"].as_str().unwrap_or_default().contains("fn add("), "hover on declaration: {h:#?}");
+        let text = h["contents"]["value"].as_str().unwrap_or_default().to_string();
+        assert!(text.contains("fn add(") && text.contains("`a`: copied"), "hover on declaration: {h:#?}");
+        // A struct's layout (line 0: `struct Stack`).
+        let h = c.request("textDocument/hover", pos(0, 8));
+        let text = h["contents"]["value"].as_str().unwrap_or_default().to_string();
+        assert!(text.contains("size 24 bytes, align 8") && text.contains("pointy"), "hover on struct: {h:#?}");
+        // Keywords explain themselves: `return` (line 6) is not just `!`.
+        let h = c.request("textDocument/hover", pos(6, 6));
+        assert!(h["contents"]["value"].as_str().unwrap_or_default().contains("Leaves the current function"), "hover on return: {h:#?}");
         // `items` field access (line 12).
         let h = c.request("textDocument/hover", pos(12, 15));
         assert!(h["contents"]["value"].as_str().unwrap_or_default().contains("items: [i32; -..+]"), "hover on field: {h:#?}");
@@ -295,8 +303,16 @@ mod lsp {
         let d = c.request("textDocument/definition", pos(10, 17));
         assert_eq!(d["range"]["start"]["line"], json!(5), "definition of add: {d:#?}");
         let d = c.request("textDocument/definition", pos(13, 6));
-        let target = d["uri"].as_str().unwrap_or_default();
-        assert!(target.contains("lunar-std-") && target.ends_with("io.ln"), "definition of println: {d:#?}");
+        let target = d["uri"].as_str().unwrap_or_default().to_string();
+        assert_eq!(target, "lunar-std:std::io", "definition of println: {d:#?}");
+        // The editor fetches the virtual document's text from the server...
+        let text = c.request("lunar/stdSource", json!({ "uri": target }));
+        let text = text.as_str().unwrap_or_default();
+        assert!(text.contains("pub fn println("), "std source: {text:.200}");
+        // ...and hover works inside it.
+        let line = text.lines().position(|l| l.contains("pub fn println(")).unwrap() as u32;
+        let h = c.request("textDocument/hover", json!({ "textDocument": { "uri": target }, "position": { "line": line, "character": 8 } }));
+        assert!(h["contents"]["value"].as_str().unwrap_or_default().contains("fn println("), "hover in std: {h:#?}");
 
         // Fixing the error clears it.
         let fixed = src.replace("undefined_name", "n as i32");
@@ -526,4 +542,100 @@ fn missing_lang_item_is_reported() {
     let out = lunar().env("LUNAR_STD_DIR", &std_copy).arg("check").arg(&file).output().unwrap();
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     assert!(reported_codes(&stderr) == ["build::missing_lang_item"], "expected only build::missing_lang_item:\n{stderr}");
+}
+
+/// The sizes shown in editor hovers (`Program::layout_of`) must match what
+/// code generation actually uses (`core::mem::size_of` / `align_of`).
+#[test]
+fn hover_layouts_match_codegen() {
+    let dir = std::env::temp_dir().join(format!("lunar-layout-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("layout.ln");
+    let types = [
+        "u8",
+        "i16",
+        "u32",
+        "i64",
+        "usize",
+        "f32",
+        "f64",
+        "bool",
+        "char",
+        "str",
+        "String",
+        "()",
+        "(u8, u64)",
+        "(u8, u16, u8)",
+        "[u8; 5]",
+        "[u16; 3]",
+        "[i64]",
+        "[u8; ..+]",
+        "[f64; -..+]",
+        "[u8; &]",
+        "*u8",
+        "Small",
+        "Mixed",
+        "Nested",
+        "Unit",
+        "Tag",
+        "Shape",
+        "Pair",
+        "Option::<u8>",
+        "Option::<u64>",
+    ];
+    let mut src = String::from(
+        "struct Small {\n    a: u8,\n    b: u8,\n}\n\nstruct Mixed {\n    a: u8,\n    b: u64,\n    c: u16,\n}\n\nstruct Nested {\n    m: Mixed,\n    s: [u8; &],\n    t: (bool, char),\n}\n\nstruct Unit;\n\nenum Tag {\n    A,\n    B,\n}\n\nenum Shape {\n    Circle(f64),\n    Rect { w: f32, h: f32, z: u8 },\n    Empty,\n}\n\nstruct Pair(u32, String);\n\nfn main() {\n",
+    );
+    for t in types {
+        src.push_str(&format!("    println(\"{{core::mem::size_of::<{t}>()}} {{core::mem::align_of::<{t}>()}}\");\n"));
+    }
+    src.push_str("}\n");
+    std::fs::write(&file, &src).unwrap();
+    let out = lunar().arg("run").arg(&file).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let actual: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect();
+
+    let a = ln_driver::analyze(&file, false);
+    let p = a.program.as_ref().expect("analysis failed");
+    let body = p.bodies.get(&p.main.unwrap()).unwrap();
+    // Each `size_of::<T>()` call in main carries T as its type argument.
+    let mut tys = Vec::new();
+    fn collect(e: &ln_sema::thir::Expr, out: &mut Vec<ln_sema::ty::Ty>, p: &ln_sema::Program) {
+        use ln_sema::thir::{Callee, ExprKind, FmtPiece};
+        match &e.kind {
+            ExprKind::Call { callee: Callee::Fn { def, args }, args: call_args } => {
+                if p.def(*def).name == "size_of" {
+                    out.push(args[0].clone());
+                }
+                for a in call_args {
+                    collect(a.expr(), out, p);
+                }
+            }
+            ExprKind::FmtArgs(pieces) => {
+                for x in pieces {
+                    if let FmtPiece::Arg(x) = x {
+                        collect(x, out, p);
+                    }
+                }
+            }
+            ExprKind::Coerce { expr, .. } | ExprKind::Read { place: expr, .. } | ExprKind::Temp(expr) => collect(expr, out, p),
+            _ => {}
+        }
+    }
+    for s in &body.block.stmts {
+        if let ln_sema::thir::Stmt::Expr(e) = s {
+            collect(e, &mut tys, p);
+        }
+    }
+    assert_eq!(tys.len(), types.len(), "found {} size_of calls", tys.len());
+    let mut failures = Vec::new();
+    for ((name, ty), line) in types.iter().zip(&tys).zip(&actual) {
+        let l = p.layout_of(ty).unwrap_or_else(|| panic!("no layout for {name}"));
+        let ours = format!("{} {}", l.size, l.align);
+        if &ours != line {
+            failures.push(format!("{name}: hover says `{ours}`, codegen says `{line}`"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

@@ -38,11 +38,18 @@ pub fn run() -> Result<(), Error> {
     Ok(())
 }
 
+/// URI scheme for the embedded standard library, named by module path:
+/// `lunar-std:core::string` is `core/string.ln`. Editors show these as
+/// virtual, read-only, pathless documents whose text comes from the
+/// `lunar/stdSource` request; nothing is written to disk.
+pub const STD_SCHEME: &str = "lunar-std";
+
+/// Custom request: `{ "uri": "lunar-std:core::string" }` -> the file's text.
+pub const STD_SOURCE_METHOD: &str = "lunar/stdSource";
+
 struct Server {
     /// Open documents by canonical path key.
     open: HashMap<PathBuf, String>,
-    /// Where the embedded std was written, so definitions can open it.
-    std_dir: PathBuf,
     /// Analyses by crate root (canonical key), with the root's real path.
     crates: HashMap<PathBuf, (PathBuf, Analysis)>,
     /// Which crate root each user file was last analyzed under.
@@ -53,9 +60,7 @@ struct Server {
 
 impl Server {
     fn new() -> Result<Self, Error> {
-        let std_dir = std::env::temp_dir().join(format!("lunar-std-{:016x}", crate::std_hash()));
-        crate::write_std_to(&std_dir)?;
-        Ok(Server { open: HashMap::new(), std_dir, crates: HashMap::new(), file_root: HashMap::new(), published: HashMap::new() })
+        Ok(Server { open: HashMap::new(), crates: HashMap::new(), file_root: HashMap::new(), published: HashMap::new() })
     }
 
     fn main_loop(&mut self, conn: &Connection) -> Result<(), Error> {
@@ -154,7 +159,7 @@ impl Server {
 
     fn analyze_root(&mut self, conn: &Connection, root: &Path) -> Result<(), Error> {
         let root_key = path_key(root);
-        let opts = AnalyzeOptions { keep_going: true, overlay: Some(&self.open), std_dir: Some(&self.std_dir), ..Default::default() };
+        let opts = AnalyzeOptions { keep_going: true, overlay: Some(&self.open), ..Default::default() };
         let analysis = match std::panic::catch_unwind(AssertUnwindSafe(|| analyze_with(root, &opts))) {
             Ok(a) => a,
             Err(_) => {
@@ -164,11 +169,10 @@ impl Server {
         };
         // Record which user files belong to this crate. A file that was its
         // own root but is now a module of this crate stops being a root.
-        let std_key = path_key(&self.std_dir);
         let mut files: Vec<(FileId, PathBuf)> = Vec::new();
         for (id, f) in analysis.map.files() {
             if let Some(p) = &f.path
-                && !path_key(p).starts_with(&std_key)
+                && std_rel_path(f).is_none()
             {
                 files.push((id, p.clone()));
             }
@@ -211,12 +215,19 @@ impl Server {
 
     /// The analysis and file id for a document, plus the byte offset of a position.
     fn locate(&self, uri: &Url, pos: Position) -> Option<(&Analysis, FileId, u32)> {
+        if uri.scheme() == STD_SCHEME {
+            // Any analysis has the same standard library.
+            let module = uri.path();
+            let (a, file) = self.crates.values().find_map(|(_, a)| {
+                let id = a.map.files().find(|(_, f)| std_rel_path(f).is_some_and(|r| std_module_path(&r) == module)).map(|(id, _)| id)?;
+                Some((a, id))
+            })?;
+            let offset = ide::offset_of(&a.map.get(file).text, pos.line, pos.character);
+            return Some((a, file, offset));
+        }
         let path = to_path(uri)?;
         let key = path_key(&path);
-        let root = self.file_root.get(&key).cloned().or_else(|| {
-            // A std file opened through go-to-definition: use any analysis.
-            self.crates.keys().next().cloned()
-        })?;
+        let root = self.file_root.get(&key).cloned()?;
         let (_, a) = self.crates.get(&root)?;
         let file = ide::file_for_path(&a.map, &path)?;
         let offset = ide::offset_of(&a.map.get(file).text, pos.line, pos.character);
@@ -228,6 +239,7 @@ impl Server {
         let result = match req.method.as_str() {
             HoverRequest::METHOD => self.hover(req).map(|h| serde_json::to_value(h).unwrap()),
             GotoDefinition::METHOD => self.definition(req).map(|d| serde_json::to_value(d).unwrap()),
+            STD_SOURCE_METHOD => std_source_request(req),
             _ => return error_response(id, ErrorCode::MethodNotFound, format!("unsupported request `{}`", req.method)),
         };
         match result {
@@ -269,9 +281,39 @@ fn range(a: &Analysis, span: Span) -> Range {
     Range::new(Position::new(l0, c0), Position::new(l1, c1))
 }
 
+/// The path of an embedded standard library file relative to the std root
+/// (`core/string.ln`), or `None` for other files.
+fn std_rel_path(f: &ln_diag::SourceFile) -> Option<String> {
+    f.name.strip_prefix("<std>/").map(str::to_string)
+}
+
+/// `core/string.ln` -> `core::string`, `std/lib.ln` -> `std`,
+/// `std/sys/mod.ln` -> `std::sys`.
+fn std_module_path(rel: &str) -> String {
+    let p = rel.trim_end_matches(".ln");
+    let p = p.strip_suffix("/lib").or_else(|| p.strip_suffix("/mod")).unwrap_or(p);
+    p.replace('/', "::")
+}
+
 fn location(a: &Analysis, span: Span) -> Option<Location> {
-    let path = a.map.get(span.file).path.as_ref()?;
-    Some(Location::new(Url::from_file_path(path).ok()?, range(a, span)))
+    let f = a.map.get(span.file);
+    let uri = match std_rel_path(f) {
+        Some(rel) => Url::parse(&format!("{STD_SCHEME}:{}", std_module_path(&rel))).ok()?,
+        None => Url::from_file_path(f.path.as_ref()?).ok()?,
+    };
+    Some(Location::new(uri, range(a, span)))
+}
+
+fn std_source_request(req: Request) -> Result<serde_json::Value, Error> {
+    let uri = req.params.get("uri").and_then(|u| u.as_str()).ok_or("missing `uri`")?;
+    let url = Url::parse(uri)?;
+    if url.scheme() != STD_SCHEME {
+        return Err(format!("not a `{STD_SCHEME}:` URI: {uri}").into());
+    }
+    let module = url.path();
+    let text = crate::std_files().find(|(rel, _)| std_module_path(rel) == module).map(|(_, text)| text);
+    let text = text.ok_or_else(|| format!("no standard library module `{module}`"))?;
+    Ok(serde_json::Value::String(text.to_string()))
 }
 
 fn to_lsp_diag(a: &Analysis, d: &Diagnostic) -> lsp_types::Diagnostic {

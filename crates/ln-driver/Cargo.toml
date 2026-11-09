@@ -16,6 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 ln-diag.workspace = true
+ln-lexer.workspace = true
 ln-parser.workspace = true
 ln-sema.workspace = true
 ln-codegen.workspace = true

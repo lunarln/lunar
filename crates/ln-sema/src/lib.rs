@@ -5,6 +5,7 @@
 pub mod borrowck;
 mod collect;
 pub mod defs;
+pub mod layout;
 pub mod loader;
 mod lower;
 mod resolve;

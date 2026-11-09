@@ -28,40 +28,10 @@ fn std_provider(std_dir: Option<&Path>) -> (Box<dyn FileProvider>, PathBuf, &'st
     (Box::new(MemFiles(files)), PathBuf::new(), "<std>/")
 }
 
-/// Write the embedded standard library to `dir` (as `dir/core/...`,
-/// `dir/std/...`), so editors can open its files.
-pub fn write_std_to(dir: &Path) -> std::io::Result<()> {
-    for (rel, text) in embedded::STD_FILES {
-        let path = dir.join(rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        if std::fs::read_to_string(&path).ok().as_deref() != Some(text) {
-            if let Ok(meta) = std::fs::metadata(&path) {
-                let mut perm = meta.permissions();
-                #[allow(clippy::permissions_set_readonly_false)]
-                perm.set_readonly(false);
-                std::fs::set_permissions(&path, perm)?;
-            }
-            std::fs::write(&path, text)?;
-        }
-        // A copy: make accidental edits fail instead of silently doing nothing.
-        let mut perm = std::fs::metadata(&path)?.permissions();
-        perm.set_readonly(true);
-        std::fs::set_permissions(&path, perm)?;
-    }
-    Ok(())
-}
-
-/// A hash of the embedded standard library, to version on-disk copies.
-pub fn std_hash() -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for (rel, text) in embedded::STD_FILES {
-        for b in rel.bytes().chain(text.bytes()) {
-            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
-        }
-    }
-    h
+/// The embedded standard library: (path relative to the std root, such as
+/// `core/string.ln`, source text). Editors show these as virtual documents.
+pub fn std_files() -> impl Iterator<Item = (&'static str, &'static str)> {
+    embedded::STD_FILES.iter().copied()
 }
 
 /// Result of the front end.
