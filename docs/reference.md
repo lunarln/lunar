@@ -196,9 +196,9 @@ How a function receives each argument is part of its signature:
 | `x: &mut T`, `&mut self` | **in-out**: the caller passes a mutable place and sees the changes |
 | `x: &mut !T`, `&mut !self` | in-out and may be shrunk (see above) |
 
-Call sites look the same whatever the modes: `f(name)` moves, borrows or
-passes in-out depending on `f`'s signature, and using a moved variable
-afterwards is `err(borrow::use_after_move)`.
+Call sites say what happens to each argument. A plain argument is moved
+(or copied), `&x` lends `x` to a borrowing parameter, and `&mut x` lends it
+to an in-out parameter:
 
 ```lunar
 fn new(name: String, age: u32): Person {   // keeps `name` without copying it
@@ -207,9 +207,21 @@ fn new(name: String, age: u32): Person {   // keeps `name` without copying it
 fn len(s: &String): usize { return s.len(); }
 fn bump(x: &mut i32) { x += 1; }
 
-let mut n = 1;
-bump(n); // n == 2
+let p = new(name, 30);   // `name` is moved
+let n = len(&p.name);    // borrowed
+let mut k = 1;
+bump(&mut k);            // k == 2
 ```
+
+The marker must match the parameter: a missing `&` or `&mut`, or one where
+the parameter takes ownership, is an error. Using a moved variable
+afterwards is `err(borrow::use_after_move)`. Three cases need no marker:
+
+* a method's receiver: `v.push(1)` lends `v` to `&mut self` (the method's
+  signature says so);
+* a parameter that already is a borrow, passed on: inside
+  `fn f(s: &String, out: &mut String)`, `len(s)` and `bump_all(out)`;
+* an in-out parameter passed on where only a borrow is needed: `len(out)`.
 
 `&T` and `&mut T` exist only on parameters; they are modes, not types you
 can store. `str` and `[T; &]` are the first-class views. Borrowing a Dull
