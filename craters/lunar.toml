@@ -1,0 +1,3 @@
+# The Lunar compiler, written in Lunar.
+[workspace]
+members = ["ln-lexer", "ln-driver"]

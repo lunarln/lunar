@@ -1,0 +1,26 @@
+// The driver of the Lunar-written compiler. For now it only runs the lexer:
+// `ln-driver FILE...` prints the tokens of each file (see `ln_lexer::dump`),
+// which crates/ln-driver/tests/selfhost.rs compares with the Rust lexer.
+
+use std::env;
+use std::fs;
+
+fn main() {
+    let mut out = String::new();
+    let mut i: usize = 1;
+    while i < env::arg_count() {
+        let path = env::arg(i).unwrap();
+        match fs::read_to_string(path) {
+            Ok(text) => {
+                out.write("== {path}\n");
+                ln_lexer::dump(text.as_str(), out);
+            }
+            Err(e) => {
+                eprintln("ln-driver: {path}: {e}");
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+    std::io::write_str(out.as_str());
+}

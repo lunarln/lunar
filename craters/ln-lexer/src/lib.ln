@@ -1,0 +1,685 @@
+// The Lunar lexer, written in Lunar: a port of the `ln-lexer` crate that
+// produces the same tokens, checked against it by
+// crates/ln-driver/tests/selfhost.rs.
+//
+// Tokens carry no text; slice the source with their byte range. `>` is
+// never fused with a following `>` or `=` (so `A::<B::<C>>` lexes cleanly);
+// the parser re-joins adjacent `>` tokens where an operator is expected.
+
+/// What a token is.
+pub enum Kind {
+    // Delimiters.
+    LParen,
+    RParen,
+    LBracket,
+    RBracket,
+    LBrace,
+    RBrace,
+    // Punctuation.
+    LAngle,
+    RAngle,
+    Le,
+    Shl,
+    ShlEq,
+    PathSep,
+    Colon,
+    Semi,
+    Comma,
+    Dot,
+    DotDot,
+    DotDotEq,
+    DotDotDot,
+    EqEq,
+    BangEq,
+    Eq,
+    FatArrow,
+    Arrow,
+    Bang,
+    AmpAmp,
+    Amp,
+    AmpEq,
+    PipePipe,
+    Pipe,
+    PipeEq,
+    Caret,
+    CaretEq,
+    Plus,
+    PlusEq,
+    Minus,
+    MinusEq,
+    Star,
+    StarEq,
+    Slash,
+    SlashEq,
+    Percent,
+    PercentEq,
+    Tilde,
+    Question,
+    Hash,
+    At,
+    Placeholder,
+    // Keywords.
+    As,
+    Break,
+    Const,
+    Continue,
+    Crater,
+    Else,
+    Enum,
+    Extern,
+    False,
+    Fn,
+    For,
+    If,
+    Impl,
+    In,
+    Let,
+    Loop,
+    Match,
+    Mod,
+    Mut,
+    Pub,
+    Return,
+    SelfValue,
+    SelfType,
+    Static,
+    Struct,
+    Super,
+    Trait,
+    True,
+    Type,
+    Unsafe,
+    Use,
+    While,
+    // Literals and identifiers.
+    Ident,
+    Int,
+    Float,
+    Str,
+    Char,
+    Byte,
+}
+
+/// A token and its byte range in the source.
+pub struct Token {
+    pub kind: Kind,
+    pub start: usize,
+    pub end: usize,
+}
+
+pub enum ErrorKind {
+    /// Characters that start no token (or a malformed literal).
+    Invalid,
+    /// A `/*` comment without its closing `*/`; the range runs to the end.
+    UnterminatedComment,
+}
+
+/// Text the lexer could not understand.
+pub struct LexError {
+    pub kind: ErrorKind,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// The tokens of a source file, and what could not be lexed.
+pub struct Lexed {
+    pub tokens: [Token; -..+],
+    pub errors: [LexError; -..+],
+}
+
+/// Lex a whole source file. Whitespace and comments are skipped.
+pub fn lex(src: str): Lexed {
+    let b = src.as_bytes();
+    let mut out = Lexed { tokens: [], errors: [] };
+    let mut i: usize = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' || c == b'\x0c' {
+            i += 1;
+            continue;
+        }
+        if c == b'/' && at(b, i + 1) == b'/' {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && at(b, i + 1) == b'*' {
+            match block_comment_end(b, i + 2) {
+                Some(end) => {
+                    i = end;
+                }
+                None => {
+                    out.errors.push(LexError { kind: ErrorKind::UnterminatedComment, start: i, end: b.len() });
+                    i = b.len();
+                }
+            }
+            continue;
+        }
+        let (kind, end) = token_at(src, i);
+        match kind {
+            Some(k) => out.tokens.push(Token { kind: k, start: i, end }),
+            None => invalid(out.errors, i, end),
+        }
+        i = end;
+    }
+    return out;
+}
+
+/// Record invalid text, merged into an invalid run that ends where it starts.
+fn invalid(errors: &mut [LexError; -..+], start: usize, end: usize) {
+    let n = errors.len();
+    if n > 0 && errors[n - 1].end == start {
+        match errors[n - 1].kind {
+            ErrorKind::Invalid => {
+                errors[n - 1].end = end;
+                return;
+            }
+            ErrorKind::UnterminatedComment => {}
+        }
+    }
+    errors.push(LexError { kind: ErrorKind::Invalid, start, end });
+}
+
+/// The end of a nested `/* ... */` comment whose body starts at `from`.
+fn block_comment_end(b: [u8; &], from: usize): Option::<usize> {
+    let mut depth: usize = 1;
+    let mut i = from;
+    while i < b.len() {
+        if b[i] == b'/' && at(b, i + 1) == b'*' {
+            depth += 1;
+            i += 2;
+        } else if b[i] == b'*' && at(b, i + 1) == b'/' {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return Some(i);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    return None;
+}
+
+/// The token starting at `i` and where it ends; no kind for invalid text
+/// (which then ends where lexing gave up, as `ln-lexer` reports it).
+fn token_at(src: str, i: usize): (Option::<Kind>, usize) {
+    let b = src.as_bytes();
+    let c = b[i];
+    if is_ident_start(c) {
+        // `b'x'` is a byte literal; a malformed one is the identifier `b`
+        // followed by whatever comes next.
+        if c == b'b' && at(b, i + 1) == b'\'' {
+            match quoted_char_end(b, i + 1) {
+                Ok(end) => {
+                    return (Some(Kind::Byte), end);
+                }
+                Err(_) => {}
+            }
+        }
+        let mut j = i + 1;
+        while j < b.len() && is_ident_continue(b[j]) {
+            j += 1;
+        }
+        return (Some(word(src[i..j])), j);
+    }
+    if is_digit(c) {
+        return (Some(number_kind(b, i)), number_end(b, i));
+    }
+    if c == b'"' {
+        return match string_end(b, i) {
+            Ok(end) => (Some(Kind::Str), end),
+            Err(end) => (None, end),
+        };
+    }
+    if c == b'\'' {
+        return match quoted_char_end(b, i) {
+            Ok(end) => (Some(Kind::Char), end),
+            Err(end) => (None, end),
+        };
+    }
+    return punct(b, i);
+}
+
+/// Punctuation at `i`, the longest that matches (`<<=` before `<<` before `<`).
+fn punct(b: [u8; &], i: usize): (Option::<Kind>, usize) {
+    let c = b[i];
+    let next = at(b, i + 1);
+    let one = i + 1;
+    let two = i + 2;
+    return match c {
+        b'(' => tok(Kind::LParen, one),
+        b')' => tok(Kind::RParen, one),
+        b'[' => tok(Kind::LBracket, one),
+        b']' => tok(Kind::RBracket, one),
+        b'{' => tok(Kind::LBrace, one),
+        b'}' => tok(Kind::RBrace, one),
+        b'<' => {
+            if next == b'=' {
+                tok(Kind::Le, two)
+            } else if next == b'<' {
+                if at(b, i + 2) == b'=' { tok(Kind::ShlEq, i + 3) } else { tok(Kind::Shl, two) }
+            } else {
+                tok(Kind::LAngle, one)
+            }
+        }
+        b'>' => tok(Kind::RAngle, one),
+        b':' => if next == b':' { tok(Kind::PathSep, two) } else { tok(Kind::Colon, one) },
+        b';' => tok(Kind::Semi, one),
+        b',' => tok(Kind::Comma, one),
+        b'.' => {
+            if next != b'.' {
+                tok(Kind::Dot, one)
+            } else if at(b, i + 2) == b'=' {
+                tok(Kind::DotDotEq, i + 3)
+            } else if at(b, i + 2) == b'.' {
+                tok(Kind::DotDotDot, i + 3)
+            } else {
+                tok(Kind::DotDot, two)
+            }
+        }
+        b'=' => {
+            if next == b'=' {
+                tok(Kind::EqEq, two)
+            } else if next == b'>' {
+                tok(Kind::FatArrow, two)
+            } else {
+                tok(Kind::Eq, one)
+            }
+        }
+        b'!' => or_eq(next, i, Kind::Bang, Kind::BangEq),
+        b'-' => if next == b'>' { tok(Kind::Arrow, two) } else { or_eq(next, i, Kind::Minus, Kind::MinusEq) },
+        b'&' => if next == b'&' { tok(Kind::AmpAmp, two) } else { or_eq(next, i, Kind::Amp, Kind::AmpEq) },
+        b'|' => if next == b'|' { tok(Kind::PipePipe, two) } else { or_eq(next, i, Kind::Pipe, Kind::PipeEq) },
+        b'^' => or_eq(next, i, Kind::Caret, Kind::CaretEq),
+        b'+' => or_eq(next, i, Kind::Plus, Kind::PlusEq),
+        b'*' => or_eq(next, i, Kind::Star, Kind::StarEq),
+        b'/' => or_eq(next, i, Kind::Slash, Kind::SlashEq),
+        b'%' => or_eq(next, i, Kind::Percent, Kind::PercentEq),
+        b'~' => tok(Kind::Tilde, one),
+        b'?' => tok(Kind::Question, one),
+        b'#' => tok(Kind::Hash, one),
+        b'@' => tok(Kind::At, one),
+        _ => (None, i + char_len(c)),
+    };
+}
+
+fn tok(k: Kind, end: usize): (Option::<Kind>, usize) {
+    return (Some(k), end);
+}
+
+/// `x` at `i`, or `x=` if `next` is `=`.
+fn or_eq(next: u8, i: usize, plain: Kind, eq: Kind): (Option::<Kind>, usize) {
+    if next == b'=' {
+        return (Some(eq), i + 2);
+    }
+    return (Some(plain), i + 1);
+}
+
+/// A keyword, `_`, or an identifier.
+fn word(s: str): Kind {
+    return match s {
+        "_" => Kind::Placeholder,
+        "as" => Kind::As,
+        "break" => Kind::Break,
+        "const" => Kind::Const,
+        "continue" => Kind::Continue,
+        "crater" => Kind::Crater,
+        "else" => Kind::Else,
+        "enum" => Kind::Enum,
+        "extern" => Kind::Extern,
+        "false" => Kind::False,
+        "fn" => Kind::Fn,
+        "for" => Kind::For,
+        "if" => Kind::If,
+        "impl" => Kind::Impl,
+        "in" => Kind::In,
+        "let" => Kind::Let,
+        "loop" => Kind::Loop,
+        "match" => Kind::Match,
+        "mod" => Kind::Mod,
+        "mut" => Kind::Mut,
+        "pub" => Kind::Pub,
+        "return" => Kind::Return,
+        "self" => Kind::SelfValue,
+        "Self" => Kind::SelfType,
+        "static" => Kind::Static,
+        "struct" => Kind::Struct,
+        "super" => Kind::Super,
+        "trait" => Kind::Trait,
+        "true" => Kind::True,
+        "type" => Kind::Type,
+        "unsafe" => Kind::Unsafe,
+        "use" => Kind::Use,
+        "while" => Kind::While,
+        _ => Kind::Ident,
+    };
+}
+
+/// The end of the number starting at `i`. Handles `0x`/`0o`/`0b` prefixes,
+/// fractions (but not `1..2` or `1.method()`), exponents and type suffixes
+/// such as `10u8` and `1.5f32`.
+fn number_end(b: [u8; &], i: usize): usize {
+    return scan_number(b, i).1;
+}
+
+fn number_kind(b: [u8; &], i: usize): Kind {
+    if scan_number(b, i).0 { Kind::Float } else { Kind::Int }
+}
+
+/// (is a float, end) of the number starting at `i`.
+fn scan_number(b: [u8; &], i: usize): (bool, usize) {
+    let first = b[i];
+    let n = b.len();
+    let mut j = i + 1;
+    let mut float = false;
+    let radix = at(b, i + 1);
+    if first == b'0' && i + 2 < n && (radix == b'x' || radix == b'o' || radix == b'b') && is_hex(b[i + 2]) {
+        j = i + 2;
+        while j < n && (is_hex(b[j]) || b[j] == b'_') {
+            j += 1;
+        }
+    } else {
+        while j < n && is_digit_or_sep(b[j]) {
+            j += 1;
+        }
+        // Fraction: `1.` and `1.5`, but not `1..2` or `1.foo`.
+        if j < n && b[j] == b'.' {
+            let next = at(b, j + 1);
+            if next != b'.' && !is_ident_start(next) {
+                float = true;
+                j += 1;
+                while j < n && is_digit_or_sep(b[j]) {
+                    j += 1;
+                }
+            }
+        }
+        // Exponent.
+        if j < n && (b[j] == b'e' || b[j] == b'E') {
+            let mut k = j + 1;
+            if k < n && (b[k] == b'+' || b[k] == b'-') {
+                k += 1;
+            }
+            if k < n && is_digit(b[k]) {
+                float = true;
+                j = k;
+                while j < n && is_digit_or_sep(b[j]) {
+                    j += 1;
+                }
+            }
+        }
+    }
+    // Suffix.
+    if j < n && is_ident_start(b[j]) {
+        let s = j;
+        while j < n && is_ident_continue(b[j]) {
+            j += 1;
+        }
+        if b[s] == b'f' && !(first == b'0' && radix == b'x') {
+            float = true;
+        }
+    }
+    return (float, j);
+}
+
+/// The end of the string literal starting at `i`, or where it gave up.
+fn string_end(b: [u8; &], i: usize): Result::<usize, usize> {
+    let mut j = i + 1;
+    while j < b.len() {
+        let c = b[j];
+        if c == b'"' {
+            return Ok(j + 1);
+        }
+        if c == b'\\' {
+            j += 1;
+            if j >= b.len() {
+                return Err(j);
+            }
+            j += char_len(b[j]);
+        } else {
+            j += char_len(c);
+        }
+    }
+    return Err(b.len());
+}
+
+/// The end of the quoted character at `q` (`'a'`, `'\n'`, `'\u{41}'`), or
+/// where it gave up: one character, or a backslash and anything up to the
+/// closing quote on the same line.
+fn quoted_char_end(b: [u8; &], q: usize): Result::<usize, usize> {
+    let n = b.len();
+    let mut j = q + 1;
+    if j >= n {
+        return Err(j);
+    }
+    let c = b[j];
+    if c == b'\\' {
+        j += 1;
+        if j >= n || b[j] == b'\n' {
+            return Err(j);
+        }
+        j += char_len(b[j]);
+        while j < n && b[j] != b'\'' && b[j] != b'\n' {
+            j += char_len(b[j]);
+        }
+    } else {
+        if c == b'\'' || c == b'\n' {
+            return Err(j);
+        }
+        j += char_len(c);
+    }
+    if j < n && b[j] == b'\'' {
+        return Ok(j + 1);
+    }
+    return Err(j);
+}
+
+/// The byte at `i`, or 0 past the end.
+fn at(b: [u8; &], i: usize): u8 {
+    if i < b.len() { b[i] } else { 0 }
+}
+
+/// The length of the UTF-8 character starting with byte `c`.
+fn char_len(c: u8): usize {
+    if c < 0x80 {
+        1
+    } else if c < 0xE0 {
+        2
+    } else if c < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+fn is_ident_start(c: u8): bool {
+    return (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || c == b'_';
+}
+
+fn is_ident_continue(c: u8): bool {
+    return is_ident_start(c) || is_digit(c);
+}
+
+fn is_digit(c: u8): bool {
+    return c >= b'0' && c <= b'9';
+}
+
+fn is_digit_or_sep(c: u8): bool {
+    return is_digit(c) || c == b'_';
+}
+
+fn is_hex(c: u8): bool {
+    return is_digit(c) || (c >= b'a' && c <= b'f') || (c >= b'A' && c <= b'F');
+}
+
+impl Kind {
+    /// The name `ln-lexer` prints for this kind (its `Debug` form).
+    pub fn name(self): str {
+        return match self {
+            Kind::LParen => "LParen",
+            Kind::RParen => "RParen",
+            Kind::LBracket => "LBracket",
+            Kind::RBracket => "RBracket",
+            Kind::LBrace => "LBrace",
+            Kind::RBrace => "RBrace",
+            Kind::LAngle => "LAngle",
+            Kind::RAngle => "RAngle",
+            Kind::Le => "Le",
+            Kind::Shl => "Shl",
+            Kind::ShlEq => "ShlEq",
+            Kind::PathSep => "PathSep",
+            Kind::Colon => "Colon",
+            Kind::Semi => "Semi",
+            Kind::Comma => "Comma",
+            Kind::Dot => "Dot",
+            Kind::DotDot => "DotDot",
+            Kind::DotDotEq => "DotDotEq",
+            Kind::DotDotDot => "DotDotDot",
+            Kind::EqEq => "EqEq",
+            Kind::BangEq => "BangEq",
+            Kind::Eq => "Eq",
+            Kind::FatArrow => "FatArrow",
+            Kind::Arrow => "Arrow",
+            Kind::Bang => "Bang",
+            Kind::AmpAmp => "AmpAmp",
+            Kind::Amp => "Amp",
+            Kind::AmpEq => "AmpEq",
+            Kind::PipePipe => "PipePipe",
+            Kind::Pipe => "Pipe",
+            Kind::PipeEq => "PipeEq",
+            Kind::Caret => "Caret",
+            Kind::CaretEq => "CaretEq",
+            Kind::Plus => "Plus",
+            Kind::PlusEq => "PlusEq",
+            Kind::Minus => "Minus",
+            Kind::MinusEq => "MinusEq",
+            Kind::Star => "Star",
+            Kind::StarEq => "StarEq",
+            Kind::Slash => "Slash",
+            Kind::SlashEq => "SlashEq",
+            Kind::Percent => "Percent",
+            Kind::PercentEq => "PercentEq",
+            Kind::Tilde => "Tilde",
+            Kind::Question => "Question",
+            Kind::Hash => "Hash",
+            Kind::At => "At",
+            Kind::Placeholder => "Placeholder",
+            Kind::As => "As",
+            Kind::Break => "Break",
+            Kind::Const => "Const",
+            Kind::Continue => "Continue",
+            Kind::Crater => "Crater",
+            Kind::Else => "Else",
+            Kind::Enum => "Enum",
+            Kind::Extern => "Extern",
+            Kind::False => "False",
+            Kind::Fn => "Fn",
+            Kind::For => "For",
+            Kind::If => "If",
+            Kind::Impl => "Impl",
+            Kind::In => "In",
+            Kind::Let => "Let",
+            Kind::Loop => "Loop",
+            Kind::Match => "Match",
+            Kind::Mod => "Mod",
+            Kind::Mut => "Mut",
+            Kind::Pub => "Pub",
+            Kind::Return => "Return",
+            Kind::SelfValue => "SelfValue",
+            Kind::SelfType => "SelfType",
+            Kind::Static => "Static",
+            Kind::Struct => "Struct",
+            Kind::Super => "Super",
+            Kind::Trait => "Trait",
+            Kind::True => "True",
+            Kind::Type => "Type",
+            Kind::Unsafe => "Unsafe",
+            Kind::Use => "Use",
+            Kind::While => "While",
+            Kind::Ident => "Ident",
+            Kind::Int => "Number(Int)",
+            Kind::Float => "Number(Float)",
+            Kind::Str => "Str",
+            Kind::Char => "Char",
+            Kind::Byte => "Byte",
+        };
+    }
+}
+
+impl ErrorKind {
+    pub fn name(self): str {
+        return match self {
+            ErrorKind::Invalid => "Invalid",
+            ErrorKind::UnterminatedComment => "UnterminatedComment",
+        };
+    }
+}
+
+/// One line per token (`Ident 0 3`) and per error (`error Invalid 4 5`),
+/// with `ln-lexer`'s names, for comparing the two lexers.
+pub fn dump(src: str, out: &mut String) {
+    let lexed = lex(src);
+    for t in lexed.tokens {
+        out.write("{t.kind.name()} {t.start} {t.end}\n");
+    }
+    for e in lexed.errors {
+        out.write("error {e.kind.name()} {e.start} {e.end}\n");
+    }
+}
+
+// ===================================================================== tests
+
+/// The token kinds of `src`, space-separated; there must be no errors.
+fn kinds(src: str): String {
+    let lexed = lex(src);
+    std::test::assert_eq(lexed.errors.len(), 0, "lex errors");
+    let mut out = String::new();
+    for t in lexed.tokens {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(t.kind.name());
+    }
+    return out;
+}
+
+#[test]
+fn numbers_and_ranges() {
+    std::test::assert_eq(kinds("0..200").as_str(), "Number(Int) DotDot Number(Int)", "range");
+    std::test::assert_eq(kinds("0.").as_str(), "Number(Float)", "trailing dot");
+    std::test::assert_eq(kinds("[0.; 8]").as_str(), "LBracket Number(Float) Semi Number(Int) RBracket", "float in array");
+    std::test::assert_eq(
+        kinds("1.5e3 2e-1 7u8 1f32 0xffu8").as_str(),
+        "Number(Float) Number(Float) Number(Int) Number(Float) Number(Int)",
+        "exponents and suffixes",
+    );
+    std::test::assert_eq(kinds("x.0").as_str(), "Ident Dot Number(Int)", "tuple field");
+    std::test::assert_eq(kinds("1.max").as_str(), "Number(Int) Dot Ident", "method on an integer");
+}
+
+#[test]
+fn array_types() {
+    std::test::assert_eq(kinds("[T; -..+]").as_str(), "LBracket Ident Semi Minus DotDot Plus RBracket", "growable");
+    std::test::assert_eq(kinds("![T; &mut]").as_str(), "Bang LBracket Ident Semi Amp Mut RBracket", "mutable slice");
+}
+
+#[test]
+fn comments_and_strings() {
+    std::test::assert_eq(kinds("/* a /* b */ c */ x // y\n\"s\\\"{x}\" 'a' '\\n'").as_str(), "Ident Str Char Char", "comments");
+    std::test::assert_eq(kinds("b'a' b'\\xff' b 'c' b2'd'").as_str(), "Byte Byte Ident Char Ident Char", "bytes");
+}
+
+#[test]
+fn generics_do_not_fuse_closers() {
+    std::test::assert_eq(kinds("A::<B::<C>>").as_str(), "Ident PathSep LAngle Ident PathSep LAngle Ident RAngle RAngle", "closers");
+}
+
+#[test]
+fn unterminated_block_comment() {
+    let lexed = lex("a /* x /* y */ b");
+    std::test::assert_eq(lexed.tokens.len(), 1, "only `a`");
+    std::test::assert_eq(lexed.errors.len(), 1, "one error");
+    std::test::assert_eq(lexed.errors[0].start, 2, "from the `/*`");
+    std::test::assert_eq(lexed.errors[0].end, 16, "to the end");
+}
