@@ -280,6 +280,35 @@ mod lsp {
         assert!(child.wait().unwrap().success());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A module file opened on its own is analyzed as part of the crate of
+    /// the (unopened) file that declares it, so `super::` resolves.
+    #[test]
+    fn module_file_opened_alone_uses_its_crate() {
+        let dir = std::env::temp_dir().join(format!("lunar-lsp-mod-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("shapes")).unwrap();
+        let main = "mod util;\nmod shapes;\n\nfn helper(): i32 {\n    return 41;\n}\n\nfn main() {\n    println(\"{util::answer()} {shapes::sides()}\");\n}\n";
+        let util = "pub fn answer(): i32 {\n    return super::helper() + 1;\n}\n";
+        let shapes = "pub fn sides(): i32 {\n    return crate::util::answer() - 38;\n}\n";
+        std::fs::write(dir.join("main.ln"), main).unwrap();
+        std::fs::write(dir.join("util.ln"), util).unwrap();
+        std::fs::write(dir.join("shapes").join("mod.ln"), shapes).unwrap();
+
+        let mut child = lunar().args(["lsp", "--stdio"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut c = Client { stdin: child.stdin.take().unwrap(), stdout: BufReader::new(child.stdout.take().unwrap()), next_id: 0, notes: Vec::new() };
+        c.request("initialize", json!({ "processId": null, "rootUri": null, "capabilities": {} }));
+        c.notify("initialized", json!({}));
+        for (path, text) in [(dir.join("util.ln"), util), (dir.join("shapes").join("mod.ln"), shapes)] {
+            let uri = uri_of(&path);
+            c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "lunar", "version": 1, "text": text } }));
+            let diags = c.diagnostics_for(&uri);
+            assert!(diags.is_empty(), "{}: unexpected diagnostics {diags:#?}", path.display());
+        }
+        let _ = c.request("shutdown", Value::Null);
+        c.notify("exit", Value::Null);
+        assert!(child.wait().unwrap().success());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Every code in `ln_diag::ALL_CODES` has a `docs/errors/<scope>/<name>.md`

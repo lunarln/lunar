@@ -138,7 +138,9 @@ impl Server {
             let key = path_key(&path);
             let root = match self.file_root.get(&key) {
                 Some(r) => self.crates.get(r).map(|(p, _)| p.clone()).unwrap_or(path),
-                None => path,
+                // Not part of any analyzed crate yet: a module file opened on
+                // its own belongs to the crate of the file that declares it.
+                None => crate_root_of(&path, &|p: &Path| self.open.get(&path_key(p)).cloned().or_else(|| std::fs::read_to_string(p).ok())),
             };
             if !roots.iter().any(|r| path_key(r) == path_key(&root)) {
                 roots.push(root);
@@ -308,4 +310,51 @@ fn publish(conn: &Connection, uri: Url, diagnostics: Vec<lsp_types::Diagnostic>)
     let params = PublishDiagnosticsParams { uri, diagnostics, version: None };
     conn.sender.send(Message::Notification(Notification::new(PublishDiagnostics::METHOD.to_string(), params)))?;
     Ok(())
+}
+
+/// The root of the crate that `file` belongs to. `dir/foo.ln` and
+/// `dir/foo/mod.ln` are module `foo`, declared by `mod foo;` in a file whose
+/// child modules live in `dir`: a root file or `mod.ln` in `dir`, or
+/// `dir.ln` next to `dir`. The declaring file may itself be a module, so
+/// the search repeats upwards. A file nobody declares is its own root.
+pub fn crate_root_of(file: &Path, read: &dyn Fn(&Path) -> Option<String>) -> PathBuf {
+    let mut cur = file.to_path_buf();
+    for _ in 0..32 {
+        match declaring_file(&cur, read) {
+            Some(parent) if path_key(&parent) != path_key(&cur) => cur = parent,
+            _ => break,
+        }
+    }
+    cur
+}
+
+fn declaring_file(file: &Path, read: &dyn Fn(&Path) -> Option<String>) -> Option<PathBuf> {
+    let is_mod_ln = file.file_name()? == "mod.ln";
+    let (name, dir) = if is_mod_ln {
+        let d = file.parent()?;
+        (d.file_name()?.to_string_lossy().into_owned(), d.parent()?.to_path_buf())
+    } else {
+        (file.file_stem()?.to_string_lossy().into_owned(), file.parent()?.to_path_buf())
+    };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    // `dir.ln`, a non-owner file whose children live in `dir/`.
+    if let (Some(parent), Some(dname)) = (dir.parent(), dir.file_name()) {
+        candidates.push(parent.join(format!("{}.ln", dname.to_string_lossy())));
+    }
+    // Files in `dir` that own it: `mod.ln` and crate roots.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut files: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "ln")).collect();
+        files.sort();
+        candidates.extend(files);
+    }
+    candidates.into_iter().find(|c| path_key(c) != path_key(file) && read(c).is_some_and(|text| declares_mod(&text, &name)))
+}
+
+/// Whether `text` has a `mod name;` declaration (possibly `pub`).
+fn declares_mod(text: &str, name: &str) -> bool {
+    text.lines().any(|line| {
+        let t = line.trim();
+        let t = t.strip_prefix("pub ").unwrap_or(t).trim_start();
+        t.strip_prefix("mod ").is_some_and(|rest| rest.trim_start().strip_prefix(name).is_some_and(|r| r.trim_start().starts_with(';')))
+    })
 }
