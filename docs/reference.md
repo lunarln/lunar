@@ -113,6 +113,11 @@ reserved address space whose pages are committed as the array grows.
     analysis reports `err(borrow::shrink_while_borrowed)` if a view is used
     after the shrink.
 * A `!` array can be passed anywhere a plain array is expected.
+* `!` also applies to `String` and to any struct, enum or tuple that
+  contains something shrinkable, at any depth: `fn drain(mut s: !Stack)`
+  for `struct Stack { items: [i32; -..+] }`. A `!` on a type with nothing
+  shrinkable in it is `err(type::bang_not_shrinkable)`, and a view into
+  any field counts as a view into the whole value.
 * Owners are freed when they go out of scope (also on `return`, `break`,
   `continue`). Moving out of a variable makes it unusable
   (`err(borrow::use_after_move)`).

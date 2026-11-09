@@ -1,0 +1,24 @@
+// `!` on a struct containing a shrinkable array.
+
+struct Stack {
+    items: [i32; -..+],
+    name: str,
+}
+
+fn drain(mut s: !Stack): i32 {
+    let mut total = 0;
+    loop {
+        match s.items.pop() {
+            Some(v) => total += v,
+            None => break,
+        }
+    }
+    return total;
+}
+
+fn main() {
+    let mut s = Stack { items: [1, 2, 3], name: "nums" };
+    let peek = s.items[..];
+    println("{peek.len()}");
+    println("{drain(s)} left={s.items.len()}");
+}
