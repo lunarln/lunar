@@ -1,10 +1,11 @@
 # name::bad_self: `self` is used as a parameter outside the first position of a method
 
 A `self` parameter makes a function a method: it receives the value the
-method is called on. It is only allowed as the first parameter of a function
-inside an `impl` or `trait` block. This code is reported when `self` appears
-in a later position, or in a free function that is not inside an `impl` or
-`trait`.
+method is called on, in any parameter mode (`self`, `mut self`, `&self`,
+`&mut self` or `&mut !self`). It is only allowed as the first parameter of a
+function inside an `impl` or `trait` block. This code is reported when
+`self` appears in a later position, or in a free function that is not inside
+an `impl` or `trait`.
 
 A function inside an `impl` without `self` is an associated function, called
 as `Type::name(...)`.

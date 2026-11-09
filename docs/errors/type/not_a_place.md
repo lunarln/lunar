@@ -7,11 +7,12 @@ expression is not a place. This error is reported for:
 
 * the left-hand side of an assignment (`=`) or compound assignment (`+=`,
   `-=`, ...) that is not a place;
-* an argument for a `mut` parameter that is not a place.
+* an argument for an in-out (`x: &mut T`) parameter that is not a place.
 
-A `mut` parameter is in-out: the callee writes back to the caller's
-variable, so the argument has to name something that can receive the
-result. To pass a computed value, bind it with `let mut` first.
+An in-out parameter writes back to the caller's variable, so the argument
+has to name something that can receive the result. To pass a computed
+value, bind it with `let mut` first, or, if the caller does not need the
+result, have the function take its own copy with `mut x: T`.
 
 ## Erroneous example
 

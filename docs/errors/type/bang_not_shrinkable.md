@@ -1,8 +1,8 @@
 # type::bang_not_shrinkable: `!` is applied to a type that cannot shrink
 
-A parameter was declared `!T`, but nothing inside `T` can ever shrink. `!`
-only makes sense when `T` is `[U; -..+]`, `String`, or a struct, enum or
-tuple that contains one at any depth. Arrays of the other kinds (`[U; N]`,
+A parameter was declared `&mut !T`, but nothing inside `T` can ever shrink.
+`!` only makes sense when `T` is `[U; -..+]`, `String`, or a struct, enum
+or tuple that contains one at any depth. Arrays of the other kinds (`[U; N]`,
 `[U]`, `[U; ..+]`, slices) never shrink, so slices into them are never
 invalidated and `!` would only restrict callers for no reason.
 
@@ -29,7 +29,7 @@ fn main() {
 
 ## Fixed
 
-`add` only grows the log, which never invalidates views, so a plain `mut`
+`add` only grows the log, which never invalidates views, so a plain `&mut`
 parameter is enough:
 
 ```lunar

@@ -5,18 +5,20 @@ A value was passed to a `!` parameter, or had a shrinking method such as
 it.
 
 Shrinking can invalidate views into a value, and only the owner can know
-whether such views exist. A plain parameter is borrowed: the caller owns it
-and may hold slices into it that this function cannot see. So shrinking is
-allowed only on:
+whether such views exist. An in-out parameter (`x: &mut T` or `&mut self`)
+is borrowed: the caller owns it and may hold slices into it that this
+function cannot see. So shrinking is allowed only on:
 
-* a local variable, or
-* a parameter that is itself declared `mut x: !T` (or a `mut self: !Self`
-  receiver), which passes the caller's permission along and makes the
-  caller check its own views.
+* a local variable,
+* a parameter that took ownership (`mut x: T` or `mut self`), or
+* a parameter declared `x: &mut !T` (or a `&mut !self` receiver), which
+  passes the caller's permission along and makes the caller check its own
+  views.
 
-The error is reported when the shrunk value is a parameter not declared
-`!`, when it is reached through a slice, and when it has no owner in the
-function at all (for example a `static` or data behind a raw pointer).
+The error is reported when the shrunk value is a borrowed parameter not
+declared `!`, when it is reached through a slice, and when it has no owner
+in the function at all (for example a `static` or data behind a raw
+pointer).
 
 ## Erroneous example
 
@@ -34,7 +36,9 @@ fn main() {
 
 ## Fixed
 
-Declare the parameter `!` so callers know it may shrink:
+Declare the parameter `&mut !` so callers know it may shrink (or, if the
+caller no longer needs the value, take ownership with
+`mut items: [i64; -..+]`):
 
 ```lunar
 fn drop_last(items: &mut ![i64; -..+]) {

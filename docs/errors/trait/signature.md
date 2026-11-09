@@ -6,14 +6,17 @@ the trait's generic arguments:
 
 * the number of the method's own generic parameters;
 * the number of parameters (including `self`);
-* each parameter's type, and whether it is `mut` (in-out);
+* each parameter's type and mode: taking ownership (`x: T`), borrowing
+  (`x: &T`) or in-out (`x: &mut T`), including `!`;
 * the return type.
 
 Callers that go through the trait rely on the trait's signature: what they
-pass, whether their argument may be changed in place, and what they get
-back. An impl with a different signature would break those calls, so the
-two must match exactly. In particular `mut self` in the trait requires
-`mut self` in the impl, and the other way round.
+pass, whether it is moved into the call or changed in place, and what they
+get back. An impl with a different signature would break those calls, so
+the two must match exactly. In particular `&self` in the trait requires
+`&self` in the impl, not `self` or `&mut self`. Only `mut` on a parameter
+that takes ownership may differ: `mut x: T` matches `x: T`, since it only
+lets the function change its own value.
 
 ## Erroneous example
 
