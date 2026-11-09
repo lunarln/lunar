@@ -77,10 +77,15 @@ lunar check <file.ln> [--target-os linux|macos|windows]
 lunar build <file.ln> [-o out] [--release] [--emit-llvm out.ll]
 lunar run   <file.ln> [--release] [-- args...]
 lunar test  <file.ln> [filter] [--release]
+lunar emit-llvm <file.ln> [-o out.ll] [--release] [--test]
 ```
 
 `--release` enables LLVM optimizations and turns integer overflow checks into
 wrapping arithmetic.
+
+`emit-llvm` prints the module's LLVM IR (after the optimization pipeline, so
+pass `--release` to see optimized code) to stdout without building anything.
+`build --emit-llvm out.ll` writes the same IR alongside a normal build.
 
 ## Repository layout
 

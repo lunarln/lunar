@@ -123,7 +123,6 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         t.subst(&self.args)
     }
 
-
     /// An alloca in the entry block.
     pub fn alloca(&mut self, ty: BasicTypeEnum<'ctx>, name: &str) -> PointerValue<'ctx> {
         let entry = self.f.get_first_basic_block().unwrap();

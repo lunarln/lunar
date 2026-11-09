@@ -112,3 +112,18 @@ fn run_tests_produce_expected_output() {
 fn examples_run() {
     run_dir("examples");
 }
+
+#[test]
+fn emit_llvm_prints_ir() {
+    for release in [false, true] {
+        let mut cmd = lunar();
+        cmd.arg("emit-llvm").arg(root().join("examples/hello.ln"));
+        if release {
+            cmd.arg("--release");
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "emit-llvm failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        let ir = String::from_utf8(out.stdout).unwrap();
+        assert!(ir.contains("define") && ir.contains("@main"), "unexpected IR (release={release}):\n{ir}");
+    }
+}

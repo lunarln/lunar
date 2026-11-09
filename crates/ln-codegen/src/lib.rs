@@ -44,6 +44,18 @@ pub struct Options {
 
 /// Compile `program` to a native object file at `out`.
 pub fn compile(program: &Program, map: &SourceMap, opts: &Options, out: &Path) -> Result<(), String> {
+    generate(program, map, opts, |module, tm| tm.write_to_file(module, FileType::Object, out).map_err(|e| format!("could not write object file: {e}")))
+}
+
+/// Generate and optimize `program`, returning its textual LLVM IR.
+pub fn emit_ir(program: &Program, map: &SourceMap, opts: &Options) -> Result<String, String> {
+    generate(program, map, opts, |module, _| Ok(module.print_to_string().to_string()))
+}
+
+/// Lower, verify and optimize `program`, then hand the module to `finish`.
+/// `opts.emit_llvm` receives the optimized IR, or the unoptimized IR if
+/// verification fails (so a compiler bug can be inspected).
+fn generate<T>(program: &Program, map: &SourceMap, opts: &Options, finish: impl FnOnce(&Module, &TargetMachine) -> Result<T, String>) -> Result<T, String> {
     init::native();
     let triple = TargetMachine::get_default_triple();
     let target = Target::from_triple(&triple).map_err(|e| format!("unsupported target: {e}"))?;
@@ -81,14 +93,18 @@ pub fn compile(program: &Program, map: &SourceMap, opts: &Options, out: &Path) -
     while let Some((def, args, f)) = cg.queue.pop() {
         cg.gen_fn(def, &args, f)?;
     }
-    if let Some(p) = &opts.emit_llvm {
-        cg.module.print_to_file(p).map_err(|e| format!("could not write LLVM IR: {e}"))?;
+    let write_ir = |m: &Module| match &opts.emit_llvm {
+        Some(p) => m.print_to_file(p).map_err(|e| format!("could not write LLVM IR: {e}")),
+        None => Ok(()),
+    };
+    if let Err(e) = cg.module.verify() {
+        write_ir(&cg.module)?;
+        return Err(format!("internal compiler error: invalid LLVM IR generated:\n{}", e.to_string_lossy()));
     }
-    cg.module.verify().map_err(|e| format!("internal compiler error: invalid LLVM IR generated:\n{}", e.to_string_lossy()))?;
     let pipeline = format!("default<O{}>", opts.opt_level.min(3));
     cg.module.run_passes(&pipeline, &tm, PassBuilderOptions::create()).map_err(|e| format!("LLVM optimization failed: {e}"))?;
-    tm.write_to_file(&cg.module, FileType::Object, out).map_err(|e| format!("could not write object file: {e}"))?;
-    Ok(())
+    write_ir(&cg.module)?;
+    finish(&cg.module, &tm)
 }
 
 pub(crate) struct Cg<'ctx, 'p> {

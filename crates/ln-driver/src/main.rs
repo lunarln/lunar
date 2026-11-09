@@ -31,9 +31,22 @@ enum Cmd {
         /// Optimize (and disable overflow checks).
         #[arg(long)]
         release: bool,
-        /// Also write the generated LLVM IR to this file.
+        /// Also write the (optimized) LLVM IR to this file.
         #[arg(long)]
         emit_llvm: Option<PathBuf>,
+    },
+    /// Print the optimized LLVM IR for a program without building it.
+    EmitLlvm {
+        file: PathBuf,
+        /// Write the IR to this file instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Optimize (and disable overflow checks), as `build --release` does.
+        #[arg(long)]
+        release: bool,
+        /// Emit the `#[test]` harness instead of `main`.
+        #[arg(long)]
+        test: bool,
     },
     /// Compile and run a program.
     Run {
@@ -72,6 +85,22 @@ fn main() -> ExitCode {
                 Err(()) => ExitCode::FAILURE,
             }
         }
+        Cmd::EmitLlvm { file, output, release, test } => match emit_ir(&file, release, test, color) {
+            Ok(ir) => {
+                let written = match &output {
+                    Some(p) => std::fs::write(p, ir).map_err(|e| format!("could not write `{}`: {e}", p.display())),
+                    None => std::io::Write::write_all(&mut std::io::stdout().lock(), ir.as_bytes()).map_err(|e| e.to_string()),
+                };
+                match written {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            Err(()) => ExitCode::FAILURE,
+        },
         Cmd::Run { file, release, args } => {
             let out = temp_exe(&file, "run");
             if compile(&file, &out, release, false, None, color).is_err() {
@@ -111,6 +140,17 @@ fn compile(file: &Path, out: &Path, release: bool, test: bool, emit_llvm: Option
     }
     let opts = BuildOptions { release, test, output: out.to_path_buf(), emit_llvm, overflow_checks: !release };
     build(&a, &opts).map_err(|e| eprintln!("error: {e}"))
+}
+
+fn emit_ir(file: &Path, release: bool, test: bool, color: bool) -> Result<String, ()> {
+    let a = analyze(file, test);
+    finish_front(&a, color)?;
+    if !test && a.program.as_ref().is_some_and(|p| p.main.is_none()) {
+        eprintln!("error: `{}` has no `main` function", file.display());
+        return Err(());
+    }
+    let opts = BuildOptions { release, test, output: PathBuf::new(), emit_llvm: None, overflow_checks: !release };
+    ln_driver::emit_llvm(&a, &opts).map_err(|e| eprintln!("error: {e}"))
 }
 
 fn default_exe(file: &Path) -> PathBuf {

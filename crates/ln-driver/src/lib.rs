@@ -103,18 +103,29 @@ pub struct BuildOptions {
     pub overflow_checks: bool,
 }
 
-/// Generate code for an analyzed program and link it into an executable.
-pub fn build(analysis: &Analysis, opts: &BuildOptions) -> Result<(), String> {
-    let program = analysis.program.as_ref().ok_or("analysis failed")?;
-    let obj_path = opts.output.with_extension(if cfg!(windows) { "obj" } else { "o" });
-    let cg = ln_codegen::Options {
+fn codegen_options(opts: &BuildOptions) -> ln_codegen::Options {
+    ln_codegen::Options {
         opt_level: if opts.release { 2 } else { 0 },
         test: opts.test,
         overflow_checks: opts.overflow_checks,
         emit_llvm: opts.emit_llvm.clone(),
-    };
-    ln_codegen::compile(program, &analysis.map, &cg, &obj_path)?;
+    }
+}
+
+/// Generate code for an analyzed program and link it into an executable.
+pub fn build(analysis: &Analysis, opts: &BuildOptions) -> Result<(), String> {
+    let program = analysis.program.as_ref().ok_or("analysis failed")?;
+    let obj_path = opts.output.with_extension(if cfg!(windows) { "obj" } else { "o" });
+    ln_codegen::compile(program, &analysis.map, &codegen_options(opts), &obj_path)?;
     let res = link::link(&obj_path, &opts.output);
     let _ = std::fs::remove_file(&obj_path);
     res
+}
+
+/// Generate code for an analyzed program and return its optimized LLVM IR
+/// as text, without writing an object file or linking. `opts.output` is
+/// ignored.
+pub fn emit_llvm(analysis: &Analysis, opts: &BuildOptions) -> Result<String, String> {
+    let program = analysis.program.as_ref().ok_or("analysis failed")?;
+    ln_codegen::emit_ir(program, &analysis.map, &codegen_options(opts))
 }

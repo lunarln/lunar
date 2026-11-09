@@ -636,7 +636,6 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         self.obligations.push((ty, tr, span));
     }
 
-
     /// Resolve remaining inference, check deferred obligations and literals.
     fn finish(&mut self) {
         for i in 0..self.vars.len() {

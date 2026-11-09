@@ -82,7 +82,11 @@ pub fn lint(body: &Body, diags: &mut Diagnostics) {
                     .with_help(format!("if this is intentional, prefix it with an underscore: `_{}`", l.name)),
             );
         } else if l.mutable && !mutated.contains(&id) {
-            diags.push(Diagnostic::warning(lint::UNUSED_MUT, l.span, format!("variable `{}` does not need to be mutable", l.name)).with_label("never mutated").with_help("remove the `mut`"));
+            diags.push(
+                Diagnostic::warning(lint::UNUSED_MUT, l.span, format!("variable `{}` does not need to be mutable", l.name))
+                    .with_label("never mutated")
+                    .with_help("remove the `mut`"),
+            );
         }
     }
 }
