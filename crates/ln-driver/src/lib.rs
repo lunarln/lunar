@@ -3,6 +3,7 @@
 pub mod ide;
 pub mod link;
 pub mod lsp;
+pub mod project;
 
 use ln_diag::{Diagnostic, SourceMap};
 use ln_parser::IdGen;

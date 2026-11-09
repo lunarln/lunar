@@ -1,0 +1,126 @@
+//! Projects end to end: `lunar new`, path and git dependencies, the
+//! lockfile, `lunar test`, `lunar update` and dependency visibility. Every
+//! scenario runs in its own temporary directory, outside this repository.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+fn lunar(dir: &Path, home: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lunar")).args(args).current_dir(dir).env("LUNAR_HOME", home).env_remove("LUNAR_STD_DIR").output().unwrap()
+}
+
+fn ok(dir: &Path, home: &Path, args: &[&str]) -> String {
+    let o = lunar(dir, home, args);
+    let all = String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "`lunar {}` failed in {}:\n{all}", args.join(" "), dir.display());
+    all
+}
+
+fn fails(dir: &Path, home: &Path, args: &[&str]) -> String {
+    let o = lunar(dir, home, args);
+    assert!(!o.status.success(), "`lunar {}` should fail in {}", args.join(" "), dir.display());
+    String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let o = Command::new("git").args(["-c", "user.email=test@example.com", "-c", "user.name=test"]).args(args).current_dir(dir).output().unwrap();
+    assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+}
+
+fn scratch(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("lunar-project-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+#[test]
+fn path_and_git_dependencies() {
+    let w = scratch("deps");
+    let home = w.join("home");
+    ok(&w, &home, &["new", "app"]);
+    ok(&w, &home, &["new", "mathx", "--lib"]);
+    ok(&w, &home, &["new", "strutil", "--lib"]);
+
+    // strutil: a git repository with a tag.
+    let strutil = w.join("strutil");
+    std::fs::write(strutil.join("src/lib.ln"), "pub fn shout(mut s: String): String {\n    s.push_str(\"!\");\n    return s;\n}\n").unwrap();
+    git(&strutil, &["add", "-A"]);
+    git(&strutil, &["commit", "-qm", "init"]);
+    git(&strutil, &["tag", "v0.1.0"]);
+
+    // mathx depends on strutil by git, and has an integration test.
+    let mathx = w.join("mathx");
+    std::fs::write(
+        mathx.join("src/lib.ln"),
+        "pub fn add(a: i32, b: i32): i32 {\n    return a + b;\n}\n\npub fn describe(a: i32, b: i32): String {\n    let mut s = String::from(\"sum is \");\n    s.write(\"{add(a, b)}\");\n    return strutil::shout(s);\n}\n\n#[test]\nfn adds() {\n    std::test::assert_eq(add(2, 2), 4, \"2 + 2\");\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(mathx.join("tests")).unwrap();
+    std::fs::write(mathx.join("tests/sums.ln"), "#[test]\nfn uses_lib() {\n    std::test::assert_eq(mathx::add(1, 1), 2, \"1 + 1\");\n}\n").unwrap();
+    let url = strutil.to_string_lossy().replace('\\', "/");
+    ok(&mathx, &home, &["add", "strutil", "--git", &url, "--tag", "v0.1.0"]);
+    let out = ok(&mathx, &home, &["test"]);
+    assert!(out.contains("test result: ok. 2 passed"), "dependency tests must not run with the crater's own:\n{out}");
+
+    // app depends on mathx by path.
+    let app = w.join("app");
+    std::fs::write(
+        app.join("src/main.ln"),
+        "use mathx::describe;\n\nfn main() {\n    println(\"{mathx::add(40, 2)}\");\n    let d = describe(1, 2);\n    println(\"{d}\");\n}\n",
+    )
+    .unwrap();
+    ok(&app, &home, &["add", "mathx", "--path", "../mathx"]);
+    let out = ok(&app, &home, &["run"]);
+    assert!(out.contains("42\n") && out.contains("sum is 3!\n"), "{out}");
+    let lock = std::fs::read_to_string(app.join("lunar.lock")).unwrap();
+    assert!(lock.contains("source = \"path+../mathx\"") && lock.contains("?tag=v0.1.0#"), "{lock}");
+
+    // The lock pins the commit: moving the tag changes nothing until `update`.
+    std::fs::write(strutil.join("src/lib.ln"), "pub fn shout(mut s: String): String {\n    s.push_str(\"!!\");\n    return s;\n}\n").unwrap();
+    git(&strutil, &["commit", "-qam", "louder"]);
+    git(&strutil, &["tag", "-f", "v0.1.0"]);
+    let out = ok(&app, &home, &["run"]);
+    assert!(out.contains("sum is 3!\n") && !out.contains("Fetching"), "{out}");
+    ok(&app, &home, &["update"]);
+    let out = ok(&app, &home, &["run"]);
+    assert!(out.contains("sum is 3!!\n"), "{out}");
+
+    // A dependency's own dependencies are not visible.
+    std::fs::write(app.join("src/main.ln"), "fn main() {\n    let s = strutil::shout(String::from(\"x\"));\n    println(\"{s}\");\n}\n").unwrap();
+    let out = fails(&app, &home, &["build"]);
+    assert!(out.contains("err(name::unresolved)"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&w);
+}
+
+#[test]
+fn manifest_errors() {
+    let w = scratch("errors");
+    let home = w.join("home");
+    ok(&w, &home, &["new", "app"]);
+    ok(&w, &home, &["new", "lib2", "--lib"]);
+    let app = w.join("app");
+    let manifest = app.join("lunar.toml");
+
+    // Version requirements are checked.
+    std::fs::write(&manifest, "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nlib2 = { path = \"../lib2\", version = \"2\" }\n").unwrap();
+    let out = fails(&app, &home, &["build"]);
+    assert!(out.contains("requires `lib2` ^2") && out.contains("version 0.1.0"), "{out}");
+
+    // The registry does not exist yet.
+    std::fs::write(&manifest, "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\njson = \"1.2\"\n").unwrap();
+    let out = fails(&app, &home, &["build"]);
+    assert!(out.contains("registry, which is not available yet"), "{out}");
+
+    // Unknown keys and bad names are reported.
+    std::fs::write(&manifest, "[package]\nname = \"App\"\nversion = \"0.1.0\"\n").unwrap();
+    let out = fails(&app, &home, &["build"]);
+    assert!(out.contains("package name `App` is not valid"), "{out}");
+
+    // Outside any project, commands without a file explain what they need.
+    let out = fails(&w, &home, &["build"]);
+    assert!(out.contains("no `lunar.toml`"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&w);
+}

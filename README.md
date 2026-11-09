@@ -77,6 +77,43 @@ cargo build --release
 
 ## Usage
 
+`lunar` is both the compiler and the project manager. In a project (a
+directory with a `lunar.toml`), commands work on the whole package:
+
+```text
+lunar new hello [--lib]  # create a package: lunar.toml, src/main.ln (or src/lib.ln)
+lunar init [--lib]       # the same, in the current directory
+lunar build [--release]  # build src/main.ln to target/<profile>/hello
+lunar run [-- args...]   # build and run it
+lunar test [filter]      # run #[test]s in src/lib.ln, src/main.ln and tests/*.ln
+lunar check              # type-check without generating code
+lunar add util --path ../util
+lunar add json --git https://github.com/x/json --tag v1.2.0
+lunar remove json
+lunar update             # move git dependencies to their newest commit; rewrite lunar.lock
+lunar clean              # remove target/
+```
+
+```toml
+# lunar.toml
+[package]
+name = "hello"
+version = "0.1.0"
+
+[dependencies]
+util = { path = "../util" }
+json = { git = "https://github.com/x/json", tag = "v1.2.0", version = "1.2" }
+```
+
+A dependency's library is reachable by its name, like `std`:
+`use json::Value;`. Only declared dependencies are visible, not their own
+dependencies. `version` requirements use Cargo's `^` rules, and `lunar.lock`
+records the exact commit of every git dependency. Registry dependencies
+(`json = "1.2"`) are parsed, but the registry is not available yet. Git
+checkouts are cached in `~/.lunar` (or `$LUNAR_HOME`).
+
+Given a file, commands work on that file alone:
+
 ```text
 lunar check <file.ln> [--target-os linux|macos|windows]
 lunar build <file.ln> [-o out] [--release] [--emit-llvm out.ll]

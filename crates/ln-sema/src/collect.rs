@@ -211,10 +211,11 @@ impl<'a> Sema<'a> {
         match &item.kind {
             ast::ItemKind::Fn(f) => {
                 let id = self.new_def(&f.name.name, DefKind::Fn, Some(module), f.name.span, AstRef::Fn(f, extern_abi.is_some()));
-                if attrs.test {
-                    if self.opts.test {
-                        self.p.tests.push(id);
-                    }
+                // Only the crater being tested contributes tests, not the
+                // craters it depends on.
+                let in_root = self.p.crate_roots.first().is_some_and(|(_, r)| *r == self.mod_data(module).krate);
+                if attrs.test && self.opts.test && in_root {
+                    self.p.tests.push(id);
                 }
                 self.finish_def(id, item, attrs);
                 self.bind(module, Ns::Value, &f.name.name, id, item.is_pub, f.name.span);
