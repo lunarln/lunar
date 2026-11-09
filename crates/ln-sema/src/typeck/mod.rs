@@ -607,6 +607,12 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     }
 
     pub(crate) fn immutable_err(&mut self, place: &Expr, span: Span, what: &str) {
+        self.immutable_err_for(place, span, what, false);
+    }
+
+    /// `shrink`: the place is about to be shrunk, so the in-place fix for a
+    /// parameter is `&mut !T` rather than `&mut T`.
+    pub(crate) fn immutable_err_for(&mut self, place: &Expr, span: Span, what: &str, shrink: bool) {
         let mut d = Diagnostic::error(tyc::IMMUTABLE, span, format!("cannot {what}: it is not mutable"));
         let container = match &place.kind {
             ExprKind::Index { base, .. } => self.shallow(&base.ty),
@@ -622,7 +628,12 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 LocalKind::Param { owned: true, .. } => {
                     d.with_help(format!("declare it `mut {n}` to change this function's own copy, or `{n}: &mut ...` to change the caller's"))
                 }
-                LocalKind::Param { .. } => d.with_help(format!("declare it `{n}: &mut ...` to pass it in-out")),
+                LocalKind::Param { .. } => {
+                    let ty = self.ty_str(local.ty.strip_bang());
+                    let bang = if shrink { "!" } else { "" };
+                    d.with_help(format!("to change the caller's value in place: `{n}: &mut {bang}{ty}`"))
+                        .with_help(format!("or take ownership and change your own: `mut {n}: {ty}`"))
+                }
                 _ => d.with_help(format!("declare it with `let mut {n}`")),
             };
             d = d.with_secondary(sp, format!("`{n}` declared here"));

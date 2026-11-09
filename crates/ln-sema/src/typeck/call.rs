@@ -617,7 +617,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             self.require_unsafe(a.span, "accessing a `static mut`");
         }
         if !self.is_mutable_place(&place) && !place.ty.is_error() {
-            self.immutable_err(&place, a.span, "pass this as a `&mut` argument");
+            self.immutable_err_for(&place, a.span, "pass this as a `&mut` argument", matches!(pt, Ty::Bang(_)));
         }
         let want = self.shallow(pt.strip_bang());
         let have = self.shallow(place.ty.strip_bang());
@@ -749,7 +749,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let want = self.shallow(self_ty.strip_bang());
         if mode == ParamMode::InOut {
             if !self.is_mutable_place(&r) && !r.ty.is_error() {
-                self.immutable_err(&r, span, "call a method taking `&mut self` on this value");
+                self.immutable_err_for(&r, span, "call a method taking `&mut self` on this value", matches!(self_ty, Ty::Bang(_)));
             }
             if step_idx > 0 && matches!(step, Ty::Array(_, k) if k.is_slice()) {
                 self.err(Diagnostic::error(tyc::MISMATCH, span, "cannot pass a slice view as `&mut self`"));

@@ -637,16 +637,25 @@ impl<'p> Cx<'p, '_> {
             return None;
         }
         let l = self.local(root);
-        if let LocalKind::Param { bang: false, owned: false, .. } = l.kind {
+        if let LocalKind::Param { bang: false, owned: false, inout, .. } = l.kind {
             let n = l.name.clone();
             let ty = self.p.ty_str(&l.ty);
             let ls = l.span;
             if self.reported.insert((span, 1 << 29)) {
-                self.err(
-                    Diagnostic::error(borrow::SHRINK_NOT_OWNER, span, format!("only the owner of `{n}` can mark it as shrinkable (`!`)"))
-                        .with_secondary(ls, format!("`{n}` is a borrowed parameter, so its caller owns it"))
-                        .with_help(format!("declare the parameter as `{n}: &mut !{ty}` so callers know it may shrink")),
-                );
+                let d = Diagnostic::error(borrow::SHRINK_NOT_OWNER, span, format!("only the owner of `{n}` can mark it as shrinkable (`!`)"));
+                // The fix depends on the mode: an in-out parameter already
+                // changes the caller's value and only has to admit it may
+                // shrink it; a borrowed one can either do that or take
+                // ownership and shrink its own value.
+                let d = if inout {
+                    d.with_secondary(ls, format!("`{n}` is in-out, but not declared as shrinkable"))
+                        .with_help(format!("let callers know it may shrink: `{n}: &mut !{ty}`"))
+                } else {
+                    d.with_secondary(ls, format!("`{n}` is a borrowed parameter, so its caller owns it"))
+                        .with_help(format!("to shrink the caller's value in place: `{n}: &mut !{ty}`"))
+                        .with_help(format!("or take ownership and shrink your own: `mut {n}: {ty}`"))
+                };
+                self.err(d);
             }
             return None;
         }
