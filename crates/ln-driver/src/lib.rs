@@ -18,9 +18,10 @@ mod embedded {
 
 /// The standard library sources: from `std_dir` or `$LUNAR_STD_DIR` if set
 /// (for working on std itself), otherwise the copy embedded in the compiler.
-fn std_provider(std_dir: Option<&Path>) -> (Box<dyn FileProvider>, PathBuf, &'static str) {
+/// An on-disk std sees `overlay` (unsaved editor buffers) like user files do.
+fn std_provider<'a>(std_dir: Option<&Path>, overlay: &'a HashMap<PathBuf, String>) -> (Box<dyn FileProvider + 'a>, PathBuf, &'static str) {
     if let Some(dir) = std_dir {
-        return (Box::new(DiskFiles), dir.to_path_buf(), "");
+        return (Box::new(Overlay(overlay)), dir.to_path_buf(), "");
     }
     if let Ok(dir) = std::env::var("LUNAR_STD_DIR") {
         return (Box::new(DiskFiles), PathBuf::from(dir), "");
@@ -123,7 +124,7 @@ pub fn analyze_craters(craters: &[CraterSpec], o: &AnalyzeOptions) -> Analysis {
             }
         }
     }
-    let (provider, base, prefix) = std_provider(o.std_dir);
+    let (provider, base, prefix) = std_provider(o.std_dir, o.overlay.unwrap_or(&empty));
     for name in ["core", "std"] {
         let root = base.join(name).join("lib.ln");
         match loader::load_crate(name, &root, prefix, provider.as_ref(), &mut map, &mut ids, &mut diags) {
@@ -158,6 +159,25 @@ fn sanitize(s: &str) -> String {
         out.insert(0, '_');
     }
     out
+}
+
+/// The root of the standard library source tree that `path` belongs to: an
+/// ancestor directory with `core/lib.ln` and `std/lib.ln`, with `path` under
+/// its `core/` or `std/`. Such files are the standard library being worked
+/// on, not programs.
+pub fn std_tree_of(path: &Path) -> Option<PathBuf> {
+    path.ancestors().skip(1).find_map(|dir| {
+        let is_tree = dir.join("core").join("lib.ln").is_file() && dir.join("std").join("lib.ln").is_file();
+        let inside = path.starts_with(dir.join("core")) || path.starts_with(dir.join("std"));
+        (is_tree && inside).then(|| dir.to_path_buf())
+    })
+}
+
+/// Analyze the standard library tree at `dir` on its own (from disk, with
+/// `o.overlay` for unsaved buffers), for editors working on std itself.
+pub fn analyze_std_tree(dir: &Path, o: &AnalyzeOptions) -> Analysis {
+    let o = AnalyzeOptions { std_dir: Some(dir), test: o.test, target_os: o.target_os, keep_going: o.keep_going, overlay: o.overlay };
+    analyze_craters(&[], &o)
 }
 
 /// Print diagnostics to stderr.

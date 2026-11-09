@@ -202,12 +202,106 @@ fn workspaces() {
     let _ = std::fs::remove_dir_all(&w);
 }
 
+/// A minimal language server client over stdio.
+struct Lsp {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    next_id: i64,
+}
+
+impl Lsp {
+    fn start(home: &Path) -> Lsp {
+        use std::process::Stdio;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_lunar"))
+            .args(["lsp", "--stdio"])
+            .env("LUNAR_HOME", home)
+            .env_remove("LUNAR_STD_DIR")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut lsp = Lsp { child, stdin, stdout, next_id: 1 };
+        lsp.request("initialize", serde_json::json!({ "processId": null, "rootUri": null, "capabilities": {} }));
+        lsp.notify("initialized", serde_json::json!({}));
+        lsp
+    }
+
+    fn send(&mut self, msg: serde_json::Value) {
+        use std::io::Write;
+        let body = msg.to_string();
+        write!(self.stdin, "Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    fn recv(&mut self) -> serde_json::Value {
+        use std::io::{BufRead, Read};
+        let mut len = 0;
+        loop {
+            let mut line = String::new();
+            self.stdout.read_line(&mut line).unwrap();
+            let line = line.trim();
+            if line.is_empty() {
+                break;
+            }
+            if let Some(n) = line.strip_prefix("Content-Length: ") {
+                len = n.parse().unwrap();
+            }
+        }
+        let mut buf = vec![0; len];
+        self.stdout.read_exact(&mut buf).unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    fn notify(&mut self, method: &str, params: serde_json::Value) {
+        self.send(serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params }));
+    }
+
+    /// Send a request and wait for its result. Diagnostics published
+    /// meanwhile are collected into `diags` (by URI, latest wins).
+    fn request_collecting(&mut self, method: &str, params: serde_json::Value, diags: &mut Vec<(String, serde_json::Value)>) -> serde_json::Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+        loop {
+            let m = self.recv();
+            if m["method"] == "textDocument/publishDiagnostics" {
+                let uri = m["params"]["uri"].as_str().unwrap_or_default().to_string();
+                diags.retain(|(u, _)| *u != uri);
+                diags.push((uri, m["params"]["diagnostics"].clone()));
+            }
+            if m.get("id") == Some(&serde_json::json!(id)) {
+                return m["result"].clone();
+            }
+        }
+    }
+
+    fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        self.request_collecting(method, params, &mut Vec::new())
+    }
+
+    fn open(&mut self, uri: &str, text: &str) {
+        self.notify("textDocument/didOpen", serde_json::json!({ "textDocument": { "uri": uri, "languageId": "lunar", "version": 1, "text": text } }));
+    }
+
+    fn stop(mut self) {
+        self.request("shutdown", serde_json::Value::Null);
+        self.notify("exit", serde_json::Value::Null);
+        assert!(self.child.wait().unwrap().success());
+    }
+}
+
+fn file_uri(p: &Path) -> String {
+    let path = p.to_string_lossy().replace('\\', "/");
+    if path.starts_with('/') { format!("file://{path}") } else { format!("file:///{path}") }
+}
+
 /// The language server analyzes a project's files with their dependencies.
 #[test]
 fn language_server_sees_dependencies() {
-    use serde_json::{Value, json};
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::process::Stdio;
+    use serde_json::json;
 
     let w = scratch("lsp");
     let home = w.join("home");
@@ -219,68 +313,69 @@ fn language_server_sees_dependencies() {
     let text = "fn main() {\n    println(\"{mathx::add(40, 2)}\");\n}\n";
     std::fs::write(&main, text).unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lunar"))
-        .args(["lsp", "--stdio"])
-        .env("LUNAR_HOME", &home)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    let mut send = |msg: Value| {
-        let body = msg.to_string();
-        write!(stdin, "Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
-        stdin.flush().unwrap();
-    };
-    let mut recv = || -> Value {
-        let mut len = 0;
-        loop {
-            let mut line = String::new();
-            stdout.read_line(&mut line).unwrap();
-            let line = line.trim();
-            if line.is_empty() {
-                break;
-            }
-            if let Some(n) = line.strip_prefix("Content-Length: ") {
-                len = n.parse().unwrap();
-            }
-        }
-        let mut buf = vec![0; len];
-        stdout.read_exact(&mut buf).unwrap();
-        serde_json::from_slice(&buf).unwrap()
-    };
-    let path = main.to_string_lossy().replace('\\', "/");
-    let uri = if path.starts_with('/') { format!("file://{path}") } else { format!("file:///{path}") };
-
-    send(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "processId": null, "rootUri": null, "capabilities": {} } }));
-    while recv().get("id") != Some(&json!(1)) {}
-    send(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }));
-    send(
-        json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen", "params": { "textDocument": { "uri": uri, "languageId": "lunar", "version": 1, "text": text } } }),
-    );
+    let mut lsp = Lsp::start(&home);
+    let uri = file_uri(&main);
+    lsp.open(&uri, text);
     // `add` in `mathx::add(40, 2)`, line 1.
-    send(
-        json!({ "jsonrpc": "2.0", "id": 2, "method": "textDocument/definition", "params": { "textDocument": { "uri": uri }, "position": { "line": 1, "character": 23 } } }),
-    );
-    let mut diags = None;
-    let definition = loop {
-        let m = recv();
-        if m["method"] == "textDocument/publishDiagnostics" && m["params"]["uri"].as_str().is_some_and(|u| u.ends_with("main.ln")) {
-            diags = Some(m["params"]["diagnostics"].clone());
-        }
-        if m.get("id") == Some(&json!(2)) {
-            break m["result"].clone();
-        }
-    };
-    let diags = diags.expect("diagnostics for main.ln");
-    assert_eq!(diags, json!([]), "the dependency should resolve");
+    let mut diags = Vec::new();
+    let definition =
+        lsp.request_collecting("textDocument/definition", json!({ "textDocument": { "uri": uri }, "position": { "line": 1, "character": 23 } }), &mut diags);
+    let main_diags = diags.iter().find(|(u, _)| u.ends_with("main.ln")).map(|(_, d)| d.clone()).expect("diagnostics for main.ln");
+    assert_eq!(main_diags, json!([]), "the dependency should resolve");
     let target = definition["uri"].as_str().unwrap_or_default();
     assert!(target.ends_with("mathx/src/lib.ln"), "definition of mathx::add: {definition:#?}");
-
-    send(json!({ "jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": null }));
-    while recv().get("id") != Some(&json!(3)) {}
-    send(json!({ "jsonrpc": "2.0", "method": "exit", "params": null }));
-    assert!(child.wait().unwrap().success());
+    lsp.stop();
     let _ = std::fs::remove_dir_all(&w);
+}
+
+/// Files of a standard library source tree (this repository's `std/`) are
+/// analyzed as the standard library, from disk and open buffers, not as
+/// programs of their own.
+#[test]
+fn language_server_edits_std() {
+    use serde_json::json;
+
+    let w = scratch("lsp-std");
+    let home = w.join("home");
+    // A copy of the std tree, so edits stay out of the repository.
+    let std_root = w.join("std");
+    copy_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../std"), &std_root);
+    let str_ln = std_root.join("core").join("str.ln");
+    let text = std::fs::read_to_string(&str_ln).unwrap();
+
+    let mut lsp = Lsp::start(&home);
+    let uri = file_uri(&str_ln);
+    lsp.open(&uri, &text);
+    let mut diags = Vec::new();
+    // Hover on `len` in `pub fn len(self)`, to sync with the analysis.
+    let line = text.lines().position(|l| l.contains("pub fn len(self)")).unwrap();
+    let hover =
+        lsp.request_collecting("textDocument/hover", json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": 12 } }), &mut diags);
+    let errors: Vec<_> = diags.iter().filter(|(_, d)| d.as_array().is_some_and(|a| !a.is_empty())).collect();
+    assert!(errors.is_empty(), "the unmodified std has no errors: {errors:#?}");
+    assert!(hover.to_string().contains("len"), "hover in std: {hover}");
+
+    // An edit shows up as an error in the edited file.
+    let broken = text.replacen("return intrinsics::str_len(self);", "return intrinsics::str_len(self) + true;", 1);
+    assert_ne!(broken, text);
+    lsp.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 2 }, "contentChanges": [{ "text": broken }] }));
+    let mut diags = Vec::new();
+    lsp.request_collecting("textDocument/hover", json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": 12 } }), &mut diags);
+    let mine = diags.iter().find(|(u, _)| *u == uri).map(|(_, d)| d.clone()).expect("diagnostics for str.ln");
+    assert!(mine.as_array().is_some_and(|a| !a.is_empty()), "the edit is an error: {diags:#?}");
+    lsp.stop();
+    let _ = std::fs::remove_dir_all(&w);
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let p = e.path();
+        if p.is_dir() {
+            copy_dir(&p, &to.join(e.file_name()));
+        } else {
+            std::fs::copy(&p, to.join(e.file_name())).unwrap();
+        }
+    }
 }

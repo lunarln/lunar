@@ -152,7 +152,11 @@ impl Server {
                 Some(r) => self.crates.get(r).map(|(p, _)| p.clone()).unwrap_or(path),
                 // Not part of any analyzed crate yet: a module file opened on
                 // its own belongs to the crate of the file that declares it.
-                None => crate_root_of(&path, &|p: &Path| self.open.get(&path_key(p)).cloned().or_else(|| std::fs::read_to_string(p).ok())),
+                // Every file of a std source tree is analyzed under one root.
+                None => match crate::std_tree_of(&path) {
+                    Some(tree) => tree.join("std").join("lib.ln"),
+                    None => crate_root_of(&path, &|p: &Path| self.open.get(&path_key(p)).cloned().or_else(|| std::fs::read_to_string(p).ok())),
+                },
             };
             if !roots.iter().any(|r| path_key(r) == path_key(&root)) {
                 roots.push(root);
@@ -418,6 +422,9 @@ fn publish(conn: &Connection, uri: Url, diagnostics: Vec<lsp_types::Diagnostic>)
 /// workspace), or on its own if it isn't one. A manifest error is reported
 /// where it is in `lunar.toml`, and the file is then analyzed alone.
 fn analyze_in_project(root: &Path, opts: &AnalyzeOptions) -> Analysis {
+    if let Some(tree) = crate::std_tree_of(root) {
+        return crate::analyze_std_tree(&tree, opts);
+    }
     let Some(parent) = root.parent() else { return analyze_with(root, opts) };
     if project::find_project(parent).is_none() {
         return analyze_with(root, opts);
