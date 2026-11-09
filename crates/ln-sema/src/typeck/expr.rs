@@ -7,7 +7,7 @@ use crate::thir::{self, Arm, Callee, Coercion, Expr, ExprKind, FmtPiece, LocalKi
 use crate::ty::{ArrKind, IntTy, TraitRef, Ty};
 use ln_ast as ast;
 use ln_ast::{BinOp, UnOp};
-use ln_diag::{Diagnostic, Span, codes::name, codes::ty as tyc};
+use ln_diag::{Diagnostic, Span, codes::name, codes::syntax, codes::ty as tyc};
 
 impl<'s, 'a> FnCtx<'s, 'a> {
     pub(crate) fn mk(&self, kind: ExprKind, ty: Ty, span: Span) -> Expr {
@@ -450,7 +450,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let pieces = match fmt {
             ast::FmtString::Ok(p) => p,
             ast::FmtString::Err(msg, sp) => {
-                self.err(Diagnostic::error(tyc::INTERPOLATION, *sp, msg.clone()));
+                self.err(
+                    Diagnostic::error(syntax::BAD_FORMAT, *sp, msg.clone())
+                        .with_note("this string is a format string because it is passed to a `FmtArgs` parameter"),
+                );
                 return self.mk(ExprKind::Error, Ty::FmtArgs, span);
             }
         };

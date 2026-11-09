@@ -55,8 +55,6 @@ codes! {
         BAD_MAIN = "bad_main",
         BAD_TEST = "bad_test",
         CONST_EVAL = "const_eval",
-        INTERPOLATION = "interpolation",
-        RECURSIVE_OWNER = "recursive_owner",
     }
     syntax ("syntax") => {
         UNEXPECTED_TOKEN = "unexpected_token",
@@ -98,7 +96,6 @@ codes! {
         OUTLIVES_ROOT = "outlives_root",
         ESCAPES_FUNCTION = "escapes_function",
         ESCAPES_VIA_PARAM = "escapes_via_param",
-        MUT_SLICE_OF_IMMUTABLE = "mut_slice_of_immutable",
     }
     unsafe_ ("unsafe") => {
         OUTSIDE_UNSAFE = "outside_unsafe",
