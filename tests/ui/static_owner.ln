@@ -1,0 +1,4 @@
+// error: type::const_eval
+static NAMES: [i32; ..+] = [];
+
+fn main() {}

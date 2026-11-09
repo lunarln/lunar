@@ -81,6 +81,17 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         Some(r)
     }
 
+    /// `name::not_a_value` for a path (`shown`) that names `def`, an item
+    /// that exists but is not a value (a module, a type, a trait, ...).
+    fn not_a_value(&self, def: DefId, shown: &str, span: Span) -> Diagnostic {
+        let kind = self.s.p.def(def).kind;
+        let d = Diagnostic::error(name::NOT_A_VALUE, span, format!("expected a value, found {} `{shown}`", kind.describe()));
+        if kind == DefKind::Struct {
+            return d.with_help(format!("build a value with a struct literal: `{shown} {{ ... }}`"));
+        }
+        d
+    }
+
     fn resolve_value_path_inner(&mut self, p: &ast::Path, span: Span) -> Option<ValueRes> {
         let segs = &p.segments;
         if p.is_single()
@@ -113,7 +124,11 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let Some((res, used)) = res else {
             if idents.len() == 1 {
                 // Maybe it names a type, e.g. a named-field struct used as a value.
-                let d = self.s.unresolved_diag(module, &idents[0], Ns::Value);
+                let d = match self.s.lookup_unqualified(module, &idents[0].name, Ns::Type) {
+                    Some(ModRes::Def(def)) => self.not_a_value(def, &idents[0].name, span),
+                    Some(ModRes::Prim(_)) => Diagnostic::error(name::NOT_A_VALUE, span, format!("expected a value, found builtin type `{}`", idents[0].name)),
+                    None => self.s.unresolved_diag(module, &idents[0], Ns::Value),
+                };
                 self.err(d);
             }
             return None;
@@ -133,7 +148,16 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                             let t = ast::Ty { kind: ast::TyKind::Path(path), span: p.span, id: p.id };
                             Some(fcx.lower_local_ty(&t))
                         }
-                        _ => None,
+                        k => {
+                            let prefix = segs[..upto].iter().map(|s| s.ident.name.as_str()).collect::<Vec<_>>().join("::");
+                            let sp = segs[upto - 1].ident.span;
+                            fcx.err(Diagnostic::error(
+                                name::NOT_A_TYPE,
+                                sp,
+                                format!("expected a type, trait or module before `::{}`, found {} `{prefix}`", segs[upto].ident.name, k.describe()),
+                            ));
+                            None
+                        }
                     }
                 }
             }
@@ -147,7 +171,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             return match d.kind {
                 DefKind::Fn => {
                     if d.parent.is_some() {
-                        // Reached a method by module path; not possible for free fns.
+                        // Methods are not module items, so module paths never
+                        // reach them; report rather than fail silently.
+                        let msg = format!("`{}` is a method; call it through its type, e.g. `Type::{}`", p.to_string_lossy(), d.name);
+                        self.err(Diagnostic::error(name::NOT_A_VALUE, span, msg));
                         return None;
                     }
                     let args = self.own_args(def, segs.last().unwrap().args.as_deref(), span);
@@ -155,6 +182,13 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 }
                 DefKind::Const => Some(ValueRes::Const(def)),
                 DefKind::Static => Some(ValueRes::Static(def)),
+                DefKind::Struct if self.s.p.adt(def).variants[0].ctor == CtorKind::Named => {
+                    // Reached through the type namespace: a named-field struct
+                    // is not a value.
+                    let d = self.not_a_value(def, &p.to_string_lossy(), span);
+                    self.err(d);
+                    None
+                }
                 DefKind::Struct => {
                     let args = self.own_args(def, segs.last().unwrap().args.as_deref(), span);
                     Some(ValueRes::Ctor { adt: def, variant: 0, args })
@@ -167,9 +201,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                     let args = self.own_args(enum_id, explicit, span);
                     Some(ValueRes::Ctor { adt: enum_id, variant: index, args })
                 }
-                k => {
-                    let msg = format!("expected a value, found {} `{}`", k.describe(), d.name);
-                    self.err(Diagnostic::error(name::NOT_A_VALUE, span, msg));
+                _ => {
+                    let d = self.not_a_value(def, &p.to_string_lossy(), span);
+                    self.err(d);
                     None
                 }
             };

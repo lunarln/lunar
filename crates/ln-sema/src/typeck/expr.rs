@@ -200,6 +200,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             let saved = self.s.diags.len();
             let r = self.s.resolve_prefix(module, &idents, Ns::Value);
             if self.s.diags.len() != saved {
+                // Not a static; the caller resolves the path again as a
+                // value and reports the problem once.
+                self.s.diags.truncate(saved);
                 return None;
             }
             match r {
@@ -417,10 +420,16 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 if let Ty::Float(_) = ty {
                     return self.mk(ExprKind::Lit(ConstVal::Float(*value as f64)), ty, span);
                 }
-                if *value > i128::MAX as u128 {
-                    self.err(Diagnostic::error(tyc::LITERAL_RANGE, span, "integer literal is too large"));
-                }
-                self.lit_checks.push((ty.clone(), *value as i128, span));
+                let Ok(v) = i128::try_from(*value) else {
+                    // Too large for every integer type; checked here because
+                    // the range checks work on `i128`.
+                    self.err(
+                        Diagnostic::error(tyc::LITERAL_RANGE, span, "integer literal is too large")
+                            .with_note(format!("the largest integer type, `u64`, holds values up to {}", u64::MAX)),
+                    );
+                    return self.error_expr(span);
+                };
+                self.lit_checks.push((ty.clone(), v, span));
                 self.mk(ExprKind::Lit(ConstVal::Int(*value as i128)), ty, span)
             }
             ast::Lit::Float { value, suffix } => {
@@ -486,34 +495,39 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             UnOp::Deref => unreachable!("deref is a place"),
             UnOp::Neg => {
                 // Fold `-literal` so `-128i8` range-checks correctly.
-                if let ast::ExprKind::Lit(ast::Lit::Int { value, .. }) = &x.kind {
-                    let mut lit = self.check_lit(
-                        match &x.kind {
-                            ast::ExprKind::Lit(l) => l,
-                            _ => unreachable!(),
-                        },
-                        expect,
-                        x.span,
-                    );
-                    if let ExprKind::Lit(ConstVal::Int(_)) = lit.kind {
-                        lit.kind = ExprKind::Lit(ConstVal::Int(-(*value as i128)));
-                        if let Some(last) = self.lit_checks.last_mut() {
-                            last.1 = -(*value as i128);
-                            last.2 = span;
+                if let ast::ExprKind::Lit(l @ ast::Lit::Int { .. }) = &x.kind {
+                    let checks_before = self.lit_checks.len();
+                    let mut lit = self.check_lit(l, expect, x.span);
+                    lit.span = span;
+                    match lit.kind {
+                        ExprKind::Lit(ConstVal::Int(v)) => {
+                            lit.kind = ExprKind::Lit(ConstVal::Int(-v));
+                            let unsigned = match self.shallow(&lit.ty) {
+                                Ty::Int(it) if !it.signed() => Some(it),
+                                _ => None,
+                            };
+                            if self.lit_checks.len() > checks_before {
+                                if unsigned.is_some() {
+                                    // Reported below; the range check would only repeat it.
+                                    self.lit_checks.pop();
+                                } else if let Some(last) = self.lit_checks.last_mut() {
+                                    last.1 = -v;
+                                    last.2 = span;
+                                }
+                            }
+                            if let Some(it) = unsigned {
+                                let n = it.name();
+                                self.err(
+                                    Diagnostic::error(tyc::BAD_OPERAND, span, format!("cannot negate unsigned integer `{n}`"))
+                                        .with_note(format!("`{n}` cannot hold negative values")),
+                                );
+                            }
                         }
-                        if let Ty::Int(it) = self.shallow(&lit.ty)
-                            && !it.signed()
-                        {
-                            self.err(Diagnostic::error(tyc::BAD_OPERAND, span, format!("cannot negate unsigned type `{}`", it.name())));
-                        }
-                        lit.span = span;
-                        return lit;
+                        ExprKind::Lit(ConstVal::Float(f)) => lit.kind = ExprKind::Lit(ConstVal::Float(-f)),
+                        // Already reported, e.g. a literal too large for any type.
+                        _ => {}
                     }
-                    if let ExprKind::Lit(ConstVal::Float(f)) = lit.kind {
-                        lit.kind = ExprKind::Lit(ConstVal::Float(-f));
-                        lit.span = span;
-                        return lit;
-                    }
+                    return lit;
                 }
                 let v = self.check_expr(x, expect);
                 let t = self.shallow(&v.ty);
@@ -1113,6 +1127,11 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             let ev = self.coerce(ev, &st, e.span);
             let t = self.shallow(&st);
             if !(t.is_integral() || self.is_int_var(&t) || t.is_error()) {
+                // An unsuffixed float literal is still an inference variable
+                // here; settle it to its default so the message names a type.
+                if self.is_float_var(&t) {
+                    self.unify(&t, &Ty::Float(crate::ty::FloatTy::F64));
+                }
                 self.err(Diagnostic::error(tyc::NOT_ITERABLE, iter.span, format!("`for` ranges must be over integers, found `{}`", self.ty_str(&t))));
             }
             let id = self.new_loop(false);

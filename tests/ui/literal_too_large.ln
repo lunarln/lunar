@@ -1,0 +1,6 @@
+// error: type::literal_range
+// once: type::literal_range
+fn main() {
+    let big = 300000000000000000000000000000000000000;
+    println("{big}");
+}

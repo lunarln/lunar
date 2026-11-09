@@ -4,8 +4,9 @@ An operator was used on a value of a type it is not defined for.
 
 On primitive types the rules are fixed: arithmetic (`+ - * / %`) needs
 numbers; `& | ^` need integers or `bool`; `<< >>` need integers; ordering
-comparisons (`< <= > >=`) are not defined for `bool`. A negative literal
-cannot have an unsigned type, and `*x` needs a raw pointer.
+comparisons (`< <= > >=`) are not defined for `bool`. A negated literal
+cannot have an unsigned type (`let n: u32 = -1;` is "cannot negate unsigned
+integer `u32`"), and `*x` needs a raw pointer.
 
 On other types, operators are calls to the traits in `core::ops` and
 `core::cmp`: `a + b` needs `Add`, `a == b` needs `Eq`, `a < b` needs `Ord`,

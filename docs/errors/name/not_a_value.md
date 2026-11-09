@@ -8,11 +8,12 @@ expression. This is reported for:
   unit structs are values on their own; tuple variants must be called
   (`Shape::Circle(1.0)`) and named-field variants written with braces
   (`Shape::Rect { w: 1.0, h: 2.0 }`);
-* a path that resolves to a module or type, such as `crate`.
+* a name or path that resolves to a module, a type or a trait, such as
+  `std::io` ("expected a value, found module `std::io`"), `i32`, or a
+  named-field struct written without its fields (build it with a struct
+  literal, `Point { x: 1, y: 2 }`).
 
-A single name that exists only as a type, such as a named-field struct or a
-trait, is reported as `name::unresolved`, since it is not found among
-values at all.
+A name that does not exist at all is `name::unresolved`.
 
 ## Erroneous example
 

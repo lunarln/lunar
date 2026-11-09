@@ -1,0 +1,7 @@
+// error: trait::dull_impl
+// absent: trait::negative_impl
+struct Rock;
+
+impl !Dull for Rock {}
+
+fn main() {}

@@ -511,8 +511,14 @@ impl<'a> Sema<'a> {
     fn lower_static(&mut self, id: DefId, s: &ast::StaticDecl) {
         let cx = LowerCx::new(self.p.defs[id.0 as usize].module);
         let ty = self.lower_ty(&cx, &s.ty, TyPos::Other);
-        if self.p.has_owner(&ty) || matches!(ty, Ty::Str | Ty::FmtArgs) && !matches!(ty, Ty::Str) {
-            self.err(Diagnostic::error(tyc::CONST_EVAL, s.ty.span, "statics cannot hold owning arrays"));
+        // `FmtArgs` is already rejected outside parameters by `lower_ty`.
+        if self.p.has_owner(&ty) {
+            let t = self.p.ty_str(&ty);
+            let what = if matches!(ty, Ty::String | Ty::Array(..)) { "is an owner" } else { "contains an owning array or `String`" };
+            self.err(
+                Diagnostic::error(tyc::CONST_EVAL, s.ty.span, format!("a static cannot own data, but `{t}` {what}"))
+                    .with_note("statics are not on any data stack, so they cannot hold an owning array, a `String`, or a type containing one"),
+            );
         }
         let value = self.eval_const(cx.module, &s.value, &ty);
         self.p.defs[id.0 as usize].data = DefData::Static(StaticData { ty, mutable: s.is_mut, value });
@@ -602,6 +608,12 @@ impl<'a> Sema<'a> {
         self.deferred.push(Deferred { kind: DeferKind::ArrayElem, ty: elem.clone(), env: cx.env.clone(), span, generics_span: cx.generics_span });
     }
 
+    fn assoc_types_unsupported(span: Span) -> Diagnostic {
+        Diagnostic::error(name::NOT_A_TYPE, span, "associated types are not supported")
+            .with_note("traits in Lunar have methods and associated functions, but no associated types")
+            .with_help("make the type a generic parameter of the trait instead, as in `Iterator::<T>`")
+    }
+
     fn lower_path_ty(&mut self, cx: &LowerCx, p: &ast::Path) -> Ty {
         // Generic parameters and `Self`.
         if p.segments.len() == 1 {
@@ -622,6 +634,18 @@ impl<'a> Sema<'a> {
                 return Ty::Param(i as u32, seg.ident.name.clone());
             }
         }
+        // `Self::Item`, `T::Item`: a path into a type, not a module.
+        if p.segments.len() > 1 {
+            let first = &p.segments[0].ident.name;
+            if first == "Self" && cx.self_ty.is_none() {
+                self.err(Diagnostic::error(name::UNRESOLVED, p.segments[0].ident.span, "`Self` is only available inside impls and traits"));
+                return Ty::Error;
+            }
+            if first == "Self" || cx.generic_names.iter().any(|n| n == first) {
+                self.err(Self::assoc_types_unsupported(p.span));
+                return Ty::Error;
+            }
+        }
         let idents: Vec<ast::Ident> = p.segments.iter().map(|s| s.ident.clone()).collect();
         let res = self.resolve_prefix(cx.module, &idents, Ns::Type);
         let (res, used) = match res {
@@ -635,7 +659,15 @@ impl<'a> Sema<'a> {
             }
         };
         if used != idents.len() {
-            self.err(Diagnostic::error(name::NOT_A_TYPE, p.span, "associated types are not supported"));
+            let d = match res {
+                ModRes::Def(def) if !matches!(self.p.defs[def.0 as usize].kind, DefKind::Struct | DefKind::Enum | DefKind::TypeAlias | DefKind::Trait) => {
+                    let d = &self.p.defs[def.0 as usize];
+                    let prefix = idents[..used].iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join("::");
+                    Diagnostic::error(name::NOT_A_TYPE, idents[used - 1].span, format!("expected a type or module, found {} `{prefix}`", d.kind.describe()))
+                }
+                _ => Self::assoc_types_unsupported(p.span),
+            };
+            self.err(d);
             return Ty::Error;
         }
         let seg_args = &p.segments[used - 1].args;
@@ -824,20 +856,25 @@ impl<'a> Sema<'a> {
             return;
         };
         let tname = self.p.defs[tr.trait_id.0 as usize].name.clone();
+        let tr_span = im.trait_ref.as_ref().unwrap().span;
         if self.p.is_lang(tr.trait_id, "dull") {
-            let what = if data.negative { "!implemented" } else { "implemented" };
+            let msg = if data.negative {
+                "`Dull` cannot be negated: whether a type is Dull is decided by the compiler"
+            } else {
+                "`Dull` cannot be implemented manually: the compiler implements it"
+            };
             self.err(
-                Diagnostic::error(trait_::DULL_IMPL, im.trait_ref.as_ref().unwrap().span, format!("`Dull` cannot be {what} manually"))
-                    .with_note("the compiler implements `core::ptr::Dull` automatically for every type without pointers or arrays"),
+                Diagnostic::error(trait_::DULL_IMPL, tr_span, msg)
+                    .with_note("the compiler implements `core::ptr::Dull` automatically for every type without pointers, slices, strings or arrays"),
             );
             return;
         }
         if data.negative {
-            self.err(Diagnostic::error(
-                trait_::NEGATIVE_IMPL,
-                im.trait_ref.as_ref().unwrap().span,
-                format!("negative impls are only meaningful for auto traits, and `{tname}` is not one"),
-            ));
+            self.err(
+                Diagnostic::error(trait_::NEGATIVE_IMPL, tr_span, format!("`{tname}` is not an auto trait, so it cannot have a negative impl"))
+                    .with_note("negative impls are only meaningful for auto traits, and Lunar's only auto trait is `Dull`, which cannot be negated either")
+                    .with_help(format!("a type without an `impl {tname}` already does not implement `{tname}`; remove this impl")),
+            );
             return;
         }
         let td = self.p.trait_data(tr.trait_id).clone();

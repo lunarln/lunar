@@ -1,0 +1,11 @@
+// error: trait::negative_impl
+// absent: trait::dull_impl
+trait Speak {
+    fn speak(self): str;
+}
+
+struct Rock;
+
+impl !Speak for Rock {}
+
+fn main() {}
