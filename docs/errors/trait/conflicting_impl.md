@@ -8,13 +8,15 @@ Trait method calls are resolved statically: for each call the compiler must
 pick exactly one impl. If two impls apply to the same type, there is no
 single answer, so implementations of a trait must not overlap.
 
-This code is reserved for that rule. The current compiler does not report it
-yet: overlapping impls are accepted and the first matching impl is used. Do
-not rely on that; keep impls disjoint.
+Two impls overlap when their headers can describe the same type. Bounds are
+taken into account only when they are definitely false: a blanket
+`impl::<T: Dull> Trait for [T; 4]` overlaps with `impl Trait for [i32; 4]`
+(`i32` is Dull), but `impl::<T: Dull> Trait for (T, String)` does not overlap
+with `impl Trait for (String, String)`, because `String` is not Dull.
 
 ## Erroneous example
 
-```lunar,ignore
+```lunar
 trait Speak {
     fn speak(self): i32;
 }

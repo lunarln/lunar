@@ -7,6 +7,7 @@
 use crate::Program;
 use crate::defs::*;
 use crate::ty::{ArrKind, TraitRef, Ty};
+use std::collections::HashMap;
 
 /// How a trait method call is implemented for a concrete self type.
 #[derive(Clone, Debug)]
@@ -280,5 +281,100 @@ impl Program {
         args.extend(tr.args.iter().cloned());
         args.extend(method_args.iter().cloned());
         Some(MethodImpl::Fn { def: tm.def, args })
+    }
+}
+
+impl Program {
+    /// Whether two impls of the same trait could both apply to some type
+    /// (coherence). Their headers must unify, and no bound of either impl may
+    /// be definitely false for the unified types: `impl::<T: Dull> X for T`
+    /// and `impl X for String` do not overlap, because `String` is not Dull.
+    pub fn impls_overlap(&self, a: DefId, b: DefId) -> bool {
+        let (da, db) = (self.impl_data(a), self.impl_data(b));
+        let (Some(ta), Some(tb)) = (&da.trait_ref, &db.trait_ref) else { return false };
+        if ta.trait_id != tb.trait_id || da.negative || db.negative {
+            return false;
+        }
+        // Each impl's generics become distinct unification variables.
+        let na = da.generics.count();
+        let va: Vec<Ty> = (0..na).map(|i| Ty::Infer(i as u32)).collect();
+        let vb: Vec<Ty> = (0..db.generics.count()).map(|i| Ty::Infer((na + i) as u32)).collect();
+        let mut s: HashMap<u32, Ty> = HashMap::new();
+        let mut pairs = vec![(da.self_ty.subst(&va), db.self_ty.subst(&vb))];
+        pairs.extend(ta.args.iter().zip(&tb.args).map(|(x, y)| (x.subst(&va), y.subst(&vb))));
+        if !pairs.iter().all(|(x, y)| unify(x, y, &mut s)) {
+            return false;
+        }
+        for (d, v) in [(da, &va), (db, &vb)] {
+            for p in &d.generics.preds {
+                let ty = resolve(&p.ty.subst(v), &s);
+                let mut tr = p.trait_ref.subst(v);
+                tr.args = tr.args.iter().map(|t| resolve(t, &s)).collect();
+                let concrete = !has_infer(&ty) && !tr.args.iter().any(has_infer);
+                if concrete && !self.implements(&ty, &tr, &[]) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+fn shallow(t: &Ty, s: &HashMap<u32, Ty>) -> Ty {
+    let mut t = t.clone();
+    while let Ty::Infer(v) = t {
+        match s.get(&v) {
+            Some(x) => t = x.clone(),
+            None => break,
+        }
+    }
+    t
+}
+
+fn resolve(t: &Ty, s: &HashMap<u32, Ty>) -> Ty {
+    let t = shallow(t, s);
+    let r = |x: &Ty| resolve(x, s);
+    match &t {
+        Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(r).collect()),
+        Ty::Adt(d, args) => Ty::Adt(*d, args.iter().map(r).collect()),
+        Ty::Array(e, k) => Ty::Array(Box::new(r(e)), *k),
+        Ty::Bang(e) => Ty::Bang(Box::new(r(e))),
+        Ty::Ptr(e, m) => Ty::Ptr(Box::new(r(e)), *m),
+        Ty::FnPtr(ps, ret) => Ty::FnPtr(ps.iter().map(r).collect(), Box::new(r(ret))),
+        _ => t,
+    }
+}
+
+fn has_infer(t: &Ty) -> bool {
+    let mut any = false;
+    t.walk(&mut |x| any |= matches!(x, Ty::Infer(_)));
+    any
+}
+
+/// Syntactic unification with occurs check, binding `Ty::Infer` variables.
+fn unify(a: &Ty, b: &Ty, s: &mut HashMap<u32, Ty>) -> bool {
+    let (a, b) = (shallow(a, s), shallow(b, s));
+    if a == b {
+        return true;
+    }
+    match (&a, &b) {
+        (Ty::Infer(v), t) | (t, Ty::Infer(v)) => {
+            let t = resolve(t, s);
+            let mut occurs = false;
+            t.walk(&mut |x| occurs |= *x == Ty::Infer(*v));
+            if occurs {
+                return false;
+            }
+            s.insert(*v, t);
+            true
+        }
+        (Ty::Error, _) | (_, Ty::Error) => true,
+        (Ty::Tuple(x), Ty::Tuple(y)) => x.len() == y.len() && x.iter().zip(y).all(|(x, y)| unify(x, y, s)),
+        (Ty::Adt(d1, x), Ty::Adt(d2, y)) => d1 == d2 && x.len() == y.len() && x.iter().zip(y).all(|(x, y)| unify(x, y, s)),
+        (Ty::Array(x, k1), Ty::Array(y, k2)) => k1 == k2 && unify(x, y, s),
+        (Ty::Bang(x), Ty::Bang(y)) => unify(x, y, s),
+        (Ty::Ptr(x, m1), Ty::Ptr(y, m2)) => m1 == m2 && unify(x, y, s),
+        (Ty::FnPtr(p1, r1), Ty::FnPtr(p2, r2)) => p1.len() == p2.len() && p1.iter().zip(p2).all(|(x, y)| unify(x, y, s)) && unify(r1, r2, s),
+        _ => false,
     }
 }

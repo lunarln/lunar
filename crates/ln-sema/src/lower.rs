@@ -255,6 +255,7 @@ impl<'a> Sema<'a> {
                 self.check_impl(DefId(i as u32), im);
             }
         }
+        self.check_overlapping_impls();
         self.check_main();
     }
 
@@ -796,6 +797,35 @@ impl<'a> Sema<'a> {
             }
         }
         false
+    }
+
+    /// Two impls of the same trait that can apply to the same type would make
+    /// method resolution ambiguous: `err(trait::conflicting_impl)`.
+    fn check_overlapping_impls(&mut self) {
+        let impls: Vec<DefId> =
+            self.p.impls.iter().copied().filter(|i| matches!(&self.p.def(*i).data, DefData::Impl(d) if d.trait_ref.is_some() && !d.negative)).collect();
+        for (k, &b) in impls.iter().enumerate() {
+            for &a in &impls[..k] {
+                if !self.p.impls_overlap(a, b) {
+                    continue;
+                }
+                let header = |s: &Self, id: DefId| match s.ast(id) {
+                    AstRef::Impl(im) => im.trait_ref.as_ref().map_or(im.self_ty.span, |t| t.span.to(im.self_ty.span)),
+                    _ => s.p.def(id).span,
+                };
+                let (sa, sb) = (header(self, a), header(self, b));
+                let td = self.p.impl_data(b);
+                let tname = self.p.def(td.trait_ref.as_ref().unwrap().trait_id).name.clone();
+                let tys = self.p.ty_str(&td.self_ty);
+                self.err(
+                    Diagnostic::error(trait_::CONFLICTING_IMPL, sb, format!("conflicting implementations of trait `{tname}` for `{tys}`"))
+                        .with_label("conflicting implementation")
+                        .with_secondary(sa, "first implementation here")
+                        .with_note("two impls of a trait may not apply to the same type, or calls would be ambiguous"),
+                );
+                break;
+            }
+        }
     }
 
     fn check_impl(&mut self, id: DefId, im: &ast::ImplDecl) {
