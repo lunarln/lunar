@@ -289,11 +289,20 @@ impl Program {
     /// (coherence). Their headers must unify, and no bound of either impl may
     /// be definitely false for the unified types: `impl::<T: Dull> X for T`
     /// and `impl X for String` do not overlap, because `String` is not Dull.
-    pub fn impls_overlap(&self, a: DefId, b: DefId) -> bool {
+    ///
+    /// "Not Dull" only separates impls when it cannot change under the other
+    /// impl's feet: the type is pointy because of the language (strings,
+    /// arrays, slices, pointers) or because of types defined in the same
+    /// crater as that other impl. A type from another crater might lose its
+    /// last pointy field in a later version and become Dull.
+    ///
+    /// Returns `None` if the impls cannot overlap, else notes explaining
+    /// why a bound did not separate them.
+    pub fn impls_overlap(&self, a: DefId, b: DefId) -> Option<Vec<String>> {
         let (da, db) = (self.impl_data(a), self.impl_data(b));
-        let (Some(ta), Some(tb)) = (&da.trait_ref, &db.trait_ref) else { return false };
+        let (Some(ta), Some(tb)) = (&da.trait_ref, &db.trait_ref) else { return None };
         if ta.trait_id != tb.trait_id || da.negative || db.negative {
-            return false;
+            return None;
         }
         // Each impl's generics become distinct unification variables.
         let na = da.generics.count();
@@ -303,20 +312,61 @@ impl Program {
         let mut pairs = vec![(da.self_ty.subst(&va), db.self_ty.subst(&vb))];
         pairs.extend(ta.args.iter().zip(&tb.args).map(|(x, y)| (x.subst(&va), y.subst(&vb))));
         if !pairs.iter().all(|(x, y)| unify(x, y, &mut s)) {
-            return false;
+            return None;
         }
-        for (d, v) in [(da, &va), (db, &vb)] {
+        let dull = self.lang.get("dull").copied();
+        let mut notes = Vec::new();
+        for (d, v, other) in [(da, &va, b), (db, &vb, a)] {
             for p in &d.generics.preds {
                 let ty = resolve(&p.ty.subst(v), &s);
                 let mut tr = p.trait_ref.subst(v);
                 tr.args = tr.args.iter().map(|t| resolve(t, &s)).collect();
                 let concrete = !has_infer(&ty) && !tr.args.iter().any(has_infer);
-                if concrete && !self.implements(&ty, &tr, &[]) {
-                    return false;
+                if !concrete || self.implements(&ty, &tr, &[]) {
+                    continue;
                 }
+                if Some(tr.trait_id) == dull {
+                    let crater = self.crater_of(other);
+                    if self.robustly_pointy(&ty, crater, 0) {
+                        return None;
+                    }
+                    notes.push(format!(
+                        "`{}` is not Dull today, but that depends on types from another crater, which might drop their last pointer or array field in a later version",
+                        self.ty_str(&ty)
+                    ));
+                    continue;
+                }
+                return None;
             }
         }
-        true
+        Some(notes)
+    }
+
+    /// The crater (root module) a definition belongs to.
+    pub fn crater_of(&self, d: DefId) -> DefId {
+        let m = if self.def(d).kind == DefKind::Mod { d } else { self.def(d).module };
+        match &self.def(m).data {
+            DefData::Mod(md) => md.krate,
+            _ => m,
+        }
+    }
+
+    /// Whether `ty` is pointy for reasons that `crater` controls: language
+    /// types that are always pointy, or fields of types defined in `crater`.
+    fn robustly_pointy(&self, ty: &Ty, crater: DefId, depth: u32) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        match ty {
+            Ty::Str | Ty::String | Ty::FmtArgs | Ty::Ptr(..) | Ty::FnPtr(..) | Ty::Array(..) => true,
+            Ty::Bang(t) => self.robustly_pointy(t, crater, depth + 1),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.robustly_pointy(t, crater, depth + 1)),
+            Ty::Adt(d, args) if self.crater_of(*d) == crater => {
+                let DefData::Adt(adt) = &self.def(*d).data else { return false };
+                adt.variants.iter().any(|v| v.fields.iter().any(|f| self.robustly_pointy(&f.ty.subst(args), crater, depth + 1)))
+            }
+            _ => false,
+        }
     }
 }
 

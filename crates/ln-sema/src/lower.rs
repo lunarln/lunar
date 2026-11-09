@@ -844,23 +844,29 @@ impl<'a> Sema<'a> {
             self.p.impls.iter().copied().filter(|i| matches!(&self.p.def(*i).data, DefData::Impl(d) if d.trait_ref.is_some() && !d.negative)).collect();
         for (k, &b) in impls.iter().enumerate() {
             for &a in &impls[..k] {
-                if !self.p.impls_overlap(a, b) {
-                    continue;
-                }
+                let Some(notes) = self.p.impls_overlap(a, b) else { continue };
                 let header = |s: &Self, id: DefId| match s.ast(id) {
                     AstRef::Impl(im) => im.trait_ref.as_ref().map_or(im.self_ty.span, |t| t.span.to(im.self_ty.span)),
                     _ => s.p.def(id).span,
                 };
-                let (sa, sb) = (header(self, a), header(self, b));
-                let td = self.p.impl_data(b);
+                // Report at the impl outside core/std when there is one.
+                let is_std = |s: &Self, id: DefId| {
+                    let k = s.p.crater_of(id);
+                    s.p.crate_roots.iter().any(|(n, r)| *r == k && (n == "core" || n == "std"))
+                };
+                let (here, first) = if is_std(self, b) && !is_std(self, a) { (a, b) } else { (b, a) };
+                let (sh, sf) = (header(self, here), header(self, first));
+                let td = self.p.impl_data(here);
                 let tname = self.p.def(td.trait_ref.as_ref().unwrap().trait_id).name.clone();
                 let tys = self.p.ty_str(&td.self_ty);
-                self.err(
-                    Diagnostic::error(trait_::CONFLICTING_IMPL, sb, format!("conflicting implementations of trait `{tname}` for `{tys}`"))
-                        .with_label("conflicting implementation")
-                        .with_secondary(sa, "first implementation here")
-                        .with_note("two impls of a trait may not apply to the same type, or calls would be ambiguous"),
-                );
+                let mut d = Diagnostic::error(trait_::CONFLICTING_IMPL, sh, format!("conflicting implementations of trait `{tname}` for `{tys}`"))
+                    .with_label("conflicting implementation")
+                    .with_secondary(sf, "other implementation here")
+                    .with_note("two impls of a trait may not apply to the same type, or calls would be ambiguous");
+                for n in notes {
+                    d = d.with_note(n);
+                }
+                self.err(d);
                 break;
             }
         }

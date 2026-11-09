@@ -1,0 +1,30 @@
+// error: trait::conflicting_impl
+
+trait Describe {
+    fn d(self): i32;
+}
+
+// Local, pointy type: its non-Dullness is ours to change, so this pairs fine.
+struct Parser {
+    buf: [u8; ..+],
+}
+
+impl::<T: Dull> Describe for T {
+    fn d(self): i32 { return 1; }
+}
+
+impl Describe for Parser {
+    fn d(self): i32 { return 2; }
+}
+
+// Language types are always pointy.
+impl Describe for String {
+    fn d(self): i32 { return 3; }
+}
+
+// A type from another crater: std's Option might change.
+impl Describe for Option::<String> {
+    fn d(self): i32 { return 4; }
+}
+
+fn main() {}

@@ -14,6 +14,14 @@ taken into account only when they are definitely false: a blanket
 (`i32` is Dull), but `impl::<T: Dull> Trait for (T, String)` does not overlap
 with `impl Trait for (String, String)`, because `String` is not Dull.
 
+"Not Dull" only keeps impls apart when it cannot change behind your back.
+That holds for types that are pointy by definition (strings, arrays,
+slices, pointers) and for types defined in the same crater as the impl
+written for them, since you control their fields. A type from another
+crater, such as `Option::<String>` from `std` or a type from a library,
+might drop its last pointer or array field in a later version and become
+Dull, so an impl for it conflicts with a blanket `impl::<T: Dull>`.
+
 ## Erroneous example
 
 ```lunar
