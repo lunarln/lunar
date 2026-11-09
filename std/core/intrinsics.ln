@@ -17,6 +17,8 @@
 #[intrinsic] pub fn arr_extend::<T: Dull>(a: &mut [T; ..+], s: [T; &]);
 /// Make room for `extra` more elements without changing the length.
 #[intrinsic] pub fn arr_reserve::<T: Dull>(a: &mut [T; ..+], extra: usize);
+#[intrinsic] pub fn arr_cap::<T: Dull>(a: &mut [T; ..+], count: usize);
+#[intrinsic] pub fn string_cap(s: &mut String, bytes: usize);
 /// Shrink to `len` elements (no-op if already shorter). Takes `!`.
 #[intrinsic] pub fn arr_truncate::<T: Dull>(a: &mut ![T; -..+], len: usize);
 /// A frozen `[T]` holding a copy of `s`.

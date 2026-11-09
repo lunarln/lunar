@@ -218,6 +218,12 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 self.ensure_cap(h, vals[1].into_int_value(), &targs[0]);
                 self.unit()
             }
+            "arr_cap" | "string_cap" => {
+                let h = ptr(vals[0]);
+                let size = if name == "arr_cap" { self.cg.size_of(&targs[0]) } else { 1 };
+                self.emit_ds_cap(h, self.usize(size), vals[1].into_int_value());
+                self.unit()
+            }
             "arr_truncate" | "string_truncate" => {
                 let h = ptr(vals[0]);
                 let ht = self.cg.handle_ty();
@@ -290,6 +296,17 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             return None;
         }
         Some(v)
+    }
+
+    /// Give the empty array behind handle `h` a slot for exactly `count`
+    /// elements of `size` bytes.
+    pub fn emit_ds_cap(&mut self, h: PointerValue<'ctx>, size: IntValue<'ctx>, count: IntValue<'ctx>) {
+        match self.cg.lang_fn("ds_cap") {
+            Ok(f) => {
+                self.cg.b.build_call(f, &[h.into(), size.into(), count.into()], "").unwrap();
+            }
+            Err(e) => self.ice(e),
+        }
     }
 
     /// Make sure the array behind handle `h` has room for `extra` more elements.

@@ -546,7 +546,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                         Some(agg.into())
                     }
                     ArrKind::Slice | ArrKind::SliceMut => Some(self.cg.slice_ty().const_zero().into()),
-                    _ => Some(self.owner_from_values(elem, vals)),
+                    _ => Some(self.owner_from_values(elem, *kind, vals)),
                 }
             }
             K::ArrayRepeat { value, count } => {
@@ -759,6 +759,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             let slot = self.alloca_for(ty, "rep");
             let ht = self.cg.handle_ty();
             self.cg.b.build_store(slot, ht.const_zero()).unwrap();
+            self.size_frozen(slot, elem, kind, n);
             self.ensure_cap(slot, n, elem);
             let dp = self.struct_field(ht.into(), slot, 0);
             let data = self.cg.b.build_load(self.cg.ptr_ty(), dp, "").unwrap().into_pointer_value();
@@ -788,12 +789,23 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
     }
 
     /// A new owning array holding `vals`.
-    fn owner_from_values(&mut self, elem: &Ty, vals: Vec<BV<'ctx>>) -> BV<'ctx> {
+    /// `[T]` never grows after it is built, so it gets a slot sized to fit
+    /// instead of the default reservation.
+    fn size_frozen(&mut self, slot: PointerValue<'ctx>, elem: &Ty, kind: ArrKind, n: IntValue<'ctx>) {
+        let bytes = self.cg.size_of(elem);
+        if kind == ArrKind::Dyn && bytes > 0 {
+            let size = self.usize(bytes);
+            self.emit_ds_cap(slot, size, n);
+        }
+    }
+
+    fn owner_from_values(&mut self, elem: &Ty, kind: ArrKind, vals: Vec<BV<'ctx>>) -> BV<'ctx> {
         let ht = self.cg.handle_ty();
         let slot = self.alloca(ht.into(), "arr");
         self.cg.b.build_store(slot, ht.const_zero()).unwrap();
         if !vals.is_empty() {
             let n = self.usize(vals.len() as u64);
+            self.size_frozen(slot, elem, kind, n);
             self.ensure_cap(slot, n, elem);
             let dp = self.struct_field(ht.into(), slot, 0);
             let data = self.cg.b.build_load(self.cg.ptr_ty(), dp, "").unwrap().into_pointer_value();

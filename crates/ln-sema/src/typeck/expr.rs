@@ -289,7 +289,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             K::Assign(lhs, rhs) => self.check_assign(lhs, rhs, span),
             K::AssignOp(op, lhs, rhs) => self.check_assign_op(*op, lhs, rhs, span),
             K::Call(f, args) => self.check_call(f, args, expect, span),
-            K::MethodCall { recv, name, generics, args } => self.check_method_call(recv, name, generics.as_deref(), args, span),
+            K::MethodCall { recv, name, generics, args } => self.check_method_call(recv, name, generics.as_deref(), args, expect, span),
             K::Index(base, idx) => {
                 let ast::ExprKind::Range { start, end, inclusive } = &idx.kind else { unreachable!("non-range index handled as place") };
                 self.check_slice(base, start.as_deref(), end.as_deref(), *inclusive, expect, span)

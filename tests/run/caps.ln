@@ -1,0 +1,43 @@
+// `capped(n)` reserves an exactly sized slot; `[T]` arrays get one sized to
+// fit. Both are freed back into per-size free lists and reused.
+
+fn checksum(a: &[u64]): u64 {
+    let mut s: u64 = 0;
+    for x in a {
+        s += x;
+    }
+    return s;
+}
+
+fn main() {
+    let mut log: [u8; ..+] = [].capped(10);
+    for i in 0..10 {
+        log.push(i as u8);
+    }
+    println("log: {log.len()} items, last {log[9]}");
+
+    let mut stack: [i32; -..+] = [].capped(3);
+    stack.push(1);
+    stack.push(2);
+    stack.push(3);
+    let top = stack.pop();
+    stack.push(4);
+    println("stack: {stack.len()} items, popped {top.unwrap()}");
+
+    let mut s = String::new().capped(11);
+    s.push_str("hello world");
+    println("{s} ({s.len()} bytes)");
+
+    // Frozen arrays of different sizes, many rounds: each gets a fitted slot
+    // that is reused through its size's free list.
+    let mut total: u64 = 0;
+    for round in 0..20000 {
+        let small: [u64] = [1, 2, 3];
+        let big: [u64] = [round as u64; 5000];
+        total += checksum(small) + checksum(big);
+        let mut c: [u8; ..+] = [].capped(100);
+        c.push(1);
+        total += c.len() as u64;
+    }
+    println("{total}");
+}

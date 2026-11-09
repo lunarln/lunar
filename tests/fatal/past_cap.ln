@@ -1,0 +1,8 @@
+// fatal: data stack overflow
+fn main() {
+    let mut a: [u32; ..+] = [].capped(4);
+    for i in 0..5 {
+        a.push(i);
+    }
+    println("{a.len()}");
+}

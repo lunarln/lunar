@@ -1,19 +1,23 @@
 // The Lunar runtime.
 //
 // Data stacks: every owning array (`[T]`, `[T; ..+]`, `[T; -..+]`, `String`)
-// lives on its own data stack, a 1 GiB slot of address space whose pages
-// are committed as the array grows. Growing never moves existing elements,
-// so views into an array stay valid while it grows.
+// lives on its own data stack, a slot of address space whose pages are
+// committed as the array grows. Growing never moves existing elements, so
+// views into an array stay valid while it grows.
+//
+// Slots are powers of two from 64 KiB to 1 TiB. An array gets a 1 GiB slot
+// by default; `capped(n)` picks the smallest slot that holds exactly n
+// elements, and arrays that never grow (`[T]`) get one sized to fit.
 //
 // All slots come from one region reserved once, at startup. Taking and
 // returning a slot never calls the operating system: fresh slots are
 // carved off the region with a bump pointer, and freed slots go on a free
-// list threaded through their headers. On Linux and macOS the region is
-// mapped readable and writable up front and the kernel supplies pages on
-// first touch, so after startup allocation makes no system calls at all.
-// On Windows (and Unix systems that refuse to overcommit) memory must be
-// committed explicitly, which happens only when a slot grows past the most
-// it has ever held.
+// list per size, threaded through their headers. On Linux and macOS the
+// region is mapped readable and writable up front and the kernel supplies
+// pages on first touch, so after startup allocation makes no system calls
+// at all. On Windows (and Unix systems that refuse to overcommit) memory
+// must be committed explicitly, which happens only when a slot grows past
+// the most it has ever held.
 //
 // Layout of a data stack: [header: 64 bytes][elements...]. The array handle
 // `{ ptr, len, cap }` points at the first element.
@@ -21,10 +25,12 @@
 use crater::sys;
 use core::intrinsics;
 
-/// Address space for one data stack: the most an array can hold.
-const SLOT: usize = 1073741824;
+/// Slot sizes are `1 << order`.
+const MIN_ORDER: usize = 16;
+const DEFAULT_ORDER: usize = 30;
+const MAX_ORDER: usize = 40;
 /// The region all slots come from is the largest power of two the system
-/// grants, from REGION_MAX (64 Ki slots) down to REGION_MIN.
+/// grants, from REGION_MAX (64 TiB) down to REGION_MIN.
 const REGION_MAX: usize = 70368744177664;
 const REGION_MIN: usize = 17179869184;
 /// Commits happen in whole pages.
@@ -39,10 +45,10 @@ const MAX_USIZE: usize = 18446744073709551615;
 
 static mut REGION: usize = 0;
 static mut REGION_END: usize = 0;
-/// Next never-used slot.
+/// Next never-used address in the region.
 static mut BUMP: usize = 0;
-/// Most recently freed slot (its base address), or 0.
-static mut FREE: usize = 0;
+/// Most recently freed slot of each order (its base address), or 0.
+static mut FREE: [usize; 41] = [0; 41];
 /// Committed bytes past KEEP held by free slots.
 static mut RETAINED: usize = 0;
 
@@ -60,8 +66,13 @@ struct RawArr {
 struct Header {
     /// Bytes committed after the header (the most the slot has held).
     committed: usize,
-    /// Next free slot while this one is on the free list.
+    /// Next free slot of the same order while this one is free.
     next: usize,
+    /// The slot is `1 << order` bytes.
+    order: usize,
+    /// The most bytes of elements the array may hold: its cap, or the whole
+    /// slot after the header.
+    limit: usize,
 }
 
 #[lang = "rt_init"]
@@ -95,34 +106,39 @@ fn reserve_region() {
 
 fn too_many_arrays(): ! {
     // No formatting here: building a String would need a free slot.
-    sys::write(2, "fatal: too many live arrays (every data stack slot is in use)\n".as_bytes());
+    sys::write(2, "fatal: out of address space for data stacks (too many or too large arrays alive)\n".as_bytes());
     sys::exit(134);
 }
 
-/// A slot for a new data stack, with at least its first page committed.
-fn acquire(): *mut u8 {
+/// A slot of `1 << order` bytes for a new data stack, with its first page
+/// committed and its header set to allow the whole slot.
+fn acquire(order: usize): *mut u8 {
     unsafe {
-        if FREE != 0 {
-            let base = FREE as *mut u8;
+        let slot = 1 << order;
+        if FREE[order] != 0 {
+            let base = FREE[order] as *mut u8;
             let h = base as *mut Header;
             let mut header = intrinsics::ptr_read(h);
-            FREE = header.next;
-            header.next = 0;
-            intrinsics::ptr_write(h, header);
+            FREE[order] = header.next;
             RETAINED -= extra(header.committed);
+            header.next = 0;
+            header.limit = slot - HEADER;
+            intrinsics::ptr_write(h, header);
             return base;
         }
         if REGION == 0 {
             // Allocation before `rt_init` (not expected, but harmless).
             reserve_region();
         }
-        if REGION_END - BUMP < SLOT {
+        // Slots are aligned to their size.
+        let start = (BUMP + slot - 1) / slot * slot;
+        if start > REGION_END || REGION_END - start < slot {
             too_many_arrays();
         }
-        let base = BUMP as *mut u8;
-        BUMP += SLOT;
+        let base = start as *mut u8;
+        BUMP = start + slot;
         sys::commit(base, PAGE);
-        intrinsics::ptr_write(base as *mut Header, Header { committed: PAGE - HEADER, next: 0 });
+        intrinsics::ptr_write(base as *mut Header, Header { committed: PAGE - HEADER, next: 0, order, limit: slot - HEADER });
         return base;
     }
 }
@@ -134,8 +150,43 @@ fn extra(committed: usize): usize {
 }
 
 fn stack_overflow(): ! {
-    sys::write(2, "fatal: data stack overflow (an array grew past its 1 GiB reservation)\n".as_bytes());
+    sys::write(2, "fatal: data stack overflow (an array grew past its cap or reservation)\n".as_bytes());
     sys::exit(134);
+}
+
+/// Give the empty array behind `handle` a slot that holds exactly `count`
+/// elements of `elem_size` bytes (the smallest slot that fits). Backs
+/// `capped(n)` and arrays that never grow.
+#[lang = "ds_cap"]
+fn ds_cap(handle: *mut RawArr, elem_size: usize, count: usize) {
+    unsafe {
+        let mut a = intrinsics::ptr_read(handle);
+        if elem_size == 0 {
+            return;
+        }
+        if a.ptr as usize != 0 {
+            sys::write(2, "fatal: `capped` called on an array that already has elements; cap it while it is empty\n".as_bytes());
+            sys::exit(134);
+        }
+        // `count * elem_size + HEADER` must fit the largest slot (no wrap).
+        let max_slot = 1 << MAX_ORDER;
+        if count > (max_slot - HEADER) / elem_size {
+            stack_overflow();
+        }
+        let need = count * elem_size + HEADER;
+        let mut order = MIN_ORDER;
+        while (1 << order) < need {
+            order += 1;
+        }
+        let base = acquire(order);
+        let h = base as *mut Header;
+        let mut header = intrinsics::ptr_read(h);
+        header.limit = count * elem_size;
+        intrinsics::ptr_write(h, header);
+        a.ptr = intrinsics::ptr_offset_mut(base, HEADER as isize);
+        a.cap = 0;
+        intrinsics::ptr_write(handle, a);
+    }
 }
 
 /// Grow the array behind `handle` so it can hold `len + additional`
@@ -154,17 +205,17 @@ fn ds_grow(handle: *mut RawArr, elem_size: usize, additional: usize) {
             intrinsics::ptr_write(handle, a);
             return;
         }
-        // `a.len * elem_size <= SLOT - HEADER`, so this cannot wrap.
-        if additional > (SLOT - HEADER) / elem_size - a.len {
-            stack_overflow();
-        }
         if a.ptr as usize == 0 {
-            let base = acquire();
+            let base = acquire(DEFAULT_ORDER);
             a.ptr = intrinsics::ptr_offset_mut(base, HEADER as isize);
         }
         let base = intrinsics::ptr_offset_mut(a.ptr, 0 - (HEADER as isize));
         let h = base as *mut Header;
         let mut header = intrinsics::ptr_read(h);
+        // `a.len * elem_size <= header.limit`, so this cannot wrap.
+        if additional > header.limit / elem_size - a.len {
+            stack_overflow();
+        }
         let need = (a.len + additional) * elem_size;
         if need > header.committed {
             let mut want = header.committed * 2;
@@ -173,9 +224,10 @@ fn ds_grow(handle: *mut RawArr, elem_size: usize, additional: usize) {
             }
             // Whole pages, including the header; doubling may overshoot the
             // slot, but `need` itself fits (checked above).
+            let slot = 1 << header.order;
             let mut total = (want + HEADER + PAGE - 1) / PAGE * PAGE;
-            if total > SLOT {
-                total = SLOT;
+            if total > slot {
+                total = slot;
             }
             // Only the new pages: the slot's first `old` bytes are committed.
             let old = header.committed + HEADER;
@@ -183,7 +235,12 @@ fn ds_grow(handle: *mut RawArr, elem_size: usize, additional: usize) {
             header.committed = total - HEADER;
             intrinsics::ptr_write(h, header);
         }
-        a.cap = header.committed / elem_size;
+        // Capacity never exceeds the cap.
+        let mut usable = header.committed;
+        if usable > header.limit {
+            usable = header.limit;
+        }
+        a.cap = usable / elem_size;
         intrinsics::ptr_write(handle, a);
     }
 }
@@ -207,9 +264,9 @@ fn ds_free(ptr: *mut u8) {
         } else {
             RETAINED += e;
         }
-        header.next = FREE;
+        header.next = FREE[header.order];
         intrinsics::ptr_write(h, header);
-        FREE = base as usize;
+        FREE[header.order] = base as usize;
     }
 }
 

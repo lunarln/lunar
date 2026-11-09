@@ -673,8 +673,24 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         Some(MethodPick { def: mdef, args, trait_call: Some((tr, step.clone())) })
     }
 
-    pub(crate) fn check_method_call(&mut self, recv: &ast::Expr, name: &ast::Ident, generics: Option<&[ast::Ty]>, args: &[ast::Expr], span: Span) -> Expr {
-        let r = self.check_place_or_temp(recv);
+    pub(crate) fn check_method_call(
+        &mut self,
+        recv: &ast::Expr,
+        name: &ast::Ident,
+        generics: Option<&[ast::Ty]>,
+        args: &[ast::Expr],
+        expect: Option<&Ty>,
+        span: Span,
+    ) -> Expr {
+        // `[].capped(n)`: an empty array literal has no type of its own; take
+        // the one the call is expected to produce (the method returns `Self`).
+        let r = match (&recv.kind, expect) {
+            (ast::ExprKind::Array(elems), Some(e)) if elems.is_empty() && matches!(self.shallow(e), Ty::Array(..)) => {
+                let v = self.check_expr(recv, Some(e));
+                self.expr_as_place(v)
+            }
+            _ => self.check_place_or_temp(recv),
+        };
         if matches!(r.kind, ExprKind::Static(_)) {
             if let ExprKind::Static(d) = r.kind
                 && matches!(&self.s.p.def(d).data, DefData::Static(s) if s.mutable)

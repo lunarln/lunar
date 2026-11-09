@@ -200,9 +200,23 @@ impl::<T: Dull> [T; ..+] {
     pub fn reserve(&mut self, extra: usize) {
         intrinsics::arr_reserve(self, extra);
     }
+
+    /// This empty array, limited to `count` elements: it reserves only the
+    /// address space that needs, and growing past it is a fatal error.
+    /// `let mut log: [u8; ..+] = [].capped(1 << 20);`
+    pub fn capped(mut self, count: usize): Self {
+        intrinsics::arr_cap(self, count);
+        return self;
+    }
 }
 
 impl::<T: Dull> [T; -..+] {
+    /// This empty array, limited to `count` elements (see `[T; ..+]::capped`).
+    pub fn capped(mut self, count: usize): Self {
+        intrinsics::arr_cap(self, count);
+        return self;
+    }
+
     /// Remove and return the last element. Takes `!Self`: the caller's
     /// slices into this array must be dead.
     pub fn pop(&mut !self): Option::<T> {

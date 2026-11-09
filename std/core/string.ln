@@ -8,6 +8,13 @@ impl String {
         return intrinsics::string_new();
     }
 
+    /// This empty string, limited to `bytes` bytes: it reserves only the
+    /// address space that needs, and growing past it is a fatal error.
+    pub fn capped(mut self, bytes: usize): String {
+        intrinsics::string_cap(self, bytes);
+        return self;
+    }
+
     pub fn from(s: str): String {
         let mut out = intrinsics::string_new();
         intrinsics::string_push_str(out, s);

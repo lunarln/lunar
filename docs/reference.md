@@ -107,9 +107,24 @@ too. Owning values (owning arrays, `String`, and types containing them) are
 ## 4. Memory model: data stacks
 
 Every owning array (`[T]`, `[T; ..+]`, `[T; -..+]`, `String`) is a small
-handle `{ ptr, len, cap }` pointing at its own *data stack*: a 1 GiB slot of
-address space whose pages are committed as the array grows. An array can
-hold at most 1 GiB; growing past that is a fatal `data stack overflow`.
+handle `{ ptr, len, cap }` pointing at its own *data stack*: a slot of
+address space whose pages are committed as the array grows. By default a
+slot is 1 GiB, so an array can hold at most 1 GiB; growing past its slot is
+a fatal `data stack overflow`.
+
+`capped(n)` limits an empty array (or `String`) to exactly `n` elements
+(bytes for a `String`) and gives it the smallest slot that holds them, from
+64 KiB up to 1 TiB, so more arrays fit and large ones can exceed 1 GiB:
+
+```lunar
+let mut log: [u8; ..+] = [].capped(1 << 20);       // at most 1 MiB
+let mut big: [f64; ..+] = [].capped(1 << 32);      // 32 GiB of address space
+let mut name = String::new().capped(64);
+```
+
+The cap is part of the value, not the type: a capped `[u8; ..+]` is still a
+`[u8; ..+]`. Pushing past it is a fatal `data stack overflow`. Arrays that
+never grow (`[T]`) get a slot sized to fit automatically.
 
 All slots come from one region reserved at startup (up to 64 TiB, so up to
 65,536 arrays can be alive at once). Taking and returning a slot never calls
