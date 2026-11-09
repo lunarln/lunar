@@ -1,0 +1,15 @@
+// error: type::non_exhaustive
+enum Shape {
+    Circle(f64),
+    Rect { w: f64, h: f64 },
+}
+
+fn kind(s: Shape): i32 {
+    match s {
+        Shape::Rect { .. } => 1,
+    }
+}
+
+fn main() {
+    let _ = kind(Shape::Circle(1.0));
+}

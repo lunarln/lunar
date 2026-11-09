@@ -261,7 +261,15 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                         let spec: Vec<Vec<Lite>> = rows
                             .iter()
                             .filter_map(|r| match &r[0] {
-                                Lite::Ctor(rc, subs) if rc == c => Some(subs.iter().cloned().chain(r[1..].iter().cloned()).collect()),
+                                // Fields the pattern does not mention (`{ .. }`, trailing
+                                // `..`) are wildcards.
+                                Lite::Ctor(rc, subs) if rc == c => Some(
+                                    subs.iter()
+                                        .cloned()
+                                        .chain(std::iter::repeat_n(Lite::Wild, field_tys.len().saturating_sub(subs.len())))
+                                        .chain(r[1..].iter().cloned())
+                                        .collect(),
+                                ),
                                 Lite::Wild => Some(std::iter::repeat_n(Lite::Wild, field_tys.len()).chain(r[1..].iter().cloned()).collect()),
                                 _ => None,
                             })

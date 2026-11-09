@@ -1,0 +1,76 @@
+// Inherent, trait and generic impls on enums; `{ .. }` patterns in matches.
+
+enum Shape {
+    Circle(f64),
+    Rect { w: f64, h: f64 },
+    Empty,
+}
+
+impl Shape {
+    fn square(side: f64): Shape {
+        return Shape::Rect { w: side, h: side };
+    }
+
+    fn area(self): f64 {
+        match self {
+            Shape::Circle(r) => 3.14159 * r * r,
+            Shape::Rect { w, h } => w * h,
+            Shape::Empty => 0.0,
+        }
+    }
+
+    fn scale(mut self, k: f64) {
+        match self {
+            Shape::Circle(r) => { self = Shape::Circle(r * k); }
+            Shape::Rect { w, h } => { self = Shape::Rect { w: w * k, h: h * k }; }
+            Shape::Empty => {}
+        }
+    }
+}
+
+trait Describe {
+    fn name(self): str;
+    fn describe(self) {
+        println("a {self.name()}");
+    }
+}
+
+impl Describe for Shape {
+    fn name(self): str {
+        match self {
+            Shape::Circle(_) => "circle",
+            Shape::Rect { .. } => "rectangle",
+            Shape::Empty => "nothing",
+        }
+    }
+}
+
+enum Maybe::<T> {
+    Just(T),
+    Nothing,
+}
+
+impl::<T: Dull> Maybe::<T> {
+    fn or(self, fallback: T): T {
+        match self {
+            Maybe::Just(v) => v,
+            Maybe::Nothing => fallback,
+        }
+    }
+}
+
+fn main() {
+    let mut s = Shape::square(2.0);
+    println("area = {s.area()}");
+    s.scale(3.0);
+    println("area = {s.area()}");
+    s.describe();
+    Shape::Circle(1.0).describe();
+    let shapes: [Shape; 3] = [Shape::Circle(1.0), Shape::Empty, Shape::square(1.5)];
+    for sh in shapes {
+        println("{sh.name()}: {sh.area()}");
+    }
+    let a: Maybe::<i32> = Maybe::Just(5);
+    let b: Maybe::<i32> = Maybe::Nothing;
+    println("{a.or(0)} {b.or(-1)}");
+}
