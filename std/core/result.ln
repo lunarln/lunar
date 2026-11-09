@@ -18,7 +18,7 @@ impl::<T, E> Result::<T, E> {
     }
 }
 
-impl::<T: Dull, E: Dull> Result::<T, E> {
+impl::<T, E> Result::<T, E> {
     pub fn unwrap(self): T {
         return match self {
             Result::Ok(v) => v,

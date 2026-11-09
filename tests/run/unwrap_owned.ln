@@ -1,0 +1,28 @@
+// unwrap and friends work for owned payloads now that `self` takes ownership.
+
+fn parse(s: str): Result::<String, String> {
+    if s.len() > 0 {
+        return Result::Ok(String::from(s));
+    }
+    return Result::Err(String::from("empty"));
+}
+
+fn greeting(loud: bool): Option::<String> {
+    if loud {
+        return Some(String::from("HELLO"));
+    }
+    return None;
+}
+
+fn main() {
+    let a = greeting(true).unwrap();
+    let b = greeting(false).unwrap_or(String::from("hi"));
+    let c = parse("ok").unwrap();
+    let d = parse("").ok().unwrap_or(String::from("fallback"));
+    let mut total: usize = 0;
+    for _ in 0..100000 {
+        total += greeting(true).unwrap().len();
+        total += parse("abc").unwrap().len();
+    }
+    println("{a} {b} {c} {d} {total}");
+}
