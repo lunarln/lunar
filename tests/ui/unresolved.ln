@@ -1,0 +1,4 @@
+// error: name::unresolved
+fn main() {
+    printn("typo");
+}

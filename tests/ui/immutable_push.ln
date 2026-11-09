@@ -1,0 +1,5 @@
+// error: type::immutable
+fn main() {
+    let v: [i32; ..+] = [];
+    v.push(1);
+}

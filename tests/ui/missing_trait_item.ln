@@ -1,0 +1,5 @@
+// error: trait::missing_item
+trait Speak { fn speak(self): str; }
+struct Dog;
+impl Speak for Dog {}
+fn main() {}

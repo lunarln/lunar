@@ -1,0 +1,140 @@
+mod geometry;
+
+use geometry::{Vec2, dot};
+
+// A generic stack that owns its storage.
+struct Stack::<T: Dull> {
+    items: [T; -..+],
+}
+
+impl::<T: Dull> Stack::<T> {
+    fn new(): Stack::<T> {
+        return Stack { items: [] };
+    }
+
+    fn push(mut self, x: T) {
+        self.items.push(x);
+    }
+
+    // `self` is marked `!` so the stack's array may shrink.
+    fn pop(mut self: !Self): Option::<T> {
+        return self.items.pop();
+    }
+
+    fn len(self): usize {
+        return self.items.len();
+    }
+}
+
+// A user-defined iterator.
+struct Countdown {
+    n: u32,
+}
+
+impl Iterator::<u32> for Countdown {
+    fn next(mut self): Option::<u32> {
+        if self.n == 0 {
+            return None;
+        }
+        self.n -= 1;
+        return Some(self.n + 1);
+    }
+}
+
+enum ParseError {
+    Empty,
+    Bad(u8),
+}
+
+impl Display for ParseError {
+    fn fmt(self, mut out: String) {
+        match self {
+            ParseError::Empty => out.push_str("empty input"),
+            ParseError::Bad(b) => out.write("bad byte {b}"),
+        }
+    }
+}
+
+fn digit(b: u8): Result::<u32, ParseError> {
+    if b < 48 || b > 57 {
+        return Err(ParseError::Bad(b));
+    }
+    return Ok((b - 48) as u32);
+}
+
+fn parse(s: str): Result::<u32, ParseError> {
+    if s.is_empty() {
+        return Err(ParseError::Empty);
+    }
+    let mut total: u32 = 0;
+    for b in s.as_bytes() {
+        total = total * 10 + digit(b)?;
+    }
+    return Ok(total);
+}
+
+fn show(r: Result::<u32, ParseError>) {
+    match r {
+        Ok(v) => println("ok {v}"),
+        Err(e) => println("error: {e}"),
+    }
+}
+
+// `!` arrays can be passed where plain arrays are expected.
+fn total(a: [i64; -..+]): i64 {
+    let mut t: i64 = 0;
+    for x in a {
+        t += x;
+    }
+    return t;
+}
+
+fn drain_total(mut a: ![i64; -..+]): i64 {
+    let t = total(a);
+    a.clear();
+    return t;
+}
+
+fn biggest::<T: Ord + Dull + Display>(items: [T; &]) {
+    let mut best = items[0];
+    for x in items {
+        best = core::cmp::max(best, x);
+    }
+    println("biggest: {best}");
+}
+
+fn main() {
+    let mut s: Stack::<i32> = Stack::new();
+    for i in 1..=5 {
+        s.push(i * i);
+    }
+    let top = s.pop();
+    println("popped {top}, {s.len()} left");
+
+    let mut line = String::new();
+    for x in (Countdown { n: 3 }) {
+        line.write("{x}..");
+    }
+    line.push_str("liftoff");
+    println("{line}");
+
+    show(parse("1234"));
+    show(parse(""));
+    show(parse("12x"));
+
+    let mut v: [i64; -..+] = [10, 20, 30];
+    let t = drain_total(v);
+    println("drained {t}, now {v.len()} elements");
+
+    let a = Vec2 { x: 1.5, y: 2.0 };
+    let b = Vec2 { x: -2.0, y: 4.0 };
+    println("dot = {dot(a, b)}, sum = {a + b}");
+
+    biggest([2.5, -1.0, 7.25][..]);
+    biggest([3, 9, 2][..]);
+
+    let opt_s: Option::<String> = Some(String::from("owned"));
+    if let Some(inner) = opt_s {
+        println("inner = {inner}");
+    }
+}

@@ -1,0 +1,9 @@
+// error: type::non_exhaustive
+enum Dir { North, South, East }
+fn name(d: Dir): str {
+    return match d {
+        Dir::North => "n",
+        Dir::South => "s",
+    };
+}
+fn main() {}

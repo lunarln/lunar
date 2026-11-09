@@ -1,0 +1,10 @@
+popped Some(25), 4 left
+3..2..1..liftoff
+ok 1234
+error: empty input
+error: bad byte 120
+drained 60, now 0 elements
+dot = 5, sum = <-0.5, 6>
+biggest: 7.25
+biggest: 9
+inner = owned

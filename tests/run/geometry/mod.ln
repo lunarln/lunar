@@ -1,0 +1,29 @@
+// A module loaded from `geometry/mod.ln`.
+
+use core::ops::Add;
+
+pub struct Vec2 {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl Add for Vec2 {
+    fn add(self, rhs: Vec2): Vec2 {
+        return Vec2 { x: self.x + rhs.x, y: self.y + rhs.y };
+    }
+}
+
+impl Display for Vec2 {
+    fn fmt(self, mut out: String) {
+        out.write("<{self.x}, {self.y}>");
+    }
+}
+
+pub fn dot(a: Vec2, b: Vec2): f64 {
+    return a.x * b.x + a.y * b.y;
+}
+
+// Private: not visible outside this module.
+fn secret(): i32 {
+    return 42;
+}

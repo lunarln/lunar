@@ -1,0 +1,5 @@
+// error: unsafe::outside_unsafe
+extern "C" { fn abs(x: i32): i32; }
+fn main() {
+    let y = abs(-3);
+}

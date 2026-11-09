@@ -1,0 +1,8 @@
+// error: name::private
+mod inner {
+    fn hidden(): i32 { return 1; }
+    pub struct S { secret: i32 }
+}
+fn main() {
+    let x = inner::hidden();
+}

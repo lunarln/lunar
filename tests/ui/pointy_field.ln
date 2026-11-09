@@ -1,0 +1,5 @@
+// error: type::array_pointy_items
+struct Bad {
+    names: [String; 3],
+}
+fn main() {}

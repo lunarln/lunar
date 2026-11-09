@@ -1,0 +1,4 @@
+// error: type::mismatch
+fn main() {
+    let x: i32 = "nope";
+}
