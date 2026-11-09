@@ -287,14 +287,16 @@ mod lsp {
         // The name in a declaration (line 5: `fn add`).
         let h = c.request("textDocument/hover", pos(5, 4));
         let text = h["contents"]["value"].as_str().unwrap_or_default().to_string();
-        assert!(text.contains("fn add(") && text.contains("`a`: copied"), "hover on declaration: {h:#?}");
-        // A struct's layout (line 0: `struct Stack`).
+        // rust-analyzer style: container, signature, `---`, docs; nothing else.
+        assert_eq!(text, "```lunar\nmain\n```\n\n```lunar\nfn add(a: i32, b: i32): i32\n```\n\n---\n\nAdds two numbers.", "hover on declaration: {h:#?}");
+        // A struct's layout as a comment in the declaration (line 0: `struct Stack`).
         let h = c.request("textDocument/hover", pos(0, 8));
         let text = h["contents"]["value"].as_str().unwrap_or_default().to_string();
-        assert!(text.contains("size 24 bytes, align 8") && text.contains("pointy"), "hover on struct: {h:#?}");
-        // Keywords explain themselves: `return` (line 6) is not just `!`.
+        assert!(text.contains("// size = 24 (0x18), align = 0x8\nstruct Stack {"), "hover on struct: {h:#?}");
+        // Keywords get keyword docs, not the `!` type of `return` (line 6).
         let h = c.request("textDocument/hover", pos(6, 6));
-        assert!(h["contents"]["value"].as_str().unwrap_or_default().contains("Leaves the current function"), "hover on return: {h:#?}");
+        let text = h["contents"]["value"].as_str().unwrap_or_default().to_string();
+        assert!(text.starts_with("```lunar\nreturn\n```\n\n---\n\nReturns a value from a function."), "hover on return: {h:#?}");
         // `items` field access (line 12).
         let h = c.request("textDocument/hover", pos(12, 15));
         assert!(h["contents"]["value"].as_str().unwrap_or_default().contains("items: [i32; -..+]"), "hover on field: {h:#?}");

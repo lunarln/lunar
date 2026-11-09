@@ -98,34 +98,17 @@ pub fn hover(a: &Analysis, file: FileId, offset: u32) -> Option<(Span, String)> 
                 let v = &data.variants[variant];
                 let f = &v.fields[field];
                 let owner = if data.is_enum { p.path_of(v.def) } else { p.path_of(adt) };
-                let env = &data.generics.preds;
-                let mut facts = Vec::new();
-                if !data.is_enum
-                    && let Some(offsets) = p.field_offsets(adt, &[])
-                {
-                    facts.push(format!("offset {}", offsets[field]));
-                }
-                facts.extend(type_facts(p, &f.ty, env));
+                let offset = if data.is_enum { None } else { p.field_offsets(adt, &[]).map(|o| o[field]) };
+                let layout = layout_comment(p.layout_of(&f.ty), offset);
                 let vis = if f.is_pub { "pub " } else { "" };
-                format!("```lunar\n{owner}\n{vis}{}: {}\n```{}", f.name, p.ty_str(&f.ty), facts_block(&facts))
+                format!("{}\n\n```lunar\n{layout}{vis}{}: {}\n```", code_block(&owner), f.name, p.ty_str(&f.ty))
             }
             RefTarget::Local { body, local } => {
                 let l = p.bodies.get(&body)?.local(local);
-                let env = match &p.def(body).data {
-                    DefData::Fn(fd) => fd.generics.preds.clone(),
-                    _ => Vec::new(),
-                };
-                let mut facts = Vec::new();
-                let kw = match l.kind {
-                    thir::LocalKind::Param { inout, bang, .. } => {
-                        facts.push(param_role(p, &l.ty, inout, bang, &env));
-                        ""
-                    }
-                    _ => "let ",
-                };
-                facts.extend(type_facts(p, &l.ty, &env));
+                let kw = if matches!(l.kind, thir::LocalKind::Param { .. }) { "" } else { "let " };
                 let m = if l.mutable { "mut " } else { "" };
-                format!("```lunar\n{kw}{m}{}: {}\n```{}", l.name, p.ty_str(&l.ty), facts_block(&facts))
+                let layout = layout_comment(p.layout_of(l.ty.strip_bang()), None);
+                format!("```lunar\n{layout}{kw}{m}{}: {}\n```", l.name, p.ty_str(&l.ty))
             }
         };
         return Some((span, text));
@@ -158,7 +141,8 @@ fn describe_def(p: &Program, map: &SourceMap, d: DefId) -> String {
         (DefData::Adt(adt), DefKind::Struct) if adt.variants[0].fields.iter().any(|f| !f.name.chars().all(|c| c.is_ascii_digit())) => {
             sig.push_str(" {\n");
             for f in &adt.variants[0].fields {
-                sig.push_str(&format!("    {}: {},\n", f.name, p.ty_str(&f.ty)));
+                let vis = if f.is_pub { "pub " } else { "" };
+                sig.push_str(&format!("    {vis}{}: {},\n", f.name, p.ty_str(&f.ty)));
             }
             sig.push('}');
         }
@@ -174,43 +158,46 @@ fn describe_def(p: &Program, map: &SourceMap, d: DefId) -> String {
     if info.kind == DefKind::Mod {
         sig = format!("mod {}", info.name);
     }
-    let path = p.path_of(d);
-    let container = path.rsplit_once("::").map(|(c, _)| c.to_string()).unwrap_or_default();
-    let mut out = String::from("```lunar\n");
+    // Like rust-analyzer: the container path, then the declaration (with the
+    // memory layout as a comment for types, and the enclosing `impl` or
+    // `trait` for methods), then the docs.
+    let mut decl = String::new();
+    if let DefData::Adt(adt) = &info.data
+        && adt.generics.names.is_empty()
+    {
+        decl.push_str(&layout_comment(p.layout_of(&Ty::Adt(d, Vec::new())), None));
+    }
+    if let Some(parent) = info.parent
+        && matches!(info.kind, DefKind::Fn)
+        && matches!(p.def(parent).kind, DefKind::Impl | DefKind::Trait)
+    {
+        let pd = p.def(parent);
+        let header = if pd.kind == DefKind::Impl { item_header(map, pd.span) } else { signature(map, pd.span) };
+        if !header.is_empty() {
+            decl.push_str(&header);
+            decl.push('\n');
+        }
+    }
+    decl.push_str(&sig);
+    // Methods: the path of the type for user-defined types (`tour::Point`),
+    // else the module of the impl (`core::num` for `impl i32`), as
+    // rust-analyzer does.
+    let container = match info.parent.map(|pd| (pd, p.def(pd))) {
+        Some((pd, pdi)) if pdi.kind == DefKind::Impl => match &p.impl_data(pd).self_ty {
+            Ty::Adt(adt, _) => p.path_of(*adt),
+            _ => p.path_of(pdi.module),
+        },
+        _ => {
+            let path = p.path_of(d);
+            path.rsplit_once("::").map(|(c, _)| c.to_string()).unwrap_or_default()
+        }
+    };
+    let mut out = String::new();
     if !container.is_empty() {
-        out.push_str(&container);
-        out.push('\n');
+        out.push_str(&code_block(&container));
+        out.push_str("\n\n");
     }
-    out.push_str(&sig);
-    out.push_str("\n```");
-    // Plain-text facts: attributes, parameter roles, layout.
-    let mut facts = Vec::new();
-    let attrs = if info.span.is_dummy() { Vec::new() } else { attributes(map, info.span) };
-    if !attrs.is_empty() {
-        facts.push(format!("attributes: {}", attrs.join(" ")));
-    }
-    match &info.data {
-        DefData::Fn(fd) => {
-            let env = &fd.generics.preds;
-            if fd.is_unsafe {
-                facts.push("unsafe to call: callers need an `unsafe` block".into());
-            }
-            for prm in &fd.sig.params {
-                let bang = matches!(prm.ty, Ty::Bang(_));
-                facts.push(format!("`{}`: {}", prm.name, param_role(p, &prm.ty, prm.inout, bang, env)));
-            }
-        }
-        DefData::Adt(adt) => {
-            let args: Vec<Ty> = adt.generics.names.iter().enumerate().map(|(i, n)| Ty::Param(i as u32, n.clone())).collect();
-            let ty = Ty::Adt(d, args);
-            facts.extend(type_facts(p, &ty, &adt.generics.preds));
-            if p.layout_of(&ty).is_none() && !adt.generics.names.is_empty() {
-                facts.push("size depends on its type arguments".into());
-            }
-        }
-        _ => {}
-    }
-    out.push_str(&facts_block(&facts));
+    out.push_str(&code_block(&decl));
     let docs = if info.span.is_dummy() { String::new() } else { doc_comment(map, info.span) };
     if !docs.is_empty() {
         out.push_str("\n\n---\n\n");
@@ -219,117 +206,331 @@ fn describe_def(p: &Program, map: &SourceMap, d: DefId) -> String {
     out
 }
 
-/// How a function treats an argument.
-fn param_role(p: &Program, ty: &Ty, inout: bool, bang: bool, env: &[ln_sema::defs::Pred]) -> String {
-    let inner = match ty {
-        Ty::Bang(t) => t.as_ref(),
-        t => t,
-    };
-    match (inout, bang) {
-        (true, true) => "in-out (`mut`), may be shrunk (`!`): only the owner can pass it, with no live views into it".into(),
-        (true, false) => "in-out (`mut`): the caller passes a mutable place and sees the changes".into(),
-        (false, _) if p.has_owner(inner) => "borrowed: the function cannot move out of it or keep it".into(),
-        (false, _) if p.is_copy(inner, env) => "copied".into(),
-        _ => "borrowed".into(),
-    }
+fn code_block(code: &str) -> String {
+    format!("```lunar\n{code}\n```")
 }
 
-/// Layout and value semantics of a type, as short plain-text facts.
-fn type_facts(p: &Program, ty: &Ty, env: &[ln_sema::defs::Pred]) -> Vec<String> {
-    let ty = match ty {
-        Ty::Bang(t) => t.as_ref(),
-        t => t,
-    };
-    let mut out = Vec::new();
-    if let Some(l) = p.layout_of(ty) {
-        out.push(format!("size {} bytes, align {}", l.size, l.align));
-    }
-    out.push(if p.is_dull(ty, env) { "Dull".into() } else { "pointy (not Dull)".into() });
-    if p.has_owner(ty) {
-        out.push("owning: moved, not copied".into());
-    } else if p.is_copy(ty, env) {
-        out.push("copied".into());
-    }
-    out
+/// rust-analyzer's memory layout line: `// size = 24 (0x18), align = 0x8`,
+/// plus `offset` for fields. Empty when the layout is not known (generics).
+fn layout_comment(layout: Option<ln_sema::layout::Layout>, offset: Option<u64>) -> String {
+    let Some(l) = layout else { return String::new() };
+    let size = if l.size >= 10 { format!("{} ({:#X})", l.size, l.size) } else { l.size.to_string() };
+    let offset = offset.map(|o| format!(", offset = {o:#X}")).unwrap_or_default();
+    format!("// size = {size}, align = {:#X}{offset}\n", l.align)
 }
 
-/// Plain-text facts below the code block, one per line.
-fn facts_block(facts: &[String]) -> String {
-    if facts.is_empty() {
-        return String::new();
-    }
-    // Two trailing spaces make a markdown line break.
-    format!("\n\n{}", facts.join("  \n"))
+/// The header of the item whose span starts at `span` (an `impl` block):
+/// its text up to the `{`, with whitespace collapsed.
+fn item_header(map: &SourceMap, span: Span) -> String {
+    let text = &map.get(span.file).text;
+    let rest = &text[span.start as usize..span.end as usize];
+    let head = rest.split('{').next().unwrap_or("");
+    head.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Attribute lines (`#[...]`) directly above the item declared at `name`.
-fn attributes(map: &SourceMap, name: Span) -> Vec<String> {
-    let text = &map.get(name.file).text;
-    let line_start = text[..name.start as usize].rfind('\n').map_or(0, |i| i + 1);
-    let mut out = Vec::new();
-    for line in text[..line_start].lines().rev() {
-        let t = line.trim();
-        if t.starts_with("#[") {
-            out.push(t.to_string());
-        } else if !t.starts_with("///") {
-            break;
-        }
-    }
-    out.reverse();
-    out
-}
-
-/// Documentation for the keyword under the cursor, if any.
+/// Documentation for the keyword under the cursor, in rust-analyzer's style.
 fn keyword_hover(map: &SourceMap, file: FileId, offset: u32) -> Option<(Span, String)> {
     let text = &map.get(file).text;
     let (toks, _) = ln_lexer::lex(text);
     let tok = toks.iter().find(|t| t.range.start as u32 <= offset && offset < t.range.end as u32)?;
     let word = &text[tok.range.clone()];
     let doc = keyword_doc(word)?;
-    Some((Span::new(file, tok.range.start as u32, tok.range.end as u32), format!("```lunar\n{word}\n```\n\n{doc}")))
+    Some((Span::new(file, tok.range.start as u32, tok.range.end as u32), format!("{}\n\n---\n\n{doc}", code_block(word))))
 }
 
 fn keyword_doc(word: &str) -> Option<&'static str> {
     Some(match word {
         "fn" => {
-            "Declares a function. Parameters are borrowed unless declared `mut` (in-out); the return type follows `:`. Generics use `::<>`: `fn max::<T: Ord>(a: T, b: T): T`."
+            r#"A function or function pointer.
+
+Functions are the primary way code is executed. Parameters are borrowed unless declared `mut`, which makes them in-out. The return type follows `:`, and generic parameters use `::<>`.
+
+```lunar
+fn max::<T: Ord>(a: T, b: T): T {
+    if a > b { a } else { b }
+}
+```"#
         }
-        "let" => "Introduces a binding. `let` bindings are immutable; `let mut` makes them mutable. The type can usually be inferred: `let x: i32 = 1;`.",
+        "let" => {
+            r#"Bind a value to a variable.
+
+`let` bindings are immutable; `let mut` makes them mutable. The type is usually inferred. The left side is a pattern, so `let` can also destructure.
+
+```lunar
+let x: i32 = 1;
+let mut total = 0;
+let (a, b) = (1, 2);
+```"#
+        }
         "mut" => {
-            "On a `let`, makes the binding mutable. On a parameter, makes it **in-out**: the caller passes a mutable place and sees the changes. A `!` parameter must also be `mut`."
+            r#"A mutable binding or an in-out parameter.
+
+On a `let`, `mut` allows the variable to be reassigned and its contents changed. On a parameter, `mut` makes it in-out: the caller passes a mutable place, and changes are visible to the caller after the call. A `!` parameter must also be `mut`.
+
+```lunar
+fn bump(mut x: i32) {
+    x += 1;
+}
+
+let mut n = 1;
+bump(n); // n == 2
+```"#
         }
-        "return" => "Leaves the current function with a value (or `()`). The `return` expression itself has type `!`, so it fits anywhere a value is expected.",
-        "if" => "Conditional expression: `if cond { a } else { b }` has a value when both branches do.",
-        "else" => "The alternative branch of an `if`.",
-        "match" => "Pattern matching. Arms are checked in order and must cover every possible value (`err(type::non_exhaustive)` otherwise).",
-        "for" => "Loops over a range (`for i in 0..n`) or the elements of a Dull array or slice (`for x in arr`).",
-        "in" => "Separates the pattern from what a `for` loop iterates over.",
-        "while" => "Loops while a condition holds.",
-        "loop" => "Loops forever; leave with `break`, which can carry a value: `let x = loop { break 5; };`.",
-        "break" => "Leaves the innermost loop, optionally with a value for `loop`. Has type `!`.",
-        "continue" => "Skips to the next iteration of the innermost loop. Has type `!`.",
+        "return" => {
+            r#"Returns a value from a function.
+
+`return` exits the current function immediately. Without a value it returns `()`. The `return` expression itself has type `!`, so it fits anywhere a value is expected. A block's final expression without a semicolon is also its value.
+
+```lunar
+fn sign(x: i32): i32 {
+    if x < 0 {
+        return -1;
+    }
+    1
+}
+```"#
+        }
+        "if" => {
+            r#"Evaluate a block if a condition holds.
+
+`if` is an expression: with an `else` branch, it produces the value of the branch that ran.
+
+```lunar
+let kind = if n % 2 == 0 { "even" } else { "odd" };
+```"#
+        }
+        "else" => {
+            r#"What expression to evaluate when an `if` condition evaluates to `false`.
+
+```lunar
+if x > 0 {
+    println("positive");
+} else if x < 0 {
+    println("negative");
+} else {
+    println("zero");
+}
+```"#
+        }
+        "match" => {
+            r#"Control flow based on pattern matching.
+
+Arms are tried in order; the first whose pattern matches (and whose `if` guard holds) runs. The arms must cover every possible value, or the compiler reports `err(type::non_exhaustive)`.
+
+```lunar
+match shape {
+    Shape::Circle(r) => 3.14 * r * r,
+    Shape::Rect { w, h } => w * h,
+    Shape::Empty => 0.0,
+}
+```"#
+        }
+        "for" => {
+            r#"Iteration over a range or the elements of an array.
+
+`for` loops over an integer range, or over the elements of a Dull array, slice or anything implementing `Iterator`. Elements are copied out.
+
+```lunar
+for i in 0..10 {
+    println("{i}");
+}
+for x in numbers {
+    total += x;
+}
+```"#
+        }
+        "in" => {
+            r#"Iterate over a series of values with `for`.
+
+```lunar
+for i in 0..3 { }
+```"#
+        }
+        "while" => {
+            r#"Loop while a condition is upheld.
+
+```lunar
+let mut i = 0;
+while i < 10 {
+    i += 1;
+}
+```"#
+        }
+        "loop" => {
+            r#"Loop indefinitely.
+
+`loop` runs its body until a `break`. A `break` can carry a value, which becomes the value of the `loop` expression.
+
+```lunar
+let first_big = loop {
+    n += 1;
+    if n * n > 100 {
+        break n;
+    }
+};
+```"#
+        }
+        "break" => {
+            r#"Exit early from a loop.
+
+`break` leaves the innermost loop. Inside `loop`, it can carry a value. The expression has type `!`."#
+        }
+        "continue" => {
+            r#"Skip to the next iteration of a loop.
+
+The expression has type `!`."#
+        }
         "struct" => {
-            "Declares a struct: named fields `struct P { x: i32 }`, a tuple struct `struct P(i32);` or a unit struct `struct P;`. Fields are private to the module unless `pub`."
+            r#"A type that is composed of other types.
+
+Structs come in three forms: with named fields, tuple structs, and unit structs. Fields are private to the module that declares the struct unless marked `pub`.
+
+```lunar
+struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
+struct Meters(f64);
+
+struct Marker;
+```"#
         }
-        "enum" => "Declares an enum: a value is exactly one of its variants. Variants can carry fields, and their fields are always public.",
-        "impl" => "Adds methods to a type (`impl T { ... }`) or implements a trait (`impl Tr for T { ... }`). Two impls of a trait may not overlap.",
-        "trait" => "Declares a trait: methods (optionally with default bodies) that types can implement. Supertraits: `trait A: B`.",
-        "type" => "Declares a type alias: `type Bytes = [u8; -..+];`.",
-        "mod" => "Declares a module, inline (`mod m { ... }`) or from a file (`mod m;` loads `m.ln` or `m/mod.ln`).",
-        "use" => "Imports names from another module: `use std::io::println;`, `use core::ops::{Add, Sub};`.",
-        "pub" => "Makes an item, field or method visible outside its module. Without it, items are private to their module and its children.",
-        "const" => "A compile-time constant: `const N: usize = 16;`. Its value is evaluated during compilation.",
-        "static" => "A global variable with a fixed address. `static mut` is mutable; reading or writing it requires `unsafe`.",
+        "enum" => {
+            r#"A type that can be any one of several variants.
+
+Variants can carry data, either as a tuple or with named fields. Variant fields are always public.
+
+```lunar
+enum Shape {
+    Circle(f64),
+    Rect { w: f64, h: f64 },
+    Empty,
+}
+```"#
+        }
+        "impl" => {
+            r#"Implementations of functionality for a type, or a type implementing some functionality.
+
+An inherent `impl` adds associated functions and methods to a type. A trait `impl` implements a trait for a type. Two impls of the same trait may not apply to the same type.
+
+```lunar
+impl Point {
+    pub fn origin(): Point {
+        return Point { x: 0.0, y: 0.0 };
+    }
+}
+
+impl Display for Point {
+    fn fmt(self, mut out: String) {
+        out.write("({self.x}, {self.y})");
+    }
+}
+```"#
+        }
+        "trait" => {
+            r#"A common interface for a group of types.
+
+A trait declares methods that implementing types provide; methods may have default bodies. Supertraits are written `trait A: B`.
+
+```lunar
+trait Describe {
+    fn name(self): str;
+    fn describe(self) {
+        println("a {self.name()}");
+    }
+}
+```"#
+        }
+        "type" => {
+            r#"Define an alias for an existing type.
+
+```lunar
+type Bytes = [u8; -..+];
+```"#
+        }
+        "mod" => {
+            r#"Organize code into modules.
+
+`mod m { ... }` declares a module inline. `mod m;` loads it from `m.ln` or `m/mod.ln` next to the declaring file."#
+        }
+        "use" => {
+            r#"Import or rename items from other modules.
+
+```lunar
+use std::io::println;
+use core::ops::{Add, Sub};
+```"#
+        }
+        "pub" => {
+            r#"Make an item visible to others.
+
+Items, fields and methods are private to the module that declares them (and its children) unless marked `pub`."#
+        }
+        "const" => {
+            r#"Compile-time constants.
+
+The value is evaluated during compilation and inlined at each use.
+
+```lunar
+const LIMIT: usize = 1024;
+```"#
+        }
+        "static" => {
+            r#"A static item is a value which is valid for the entire duration of your program.
+
+A `static` has a fixed address. A `static mut` can be changed, but every read or write of it requires `unsafe`.
+
+```lunar
+static GREETING: str = "hello";
+```"#
+        }
         "unsafe" => {
-            "An `unsafe { }` block allows unsafe operations: calling `unsafe` or `extern` functions, dereferencing raw pointers, and using `static mut`. On a function, makes it unsafe to *call*; its body still needs `unsafe` blocks (hard error otherwise)."
+            r#"Code or interfaces whose memory safety cannot be verified by the type system.
+
+An `unsafe { }` block allows unsafe operations: calling `unsafe` or `extern` functions, dereferencing raw pointers, and accessing a `static mut`. Marking a function `unsafe fn` only makes it unsafe to call. Its body gets no implicit unsafe context, so unsafe operations inside it still need an `unsafe` block (a hard error otherwise)."#
         }
-        "extern" => "Declares functions implemented elsewhere with the C ABI: `extern \"C\" { fn puts(s: *u8): i32; }`. Calling them requires `unsafe`.",
-        "as" => "Numeric and pointer casts (`x as u64`), and renaming imports (`use a::b as c;`).",
-        "self" => "The receiver of a method (`fn len(self)`, `fn push(mut self, ..)`, `fn pop(mut self: !Self)`), or the current module in paths (`self::x`).",
-        "Self" => "The type an `impl` or trait is for.",
-        "crate" => "The root module of the current crate: `crate::util::f`.",
-        "super" => "The parent module: `super::helper()`.",
-        "true" | "false" => "A `bool` value.",
+        "extern" => {
+            r#"Link to or import external code.
+
+An `extern "C"` block declares functions implemented elsewhere with the C calling convention. Calling them requires `unsafe`.
+
+```lunar
+extern "C" {
+    fn puts(s: *u8): i32;
+}
+```"#
+        }
+        "as" => {
+            r#"Cast between types, or rename an import.
+
+```lunar
+let n = x as u64;
+use std::io::println as say;
+```"#
+        }
+        "self" => {
+            r#"The receiver of a method, or the current module.
+
+As a method's first parameter, `self` is the value the method is called on: `self` borrows it, `mut self` makes it in-out, and `mut self: !Self` may shrink it. In paths, `self::x` names an item of the current module."#
+        }
+        "Self" => r#"The implementing type within a `trait` or `impl` block, or within a type definition."#,
+        "crate" => {
+            r#"A path segment that refers to the root of the current crate.
+
+```lunar
+crate::util::helper();
+```"#
+        }
+        "super" => {
+            r#"The parent of the current module.
+
+```lunar
+super::helper();
+```"#
+        }
+        "true" => r#"A value of type `bool` representing logical **true**."#,
+        "false" => r#"A value of type `bool` representing logical **false**."#,
         _ => return None,
     })
 }
@@ -360,8 +561,7 @@ fn signature(map: &SourceMap, name: Span) -> String {
             _ => {}
         }
     }
-    let sig = text[start..end].split_whitespace().collect::<Vec<_>>().join(" ");
-    sig.strip_prefix("pub ").unwrap_or(&sig).to_string()
+    text[start..end].split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// `///` lines directly above the item declared at `name` (attributes skipped).
