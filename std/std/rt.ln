@@ -1,10 +1,19 @@
 // The Lunar runtime.
 //
 // Data stacks: every owning array (`[T]`, `[T; ..+]`, `[T; -..+]`, `String`)
-// lives on its own data stack: a large reservation of address space whose
-// pages are committed on demand. Growing never moves existing elements, so
-// views into an array stay valid while it grows. Freed stacks are kept in a
-// small pool for reuse.
+// lives on its own data stack, a 1 GiB slot of address space whose pages
+// are committed as the array grows. Growing never moves existing elements,
+// so views into an array stay valid while it grows.
+//
+// All slots come from one region reserved once, at startup. Taking and
+// returning a slot never calls the operating system: fresh slots are
+// carved off the region with a bump pointer, and freed slots go on a free
+// list threaded through their headers. On Linux and macOS the region is
+// mapped readable and writable up front and the kernel supplies pages on
+// first touch, so after startup allocation makes no system calls at all.
+// On Windows (and Unix systems that refuse to overcommit) memory must be
+// committed explicitly, which happens only when a slot grows past the most
+// it has ever held.
 //
 // Layout of a data stack: [header: 64 bytes][elements...]. The array handle
 // `{ ptr, len, cap }` points at the first element.
@@ -12,21 +21,30 @@
 use crater::sys;
 use core::intrinsics;
 
-/// Address space reserved for each data stack.
-const RESERVE: usize = 8589934592;
-/// Granularity of commits.
-const CHUNK: usize = 65536;
+/// Address space for one data stack: the most an array can hold.
+const SLOT: usize = 1073741824;
+/// The region all slots come from is the largest power of two the system
+/// grants, from REGION_MAX (64 Ki slots) down to REGION_MIN.
+const REGION_MAX: usize = 70368744177664;
+const REGION_MIN: usize = 17179869184;
+/// Commits happen in whole pages.
+const PAGE: usize = 4096;
 const HEADER: usize = 64;
-const POOL_SIZE: usize = 64;
-/// Committed bytes (including the header) a pooled stack may keep; anything
-/// beyond is returned to the OS on free, so one huge array does not leave
-/// its peak memory parked in the pool.
-const RETAIN: usize = 1048576;
+/// Committed bytes (including the header) a free slot always keeps.
+const KEEP: usize = 65536;
+/// Free slots may hold this much more committed memory in total; beyond
+/// it, a freed slot's memory past KEEP goes back to the system.
+const RETAIN_BUDGET: usize = 67108864;
 const MAX_USIZE: usize = 18446744073709551615;
 
-/// Freed stacks (base addresses) available for reuse.
-static mut POOL: [usize; 64] = [0; 64];
-static mut POOL_LEN: usize = 0;
+static mut REGION: usize = 0;
+static mut REGION_END: usize = 0;
+/// Next never-used slot.
+static mut BUMP: usize = 0;
+/// Most recently freed slot (its base address), or 0.
+static mut FREE: usize = 0;
+/// Committed bytes past KEEP held by free slots.
+static mut RETAINED: usize = 0;
 
 pub static mut ARGC: i32 = 0;
 pub static mut ARGV: usize = 0;
@@ -40,8 +58,10 @@ struct RawArr {
 
 /// Header at the start of each data stack.
 struct Header {
-    /// Bytes committed after the header.
+    /// Bytes committed after the header (the most the slot has held).
     committed: usize,
+    /// Next free slot while this one is on the free list.
+    next: usize,
 }
 
 #[lang = "rt_init"]
@@ -50,28 +70,71 @@ fn rt_init(argc: i32, argv: usize) {
         ARGC = argc;
         ARGV = argv;
     }
+    reserve_region();
 }
 
+fn reserve_region() {
+    unsafe {
+        let mut size = REGION_MAX;
+        loop {
+            let base = sys::reserve(size);
+            if (base as usize) != 0 {
+                REGION = base as usize;
+                REGION_END = REGION + size;
+                BUMP = REGION;
+                return;
+            }
+            size = size / 2;
+            if size < REGION_MIN {
+                sys::write(2, "fatal: could not reserve address space for data stacks\n".as_bytes());
+                sys::exit(134);
+            }
+        }
+    }
+}
+
+fn too_many_arrays(): ! {
+    // No formatting here: building a String would need a free slot.
+    sys::write(2, "fatal: too many live arrays (every data stack slot is in use)\n".as_bytes());
+    sys::exit(134);
+}
+
+/// A slot for a new data stack, with at least its first page committed.
 fn acquire(): *mut u8 {
     unsafe {
-        if POOL_LEN > 0 {
-            POOL_LEN -= 1;
-            return POOL[POOL_LEN] as *mut u8;
+        if FREE != 0 {
+            let base = FREE as *mut u8;
+            let h = base as *mut Header;
+            let mut header = intrinsics::ptr_read(h);
+            FREE = header.next;
+            header.next = 0;
+            intrinsics::ptr_write(h, header);
+            RETAINED -= extra(header.committed);
+            return base;
         }
-        let base = sys::reserve(RESERVE);
-        if (base as usize) == 0 {
-            sys::write(2, "fatal: could not reserve address space for a data stack\n".as_bytes());
-            sys::exit(134);
+        if REGION == 0 {
+            // Allocation before `rt_init` (not expected, but harmless).
+            reserve_region();
         }
-        sys::commit(base, CHUNK);
-        let h = base as *mut Header;
-        intrinsics::ptr_write(h, Header { committed: CHUNK - HEADER });
+        if REGION_END - BUMP < SLOT {
+            too_many_arrays();
+        }
+        let base = BUMP as *mut u8;
+        BUMP += SLOT;
+        sys::commit(base, PAGE);
+        intrinsics::ptr_write(base as *mut Header, Header { committed: PAGE - HEADER, next: 0 });
         return base;
     }
 }
 
+/// Committed bytes of a slot beyond what every free slot keeps.
+fn extra(committed: usize): usize {
+    let total = committed + HEADER;
+    if total > KEEP { total - KEEP } else { 0 }
+}
+
 fn stack_overflow(): ! {
-    sys::write(2, "fatal: data stack overflow (array exceeds 8 GiB)\n".as_bytes());
+    sys::write(2, "fatal: data stack overflow (an array grew past its 1 GiB reservation)\n".as_bytes());
     sys::exit(134);
 }
 
@@ -91,8 +154,8 @@ fn ds_grow(handle: *mut RawArr, elem_size: usize, additional: usize) {
             intrinsics::ptr_write(handle, a);
             return;
         }
-        // `a.len * elem_size <= RESERVE`, so this subtraction cannot wrap.
-        if additional > (RESERVE - HEADER) / elem_size - a.len {
+        // `a.len * elem_size <= SLOT - HEADER`, so this cannot wrap.
+        if additional > (SLOT - HEADER) / elem_size - a.len {
             stack_overflow();
         }
         if a.ptr as usize == 0 {
@@ -108,13 +171,15 @@ fn ds_grow(handle: *mut RawArr, elem_size: usize, additional: usize) {
             if want < need {
                 want = need;
             }
-            // Round up to whole chunks (including the header).
-            let mut total = (want + HEADER + CHUNK - 1) / CHUNK * CHUNK;
-            if total > RESERVE {
-                // Doubling overshot, but `need` itself fits (checked above).
-                total = RESERVE;
+            // Whole pages, including the header; doubling may overshoot the
+            // slot, but `need` itself fits (checked above).
+            let mut total = (want + HEADER + PAGE - 1) / PAGE * PAGE;
+            if total > SLOT {
+                total = SLOT;
             }
-            sys::commit(base, total);
+            // Only the new pages: the slot's first `old` bytes are committed.
+            let old = header.committed + HEADER;
+            sys::commit(intrinsics::ptr_offset_mut(base, old as isize), total - old);
             header.committed = total - HEADER;
             intrinsics::ptr_write(h, header);
         }
@@ -131,20 +196,20 @@ fn ds_free(ptr: *mut u8) {
     }
     unsafe {
         let base = intrinsics::ptr_offset_mut(ptr, 0 - (HEADER as isize));
-        if POOL_LEN < POOL_SIZE {
-            let h = base as *mut Header;
-            let mut header = intrinsics::ptr_read(h);
-            let total = header.committed + HEADER;
-            if total > RETAIN {
-                sys::decommit(intrinsics::ptr_offset_mut(base, RETAIN as isize), total - RETAIN);
-                header.committed = RETAIN - HEADER;
-                intrinsics::ptr_write(h, header);
-            }
-            POOL[POOL_LEN] = base as usize;
-            POOL_LEN += 1;
+        let h = base as *mut Header;
+        let mut header = intrinsics::ptr_read(h);
+        // Keep the memory for the next array that takes this slot, unless
+        // free slots already hold too much.
+        let e = extra(header.committed);
+        if RETAINED + e > RETAIN_BUDGET {
+            sys::decommit(intrinsics::ptr_offset_mut(base, KEEP as isize), e);
+            header.committed = KEEP - HEADER;
         } else {
-            sys::release(base, RESERVE);
+            RETAINED += e;
         }
+        header.next = FREE;
+        intrinsics::ptr_write(h, header);
+        FREE = base as usize;
     }
 }
 

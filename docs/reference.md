@@ -107,8 +107,17 @@ too. Owning values (owning arrays, `String`, and types containing them) are
 ## 4. Memory model: data stacks
 
 Every owning array (`[T]`, `[T; ..+]`, `[T; -..+]`, `String`) is a small
-handle `{ ptr, len, cap }` pointing at its own *data stack*: 8 GiB of
-reserved address space whose pages are committed as the array grows.
+handle `{ ptr, len, cap }` pointing at its own *data stack*: a 1 GiB slot of
+address space whose pages are committed as the array grows. An array can
+hold at most 1 GiB; growing past that is a fatal `data stack overflow`.
+
+All slots come from one region reserved at startup (up to 64 TiB, so up to
+65,536 arrays can be alive at once). Taking and returning a slot never calls
+the operating system. On Linux and macOS the region is usable up front and
+the kernel supplies pages on first touch, so allocation makes no system
+calls after startup; on Windows, memory is committed only when a slot grows
+past the most it has ever held. Freed slots keep their memory for reuse, up
+to 64 MiB in total.
 
 * **Growing never moves elements.** Slices taken from a `[T; ..+]` stay
   valid after any number of `push`es.

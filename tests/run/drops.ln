@@ -1,6 +1,6 @@
-// Owned values must be freed: every String / growable array reserves 8 GiB of
-// address space for its data stack, so leaking 100k of them would exhaust
-// the address space and crash.
+// Owned values must be freed: every String / growable array takes a 1 GiB
+// data stack slot, and the region holds at most 65,536 of them, so leaking
+// 100k would run out of slots and crash.
 
 struct Named {
     name: String,

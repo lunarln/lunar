@@ -48,16 +48,38 @@ pub fn exit(code: i32): ! {
     unsafe { c_exit(code) }
 }
 
+/// Whether reserved memory is usable as it is: the kernel supplies pages on
+/// first touch, so `commit` has nothing to do.
+static mut LAZY: bool = false;
+
+/// Reserve `size` bytes of address space. Preferably readable and writable
+/// but not backed by memory (`MAP_NORESERVE`): pages appear when first
+/// touched, without further system calls. Systems that refuse to overcommit
+/// get an inaccessible reservation that `commit` makes usable piece by piece.
 pub fn reserve(size: usize): *mut u8 {
-    let p = unsafe { mmap(core::ptr::null_mut(), size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0) };
+    let flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
+    let p = unsafe { mmap(core::ptr::null_mut(), size, PROT_READ_WRITE, flags, -1, 0) };
     // MAP_FAILED is (void*)-1.
+    if (p as usize) != 18446744073709551615 {
+        unsafe {
+            LAZY = true;
+        }
+        return p;
+    }
+    let p = unsafe { mmap(core::ptr::null_mut(), size, PROT_NONE, flags, -1, 0) };
     if (p as usize) == 18446744073709551615 {
         return core::ptr::null_mut();
+    }
+    unsafe {
+        LAZY = false;
     }
     return p;
 }
 
 pub fn commit(base: *mut u8, size: usize) {
+    if unsafe { LAZY } {
+        return;
+    }
     let r = unsafe { mprotect(base, size, PROT_READ_WRITE) };
     if r != 0 {
         write(2, "fatal: out of memory (could not commit data stack pages)\n".as_bytes());
@@ -66,10 +88,11 @@ pub fn commit(base: *mut u8, size: usize) {
 }
 
 pub fn decommit(base: *mut u8, size: usize) {
-    // Mapping fresh inaccessible pages over the range drops the old ones
-    // while keeping the address space reserved.
+    // Mapping fresh pages over the range drops the old ones while keeping
+    // the address space reserved (and, if lazy, still usable).
+    let prot = if unsafe { LAZY } { PROT_READ_WRITE } else { PROT_NONE };
     unsafe {
-        mmap(base, size, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+        mmap(base, size, prot, MAP_FIXED | MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
     }
 }
 
