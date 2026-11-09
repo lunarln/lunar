@@ -150,10 +150,15 @@ impl<'a> Sema<'a> {
             }
             let seg = &segs[i];
             let ns = if i + 1 == segs.len() { last_ns } else { Ns::Type };
-            let found = self.lookup_in(cur, &seg.name, ns).or_else(|| {
-                // Enum variants live in both namespaces.
-                if kind == DefKind::Enum { self.lookup_in(cur, &seg.name, Ns::Value) } else { None }
-            });
+            let other = match ns {
+                Ns::Type => Ns::Value,
+                Ns::Value => Ns::Type,
+            };
+            // Enum variants live in both namespaces. In a module, a name
+            // found only in the other namespace is still returned, so the
+            // caller can say "expected a value, found module `std::io`"
+            // instead of claiming that `io` does not exist.
+            let found = self.lookup_in(cur, &seg.name, ns).or_else(|| self.lookup_in(cur, &seg.name, other));
             let Some(b) = found else {
                 if kind == DefKind::Enum {
                     // Possibly an associated function on the enum.

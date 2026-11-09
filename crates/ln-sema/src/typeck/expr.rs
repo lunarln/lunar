@@ -7,7 +7,7 @@ use crate::thir::{self, Arm, Callee, Coercion, Expr, ExprKind, FmtPiece, LocalKi
 use crate::ty::{ArrKind, IntTy, TraitRef, Ty};
 use ln_ast as ast;
 use ln_ast::{BinOp, UnOp};
-use ln_diag::{Diagnostic, Span, codes::name, codes::ty as tyc};
+use ln_diag::{Diagnostic, Span, codes::build, codes::name, codes::syntax, codes::ty as tyc};
 
 impl<'s, 'a> FnCtx<'s, 'a> {
     pub(crate) fn mk(&self, kind: ExprKind, ty: Ty, span: Span) -> Expr {
@@ -16,6 +16,17 @@ impl<'s, 'a> FnCtx<'s, 'a> {
 
     pub(crate) fn error_expr(&self, span: Span) -> Expr {
         Expr { kind: ExprKind::Error, ty: Ty::Error, span }
+    }
+
+    /// `what` needs the lang item `name`, which the loaded `core` does not
+    /// define (only possible with a modified standard library).
+    pub(crate) fn missing_lang_item(&mut self, name: &str, what: &str, span: Span) {
+        self.err(
+            Diagnostic::error(build::MISSING_LANG_ITEM, span, format!("{what} needs the lang item `{name}`, which the standard library does not define"))
+                .with_note(format!(
+                    "`core` must mark an item `#[lang = \"{name}\"]`; if `LUNAR_STD_DIR` is set, check that it points at an unmodified standard library"
+                )),
+        );
     }
 
     pub(crate) fn unit_expr(&self, span: Span) -> Expr {
@@ -200,6 +211,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             let saved = self.s.diags.len();
             let r = self.s.resolve_prefix(module, &idents, Ns::Value);
             if self.s.diags.len() != saved {
+                // Not a static; the caller resolves the path again as a
+                // value and reports the problem once.
+                self.s.diags.truncate(saved);
                 return None;
             }
             match r {
@@ -417,10 +431,16 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 if let Ty::Float(_) = ty {
                     return self.mk(ExprKind::Lit(ConstVal::Float(*value as f64)), ty, span);
                 }
-                if *value > i128::MAX as u128 {
-                    self.err(Diagnostic::error(tyc::LITERAL_RANGE, span, "integer literal is too large"));
-                }
-                self.lit_checks.push((ty.clone(), *value as i128, span));
+                let Ok(v) = i128::try_from(*value) else {
+                    // Too large for every integer type; checked here because
+                    // the range checks work on `i128`.
+                    self.err(
+                        Diagnostic::error(tyc::LITERAL_RANGE, span, "integer literal is too large")
+                            .with_note(format!("the largest integer type, `u64`, holds values up to {}", u64::MAX)),
+                    );
+                    return self.error_expr(span);
+                };
+                self.lit_checks.push((ty.clone(), v, span));
                 self.mk(ExprKind::Lit(ConstVal::Int(*value as i128)), ty, span)
             }
             ast::Lit::Float { value, suffix } => {
@@ -450,7 +470,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let pieces = match fmt {
             ast::FmtString::Ok(p) => p,
             ast::FmtString::Err(msg, sp) => {
-                self.err(Diagnostic::error(tyc::INTERPOLATION, *sp, msg.clone()));
+                self.err(
+                    Diagnostic::error(syntax::BAD_FORMAT, *sp, msg.clone())
+                        .with_note("this string is a format string because it is passed to a `FmtArgs` parameter"),
+                );
                 return self.mk(ExprKind::Error, Ty::FmtArgs, span);
             }
         };
@@ -483,34 +506,39 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             UnOp::Deref => unreachable!("deref is a place"),
             UnOp::Neg => {
                 // Fold `-literal` so `-128i8` range-checks correctly.
-                if let ast::ExprKind::Lit(ast::Lit::Int { value, .. }) = &x.kind {
-                    let mut lit = self.check_lit(
-                        match &x.kind {
-                            ast::ExprKind::Lit(l) => l,
-                            _ => unreachable!(),
-                        },
-                        expect,
-                        x.span,
-                    );
-                    if let ExprKind::Lit(ConstVal::Int(_)) = lit.kind {
-                        lit.kind = ExprKind::Lit(ConstVal::Int(-(*value as i128)));
-                        if let Some(last) = self.lit_checks.last_mut() {
-                            last.1 = -(*value as i128);
-                            last.2 = span;
+                if let ast::ExprKind::Lit(l @ ast::Lit::Int { .. }) = &x.kind {
+                    let checks_before = self.lit_checks.len();
+                    let mut lit = self.check_lit(l, expect, x.span);
+                    lit.span = span;
+                    match lit.kind {
+                        ExprKind::Lit(ConstVal::Int(v)) => {
+                            lit.kind = ExprKind::Lit(ConstVal::Int(-v));
+                            let unsigned = match self.shallow(&lit.ty) {
+                                Ty::Int(it) if !it.signed() => Some(it),
+                                _ => None,
+                            };
+                            if self.lit_checks.len() > checks_before {
+                                if unsigned.is_some() {
+                                    // Reported below; the range check would only repeat it.
+                                    self.lit_checks.pop();
+                                } else if let Some(last) = self.lit_checks.last_mut() {
+                                    last.1 = -v;
+                                    last.2 = span;
+                                }
+                            }
+                            if let Some(it) = unsigned {
+                                let n = it.name();
+                                self.err(
+                                    Diagnostic::error(tyc::BAD_OPERAND, span, format!("cannot negate unsigned integer `{n}`"))
+                                        .with_note(format!("`{n}` cannot hold negative values")),
+                                );
+                            }
                         }
-                        if let Ty::Int(it) = self.shallow(&lit.ty)
-                            && !it.signed()
-                        {
-                            self.err(Diagnostic::error(tyc::BAD_OPERAND, span, format!("cannot negate unsigned type `{}`", it.name())));
-                        }
-                        lit.span = span;
-                        return lit;
+                        ExprKind::Lit(ConstVal::Float(f)) => lit.kind = ExprKind::Lit(ConstVal::Float(-f)),
+                        // Already reported, e.g. a literal too large for any type.
+                        _ => {}
                     }
-                    if let ExprKind::Lit(ConstVal::Float(f)) = lit.kind {
-                        lit.kind = ExprKind::Lit(ConstVal::Float(-f));
-                        lit.span = span;
-                        return lit;
-                    }
+                    return lit;
                 }
                 let v = self.check_expr(x, expect);
                 let t = self.shallow(&v.ty);
@@ -605,7 +633,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     /// Call an operator trait method on a non-primitive operand.
     fn op_trait_call(&mut self, lang: &str, method: &str, lhs: Expr, rhs: Option<Expr>, span: Span) -> Expr {
         let Some(tr) = lang_trait_ref(&self.s.p, lang) else {
-            self.err(Diagnostic::error(tyc::BAD_OPERAND, span, format!("operator trait `{lang}` is not available (missing lang item)")));
+            self.missing_lang_item(lang, &format!("the operator method `{method}`"), span);
             return self.error_expr(span);
         };
         let self_ty = self.resolve(&lhs.ty);
@@ -845,7 +873,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     /// A range used as a value: `core::ops::Range::<T> { start, end }`.
     fn check_range_value(&mut self, start: Option<&ast::Expr>, end: Option<&ast::Expr>, inclusive: bool, expect: Option<&Ty>, span: Span) -> Expr {
         let Some(range) = self.s.p.lang_item("range") else {
-            self.err(Diagnostic::error(tyc::BAD_OPERAND, span, "ranges are not available (missing lang item)"));
+            self.missing_lang_item("range", "a range value", span);
             return self.error_expr(span);
         };
         let (Some(s), Some(e)) = (start, end) else {
@@ -1110,6 +1138,11 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             let ev = self.coerce(ev, &st, e.span);
             let t = self.shallow(&st);
             if !(t.is_integral() || self.is_int_var(&t) || t.is_error()) {
+                // An unsuffixed float literal is still an inference variable
+                // here; settle it to its default so the message names a type.
+                if self.is_float_var(&t) {
+                    self.unify(&t, &Ty::Float(crate::ty::FloatTy::F64));
+                }
                 self.err(Diagnostic::error(tyc::NOT_ITERABLE, iter.span, format!("`for` ranges must be over integers, found `{}`", self.ty_str(&t))));
             }
             let id = self.new_loop(false);
@@ -1158,7 +1191,8 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     /// `for x in it` over an `Iterator::<T>` value: `loop { match it.next() { Some(x) => body, _ => break } }`.
     fn check_for_iterator(&mut self, pat: &ast::Pat, it: Expr, it_ty: Ty, body: &ast::Block, iter_span: Span, span: Span) -> Expr {
         let (Some(iter_trait), Some(option)) = (self.s.p.lang_item("iterator"), self.s.p.lang_item("option")) else {
-            self.err(Diagnostic::error(tyc::NOT_ITERABLE, iter_span, "iteration is not available (missing lang items)"));
+            let missing = if self.s.p.lang_item("iterator").is_none() { "iterator" } else { "option" };
+            self.missing_lang_item(missing, "a `for` loop over an iterator", iter_span);
             return self.error_expr(span);
         };
         // Find the item type from an impl or bound.
@@ -1247,6 +1281,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let v = self.check_place_or_temp(x);
         let vt = self.shallow(&v.ty);
         let (Some(option), result) = (self.s.p.lang_item("option"), self.s.p.lang_item("result")) else {
+            self.missing_lang_item("option", "the `?` operator", span);
             return self.error_expr(span);
         };
         let ret = self.shallow(&self.ret_ty.clone());

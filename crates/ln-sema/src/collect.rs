@@ -4,7 +4,14 @@ use crate::defs::*;
 use crate::loader::{CrateSource, ModSource};
 use crate::{AstRef, Sema};
 use ln_ast as ast;
-use ln_diag::{Diagnostic, Span, codes::name, codes::syntax};
+use ln_diag::{Diagnostic, Span, codes::lint, codes::name, codes::syntax};
+
+/// Values of `target_os` the compiler can be run for or with (the values
+/// of Rust's `std::env::consts::OS` for hosts LLVM supports).
+const KNOWN_OS: &[&str] = &["linux", "macos", "windows", "ios", "android", "freebsd", "netbsd", "openbsd", "dragonfly", "solaris", "illumos"];
+
+/// Common `target_arch` values, only used to suggest `target_arch = "..."`.
+const KNOWN_ARCH: &[&str] = &["x86_64", "x86", "aarch64", "arm", "riscv64", "wasm32"];
 
 impl<'a> Sema<'a> {
     pub(crate) fn new_def(&mut self, name: &str, kind: DefKind, module: Option<DefId>, span: Span, ast: AstRef<'a>) -> DefId {
@@ -69,24 +76,66 @@ impl<'a> Sema<'a> {
         })
     }
 
+    /// `lint::unknown_cfg`: a cfg name or value the compiler never sets, so
+    /// the predicate is always false (often a typo or a Rust-ism such as
+    /// `#[cfg(linux)]`).
+    fn unknown_cfg(&mut self, span: Span, what: String, help: Option<String>) {
+        let mut d = Diagnostic::warning(lint::UNKNOWN_CFG, span, format!("unknown cfg {what}"))
+            .with_label("this is never set, so the condition is always false")
+            .with_note("valid cfg options are `unix`, `windows`, `test`, `target_os = \"...\"`, `target_family = \"...\"` and `target_arch = \"...\"`, combined with `not(...)`, `all(...)` and `any(...)`");
+        if let Some(h) = help {
+            d = d.with_help(h);
+        }
+        self.err(d);
+    }
+
     fn eval_cfg(&mut self, m: &ast::Meta) -> bool {
         match m {
             ast::Meta::Word(w) => match w.name.as_str() {
                 "windows" => self.opts.target_family == "windows",
                 "unix" => self.opts.target_family == "unix",
                 "test" => self.opts.test,
-                _ => false,
+                n => {
+                    let help = if KNOWN_OS.contains(&n) {
+                        Some(format!("to test the operating system, write `target_os = \"{n}\"`"))
+                    } else if KNOWN_ARCH.contains(&n) {
+                        Some(format!("to test the architecture, write `target_arch = \"{n}\"`"))
+                    } else if matches!(n, "target_os" | "target_family" | "target_arch") {
+                        Some(format!("`{n}` needs a value, as in `{n} = \"...\"`"))
+                    } else {
+                        None
+                    };
+                    self.unknown_cfg(w.span, format!("name `{n}`"), help);
+                    false
+                }
             },
             ast::Meta::NameValue(k, v) => match k.name.as_str() {
-                "target_os" => self.opts.target_os == *v,
+                "target_os" => {
+                    if !KNOWN_OS.contains(&v.as_str()) {
+                        let help = format!("known operating systems: {}", KNOWN_OS.iter().map(|o| format!("`{o}`")).collect::<Vec<_>>().join(", "));
+                        self.unknown_cfg(k.span, format!("value `target_os = \"{v}\"`"), Some(help));
+                    }
+                    self.opts.target_os == *v
+                }
                 "target_arch" => self.opts.target_arch == *v,
-                "target_family" => self.opts.target_family == *v,
-                _ => false,
+                "target_family" => {
+                    if !matches!(v.as_str(), "unix" | "windows") {
+                        self.unknown_cfg(k.span, format!("value `target_family = \"{v}\"`"), Some("the families are `\"unix\"` and `\"windows\"`".into()));
+                    }
+                    self.opts.target_family == *v
+                }
+                n => {
+                    let help = matches!(n, "unix" | "windows" | "test").then(|| format!("`{n}` takes no value: write `{n}`"));
+                    self.unknown_cfg(k.span, format!("name `{n}`"), help);
+                    false
+                }
             },
             ast::Meta::List(k, args) => match k.name.as_str() {
                 "not" if args.len() == 1 => !self.eval_cfg(&args[0]),
-                "all" => args.iter().all(|a| self.eval_cfg(a)),
-                "any" => args.iter().any(|a| self.eval_cfg(a)),
+                // Evaluate every argument (no short-circuit) so each unknown
+                // name is reported.
+                "all" => args.iter().map(|a| self.eval_cfg(a)).fold(true, |acc, x| acc && x),
+                "any" => args.iter().map(|a| self.eval_cfg(a)).fold(false, |acc, x| acc || x),
                 _ => {
                     self.err(Diagnostic::error(syntax::BAD_ATTRIBUTE, k.span, format!("unknown cfg predicate `{}`", k.name)));
                     false

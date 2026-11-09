@@ -1,0 +1,11 @@
+// error: name::not_a_type
+// absent: name::unresolved
+trait Container {
+    fn size(self): usize;
+}
+
+fn first::<T: Container>(c: T): T::Item {
+    return c;
+}
+
+fn main() {}

@@ -1,0 +1,5 @@
+// warning: lint::unknown_cfg
+#[cfg(linux)]
+fn setup() {}
+
+fn main() {}

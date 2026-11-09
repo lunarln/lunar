@@ -1,7 +1,13 @@
 //! End-to-end language tests driven by files in the repository:
 //!
-//! * `tests/ui/*.ln`: must fail to compile; every `// error: scope::name`
-//!   line must appear as `err(scope::name)` in the diagnostics.
+//! * `tests/ui/*.ln`: every `// error: scope::name` line must appear as
+//!   `err(scope::name)` in the diagnostics, and every `// warning:
+//!   scope::name` line as `warn(scope::name)`. A file with `// error:`
+//!   lines must fail to compile; one with only `// warning:` lines must
+//!   compile. `// absent: scope::name` must not be reported at all, and
+//!   `// once: scope::name` exactly once. A `// command: build` line runs
+//!   `lunar build` instead of `lunar check` (for errors only a build
+//!   reports, such as a missing `main`).
 //! * `tests/run/*.ln` and `examples/*.ln`: must compile and run; if a
 //!   sibling `.out` file exists, stdout must match it exactly.
 //! * Files with `#[test]` functions are also run through `lunar test`.
@@ -47,17 +53,40 @@ fn ui_tests_report_expected_errors() {
     let mut failures = Vec::new();
     for f in ln_files(&root().join("tests/ui")) {
         let src = std::fs::read_to_string(&f).unwrap();
-        let expected: Vec<&str> = src.lines().filter_map(|l| l.trim().strip_prefix("// error:")).map(str::trim).collect();
-        assert!(!expected.is_empty(), "{} declares no `// error:` lines", f.display());
-        let out = lunar().arg("check").arg(&f).output().unwrap();
-        let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
-        if out.status.success() {
-            failures.push(format!("{}: compiled successfully but should fail", f.display()));
-            continue;
+        let header = |prefix: &str| -> Vec<String> { src.lines().filter_map(|l| l.trim().strip_prefix(prefix)).map(|c| c.trim().to_string()).collect() };
+        let errors = header("// error:");
+        let warnings = header("// warning:");
+        assert!(!errors.is_empty() || !warnings.is_empty(), "{} declares no `// error:` or `// warning:` lines", f.display());
+        let mut cmd = lunar();
+        if header("// command:").iter().any(|c| c == "build") {
+            let exe =
+                PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("ui-{}{}", f.file_stem().unwrap().to_string_lossy(), std::env::consts::EXE_SUFFIX));
+            cmd.arg("build").arg(&f).arg("-o").arg(exe);
+        } else {
+            cmd.arg("check").arg(&f);
         }
-        for code in expected {
-            if !stderr.contains(&format!("err({code})")) {
-                failures.push(format!("{}: expected err({code}), got:\n{stderr}", f.display()));
+        let out = cmd.output().unwrap();
+        let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+        match (errors.is_empty(), out.status.success()) {
+            (false, true) => failures.push(format!("{}: compiled successfully but should fail", f.display())),
+            (true, false) => failures.push(format!("{}: should compile with warnings only, but failed:\n{stderr}", f.display())),
+            _ => {}
+        }
+        for (kind, codes) in [("err", &errors), ("warn", &warnings)] {
+            for code in codes {
+                if !stderr.contains(&format!("{kind}({code})")) {
+                    failures.push(format!("{}: expected {kind}({code}), got:\n{stderr}", f.display()));
+                }
+            }
+        }
+        for code in header("// absent:") {
+            if stderr.contains(&format!("({code})")) {
+                failures.push(format!("{}: {code} should not be reported, got:\n{stderr}", f.display()));
+            }
+        }
+        for (code, n) in header("// once:").iter().map(|c| (c, stderr.matches(&format!("({c})")).count())) {
+            if n != 1 {
+                failures.push(format!("{}: {code} should be reported exactly once, got {n}:\n{stderr}", f.display()));
             }
         }
     }
@@ -441,4 +470,60 @@ fn failed_check_suggests_explain() {
         stderr.trim_end().ends_with("For more information about this error, try `lunar explain borrow::shrink_while_borrowed`."),
         "missing hint:\n{stderr}"
     );
+}
+
+/// Failures after the front end are diagnostics with `build::` codes,
+/// rendered without a source snippet.
+#[test]
+fn build_failures_are_diagnostics() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("build-failures");
+    std::fs::create_dir_all(&dir).unwrap();
+    let hello = root().join("examples/hello.ln");
+    let exe = dir.join(format!("hello{}", std::env::consts::EXE_SUFFIX));
+    let check = |out: std::process::Output, code: &str, extra: &str| {
+        let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+        assert!(!out.status.success(), "{code}: should fail");
+        assert!(stderr.starts_with(&format!("err({code}): ")), "{code}: unexpected output:\n{stderr}");
+        assert!(stderr.contains(extra), "{code}: missing `{extra}`:\n{stderr}");
+        assert!(!stderr.contains('│'), "{code}: should render without a source snippet:\n{stderr}");
+        assert!(stderr.contains(&format!("try `lunar explain {code}`")), "{code}: missing hint:\n{stderr}");
+    };
+
+    let out = lunar().env("LUNAR_CC", "lunar-test-no-such-linker").arg("build").arg(&hello).arg("-o").arg(&exe).output().unwrap();
+    check(out, "build::link", "lunar-test-no-such-linker");
+
+    // Writing the IR into a directory fails in code generation.
+    let out = lunar().arg("build").arg(&hello).arg("-o").arg(&exe).arg("--emit-llvm").arg(&dir).output().unwrap();
+    check(out, "build::llvm", "could not write LLVM IR");
+
+    let out = lunar().arg("emit-llvm").arg(root().join("tests/ui/no_main.ln")).output().unwrap();
+    check(out, "build::no_main", "has no `main` function");
+}
+
+/// A standard library without a lang item the program needs reports
+/// `build::missing_lang_item`.
+#[test]
+fn missing_lang_item_is_reported() {
+    let std_copy = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("std-without-range");
+    fn copy(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap().flatten() {
+            let target = to.join(e.file_name());
+            if e.path().is_dir() {
+                copy(&e.path(), &target);
+            } else {
+                std::fs::write(&target, std::fs::read(e.path()).unwrap()).unwrap();
+            }
+        }
+    }
+    copy(&root().join("std"), &std_copy);
+    let ops = std_copy.join("core/ops.ln");
+    let src = std::fs::read_to_string(&ops).unwrap();
+    assert!(src.contains("#[lang = \"range\"]"), "core::ops no longer defines the `range` lang item");
+    std::fs::write(&ops, src.replace("#[lang = \"range\"]", "")).unwrap();
+    let file = std_copy.join("uses_range.ln");
+    std::fs::write(&file, "fn main() {\n    let r = 0..3;\n    println(\"{r.start}\");\n}\n").unwrap();
+    let out = lunar().env("LUNAR_STD_DIR", &std_copy).arg("check").arg(&file).output().unwrap();
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(reported_codes(&stderr) == ["build::missing_lang_item"], "expected only build::missing_lang_item:\n{stderr}");
 }

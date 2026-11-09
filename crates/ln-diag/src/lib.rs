@@ -136,6 +136,11 @@ impl Diagnostics {
         self.list.is_empty()
     }
 
+    /// Drop every diagnostic after the first `len` (undo a speculative lookup).
+    pub fn truncate(&mut self, len: usize) {
+        self.list.truncate(len);
+    }
+
     pub fn take(&mut self) -> Vec<Diagnostic> {
         std::mem::take(&mut self.list)
     }

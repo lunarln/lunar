@@ -6,8 +6,12 @@ is expected. This is reported for:
 * a module or trait used as a type, as in `fn f(s: Shape)` where `Shape` is
   a trait. Lunar has no trait objects; take a generic parameter bounded by
   the trait instead;
-* a path into a type used as a type, such as `Point::Item` (associated
-  types are not supported);
+* a path into a type used as a type, such as `Point::Item`, `T::Item` on a
+  generic parameter or `Self::Item` (associated types are not supported;
+  make the type a generic parameter of the trait instead, as
+  `Iterator::<T>` does);
+* a path through something that is not a type, trait or module, such as
+  `std::io::println::Item`;
 * a struct literal or struct pattern whose path does not name a struct or an
   enum variant with fields: a module, an enum itself (`E { .. }` instead of
   `E::Variant { .. }`), a type alias of a non-struct type, or `Self` inside

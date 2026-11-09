@@ -338,8 +338,18 @@ impl P<'_, '_, '_> {
                 let raw = &text[1..text.len() - 1];
                 match crate::lit::unescape(raw) {
                     Ok(s) if s.chars().count() == 1 => Lit::Char(s.chars().next().unwrap()),
-                    Ok(_) => {
-                        self.error(Diagnostic::error(syntax::BAD_ESCAPE, sp, "character literal must contain exactly one character"));
+                    Ok(s) => {
+                        let n = s.chars().count();
+                        let mut d = Diagnostic::error(syntax::BAD_CHAR, sp, "character literal must contain exactly one character");
+                        if n == 0 {
+                            d = d.with_label("this literal is empty").with_help("for a space write `' '`; for the NUL character write `'\\0'`");
+                        } else {
+                            d = d.with_label(format!("this literal contains {n} characters"));
+                            if !raw.contains('"') {
+                                d = d.with_help(format!("for text, use a string literal: `\"{raw}\"`"));
+                            }
+                        }
+                        self.error(d);
                         Lit::Char('\0')
                     }
                     Err((_, _, m)) => {

@@ -1,0 +1,9 @@
+// error: type::variadic_not_extern
+// absent: type::ffi_type
+fn sum(first: i32, ...): i32 {
+    return first;
+}
+
+fn main() {
+    println("{sum(1, 2, 3)}");
+}

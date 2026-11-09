@@ -1,0 +1,6 @@
+// error: name::not_a_value
+// once: name::not_a_value
+// absent: name::unresolved
+fn main() {
+    let io = std::io;
+}

@@ -1,0 +1,9 @@
+// error: borrow::shrink_while_borrowed
+// absent: lint::unused_variable
+fn main() {
+    let mut a: [i32; -..+] = [1, 2];
+    let s: [i32; &] = a[..];
+    a.clear();
+    let unused = 3;
+    println("{s[0]}");
+}

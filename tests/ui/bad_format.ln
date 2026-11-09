@@ -1,0 +1,7 @@
+// error: syntax::bad_format
+// absent: type::interpolation
+fn main() {
+    let x = 3;
+    println("set: {x");
+    println("stray }");
+}

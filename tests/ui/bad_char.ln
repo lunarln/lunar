@@ -1,0 +1,10 @@
+// error: syntax::bad_char
+// absent: syntax::bad_escape
+// absent: syntax::unterminated
+// absent: syntax::unknown_char
+fn main() {
+    let a = 'ab';
+    let b = '\u{41}\u{42}';
+    let c = '';
+    println("{a}{b}{c}");
+}

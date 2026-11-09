@@ -52,7 +52,10 @@ Struct fields are private unless `pub`.
 * `#[test]`: a test function, run by `lunar test`.
 * `#[cfg(windows)]`, `#[cfg(unix)]`, `#[cfg(target_os = "linux")]`,
   `#[cfg(target_arch = "aarch64")]`, `#[cfg(test)]`, `not(...)`, `all(...)`,
-  `any(...)`: conditional compilation.
+  `any(...)`: conditional compilation. Any other name or `target_os` value
+  is never set, so it is always false; the compiler warns about it
+  (`warn(lint::unknown_cfg)`), e.g. `#[cfg(linux)]` for
+  `#[cfg(target_os = "linux")]`.
 * `#[link_name = "..."]` on extern functions.
 * `#[inline]`, `#[allow(...)]`, `#[doc = "..."]` are accepted.
 * `#[lang = "..."]` and `#[intrinsic]` are used by the standard library.
@@ -219,6 +222,18 @@ methods of `[T; ..+]`, `[T]`, `[T; &mut]` and `[T; &]`, in that order, and a
 
 Every diagnostic has a scoped code: `err(scope::name)`. Scopes:
 `syntax`, `name`, `type`, `trait`, `borrow`, `unsafe`, `lint`, `build`.
+
+* `lint` codes are warnings, printed as `warn(lint::name)`:
+  `unused_variable` (assigning to a variable does not count as using it),
+  `unused_mut`, `unreachable` (code after `return`, `break`, `continue`, a
+  call returning `!` or a `loop` without `break`) and `unknown_cfg`. The
+  first three are reported only for functions without errors, and never
+  for the standard library.
+* `build` codes are reported after the program has been checked, and are
+  not about a place in the source: `no_main` (by `build`, `run` and
+  `emit-llvm`; `lunar check` does not require `main`), `llvm` (code
+  generation), `link` (with the linker's output as a note), `io` and
+  `missing_lang_item` (only with a modified standard library).
 
 `lunar explain scope::name` (or the pasted `err(scope::name)`) explains a
 code in detail, with an erroneous and a fixed example; `lunar explain`

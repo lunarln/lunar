@@ -18,7 +18,6 @@ What to do:
   helps.
 
 There is no erroneous example: valid programs should never cause this.
-`lunar check` does not run code generation and never reports it.
-
-The current compiler prints these failures as a plain `error: ...` line
-rather than with this code.
+`lunar check` does not run code generation and never reports it. Further
+detail, such as the LLVM verifier's output for an internal compiler error,
+is shown in a note under the error.

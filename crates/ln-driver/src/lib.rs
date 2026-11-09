@@ -193,11 +193,38 @@ fn codegen_options(opts: &BuildOptions) -> ln_codegen::Options {
     }
 }
 
+/// `build::no_main` if a program that is built as an executable (not as a
+/// test harness) has no `main` function.
+pub fn check_main(analysis: &Analysis, file: &Path, test: bool) -> Option<Diagnostic> {
+    let program = analysis.program.as_ref()?;
+    if test || program.main.is_some() {
+        return None;
+    }
+    Some(
+        Diagnostic::error(ln_diag::codes::build::NO_MAIN, ln_diag::Span::DUMMY, format!("`{}` has no `main` function", file.display()))
+            .with_help("add `fn main() { ... }` to the file; to run its `#[test]` functions instead, use `lunar test`"),
+    )
+}
+
+/// A code generation failure as a `build::llvm` diagnostic. The first line
+/// of `msg` is the message; any further lines (such as the LLVM verifier's
+/// output) become a note.
+fn codegen_error(msg: String) -> Diagnostic {
+    let (first, rest) = msg.split_once('\n').unwrap_or((&msg, ""));
+    let d = Diagnostic::error(ln_diag::codes::build::LLVM, ln_diag::Span::DUMMY, first.trim_end_matches(':'));
+    if rest.trim().is_empty() { d } else { d.with_note(rest.trim_end()) }
+}
+
+fn analyzed(analysis: &Analysis) -> Result<&Program, Diagnostic> {
+    analysis.program.as_ref().ok_or_else(|| codegen_error("cannot generate code: the program has errors".into()))
+}
+
 /// Generate code for an analyzed program and link it into an executable.
-pub fn build(analysis: &Analysis, opts: &BuildOptions) -> Result<(), String> {
-    let program = analysis.program.as_ref().ok_or("analysis failed")?;
+/// Failures are `build::llvm` and `build::link` diagnostics.
+pub fn build(analysis: &Analysis, opts: &BuildOptions) -> Result<(), Diagnostic> {
+    let program = analyzed(analysis)?;
     let obj_path = opts.output.with_extension(if cfg!(windows) { "obj" } else { "o" });
-    ln_codegen::compile(program, &analysis.map, &codegen_options(opts), &obj_path)?;
+    ln_codegen::compile(program, &analysis.map, &codegen_options(opts), &obj_path).map_err(codegen_error)?;
     let res = link::link(&obj_path, &opts.output);
     let _ = std::fs::remove_file(&obj_path);
     res
@@ -206,7 +233,7 @@ pub fn build(analysis: &Analysis, opts: &BuildOptions) -> Result<(), String> {
 /// Generate code for an analyzed program and return its optimized LLVM IR
 /// as text, without writing an object file or linking. `opts.output` is
 /// ignored.
-pub fn emit_llvm(analysis: &Analysis, opts: &BuildOptions) -> Result<String, String> {
-    let program = analysis.program.as_ref().ok_or("analysis failed")?;
-    ln_codegen::emit_ir(program, &analysis.map, &codegen_options(opts))
+pub fn emit_llvm(analysis: &Analysis, opts: &BuildOptions) -> Result<String, Diagnostic> {
+    let program = analyzed(analysis)?;
+    ln_codegen::emit_ir(program, &analysis.map, &codegen_options(opts)).map_err(codegen_error)
 }

@@ -15,9 +15,9 @@ incorrectly. This code is reported for:
 Lunar has no `derive`: traits such as `Eq`, `Clone` or `Display` are
 implemented with an explicit `impl`.
 
-Note that an unknown plain `cfg` predicate such as `#[cfg(linux)]` is not an
-error: it is simply false, so the item is compiled out. Use
-`#[cfg(target_os = "linux")]`.
+An unknown `cfg` name or value such as `#[cfg(linux)]` is not an error: it
+is false, so the item is compiled out, and the compiler warns about it with
+`lint::unknown_cfg`. Use `#[cfg(target_os = "linux")]`.
 
 ## Erroneous example
 

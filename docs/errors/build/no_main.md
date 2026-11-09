@@ -11,9 +11,13 @@ harness that runs the `#[test]` functions instead.
 `main` must take no parameters and return `()` or `i32`; a `main` with a
 different signature is `err(type::bad_main)`.
 
-The current compiler prints this as a plain ``error: `file.ln` has no
-`main` function`` line rather than with this code, and only when building,
-so the examples below are not checked automatically.
+Because `lunar check` does not report it, the erroneous example below is
+not checked automatically. Building it reports:
+
+```text
+err(build::no_main): `greet.ln` has no `main` function
+  help: add `fn main() { ... }` to the file; to run its `#[test]` functions instead, use `lunar test`
+```
 
 ## Erroneous example
 

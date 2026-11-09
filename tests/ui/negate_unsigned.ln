@@ -1,0 +1,7 @@
+// error: type::bad_operand
+// once: type::bad_operand
+// absent: type::literal_range
+fn main() {
+    let u: u32 = -1;
+    println("{u}");
+}

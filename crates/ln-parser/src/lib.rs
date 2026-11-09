@@ -109,8 +109,59 @@ fn conflict_diag(src: &str, file: FileId, c: &ln_lexer::Conflict) -> Diagnostic 
         .with_help("keep the code you want from each section, then delete the lines that hold conflict markers")
 }
 
+/// The lexer's `Char` token only matches well-formed literals, so `'ab'`
+/// and `''` come out as stray quotes around other tokens. Turn a `'` that
+/// is closed later on the same line back into one `Char` token, so the
+/// parser reports `syntax::bad_char` once for the whole literal. A `'`
+/// that is never closed stays an error (`syntax::unterminated`).
+fn rejoin_char_literals(src: &str, toks: &mut Vec<ln_lexer::Spanned>, errs: &mut Vec<ln_lexer::LexError>) {
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    while i < errs.len() {
+        let start = errs[i].range.start;
+        let mut end = None;
+        let mut j = start + 1;
+        while bytes.get(start) == Some(&b'\'') && j < bytes.len() {
+            match bytes[j] {
+                b'\n' => break,
+                b'\\' => j += 2,
+                b'\'' => {
+                    end = Some(j + 1);
+                    break;
+                }
+                _ => j += 1,
+            }
+        }
+        let Some(end) = end else {
+            i += 1;
+            continue;
+        };
+        toks.retain(|t| t.range.end <= start || t.range.start >= end);
+        // An error inside the literal may also have swallowed text after it
+        // (the lexer consumed `';` trying to match a literal): lex that
+        // text again.
+        let mut leftover = Vec::new();
+        errs.retain(|e| {
+            let inside = e.range.start >= start && e.range.start < end;
+            if inside && e.range.end > end {
+                leftover.push(end..e.range.end);
+            }
+            !inside
+        });
+        toks.push(ln_lexer::Spanned { token: Token::Char, range: start..end });
+        for r in leftover {
+            let (more, more_errs) = ln_lexer::lex(&src[r.clone()]);
+            toks.extend(more.into_iter().map(|t| ln_lexer::Spanned { token: t.token, range: t.range.start + r.start..t.range.end + r.start }));
+            errs.extend(more_errs.into_iter().map(|e| ln_lexer::LexError { range: e.range.start + r.start..e.range.end + r.start, kind: e.kind }));
+        }
+        toks.sort_by_key(|t| t.range.start);
+        errs.sort_by_key(|e| e.range.start);
+    }
+}
+
 fn lex_with_offset(src: &str, offset: u32, file: FileId) -> (Vec<Tok<Token>>, Vec<Diagnostic>) {
-    let (toks, errs) = ln_lexer::lex(src);
+    let (mut toks, mut errs) = ln_lexer::lex(src);
+    rejoin_char_literals(src, &mut toks, &mut errs);
     let toks = toks.into_iter().map(|s| Tok::new(s.token, s.range.start as u32 + offset, s.range.end as u32 + offset)).collect();
     let diags = errs
         .into_iter()
@@ -127,7 +178,7 @@ fn lex_with_offset(src: &str, offset: u32, file: FileId) -> (Vec<Tok<Token>>, Ve
             let (code, msg) = if text.starts_with('"') {
                 (syntax::UNTERMINATED, "unterminated string literal".to_string())
             } else if text.starts_with('\'') {
-                (syntax::UNTERMINATED, "invalid character literal".to_string())
+                (syntax::UNTERMINATED, "unterminated character literal".to_string())
             } else {
                 (syntax::UNKNOWN_CHAR, format!("unknown character(s) `{text}`"))
             };

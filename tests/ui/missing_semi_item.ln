@@ -1,0 +1,13 @@
+// error: syntax::missing_semi
+// absent: syntax::unexpected_token
+struct Unit
+struct Pair(i32, i32)
+const LIMIT: i32 = 10
+static START: i32 = 1
+type Count = i32
+use std::io::println
+
+fn main() {
+    let c: Count = LIMIT + START;
+    println("{c}");
+}

@@ -55,8 +55,7 @@ codes! {
         BAD_MAIN = "bad_main",
         BAD_TEST = "bad_test",
         CONST_EVAL = "const_eval",
-        INTERPOLATION = "interpolation",
-        RECURSIVE_OWNER = "recursive_owner",
+        VARIADIC_NOT_EXTERN = "variadic_not_extern",
     }
     syntax ("syntax") => {
         UNEXPECTED_TOKEN = "unexpected_token",
@@ -66,6 +65,8 @@ codes! {
         BAD_NUMBER = "bad_number",
         BAD_FORMAT = "bad_format",
         MISSING_SEMI = "missing_semi",
+        MISSING_BODY = "missing_body",
+        BAD_CHAR = "bad_char",
         BAD_ATTRIBUTE = "bad_attribute",
         CONFLICT_MARKER = "conflict_marker",
     }
@@ -99,7 +100,6 @@ codes! {
         OUTLIVES_ROOT = "outlives_root",
         ESCAPES_FUNCTION = "escapes_function",
         ESCAPES_VIA_PARAM = "escapes_via_param",
-        MUT_SLICE_OF_IMMUTABLE = "mut_slice_of_immutable",
     }
     unsafe_ ("unsafe") => {
         OUTSIDE_UNSAFE = "outside_unsafe",
@@ -109,11 +109,13 @@ codes! {
         UNUSED_VARIABLE = "unused_variable",
         UNREACHABLE = "unreachable",
         UNUSED_MUT = "unused_mut",
+        UNKNOWN_CFG = "unknown_cfg",
     }
     build ("build") => {
         LINK = "link",
         LLVM = "llvm",
         IO = "io",
         NO_MAIN = "no_main",
+        MISSING_LANG_ITEM = "missing_lang_item",
     }
 }

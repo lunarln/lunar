@@ -1,0 +1,7 @@
+// error: name::not_a_value
+// absent: name::unresolved
+struct Point { x: i32, y: i32 }
+
+fn main() {
+    let p = Point;
+}

@@ -9,9 +9,8 @@ Lunar types such as `str`, slices, owning arrays, `String`, structs and
 enums have no defined C layout. Pass a pointer and a length instead; `str`
 and slices provide them with `as_bytes()`, `as_ptr()` and `len()`.
 
-The same code is reported for a non-extern function declared variadic
-(`fn f(x: i32, ...)`). Only extern functions can take a variable number of
-arguments.
+A non-extern function declared variadic (`fn f(x: i32, ...)`) is a
+different error: `type::variadic_not_extern`.
 
 ## Erroneous example
 

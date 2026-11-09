@@ -10,8 +10,8 @@ The error is reported for an unknown escape such as `\q`, a malformed `\x`
 or `\u` escape, a `\u{...}` that is not a valid Unicode scalar value, and a
 trailing backslash. Only the first bad escape in a literal is reported.
 
-It is also reported for a character literal whose escapes produce more than
-one character, such as `'\u{41}\u{42}'`: a `char` holds exactly one.
+A character literal whose escapes are valid but produce more (or fewer)
+than one character, such as `'\u{41}\u{42}'`, is `syntax::bad_char`.
 
 A Windows path is a frequent cause: in `"C:\Users"`, `\U` is read as an
 escape.

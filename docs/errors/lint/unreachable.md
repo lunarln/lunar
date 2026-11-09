@@ -1,20 +1,23 @@
 # lint::unreachable: code that can never run
 
 Code follows a statement that never completes normally, such as `return`,
-`break`, `continue`, a loop without a `break`, or a call to a function
-returning `!` like `panic`. That code can never execute. This is a warning,
-not an error.
+`break`, `continue`, a loop without a `break`, a call to a function
+returning `!` like `panic`, or an `if` or `match` all of whose branches do
+one of those. That code can never execute. This is a warning, not an
+error.
+
+The warning is reported once per block, at the first unreachable statement
+(or the block's final expression), with a second label on the statement
+that never finishes. Like the other lints, it is only reported for
+functions that compiled without errors.
 
 Unreachable code usually means a `return` or `break` was left in by mistake
 or placed too early, so the code after it was meant to run but silently
 does not.
 
-This code is reserved for that lint. The current compiler does not report
-it yet; unreachable code is accepted without a warning.
-
 ## Erroneous example
 
-```lunar,ignore
+```lunar
 fn total(a: i32, b: i32): i32 {
     return a;
     let sum = a + b;

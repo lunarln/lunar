@@ -104,13 +104,18 @@ impl P<'_, '_, '_> {
             Some(T::Use) => {
                 self.k.bump();
                 let tree = self.use_tree()?;
-                self.k.expect(T::Semi)?;
+                self.expect_item_semi("`use` declaration")?;
                 ItemKind::Use(tree)
             }
             Some(T::Mod) => {
                 self.k.bump();
                 let name = self.ident()?;
-                let items = if self.k.eat(T::Semi) { None } else { Some(self.items_until_brace()?) };
+                let items = if self.k.at(T::LBrace) {
+                    Some(self.items_until_brace()?)
+                } else {
+                    self.expect_item_semi("module declaration")?;
+                    None
+                };
                 ItemKind::Mod(ModDecl { name, items })
             }
             Some(T::Const) => {
@@ -120,7 +125,7 @@ impl P<'_, '_, '_> {
                 let ty = self.ty()?;
                 self.k.expect(T::Eq)?;
                 let value = self.expr()?;
-                self.k.expect(T::Semi)?;
+                self.expect_item_semi("constant")?;
                 ItemKind::Const(ConstDecl { name, ty, value })
             }
             Some(T::Static) => {
@@ -131,7 +136,7 @@ impl P<'_, '_, '_> {
                 let ty = self.ty()?;
                 self.k.expect(T::Eq)?;
                 let value = self.expr()?;
-                self.k.expect(T::Semi)?;
+                self.expect_item_semi("static")?;
                 ItemKind::Static(StaticDecl { name, is_mut, ty, value })
             }
             Some(T::Extern) => {
@@ -152,7 +157,7 @@ impl P<'_, '_, '_> {
                 let generics = self.generics_decl()?;
                 self.k.expect(T::Eq)?;
                 let ty = self.ty()?;
-                self.k.expect(T::Semi)?;
+                self.expect_item_semi("type alias")?;
                 ItemKind::TypeAlias(TypeAlias { name, generics, ty })
             }
             _ => {
@@ -248,14 +253,15 @@ impl P<'_, '_, '_> {
         self.k.expect(T::Struct)?;
         let name = self.ident()?;
         let generics = self.generics_decl()?;
-        let kind = if self.k.eat(T::Semi) {
-            VariantData::Unit
-        } else if self.k.at(T::LParen) {
+        let kind = if self.k.at(T::LParen) {
             let d = self.tuple_fields()?;
-            self.k.expect(T::Semi)?;
+            self.expect_item_semi("tuple struct")?;
             d
-        } else {
+        } else if self.k.at(T::LBrace) {
             self.named_fields()?
+        } else {
+            self.expect_item_semi("unit struct")?;
+            VariantData::Unit
         };
         Ok(StructDecl { name, generics, kind })
     }
@@ -437,8 +443,21 @@ impl P<'_, '_, '_> {
         Ok(Meta::Word(name))
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn bad_attr(&mut self, span: Span, msg: &str) {
-        self.error(Diagnostic::error(syntax::BAD_ATTRIBUTE, span, msg.to_string()));
+    /// The `;` that ends an item such as `use`, `const` or `struct S;`.
+    /// When the next token starts another item (or closes the enclosing
+    /// block, or ends the file), the `;` was simply forgotten:
+    /// `syntax::missing_semi`, and parsing goes on. Otherwise the item is
+    /// followed by something unexpected, reported as such.
+    fn expect_item_semi(&mut self, what: &str) -> PResult<()> {
+        if self.k.eat(T::Semi) {
+            return Ok(());
+        }
+        if self.at_item_start() || self.k.at(T::RBrace) || self.k.at_eof() {
+            let at = self.span(self.k.prev_end(), self.k.prev_end());
+            self.error(Diagnostic::error(syntax::MISSING_SEMI, at, format!("expected `;` after {what}")).with_label("add `;` here"));
+            return Ok(());
+        }
+        self.k.expect(T::Semi)?;
+        Ok(())
     }
 }
