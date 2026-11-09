@@ -159,9 +159,30 @@ fn rejoin_char_literals(src: &str, toks: &mut Vec<ln_lexer::Spanned>, errs: &mut
     }
 }
 
+/// An unclosed character literal (`'a;`) is already reported by the lexer.
+/// Put a `Char` token in its place, covering the rest of the word, so the
+/// parser sees a complete expression instead of reporting a second error.
+fn placeholder_for_unclosed_chars(src: &str, toks: &mut Vec<ln_lexer::Spanned>, errs: &[ln_lexer::LexError]) {
+    let bytes = src.as_bytes();
+    for e in errs {
+        if e.kind != ln_lexer::LexErrorKind::Invalid || bytes.get(e.range.start) != Some(&b'\'') {
+            continue;
+        }
+        let start = e.range.start;
+        let mut end = start + 1;
+        while end < bytes.len() && !matches!(bytes[end], b' ' | b'\t' | b'\r' | b'\n' | b';' | b',' | b')' | b']' | b'}' | b'\'') {
+            end += 1;
+        }
+        toks.retain(|t| t.range.end <= start || t.range.start >= end);
+        toks.push(ln_lexer::Spanned { token: Token::Char, range: start..end });
+    }
+    toks.sort_by_key(|t| t.range.start);
+}
+
 fn lex_with_offset(src: &str, offset: u32, file: FileId) -> (Vec<Tok<Token>>, Vec<Diagnostic>) {
     let (mut toks, mut errs) = ln_lexer::lex(src);
     rejoin_char_literals(src, &mut toks, &mut errs);
+    placeholder_for_unclosed_chars(src, &mut toks, &errs);
     let toks = toks.into_iter().map(|s| Tok::new(s.token, s.range.start as u32 + offset, s.range.end as u32 + offset)).collect();
     let diags = errs
         .into_iter()

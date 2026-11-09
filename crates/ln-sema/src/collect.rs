@@ -158,10 +158,26 @@ impl<'a> Sema<'a> {
                 ast::Meta::NameValue(n, _) if n.name == "doc" => {}
                 m => {
                     let n = m.name();
-                    self.err(
-                        Diagnostic::error(syntax::BAD_ATTRIBUTE, a.span, format!("unknown attribute `{}`", n.name))
+                    // A known attribute written in the wrong form gets the
+                    // right form, not "unknown attribute".
+                    let usage = match n.name.as_str() {
+                        "test" => Some("#[test]"),
+                        "inline" => Some("#[inline]"),
+                        "intrinsic" => Some("#[intrinsic]"),
+                        "lang" => Some("#[lang = \"name\"]"),
+                        "link_name" => Some("#[link_name = \"symbol\"]"),
+                        "doc" => Some("#[doc = \"text\"] (or a `///` comment)"),
+                        "cfg" => Some("#[cfg(predicate)]"),
+                        "allow" => Some("#[allow(lint_name)]"),
+                        _ => None,
+                    };
+                    let d = match usage {
+                        Some(u) => Diagnostic::error(syntax::BAD_ATTRIBUTE, a.span, format!("malformed `{}` attribute", n.name))
+                            .with_help(format!("write it as `{u}`")),
+                        None => Diagnostic::error(syntax::BAD_ATTRIBUTE, a.span, format!("unknown attribute `{}`", n.name))
                             .with_note("known attributes: cfg, test, inline, lang, intrinsic, link_name, allow, doc"),
-                    );
+                    };
+                    self.err(d);
                 }
             }
         }

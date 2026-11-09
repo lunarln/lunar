@@ -334,6 +334,8 @@ impl P<'_, '_, '_> {
                     Lit::Float { value: 0.0, suffix: None }
                 }
             },
+            // A placeholder for an unclosed literal (already reported).
+            T::Char if text.len() < 2 || !text.ends_with('\'') => Lit::Char('\0'),
             T::Char => {
                 let raw = &text[1..text.len() - 1];
                 match crate::lit::unescape(raw) {

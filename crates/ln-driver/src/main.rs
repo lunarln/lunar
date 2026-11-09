@@ -160,12 +160,21 @@ fn finish_front(a: &Analysis, color: bool) -> Result<(), ()> {
     Ok(())
 }
 
-fn compile(file: &Path, out: &Path, release: bool, test: bool, emit_llvm: Option<PathBuf>, color: bool) -> Result<(), ()> {
-    let a = analyze(file, test);
-    finish_front(&a, color)?;
-    if let Some(d) = ln_driver::check_main(&a, file, test) {
-        return Err(report(&a, d, color));
+/// Analyze a program that will be built as an executable. A missing `main`
+/// is reported first, ahead of any warnings, with the front end's errors.
+fn analyze_for_build(file: &Path, test: bool, color: bool) -> Result<Analysis, ()> {
+    let mut a = analyze(file, test);
+    if a.program.is_some()
+        && let Some(d) = ln_driver::check_main(&a, file, test)
+    {
+        a.diags.insert(0, d);
     }
+    finish_front(&a, color)?;
+    Ok(a)
+}
+
+fn compile(file: &Path, out: &Path, release: bool, test: bool, emit_llvm: Option<PathBuf>, color: bool) -> Result<(), ()> {
+    let a = analyze_for_build(file, test, color)?;
     let opts = BuildOptions { release, test, output: out.to_path_buf(), emit_llvm, overflow_checks: !release };
     build(&a, &opts).map_err(|d| report(&a, d, color))
 }
@@ -197,11 +206,7 @@ fn exit_code_of(s: std::process::ExitStatus) -> ExitCode {
 }
 
 fn emit_ir(file: &Path, release: bool, test: bool, color: bool) -> Result<String, ()> {
-    let a = analyze(file, test);
-    finish_front(&a, color)?;
-    if let Some(d) = ln_driver::check_main(&a, file, test) {
-        return Err(report(&a, d, color));
-    }
+    let a = analyze_for_build(file, test, color)?;
     let opts = BuildOptions { release, test, output: PathBuf::new(), emit_llvm: None, overflow_checks: !release };
     ln_driver::emit_llvm(&a, &opts).map_err(|d| report(&a, d, color))
 }

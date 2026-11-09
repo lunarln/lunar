@@ -1,0 +1,8 @@
+// error: syntax::unterminated
+// once: syntax::unterminated
+// absent: syntax::unexpected_token
+fn main() {
+    let c = 'a;
+    let n = 1;
+    println("{n}");
+}

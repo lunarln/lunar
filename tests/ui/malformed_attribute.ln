@@ -1,0 +1,5 @@
+// error: syntax::bad_attribute
+#[test(fast)]
+fn quick() {}
+
+fn main() {}
