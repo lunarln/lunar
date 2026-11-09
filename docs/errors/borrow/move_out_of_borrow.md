@@ -3,17 +3,19 @@
 Code tried to move an owning value (an owning array, a `String`, or a type
 containing one) out of a place it only borrows.
 
-Function parameters are borrowed from the caller: the caller keeps
-ownership and frees the value after the call returns. If the callee could
-move a parameter, or an owning field of it, into a new owner, both would
-end up freeing the same data. The same applies to an owned value reached
-through an array element, a `static`, or a raw pointer: none of these
-places can be left empty, so their contents cannot be moved out.
+A parameter declared `x: &T` (or `x: &mut T`, or a `&self` / `&mut self`
+receiver) is borrowed: the caller keeps ownership and frees the value after
+the call returns. If the callee could move the parameter, or an owning field
+of it, into a new owner, both would end up freeing the same data. The same
+applies to an owned value reached through an array element, a `static`, or a
+raw pointer: none of these places can be left empty, so their contents
+cannot be moved out.
 
 The error is reported for:
 
-* moving a parameter, or a field of one (by binding, assigning, returning
-  or matching it by value);
+* moving a borrowed parameter, or a field of one (by binding, assigning,
+  returning, passing it to a parameter that takes ownership, or matching it
+  by value);
 * moving an owned value out of an array element;
 * moving an owned value out of a `static` or through a raw pointer.
 
@@ -40,16 +42,17 @@ fn main() {
 
 ## Fixed
 
-Return an owned copy with `.clone()` (or return a view, or have the caller
-take the field itself):
+Take ownership of the parameter (`inbox: Inbox`), so the function may move
+its fields; the caller's `inbox` is moved into the call. If the caller still
+needs its value, keep `&Inbox` and return `inbox.messages.clone()` instead:
 
 ```lunar
 struct Inbox {
     messages: [i32; ..+],
 }
 
-fn take_all(inbox: &Inbox): [i32; ..+] {
-    return inbox.messages.clone();
+fn take_all(inbox: Inbox): [i32; ..+] {
+    return inbox.messages;
 }
 
 fn main() {

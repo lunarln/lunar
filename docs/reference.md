@@ -78,7 +78,7 @@ Struct fields are private unless `pub`.
 | `[T; ..+]` | owning array that can grow but never shrinks |
 | `[T; -..+]` | owning array that can grow and shrink |
 | `[T; &]`, `[T; &mut]` | read-only / mutable slices (views) |
-| `!T` | `mut` parameters and receivers only, where `T` contains something shrinkable (`[U; -..+]`, `String`, or a type containing one): the argument may be shrunk (see §4) |
+| `!T` | `&mut` parameters and receivers only, where `T` contains something shrinkable (`[U; -..+]`, `String`, or a type containing one): the argument may be shrunk (see §4) |
 | `str` | UTF-8 view (like Rust's `&str`) |
 | `String` | owned UTF-8 text (a `[u8; -..+]` with a UTF-8 invariant) |
 | `FmtArgs` | parameter only: an interpolated string literal |
@@ -139,10 +139,10 @@ to 64 MiB in total.
   such a method follows the same rules as passing the receiver to a `!`
   parameter.
 * `!` always comes with `&mut`: shrinking happens in place, so a `!`
-  parameter that is not in-out is `err(type::bang_without_mut)`. A `!` on a type with
-  nothing shrinkable in it is `err(type::bang_not_shrinkable)`.
-* Passing a value to a `!` parameter (or calling a `!Self` method on it) is
-  only allowed:
+  parameter that is not in-out is `err(type::bang_without_mut)`. A `!` on a
+  type with nothing shrinkable in it is `err(type::bang_not_shrinkable)`.
+* Passing a value to a `!` parameter (or calling a `&mut !self` method on
+  it) is only allowed:
   * for the value's **owner** (a local variable, a parameter that took
     ownership, or a parameter that is itself declared `!`):
     `err(borrow::shrink_not_owner)` otherwise;
@@ -270,10 +270,10 @@ Every diagnostic has a scoped code: `err(scope::name)`. Scopes:
 
 * `lint` codes are warnings, printed as `warn(lint::name)`:
   `unused_variable` (assigning to a variable does not count as using it),
-  `unused_mut`, `unreachable` (code after `return`, `break`, `continue`, a
-  call returning `!` or a `loop` without `break`) and `unknown_cfg`. The
-  first three are reported only for functions without errors, and never
-  for the standard library.
+  `unused_mut`, `mut_param_not_read`, `unreachable` (code after `return`,
+  `break`, `continue`, a call returning `!` or a `loop` without `break`),
+  `needless_borrow` and `unknown_cfg`. The first four are reported only
+  for functions without errors, and never for the standard library.
 * `build` codes are reported after the program has been checked, and are
   not about a place in the source: `no_main` (by `build`, `run` and
   `emit-llvm`; `lunar check` does not require `main`), `llvm` (code
