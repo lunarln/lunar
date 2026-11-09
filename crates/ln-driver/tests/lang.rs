@@ -254,6 +254,9 @@ mod lsp {
         // `total` declaration.
         let h = c.request("textDocument/hover", pos(10, 9));
         assert!(h["contents"]["value"].as_str().unwrap_or_default().contains("let total: i32"), "hover on local: {h:#?}");
+        // The name in a declaration (line 5: `fn add`).
+        let h = c.request("textDocument/hover", pos(5, 4));
+        assert!(h["contents"]["value"].as_str().unwrap_or_default().contains("fn add("), "hover on declaration: {h:#?}");
         // `items` field access (line 12).
         let h = c.request("textDocument/hover", pos(12, 15));
         assert!(h["contents"]["value"].as_str().unwrap_or_default().contains("items: [i32; -..+]"), "hover on field: {h:#?}");

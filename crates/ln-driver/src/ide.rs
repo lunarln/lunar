@@ -43,13 +43,32 @@ pub fn position_of(text: &str, offset: u32) -> (u32, u32) {
     (line, col)
 }
 
-/// The innermost recorded name at `offset` in `file`.
+/// The innermost recorded name at `offset` in `file`: a use of a name, or
+/// the name in an item or field declaration.
 fn ref_at(p: &Program, file: FileId, offset: u32) -> Option<(Span, RefTarget)> {
     let mut best: Option<(Span, RefTarget)> = None;
-    for r in &p.refs {
-        let s = r.span;
+    let mut consider = |s: Span, t: RefTarget| {
         if s.file == file && s.start <= offset && offset <= s.end && best.is_none_or(|(b, _)| s.len() <= b.len()) {
-            best = Some((s, r.target));
+            best = Some((s, t));
+        }
+    };
+    for r in &p.refs {
+        consider(r.span, r.target);
+    }
+    for (i, d) in p.defs.iter().enumerate() {
+        if d.span.file != file || matches!(d.kind, DefKind::Impl) || d.name.starts_with('<') {
+            continue;
+        }
+        let id = DefId(i as u32);
+        consider(d.span, RefTarget::Def(id));
+        if let DefData::Adt(adt) = &d.data {
+            for (vi, v) in adt.variants.iter().enumerate() {
+                for (fi, f) in v.fields.iter().enumerate() {
+                    // Field spans cover `name: Type`; only the name counts.
+                    let name = Span::new(f.span.file, f.span.start, f.span.start + f.name.len() as u32);
+                    consider(name, RefTarget::Field { adt: id, variant: vi, field: fi });
+                }
+            }
         }
     }
     best

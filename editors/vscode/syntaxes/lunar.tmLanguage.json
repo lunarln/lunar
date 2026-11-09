@@ -1,0 +1,252 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Lunar",
+  "scopeName": "source.lunar",
+  "fileTypes": ["ln"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#attributes" },
+    { "include": "#items" },
+    { "include": "#expressions" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.documentation.lunar",
+          "match": "///.*$"
+        },
+        {
+          "name": "comment.line.double-slash.lunar",
+          "match": "//.*$"
+        },
+        { "include": "#block-comment" }
+      ]
+    },
+    "block-comment": {
+      "name": "comment.block.lunar",
+      "begin": "/\\*",
+      "end": "\\*/",
+      "patterns": [{ "include": "#block-comment" }]
+    },
+    "attributes": {
+      "name": "meta.attribute.lunar",
+      "begin": "#!?\\[",
+      "end": "\\]",
+      "beginCaptures": { "0": { "name": "punctuation.definition.attribute.lunar" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.attribute.lunar" } },
+      "patterns": [
+        { "include": "#strings" },
+        {
+          "name": "entity.name.function.attribute.lunar",
+          "match": "\\b(test|lang|intrinsic|cfg|link_name|inline|allow)\\b"
+        },
+        { "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b", "name": "variable.other.attribute.lunar" }
+      ]
+    },
+    "items": {
+      "patterns": [
+        {
+          "comment": "fn name",
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.fn.lunar" },
+            "2": { "name": "entity.name.function.lunar" }
+          }
+        },
+        {
+          "comment": "struct / enum / trait / type alias name",
+          "match": "\\b(struct|enum|trait|type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.$1.lunar" },
+            "2": { "name": "entity.name.type.lunar" }
+          }
+        },
+        {
+          "comment": "mod name",
+          "match": "\\b(mod)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.mod.lunar" },
+            "2": { "name": "entity.name.namespace.lunar" }
+          }
+        }
+      ]
+    },
+    "expressions": {
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#strings" },
+        { "include": "#chars" },
+        { "include": "#numbers" },
+        { "include": "#array-kinds" },
+        { "include": "#keywords" },
+        { "include": "#types" },
+        { "include": "#calls" },
+        { "include": "#operators" },
+        { "include": "#punctuation" },
+        { "include": "#identifiers" }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.lunar",
+      "begin": "\"",
+      "end": "\"",
+      "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.lunar" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.string.end.lunar" } },
+      "patterns": [
+        { "include": "#escapes" },
+        { "name": "constant.character.escape.brace.lunar", "match": "\\{\\{|\\}\\}" },
+        {
+          "comment": "Interpolation holes (only interpolated when the literal becomes FmtArgs)",
+          "name": "meta.interpolation.lunar",
+          "begin": "\\{",
+          "end": "\\}",
+          "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.lunar" } },
+          "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.lunar" } },
+          "contentName": "source.lunar.embedded",
+          "patterns": [{ "include": "#expressions" }]
+        }
+      ]
+    },
+    "escapes": {
+      "name": "constant.character.escape.lunar",
+      "match": "\\\\(n|r|t|0|\\\\|\"|'|x[0-9A-Fa-f]{2}|u\\{[0-9A-Fa-f_]{1,6}\\})"
+    },
+    "chars": {
+      "name": "string.quoted.single.char.lunar",
+      "match": "'(\\\\(n|r|t|0|\\\\|\"|'|x[0-9A-Fa-f]{2}|u\\{[0-9A-Fa-f_]{1,6}\\})|[^'\\\\])'",
+      "captures": {
+        "1": { "patterns": [{ "include": "#escapes" }] }
+      }
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.lunar",
+          "match": "\\b\\d[\\d_]*\\.\\d[\\d_]*([eE][+-]?\\d[\\d_]*)?(f32|f64)?\\b"
+        },
+        {
+          "name": "constant.numeric.float.lunar",
+          "match": "\\b\\d[\\d_]*([eE][+-]?\\d[\\d_]*)(f32|f64)?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.hex.lunar",
+          "match": "\\b0x[0-9A-Fa-f_]+([iu](8|16|32|64|size))?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.octal.lunar",
+          "match": "\\b0o[0-7_]+([iu](8|16|32|64|size))?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.binary.lunar",
+          "match": "\\b0b[01_]+([iu](8|16|32|64|size))?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.decimal.lunar",
+          "match": "\\b\\d[\\d_]*([iu](8|16|32|64|size)|f32|f64)?\\b"
+        }
+      ]
+    },
+    "array-kinds": {
+      "comment": "The array kind after `;` in `[T; ...]`: `-..+`, `..+`, `&`, `&mut`, `_`",
+      "patterns": [
+        {
+          "match": ";\\s*(-\\.\\.\\+|\\.\\.\\+)\\s*(?=\\])",
+          "captures": { "1": { "name": "storage.modifier.array-kind.lunar" } }
+        },
+        {
+          "match": ";\\s*(&\\s*mut|&)\\s*(?=\\])",
+          "captures": { "1": { "name": "storage.modifier.array-kind.lunar" } }
+        },
+        {
+          "match": ";\\s*(_)\\s*(?=\\])",
+          "captures": { "1": { "name": "storage.modifier.array-kind.lunar" } }
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.lunar",
+          "match": "\\b(if|else|match|for|in|while|loop|break|continue|return)\\b"
+        },
+        {
+          "name": "keyword.other.unsafe.lunar",
+          "match": "\\bunsafe\\b"
+        },
+        {
+          "name": "storage.modifier.lunar",
+          "match": "\\b(pub|mut|const|static|extern)\\b"
+        },
+        {
+          "name": "keyword.other.lunar",
+          "match": "\\b(fn|let|struct|enum|impl|trait|type|mod|use|as)\\b"
+        },
+        {
+          "name": "variable.language.self.lunar",
+          "match": "\\b(self|Self|crate|super)\\b"
+        },
+        {
+          "name": "constant.language.boolean.lunar",
+          "match": "\\b(true|false)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "entity.name.type.primitive.lunar",
+          "match": "\\b(i8|i16|i32|i64|isize|u8|u16|u32|u64|usize|f32|f64|bool|char|str|String|FmtArgs)\\b"
+        },
+        {
+          "comment": "The `!` shrink marker before a type: `!Self`, `![T; -..+]`",
+          "match": "(?<!:)(:)\\s*(!)(?=\\s*[\\[A-Za-z_(])",
+          "captures": {
+            "1": { "name": "punctuation.separator.colon.lunar" },
+            "2": { "name": "storage.modifier.bang.lunar" }
+          }
+        },
+        {
+          "name": "entity.name.type.lunar",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "calls": {
+      "patterns": [
+        {
+          "comment": "name(  or  name::<...>(",
+          "match": "\\b([a-z_][A-Za-z0-9_]*)\\s*(?=(::<[^()]*>)?\\()",
+          "captures": { "1": { "name": "entity.name.function.call.lunar" } }
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        { "name": "keyword.operator.namespace.lunar", "match": "::" },
+        { "name": "keyword.operator.arrow.lunar", "match": "=>|->" },
+        { "name": "keyword.operator.range.lunar", "match": "\\.\\.=?" },
+        { "name": "keyword.operator.comparison.lunar", "match": "==|!=|<=|>=" },
+        { "name": "keyword.operator.logical.lunar", "match": "&&|\\|\\||!" },
+        { "name": "keyword.operator.assignment.compound.lunar", "match": "(\\+|-|\\*|/|%|&|\\||\\^|<<|>>)=" },
+        { "name": "keyword.operator.assignment.lunar", "match": "=" },
+        { "name": "keyword.operator.question.lunar", "match": "\\?" },
+        { "name": "keyword.operator.arithmetic.lunar", "match": "\\+|-|\\*|/|%" },
+        { "name": "keyword.operator.bitwise.lunar", "match": "&|\\||\\^|<<|>>" },
+        { "name": "keyword.operator.comparison.lunar", "match": "<|>" }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        { "name": "punctuation.terminator.lunar", "match": ";" },
+        { "name": "punctuation.separator.comma.lunar", "match": "," },
+        { "name": "punctuation.accessor.dot.lunar", "match": "\\." },
+        { "name": "punctuation.separator.colon.lunar", "match": ":" }
+      ]
+    },
+    "identifiers": {
+      "name": "variable.other.lunar",
+      "match": "\\b[a-z_][A-Za-z0-9_]*\\b"
+    }
+  }
+}

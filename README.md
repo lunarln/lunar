@@ -82,6 +82,7 @@ lunar test  <file.ln> [filter] [--release]
 lunar emit-llvm <file.ln> [-o out.ll] [--release] [--test]
 lunar explain <code>     # e.g. borrow::shrink_while_borrowed
 lunar explain [--list]
+lunar lsp                # language server over stdio, for editors
 ```
 
 `--release` enables LLVM optimizations and turns integer overflow checks into
@@ -96,6 +97,19 @@ and a fixed example. It also accepts the code as printed, e.g.
 `lunar explain 'err(type::mismatch)'`; without a code it lists every code.
 The explanations live in [docs/errors](docs/errors), one file per code.
 
+## Editor support
+
+`lunar lsp` is a language server with diagnostics as you type, hover
+(signatures, doc comments, types of locals, fields and expressions) and go
+to definition, including into the standard library. The VS Code extension in
+[editors/vscode](editors/vscode) adds syntax highlighting and runs it:
+
+```sh
+cargo install --path crates/ln-driver   # puts `lunar` on PATH
+cd editors/vscode && npm install && npx @vscode/vsce package
+code --install-extension lunar-0.1.0.vsix
+```
+
 ## Repository layout
 
 | Path | Contents |
@@ -107,7 +121,8 @@ The explanations live in [docs/errors](docs/errors), one file per code.
 | `crates/ln-diag` | Spans, scoped error codes, ariadne rendering |
 | `crates/ln-sema` | Name resolution, type checking, traits, borrow checking → typed IR |
 | `crates/ln-codegen` | Monomorphization and LLVM code generation (inkwell) |
-| `crates/ln-driver` | The `lunar` CLI, linking, end-to-end tests |
+| `crates/ln-driver` | The `lunar` CLI, linking, the language server, end-to-end tests |
+| `editors/vscode` | VS Code extension: syntax highlighting, LSP client |
 | `std/core`, `std/std` | The standard library, written in Lunar (embedded in the compiler) |
 | `docs/errors` | One explanation per diagnostic code, shown by `lunar explain` (embedded in the compiler) |
 | `examples/` | Example programs (with expected output in `.out` files) |

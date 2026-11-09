@@ -1,0 +1,81 @@
+{
+  "name": "lunar",
+  "displayName": "Lunar",
+  "description": "Lunar language support: syntax highlighting, diagnostics, hover and go to definition",
+  "version": "0.1.0",
+  "publisher": "worriedarrow",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/WorriedArrow/lunar"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "languages": [
+      {
+        "id": "lunar",
+        "aliases": [
+          "Lunar",
+          "lunar"
+        ],
+        "extensions": [
+          ".ln"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "lunar",
+        "scopeName": "source.lunar",
+        "path": "./syntaxes/lunar.tmLanguage.json"
+      },
+      {
+        "scopeName": "markdown.lunar.codeblock",
+        "path": "./syntaxes/lunar.markdown.tmLanguage.json",
+        "injectTo": [
+          "text.html.markdown"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.block.lunar": "lunar"
+        }
+      }
+    ],
+    "configuration": {
+      "title": "Lunar",
+      "properties": {
+        "lunar.server.path": {
+          "type": "string",
+          "default": "lunar",
+          "description": "Path to the `lunar` executable used to run the language server (`lunar lsp`)."
+        },
+        "lunar.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace communication with the Lunar language server."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "lunar.restartServer",
+        "title": "Lunar: Restart Language Server"
+      }
+    ]
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}
