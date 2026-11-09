@@ -1,7 +1,7 @@
 // `String`: owned UTF-8 text. Laid out exactly like a `[u8; -..+]` living on
 // its own data stack; `str` is the borrowed view.
 
-use crate::intrinsics;
+use crater::intrinsics;
 
 impl String {
     pub fn new(): String {
@@ -110,7 +110,7 @@ impl Eq for String {
 }
 
 impl Ord for String {
-    fn cmp(self, other: String): crate::cmp::Ordering {
+    fn cmp(self, other: String): crater::cmp::Ordering {
         return self.as_str().cmp(other.as_str());
     }
 }

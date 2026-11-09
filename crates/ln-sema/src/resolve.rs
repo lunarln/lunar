@@ -115,14 +115,14 @@ impl<'a> Sema<'a> {
         let first = &segs[0];
         let first_ns = if segs.len() == 1 { last_ns } else { Ns::Type };
         let mut cur = match first.name.as_str() {
-            "crate" => DefId(self.mod_data(from).krate.0),
+            "crater" => DefId(self.mod_data(from).krate.0),
             "self" if segs.len() > 1 => self.normal_module(from),
             "super" => {
                 let m = self.normal_module(from);
                 match self.mod_data(m).parent {
                     Some(p) => p,
                     None => {
-                        self.err(Diagnostic::error(name::UNRESOLVED, first.span, "`super` used in a crate root"));
+                        self.err(Diagnostic::error(name::UNRESOLVED, first.span, "`super` used in a crater root"));
                         return None;
                     }
                 }
@@ -194,6 +194,10 @@ impl<'a> Sema<'a> {
             Ns::Value => "value",
         };
         let mut d = Diagnostic::error(name::UNRESOLVED, id.span, format!("cannot find {what} `{}` in this scope", id.name));
+        if id.name == "crate" {
+            // Habit from Rust.
+            return d.with_help("Lunar calls the root of the current program or library a crater: write `crater::`");
+        }
         if let Some(s) = self.suggest(from, &id.name, ns) {
             d = d.with_help(format!("a similar name exists: `{s}`"));
         }
@@ -318,7 +322,7 @@ impl<'a> Sema<'a> {
         let first = &segs[0];
         let first_ns = if segs.len() == 1 { last_ns } else { Ns::Type };
         let mut cur = match first.name.as_str() {
-            "crate" => self.mod_data(from).krate,
+            "crater" => self.mod_data(from).krate,
             "self" => self.normal_module(from),
             "super" => self.mod_data(self.normal_module(from)).parent?,
             n => match self.lookup_unqualified(from, n, first_ns)? {

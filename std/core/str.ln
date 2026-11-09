@@ -1,6 +1,6 @@
 // Methods on `str`, a borrowed view of UTF-8 text.
 
-use crate::intrinsics;
+use crater::intrinsics;
 
 impl str {
     /// Length in bytes.

@@ -20,7 +20,7 @@ pub struct Range::<T> {
     pub end: T,
 }
 
-impl::<T: crate::num::Int> Iterator::<T> for Range::<T> {
+impl::<T: crater::num::Int> Iterator::<T> for Range::<T> {
     fn next(mut self): Option::<T> {
         if self.start < self.end {
             let v = self.start;
@@ -31,7 +31,7 @@ impl::<T: crate::num::Int> Iterator::<T> for Range::<T> {
     }
 }
 
-impl::<T: crate::num::Int> Range::<T> {
+impl::<T: crater::num::Int> Range::<T> {
     pub fn contains(self, x: T): bool {
         return x >= self.start && x < self.end;
     }

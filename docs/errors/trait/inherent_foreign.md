@@ -1,13 +1,13 @@
-# trait::inherent_foreign: inherent methods on a type from another crate
+# trait::inherent_foreign: inherent methods on a type from another crater
 
 An inherent `impl T { ... }` block (one without a trait) was written for a
-type that is not defined in the current crate: a primitive such as `i32`,
+type that is not defined in the current crater: a primitive such as `i32`,
 an array or slice type such as `[i32; ..+]`, or a type from `core` or `std`
 such as `String` or `Option::<i32>`.
 
-Inherent methods belong to the crate that defines the type. If any crate
-could add them, two crates could define the same method name on the same
-type, and the methods a type has would depend on which crates happen to be
+Inherent methods belong to the crater that defines the type. If any crater
+could add them, two craters could define the same method name on the same
+type, and the methods a type has would depend on which craters happen to be
 compiled together.
 
 To add methods to a foreign type, declare a trait with those methods and

@@ -1,7 +1,7 @@
 // Formatting. A string literal passed to a `FmtArgs` parameter is
 // interpolated: `"x = {x}"` calls `Display::fmt` on `x`.
 
-use crate::intrinsics;
+use crater::intrinsics;
 
 /// Types that can be written into a `String` by format strings.
 #[lang = "display"]

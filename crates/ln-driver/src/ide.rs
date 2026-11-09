@@ -515,11 +515,13 @@ use std::io::println as say;
 As a method's first parameter, `self` is the value the method is called on: `self` borrows it, `mut self` makes it in-out, and `mut self: !Self` may shrink it. In paths, `self::x` names an item of the current module."#
         }
         "Self" => r#"The implementing type within a `trait` or `impl` block, or within a type definition."#,
-        "crate" => {
-            r#"A path segment that refers to the root of the current crate.
+        "crater" => {
+            r#"A path segment that refers to the root of the current crater.
+
+A crater is what Lunar compiles as one unit: a root file and every module it loads with `mod`. Your program is a crater, and so are `core` and `std`. In a path, `crater` names the root module of the crater the code is in.
 
 ```lunar
-crate::util::helper();
+crater::util::helper();
 ```"#
         }
         "super" => {

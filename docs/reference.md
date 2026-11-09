@@ -4,7 +4,7 @@
 
 * Comments: `// line`, `/* block */` (block comments nest).
 * Identifiers: `[a-zA-Z_][a-zA-Z0-9_]*`. `_` alone is the placeholder.
-* Keywords: `as break const continue crate else enum extern false fn for if
+* Keywords: `as break const continue crater else enum extern false fn for if
   impl in let loop match mod mut pub return self Self static struct super
   trait true type unsafe use while`.
 * Integers: `42`, `1_000`, `0xff`, `0o17`, `0b1010`, with optional suffix
@@ -32,7 +32,7 @@ impl::<T: Dull> Show for Pair::<T> { ... }
 impl Point { fn new(): Point { ... } }
 
 use std::io::{print, println as say};
-use crate::shapes::*;
+use crater::shapes::*;
 mod shapes;            // loads shapes.ln or shapes/mod.ln
 mod inline { ... }
 const N: usize = 4;
@@ -43,6 +43,11 @@ extern "C" { fn puts(s: *u8): i32; #[link_name = "write"] fn c_write(fd: i32, b:
 
 Generic parameters are always introduced and applied with `::<...>`:
 `Pair::<i32>`, `size_of::<T>()`, `impl::<T> ...`.
+
+A **crater** is what Lunar compiles as one unit: a root file and every
+module it loads with `mod`. Your program is a crater, and so are `core` and
+`std`. In paths, `crater::` starts at the root module of the current
+crater, `super::` at the parent module, and `self::` at the current one.
 
 Items are private to their module (and its children) unless marked `pub`.
 Struct fields are private unless `pub`.

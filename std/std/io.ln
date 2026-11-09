@@ -1,4 +1,4 @@
-use crate::sys;
+use crater::sys;
 
 /// Print formatted text to standard output.
 pub fn print(args: FmtArgs) {

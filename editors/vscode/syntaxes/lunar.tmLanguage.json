@@ -184,7 +184,7 @@
         },
         {
           "name": "variable.language.self.lunar",
-          "match": "\\b(self|Self|crate|super)\\b"
+          "match": "\\b(self|Self|crater|super)\\b"
         },
         {
           "name": "constant.language.boolean.lunar",

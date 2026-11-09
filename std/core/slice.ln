@@ -2,7 +2,7 @@
 // `[T; -..+]` also finds methods of `[T; ..+]`, `[T]`, `[T; &mut]` and
 // `[T; &]`, in that order.
 
-use crate::intrinsics;
+use crater::intrinsics;
 
 impl::<T: Dull> [T; &] {
     pub fn len(self): usize {

@@ -54,7 +54,7 @@ impl::<T: Eq + Dull> Eq for Option::<T> {
     }
 }
 
-impl::<T: crate::fmt::Display + Dull> crate::fmt::Display for Option::<T> {
+impl::<T: crater::fmt::Display + Dull> crater::fmt::Display for Option::<T> {
     fn fmt(self, mut out: String) {
         match self {
             Option::Some(v) => {

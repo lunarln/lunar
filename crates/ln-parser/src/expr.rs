@@ -96,7 +96,7 @@ impl P<'_, '_, '_> {
                     | T::Star
                     | T::SelfValue
                     | T::SelfType
-                    | T::Crate
+                    | T::Crater
                     | T::Super
                     | T::If
                     | T::Match
@@ -387,7 +387,7 @@ impl P<'_, '_, '_> {
         };
         let kind = match t {
             T::Number(_) | T::Str | T::Char | T::True | T::False => ExprKind::Lit(self.literal()?),
-            T::Ident | T::SelfValue | T::SelfType | T::Crate | T::Super => {
+            T::Ident | T::SelfValue | T::SelfType | T::Crater | T::Super => {
                 let path = self.path_ty_style()?;
                 if self.k.at(T::LBrace) && !r.no_struct && self.looks_like_struct_lit(&path) { self.struct_lit(path)? } else { ExprKind::Path(path) }
             }

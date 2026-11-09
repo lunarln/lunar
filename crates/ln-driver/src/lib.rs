@@ -110,7 +110,7 @@ pub fn analyze_with(path: &Path, o: &AnalyzeOptions) -> Analysis {
                 diags.push(Diagnostic::error(
                     ln_diag::codes::build::IO,
                     ln_diag::Span::DUMMY,
-                    format!("standard library crate `{name}` not found at {}", root.display()),
+                    format!("standard library crater `{name}` not found at {}", root.display()),
                 ));
                 return Analysis { map, program: None, diags };
             }

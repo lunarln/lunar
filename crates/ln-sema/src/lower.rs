@@ -884,7 +884,7 @@ impl<'a> Sema<'a> {
                     Diagnostic::error(
                         trait_::INHERENT_FOREIGN,
                         im.self_ty.span,
-                        format!("cannot define inherent methods on `{s}` outside the crate that defines it"),
+                        format!("cannot define inherent methods on `{s}` outside the crater that defines it"),
                     )
                     .with_help("define a trait with these methods and implement it instead"),
                 );

@@ -1,9 +1,9 @@
 pub fn size_of::<T>(): usize {
-    return crate::intrinsics::size_of::<T>();
+    return crater::intrinsics::size_of::<T>();
 }
 
 pub fn align_of::<T>(): usize {
-    return crate::intrinsics::align_of::<T>();
+    return crater::intrinsics::align_of::<T>();
 }
 
 /// Swap two Dull values in place.

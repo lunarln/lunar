@@ -1,4 +1,4 @@
-use crate::sys;
+use crater::sys;
 
 /// Stop the program with a message. Exits with status 101.
 #[lang = "panic_fmt"]

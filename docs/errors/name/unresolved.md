@@ -11,7 +11,7 @@ This code is reported for:
 * a misspelled or undeclared variable, function, type or module (the help
   suggests a similar item name when one exists);
 * a `use` that imports something that does not exist;
-* `super` in a crate root, which has no parent module;
+* `super` in a crater root, which has no parent module;
 * `Self` outside an `impl` or `trait`;
 * a path that continues past something that has no such member, such as a
   missing associated function or struct path.

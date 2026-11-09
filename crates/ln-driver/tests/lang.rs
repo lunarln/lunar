@@ -342,7 +342,7 @@ mod lsp {
         std::fs::create_dir_all(dir.join("shapes")).unwrap();
         let main = "mod util;\nmod shapes;\n\nfn helper(): i32 {\n    return 41;\n}\n\nfn main() {\n    println(\"{util::answer()} {shapes::sides()}\");\n}\n";
         let util = "pub fn answer(): i32 {\n    return super::helper() + 1;\n}\n";
-        let shapes = "pub fn sides(): i32 {\n    return crate::util::answer() - 38;\n}\n";
+        let shapes = "pub fn sides(): i32 {\n    return crater::util::answer() - 38;\n}\n";
         std::fs::write(dir.join("main.ln"), main).unwrap();
         std::fs::write(dir.join("util.ln"), util).unwrap();
         std::fs::write(dir.join("shapes").join("mod.ln"), shapes).unwrap();

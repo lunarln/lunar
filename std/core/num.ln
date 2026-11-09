@@ -1,7 +1,7 @@
-use crate::ops::{Add, Sub, Mul, Div, Rem};
+use crater::ops::{Add, Sub, Mul, Div, Rem};
 
 /// Integer types.
-pub trait Int: Add + Sub + Mul + Div + Rem + Eq + Ord + Dull + crate::fmt::Display {
+pub trait Int: Add + Sub + Mul + Div + Rem + Eq + Ord + Dull + crater::fmt::Display {
     fn zero(): Self;
     fn one(): Self;
     fn min_value(): Self;

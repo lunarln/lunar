@@ -128,8 +128,8 @@ pub enum Token {
     Const,
     #[token("continue")]
     Continue,
-    #[token("crate")]
-    Crate,
+    #[token("crater")]
+    Crater,
     #[token("else")]
     Else,
     #[token("enum")]
@@ -448,7 +448,7 @@ impl Token {
             Break => "`break`",
             Const => "`const`",
             Continue => "`continue`",
-            Crate => "`crate`",
+            Crater => "`crater`",
             Else => "`else`",
             Enum => "`enum`",
             Extern => "`extern`",
@@ -487,7 +487,7 @@ impl Token {
 
     /// Whether this token is a keyword that may also appear as a path segment.
     pub fn is_path_keyword(self) -> bool {
-        matches!(self, Token::Crate | Token::SelfValue | Token::SelfType | Token::Super)
+        matches!(self, Token::Crater | Token::SelfValue | Token::SelfType | Token::Super)
     }
 }
 

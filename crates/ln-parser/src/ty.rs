@@ -19,7 +19,7 @@ impl P<'_, '_, '_> {
                 args = Some(self.generic_args()?);
             }
             segments.push(PathSegment { ident, args });
-            if self.k.at(T::PathSep) && matches!(self.k.nth(1), Some(T::Ident | T::SelfType | T::SelfValue | T::Super | T::Crate)) {
+            if self.k.at(T::PathSep) && matches!(self.k.nth(1), Some(T::Ident | T::SelfType | T::SelfValue | T::Super | T::Crater)) {
                 self.k.bump();
                 continue;
             }
@@ -58,14 +58,14 @@ impl P<'_, '_, '_> {
     fn ty_can_start(&mut self, n: usize) -> bool {
         matches!(
             self.k.nth(n),
-            Some(T::Ident | T::SelfType | T::Crate | T::Super | T::SelfValue | T::LBracket | T::LParen | T::Star | T::Bang | T::Fn | T::Placeholder)
+            Some(T::Ident | T::SelfType | T::Crater | T::Super | T::SelfValue | T::LBracket | T::LParen | T::Star | T::Bang | T::Fn | T::Placeholder)
         )
     }
 
     pub(crate) fn ty(&mut self) -> PResult<Ty> {
         let start = self.start();
         let kind = match self.k.peek() {
-            Some(T::Ident | T::SelfType | T::Crate | T::Super | T::SelfValue) => TyKind::Path(self.path_ty_style()?),
+            Some(T::Ident | T::SelfType | T::Crater | T::Super | T::SelfValue) => TyKind::Path(self.path_ty_style()?),
             Some(T::Placeholder) => {
                 self.k.bump();
                 TyKind::Infer

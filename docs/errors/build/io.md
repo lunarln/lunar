@@ -4,7 +4,7 @@ The compiler could not read a file it needs. This is reported when:
 
 * the file given on the command line (`lunar check foo.ln`, `lunar build
   foo.ln`, ...) does not exist or cannot be read;
-* the standard library crates `core` and `std` cannot be found. By default
+* the standard library craters `core` and `std` cannot be found. By default
   they are embedded in the compiler, so this only happens when the
   `LUNAR_STD_DIR` environment variable points at a directory that does not
   contain `core/lib.ln` and `std/lib.ln`.

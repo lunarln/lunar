@@ -10,9 +10,9 @@ pub fn is_null::<T>(p: *T): bool {
 }
 
 pub fn null::<T>(): *T {
-    return crate::intrinsics::ptr_null::<T>();
+    return crater::intrinsics::ptr_null::<T>();
 }
 
 pub fn null_mut::<T>(): *mut T {
-    return crate::intrinsics::ptr_null_mut::<T>();
+    return crater::intrinsics::ptr_null_mut::<T>();
 }

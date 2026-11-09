@@ -9,7 +9,7 @@
 // Layout of a data stack: [header: 64 bytes][elements...]. The array handle
 // `{ ptr, len, cap }` points at the first element.
 
-use crate::sys;
+use crater::sys;
 use core::intrinsics;
 
 /// Address space reserved for each data stack.

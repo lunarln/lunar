@@ -56,7 +56,7 @@ impl Eq for Ordering {
     }
 }
 
-impl crate::fmt::Display for Ordering {
+impl crater::fmt::Display for Ordering {
     fn fmt(self, mut out: String) {
         out.push_str(match self {
             Ordering::Less => "Less",

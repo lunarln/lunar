@@ -1,13 +1,13 @@
 // Names available in every module without a `use`.
 
-pub use crate::ptr::Dull;
-pub use crate::option::Option::{self, Some, None};
-pub use crate::result::Result::{self, Ok, Err};
-pub use crate::cmp::{Eq, Ord, Ordering};
-pub use crate::clone::Clone;
-pub use crate::default::Default;
-pub use crate::fmt::Display;
-pub use crate::iter::Iterator;
+pub use crater::ptr::Dull;
+pub use crater::option::Option::{self, Some, None};
+pub use crater::result::Result::{self, Ok, Err};
+pub use crater::cmp::{Eq, Ord, Ordering};
+pub use crater::clone::Clone;
+pub use crater::default::Default;
+pub use crater::fmt::Display;
+pub use crater::iter::Iterator;
 pub use std::io::{print, println, eprint, eprintln};
 pub use std::process::panic;
 pub use std::test::{assert, assert_eq};
