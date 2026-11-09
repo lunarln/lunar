@@ -43,6 +43,9 @@ pub struct Analysis {
     /// with [`AnalyzeOptions::keep_going`] (as far as analysis got).
     pub program: Option<Program>,
     pub diags: Vec<Diagnostic>,
+    /// The parsed craters (user craters first, then `core` and `std`), for
+    /// editor queries that print declarations.
+    pub sources: Vec<CrateSource>,
 }
 
 /// Options for [`analyze_with`].
@@ -120,7 +123,7 @@ pub fn analyze_craters(craters: &[CraterSpec], o: &AnalyzeOptions) -> Analysis {
             }
             None => {
                 diags.push(Diagnostic::error(ln_diag::codes::build::IO, ln_diag::Span::DUMMY, format!("could not read `{}`", spec.root.display())));
-                return Analysis { map, program: None, diags };
+                return Analysis { map, program: None, diags, sources: crates };
             }
         }
     }
@@ -135,12 +138,12 @@ pub fn analyze_craters(craters: &[CraterSpec], o: &AnalyzeOptions) -> Analysis {
                     ln_diag::Span::DUMMY,
                     format!("standard library crater `{name}` not found at {}", root.display()),
                 ));
-                return Analysis { map, program: None, diags };
+                return Analysis { map, program: None, diags, sources: crates };
             }
         }
     }
     if diags.iter().any(|d| d.is_error()) && !o.keep_going {
-        return Analysis { map, program: None, diags };
+        return Analysis { map, program: None, diags, sources: crates };
     }
     let mut opts = ln_sema::Options::host(o.test);
     opts.keep_going = o.keep_going;
@@ -150,7 +153,7 @@ pub fn analyze_craters(craters: &[CraterSpec], o: &AnalyzeOptions) -> Analysis {
     }
     let (program, mut d) = ln_sema::analyze(&crates, opts);
     diags.append(&mut d);
-    Analysis { map, program, diags }
+    Analysis { map, program, diags, sources: crates }
 }
 
 fn sanitize(s: &str) -> String {

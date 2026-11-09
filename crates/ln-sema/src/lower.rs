@@ -41,6 +41,8 @@ pub(crate) enum TyPos {
 pub(crate) struct LowerCx {
     pub module: DefId,
     pub generic_names: Vec<String>,
+    /// Where each of `generic_names` is declared (dummy for a trait's `Self`).
+    pub generic_spans: Vec<Span>,
     pub self_ty: Option<Ty>,
     pub env: Vec<Pred>,
     pub allow_infer: bool,
@@ -49,7 +51,7 @@ pub(crate) struct LowerCx {
 
 impl LowerCx {
     pub fn new(module: DefId) -> Self {
-        Self { module, generic_names: Vec::new(), self_ty: None, env: Vec::new(), allow_infer: false, generics_span: Span::DUMMY }
+        Self { module, generic_names: Vec::new(), generic_spans: Vec::new(), self_ty: None, env: Vec::new(), allow_infer: false, generics_span: Span::DUMMY }
     }
 }
 
@@ -64,23 +66,30 @@ impl<'a> Sema<'a> {
 
     /// Generic parameter names visible in an item, parents first.
     pub(crate) fn generic_names_of(&self, id: DefId) -> Vec<String> {
+        self.generic_params_of(id).into_iter().map(|(n, _)| n).collect()
+    }
+
+    /// Generic parameters in scope for an item (parents' first) and where
+    /// each is declared. A trait's implicit `Self` has a dummy span.
+    pub(crate) fn generic_params_of(&self, id: DefId) -> Vec<(String, Span)> {
         let d = &self.p.defs[id.0 as usize];
-        let own: Vec<String> = match self.ast(id) {
-            AstRef::Fn(f, _) => f.generics.params.iter().map(|p| p.name.name.clone()).collect(),
-            AstRef::Struct(s) => s.generics.params.iter().map(|p| p.name.name.clone()).collect(),
-            AstRef::Enum(e) => e.generics.params.iter().map(|p| p.name.name.clone()).collect(),
+        let of = |g: &ast::Generics| g.params.iter().map(|p| (p.name.name.clone(), p.name.span)).collect::<Vec<_>>();
+        let own = match self.ast(id) {
+            AstRef::Fn(f, _) => of(&f.generics),
+            AstRef::Struct(s) => of(&s.generics),
+            AstRef::Enum(e) => of(&e.generics),
             AstRef::Trait(t) => {
-                let mut v = vec!["Self".to_string()];
-                v.extend(t.generics.params.iter().map(|p| p.name.name.clone()));
+                let mut v = vec![("Self".to_string(), Span::DUMMY)];
+                v.extend(of(&t.generics));
                 v
             }
-            AstRef::Impl(i) => i.generics.params.iter().map(|p| p.name.name.clone()).collect(),
-            AstRef::Alias(a) => a.generics.params.iter().map(|p| p.name.name.clone()).collect(),
+            AstRef::Impl(i) => of(&i.generics),
+            AstRef::Alias(a) => of(&a.generics),
             _ => Vec::new(),
         };
         match (d.kind, d.parent) {
             (DefKind::Fn, Some(parent)) => {
-                let mut v = self.generic_names_of(parent);
+                let mut v = self.generic_params_of(parent);
                 v.extend(own);
                 v
             }
@@ -151,9 +160,11 @@ impl<'a> Sema<'a> {
             AstRef::Impl(i) => i.generics.span,
             _ => d.span,
         };
+        let params = self.generic_params_of(id);
         LowerCx {
             module: d.module,
-            generic_names: self.generic_names_of(id),
+            generic_names: params.iter().map(|(n, _)| n.clone()).collect(),
+            generic_spans: params.iter().map(|(_, s)| *s).collect(),
             self_ty: self.self_ty_of(id),
             env: self.env_of(id),
             allow_infer: false,
@@ -302,6 +313,9 @@ impl<'a> Sema<'a> {
             _ => 0,
         };
         let mut preds = Vec::new();
+        for p in params {
+            self.p.refs.push(crate::Ref { span: p.name.span, target: crate::RefTarget::TyParam(p.name.span) });
+        }
         for (i, p) in params.iter().enumerate() {
             for b in &p.bounds {
                 if let Some(tr) = self.lower_trait_ref(&cx, b) {
@@ -666,6 +680,11 @@ impl<'a> Sema<'a> {
             if let Some(i) = cx.generic_names.iter().rposition(|n| *n == seg.ident.name) {
                 if seg.args.is_some() {
                     self.err(Diagnostic::error(tyc::GENERIC_COUNT, p.span, "generic parameters cannot take generic arguments"));
+                }
+                if let Some(&decl) = cx.generic_spans.get(i)
+                    && !decl.is_dummy()
+                {
+                    self.p.refs.push(crate::Ref { span: seg.ident.span, target: crate::RefTarget::TyParam(decl) });
                 }
                 return Ty::Param(i as u32, seg.ident.name.clone());
             }

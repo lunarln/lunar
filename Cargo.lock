@@ -423,6 +423,7 @@ version = "0.1.0"
 dependencies = [
  "cc",
  "clap",
+ "ln-ast",
  "ln-codegen",
  "ln-diag",
  "ln-lexer",

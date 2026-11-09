@@ -15,6 +15,7 @@ name = "ln_driver"
 path = "src/lib.rs"
 
 [dependencies]
+ln-ast.workspace = true
 ln-diag.workspace = true
 ln-lexer.workspace = true
 ln-parser.workspace = true

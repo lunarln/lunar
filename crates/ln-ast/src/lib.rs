@@ -5,6 +5,8 @@
 
 pub use ln_diag::Span;
 
+pub mod pretty;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
 

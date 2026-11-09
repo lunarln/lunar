@@ -2,8 +2,10 @@
 //! positions. Protocol-independent so it can be tested directly.
 
 use crate::Analysis;
+use ln_ast::{self as ast, pretty};
 use ln_diag::{FileId, SourceMap, Span};
 use ln_sema::defs::{DefData, DefId, DefKind};
+use ln_sema::loader::ModSource;
 use ln_sema::thir::{self, Block, Expr, ExprKind, FmtPiece, Pat, PatKind, Stmt};
 use ln_sema::ty::Ty;
 use ln_sema::{Program, RefTarget};
@@ -83,8 +85,69 @@ pub fn definition(a: &Analysis, file: FileId, offset: u32) -> Option<Span> {
         RefTarget::Def(d) => p.def(d).span,
         RefTarget::Field { adt, variant, field } => p.adt(adt).variants[variant].fields[field].span,
         RefTarget::Local { body, local } => p.bodies.get(&body)?.local(local).span,
+        RefTarget::TyParam(decl) => decl,
     };
     (!span.is_dummy()).then_some(span)
+}
+
+/// A declaration in the parsed source, found by the span of its name.
+#[derive(Clone, Copy)]
+enum Decl<'a> {
+    /// An item, the `impl` or `trait` it is declared in, and the ABI of its
+    /// `extern` block.
+    Item {
+        item: &'a ast::Item,
+        parent: Option<&'a ast::Item>,
+        abi: Option<&'a str>,
+    },
+    Variant(&'a ast::VariantDecl),
+    Param(&'a ast::GenericParam),
+}
+
+fn find_decl(a: &Analysis, name: Span) -> Option<Decl<'_>> {
+    fn module(m: &ModSource, file: FileId) -> Option<&ModSource> {
+        if m.file == file {
+            return Some(m);
+        }
+        m.children.values().find_map(|c| module(c, file))
+    }
+    let m = a.sources.iter().find_map(|c| module(&c.root, name.file))?;
+    decl_in_items(&m.ast.items, name, None, None)
+}
+
+fn decl_in_items<'a>(items: &'a [ast::Item], name: Span, parent: Option<&'a ast::Item>, abi: Option<&'a str>) -> Option<Decl<'a>> {
+    items.iter().find_map(|item| decl_in_item(item, name, parent, abi))
+}
+
+fn decl_in_item<'a>(item: &'a ast::Item, name: Span, parent: Option<&'a ast::Item>, abi: Option<&'a str>) -> Option<Decl<'a>> {
+    use ast::ItemKind as K;
+    let here = Decl::Item { item, parent, abi };
+    let params = |g: &'a ast::Generics| g.params.iter().find(|p| p.name.span == name).map(Decl::Param);
+    match &item.kind {
+        K::Fn(f) if f.name.span == name => Some(here),
+        K::Fn(f) => params(&f.generics).or_else(|| {
+            // Items declared inside the function's body.
+            f.body.as_ref()?.stmts.iter().find_map(|s| match &s.kind {
+                ast::StmtKind::Item(i) => decl_in_item(i, name, None, None),
+                _ => None,
+            })
+        }),
+        K::Struct(s) if s.name.span == name => Some(here),
+        K::Struct(s) => params(&s.generics),
+        K::Enum(e) if e.name.span == name => Some(here),
+        K::Enum(e) => params(&e.generics).or_else(|| e.variants.iter().find(|v| v.name.span == name).map(Decl::Variant)),
+        K::Trait(t) if t.name.span == name => Some(here),
+        K::Trait(t) => params(&t.generics).or_else(|| decl_in_items(&t.items, name, Some(item), None)),
+        K::Impl(i) => params(&i.generics).or_else(|| decl_in_items(&i.items, name, Some(item), None)),
+        K::Mod(m) if m.name.span == name => Some(here),
+        K::Mod(m) => decl_in_items(m.items.as_deref()?, name, None, None),
+        K::Const(c) => (c.name.span == name).then_some(here),
+        K::Static(s) => (s.name.span == name).then_some(here),
+        K::TypeAlias(t) if t.name.span == name => Some(here),
+        K::TypeAlias(t) => params(&t.generics),
+        K::Extern(b) => decl_in_items(&b.items, name, None, Some(b.abi.as_deref().unwrap_or("C"))),
+        K::Use(_) => None,
+    }
 }
 
 /// Markdown hover text for `offset`, and the span it describes.
@@ -92,7 +155,12 @@ pub fn hover(a: &Analysis, file: FileId, offset: u32) -> Option<(Span, String)> 
     let p = a.program.as_ref()?;
     if let Some((span, target)) = ref_at(p, file, offset) {
         let text = match target {
-            RefTarget::Def(d) => describe_def(p, &a.map, d),
+            RefTarget::Def(d) => describe_def(a, p, d),
+            // Just the parameter and its bounds: `T: Ord + Clone`.
+            RefTarget::TyParam(decl) => match find_decl(a, decl)? {
+                Decl::Param(g) => code_block(&pretty::generic_param(g)),
+                _ => return None,
+            },
             RefTarget::Field { adt, variant, field } => {
                 let data = p.adt(adt);
                 let v = &data.variants[variant];
@@ -138,31 +206,11 @@ pub fn hover(a: &Analysis, file: FileId, offset: u32) -> Option<(Span, String)> 
     best
 }
 
-/// Signature (from source), container path and doc comments of a definition.
-fn describe_def(p: &Program, map: &SourceMap, d: DefId) -> String {
+/// Declaration (printed from the AST), container path and doc comments of a
+/// definition.
+fn describe_def(a: &Analysis, p: &Program, d: DefId) -> String {
+    let map = &a.map;
     let info = p.def(d);
-    let mut sig = if info.span.is_dummy() { String::new() } else { signature(map, info.span) };
-    match (&info.data, info.kind) {
-        (DefData::Adt(adt), DefKind::Struct) if adt.variants[0].fields.iter().any(|f| !f.name.chars().all(|c| c.is_ascii_digit())) => {
-            sig.push_str(" {\n");
-            for f in &adt.variants[0].fields {
-                let vis = if f.is_pub { "pub " } else { "" };
-                sig.push_str(&format!("    {vis}{}: {},\n", f.name, p.ty_str(&f.ty)));
-            }
-            sig.push('}');
-        }
-        (DefData::Adt(adt), DefKind::Enum) => {
-            sig.push_str(" {\n");
-            for v in &adt.variants {
-                sig.push_str(&format!("    {},\n", signature(map, v.span).trim_end_matches(',')));
-            }
-            sig.push('}');
-        }
-        _ => {}
-    }
-    if info.kind == DefKind::Mod {
-        sig = format!("mod {}", info.name);
-    }
     // Like rust-analyzer: the container path, then the declaration (with the
     // memory layout as a comment for types, and the enclosing `impl` or
     // `trait` for methods), then the docs.
@@ -172,17 +220,19 @@ fn describe_def(p: &Program, map: &SourceMap, d: DefId) -> String {
     {
         decl.push_str(&layout_comment(p.layout_of(&Ty::Adt(d, Vec::new())), None));
     }
-    if let Some(parent) = info.parent
-        && matches!(info.kind, DefKind::Fn)
-        && matches!(p.def(parent).kind, DefKind::Impl | DefKind::Trait)
-    {
-        let pd = p.def(parent);
-        let header = if pd.kind == DefKind::Impl { item_header(map, pd.span) } else { signature(map, pd.span) };
-        if !header.is_empty() {
-            decl.push_str(&header);
-            decl.push('\n');
+    let found = if info.span.is_dummy() { None } else { find_decl(a, info.span) };
+    let sig = match found {
+        Some(Decl::Item { item, parent, abi }) => {
+            if let Some(parent) = parent {
+                decl.push_str(&pretty::item(parent, None));
+                decl.push('\n');
+            }
+            pretty::item(item, abi)
         }
-    }
+        Some(Decl::Variant(v)) => pretty::variant(v),
+        Some(Decl::Param(g)) => pretty::generic_param(g),
+        None => info.name.clone(),
+    };
     decl.push_str(&sig);
     // Methods: the path of the type for user-defined types (`tour::Point`),
     // else the module of the impl (`core::num` for `impl i32`), as
@@ -222,15 +272,6 @@ fn layout_comment(layout: Option<ln_sema::layout::Layout>, offset: Option<u64>) 
     let size = if l.size >= 10 { format!("{} ({:#X})", l.size, l.size) } else { l.size.to_string() };
     let offset = offset.map(|o| format!(", offset = {o:#X}")).unwrap_or_default();
     format!("// size = {size}, align = {:#X}{offset}\n", l.align)
-}
-
-/// The header of the item whose span starts at `span` (an `impl` block):
-/// its text up to the `{`, with whitespace collapsed.
-fn item_header(map: &SourceMap, span: Span) -> String {
-    let text = &map.get(span.file).text;
-    let rest = &text[span.start as usize..span.end as usize];
-    let head = rest.split('{').next().unwrap_or("");
-    head.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Documentation for the keyword under the cursor, in rust-analyzer's style.
@@ -540,35 +581,6 @@ super::helper();
         "false" => r#"A value of type `bool` representing logical **false**."#,
         _ => return None,
     })
-}
-
-/// The declaration containing `name` (an identifier span), from the start
-/// of its line to the first `{`, `;` or `=` (for fns, up to the body),
-/// with whitespace collapsed.
-fn signature(map: &SourceMap, name: Span) -> String {
-    let text = &map.get(name.file).text;
-    let start = text[..name.start as usize].rfind('\n').map_or(0, |i| i + 1);
-    let mut depth = 0i32;
-    let mut end = text.len();
-    for (i, c) in text[start..].char_indices() {
-        let at = start + i;
-        match c {
-            '(' | '[' | '<' => depth += 1,
-            ')' | ']' => depth -= 1,
-            '>' if !text[..at].ends_with('-') => depth -= 1,
-            '{' | ';' if depth <= 0 && at >= name.end as usize => {
-                end = at;
-                break;
-            }
-            ',' if depth <= 0 && at >= name.end as usize => {
-                // Enum variants end at their comma.
-                end = at;
-                break;
-            }
-            _ => {}
-        }
-    }
-    text[start..end].split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// `///` lines directly above the item declared at `name` (attributes skipped).

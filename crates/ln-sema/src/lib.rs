@@ -67,6 +67,8 @@ pub enum RefTarget {
         body: DefId,
         local: thir::LocalId,
     },
+    /// A generic parameter, by the span of its name where it is declared.
+    TyParam(ln_diag::Span),
 }
 
 /// The analyzed program handed to code generation.
