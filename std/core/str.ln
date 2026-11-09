@@ -3,6 +3,15 @@
 use crater::intrinsics;
 
 impl str {
+    /// `bytes` as text, or `None` if they are not valid UTF-8 (overlong
+    /// encodings, surrogates and values past U+10FFFF are invalid).
+    pub fn from_utf8(bytes: [u8; &]): Option::<str> {
+        if utf8_error_at(bytes).is_some() {
+            return None;
+        }
+        return Some(unsafe { intrinsics::str_from_bytes(bytes) });
+    }
+
     /// Length in bytes.
     pub fn len(self): usize {
         return intrinsics::str_len(self);
@@ -107,6 +116,47 @@ impl str {
     pub fn to_string(self): String {
         return String::from(self);
     }
+}
+
+/// The index of the first byte that does not start a valid UTF-8 sequence,
+/// or `None` if all of `b` is valid.
+pub fn utf8_error_at(b: [u8; &]): Option::<usize> {
+    let n = b.len();
+    let mut i: usize = 0;
+    while i < n {
+        let c = b[i];
+        if c < 0x80 {
+            i += 1;
+            continue;
+        }
+        let (more, min, init): (usize, u32, u32) = if (c & 0xE0) == 0xC0 {
+            (1, 0x80, (c & 0x1F) as u32)
+        } else if (c & 0xF0) == 0xE0 {
+            (2, 0x800, (c & 0x0F) as u32)
+        } else if (c & 0xF8) == 0xF0 {
+            (3, 0x10000, (c & 0x07) as u32)
+        } else {
+            return Some(i);
+        };
+        if n - i <= more {
+            return Some(i);
+        }
+        let mut cp = init;
+        let mut k: usize = 1;
+        while k <= more {
+            let d = b[i + k];
+            if (d & 0xC0) != 0x80 {
+                return Some(i);
+            }
+            cp = (cp << 6) | (d & 0x3F) as u32;
+            k += 1;
+        }
+        if cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) {
+            return Some(i);
+        }
+        i += more + 1;
+    }
+    return None;
 }
 
 fn is_space(c: u8): bool {

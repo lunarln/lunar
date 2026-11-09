@@ -1,5 +1,67 @@
 use crater::sys;
 
+/// What kind of failure an I/O `Error` is.
+pub enum ErrorKind {
+    /// The file or directory does not exist.
+    NotFound,
+    /// The operating system refused access.
+    PermissionDenied,
+    /// An argument was unusable, such as a path containing a NUL byte.
+    InvalidInput,
+    /// The data was not what was expected, such as text that is not UTF-8.
+    InvalidData,
+    /// Any other failure; `Error::os_code` has the details.
+    Other,
+}
+
+/// A failed I/O operation.
+pub struct Error {
+    kind: ErrorKind,
+    code: i32,
+}
+
+impl Error {
+    /// An error of `kind` that did not come from the operating system.
+    pub fn new(kind: ErrorKind): Error {
+        return Error { kind, code: 0 };
+    }
+
+    /// The error for operating system error code `code` (`errno` on Unix,
+    /// `GetLastError()` on Windows).
+    pub fn from_os(code: i32): Error {
+        return Error { kind: sys::error_kind(code), code };
+    }
+
+    /// The error for the operating system's most recent failure.
+    pub fn last_os_error(): Error {
+        return Error::from_os(sys::last_error());
+    }
+
+    pub fn kind(&self): ErrorKind {
+        return self.kind;
+    }
+
+    /// The operating system's error code, or 0 if it did not come from one.
+    pub fn os_code(&self): i32 {
+        return self.code;
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, out: &mut String) {
+        out.push_str(match self.kind {
+            ErrorKind::NotFound => "not found",
+            ErrorKind::PermissionDenied => "permission denied",
+            ErrorKind::InvalidInput => "invalid input",
+            ErrorKind::InvalidData => "invalid data",
+            ErrorKind::Other => "I/O error",
+        });
+        if self.code != 0 {
+            out.write(" (os error {self.code})");
+        }
+    }
+}
+
 /// Print formatted text to standard output.
 pub fn print(args: FmtArgs) {
     let mut s = String::new();

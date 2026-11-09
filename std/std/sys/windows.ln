@@ -9,6 +9,118 @@ extern "C" {
     fn VirtualAlloc(addr: *mut u8, size: usize, kind: u32, protect: u32): *mut u8;
     fn VirtualFree(addr: *mut u8, size: usize, kind: u32): i32;
     fn ExitProcess(code: u32): !;
+    fn CreateFileW(name: *u16, access: u32, share: u32, security: *mut u8, disposition: u32, flags: u32, template: *mut u8): *mut u8;
+    fn CloseHandle(h: *mut u8): i32;
+    fn DeleteFileW(name: *u16): i32;
+    fn GetLastError(): u32;
+}
+
+const GENERIC_READ: u32 = 2147483648;
+const GENERIC_WRITE: u32 = 1073741824;
+const FILE_SHARE_READ_WRITE: u32 = 3;
+const CREATE_ALWAYS: u32 = 2;
+const OPEN_EXISTING: u32 = 3;
+const FILE_ATTRIBUTE_NORMAL: u32 = 128;
+
+const ERROR_FILE_NOT_FOUND: i32 = 2;
+const ERROR_PATH_NOT_FOUND: i32 = 3;
+const ERROR_ACCESS_DENIED: i32 = 5;
+const ERROR_INVALID_NAME: i32 = 123;
+
+pub fn last_error(): i32 {
+    return unsafe { GetLastError() } as i32;
+}
+
+pub fn error_kind(code: i32): crater::io::ErrorKind {
+    if code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND {
+        return crater::io::ErrorKind::NotFound;
+    }
+    if code == ERROR_ACCESS_DENIED {
+        return crater::io::ErrorKind::PermissionDenied;
+    }
+    if code == ERROR_INVALID_NAME {
+        return crater::io::ErrorKind::InvalidInput;
+    }
+    return crater::io::ErrorKind::Other;
+}
+
+/// Open `path` for reading, or create or truncate it for writing. Returns
+/// the handle, or -1 (see `last_error`).
+pub fn open_file(path: str, write: bool): isize {
+    let w = wide(path);
+    let access = if write { GENERIC_WRITE } else { GENERIC_READ };
+    let disposition = if write { CREATE_ALWAYS } else { OPEN_EXISTING };
+    let h = unsafe {
+        CreateFileW(w[..].as_ptr(), access, FILE_SHARE_READ_WRITE, core::ptr::null_mut(), disposition, FILE_ATTRIBUTE_NORMAL, core::ptr::null_mut())
+    };
+    // INVALID_HANDLE_VALUE is (HANDLE)-1.
+    if (h as usize) == 18446744073709551615 {
+        return -1;
+    }
+    return (h as usize) as isize;
+}
+
+/// Read into `buf`: the number of bytes read, 0 at the end, or -1.
+pub fn read_file(h: isize, buf: [u8; &mut]): isize {
+    let mut got: u32 = 0;
+    let mut n = buf.len();
+    if n > 1073741824 {
+        n = 1073741824;
+    }
+    let ok = unsafe { ReadFile((h as usize) as *mut u8, buf.as_mut_ptr(), n as u32, intrinsics::addr_of_mut(got), core::ptr::null_mut()) };
+    if ok == 0 {
+        return -1;
+    }
+    return got as isize;
+}
+
+/// Write all of `bytes`; false on failure.
+pub fn write_file(h: isize, bytes: [u8; &]): bool {
+    let mut off: usize = 0;
+    while off < bytes.len() {
+        let mut written: u32 = 0;
+        let mut chunk = bytes.len() - off;
+        if chunk > 1073741824 {
+            chunk = 1073741824;
+        }
+        let ok = unsafe {
+            WriteFile((h as usize) as *mut u8, intrinsics::ptr_offset(bytes.as_ptr(), off as isize), chunk as u32, intrinsics::addr_of_mut(written), core::ptr::null_mut())
+        };
+        if ok == 0 {
+            return false;
+        }
+        off += written as usize;
+    }
+    return true;
+}
+
+pub fn close_file(h: isize) {
+    unsafe {
+        CloseHandle((h as usize) as *mut u8);
+    }
+}
+
+/// Delete the file at `path`; false on failure.
+pub fn remove_file(path: str): bool {
+    let w = wide(path);
+    return unsafe { DeleteFileW(w[..].as_ptr()) } != 0;
+}
+
+/// `path` as NUL-terminated UTF-16.
+fn wide(path: str): [u16; -..+] {
+    let mut w: [u16; -..+] = [];
+    for c in path.chars() {
+        let cp = c as u32;
+        if cp < 65536 {
+            w.push(cp as u16);
+        } else {
+            let v = cp - 65536;
+            w.push((55296 | (v >> 10)) as u16);
+            w.push((56320 | (v & 1023)) as u16);
+        }
+    }
+    w.push(0);
+    return w;
 }
 
 const MEM_COMMIT: u32 = 4096;

@@ -2,6 +2,7 @@
 // and the runtime (data stacks, panics, program entry).
 
 pub mod io;
+pub mod fs;
 pub mod math;
 pub mod test;
 pub mod process;

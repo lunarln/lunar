@@ -328,9 +328,14 @@ alone lists every code. The explanations are the files in
   (`push`, `extend`, `reserve`), shrinkable arrays (`pop`, `truncate`,
   `clear`, `remove`, `insert`), `str` (`len`, `as_bytes`, `chars`, `bytes`,
   `find`, `contains`, `starts_with`, `ends_with`, `trim`, `parse_i64`,
-  `to_string`) and `String` (`new`, `from`, `push`, `push_str`, `write`,
+  `to_string`, and `str::from_utf8(bytes): Option::<str>`) and `String` (`new`, `from`, `push`, `push_str`, `write`,
   `as_str`, `len`, `clear`, `truncate`, `pop`).
-* `std::io::{print, println, eprint, eprintln, write_str, read_line}`,
+* `std::io::{print, println, eprint, eprintln, write_str, read_line}`, and
+  `std::io::{Error, ErrorKind}` for failures (`kind()`, `os_code()`,
+  `Display`),
+* `std::fs::{read_to_string, read, write, remove_file}`: whole files by
+  path, returning `Result::<_, io::Error>`; `read_to_string` fails with
+  `ErrorKind::InvalidData` on text that is not UTF-8,
   `std::math` (`pow`, `min`, `max`, `clamp`, float functions),
   `std::test::{assert, assert_eq, assert_ne}`,
   `std::process::{exit, abort, panic}`, `std::env::{arg_count, arg}`.

@@ -9,6 +9,13 @@
 //   decommit(base: *mut u8, size: usize) (return those pages to the OS,
 //                                          keeping the address space)
 //   release(base: *mut u8, size: usize)
+//   last_error(): i32                   (errno / GetLastError)
+//   error_kind(code: i32): io::ErrorKind
+//   open_file(path: str, write: bool): isize   (handle, or -1)
+//   read_file(h: isize, buf: [u8; &mut]): isize (bytes, 0 at end, or -1)
+//   write_file(h: isize, bytes: [u8; &]): bool
+//   close_file(h: isize)
+//   remove_file(path: str): bool
 
 #[cfg(windows)]
 mod windows;

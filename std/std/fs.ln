@@ -1,0 +1,90 @@
+// Files: reading and writing whole files by path.
+
+use crater::io::{Error, ErrorKind};
+use crater::sys;
+
+/// Read the whole file at `path` as text. Fails with `ErrorKind::InvalidData`
+/// if it is not UTF-8.
+pub fn read_to_string(path: str): Result::<String, Error> {
+    let h = open(path, false)?;
+    let mut out = String::new();
+    let mut buf: [u8; 16384] = [0; 16384];
+    loop {
+        let n = sys::read_file(h, buf[..]);
+        if n < 0 {
+            let e = Error::last_os_error();
+            sys::close_file(h);
+            return Err(e);
+        }
+        if n == 0 {
+            break;
+        }
+        // Not yet known to be UTF-8 (a character may also straddle two
+        // reads); the whole text is checked below before anyone sees it.
+        out.push_str(unsafe { core::intrinsics::str_from_bytes(buf[..n as usize]) });
+    }
+    sys::close_file(h);
+    if core::str::utf8_error_at(out.as_bytes()).is_some() {
+        return Err(Error::new(ErrorKind::InvalidData));
+    }
+    return Ok(out);
+}
+
+/// Read the whole file at `path` as bytes.
+pub fn read(path: str): Result::<[u8; -..+], Error> {
+    let h = open(path, false)?;
+    let mut out: [u8; -..+] = [];
+    let mut buf: [u8; 16384] = [0; 16384];
+    loop {
+        let n = sys::read_file(h, buf[..]);
+        if n < 0 {
+            let e = Error::last_os_error();
+            sys::close_file(h);
+            return Err(e);
+        }
+        if n == 0 {
+            break;
+        }
+        out.extend(buf[..n as usize]);
+    }
+    sys::close_file(h);
+    return Ok(out);
+}
+
+/// Create the file at `path`, or replace its contents, with `contents`.
+/// Text is written with `fs::write(path, text.as_bytes())`.
+pub fn write(path: str, contents: [u8; &]): Result::<(), Error> {
+    let h = open(path, true)?;
+    if !sys::write_file(h, contents) {
+        let e = Error::last_os_error();
+        sys::close_file(h);
+        return Err(e);
+    }
+    sys::close_file(h);
+    return Ok(());
+}
+
+/// Delete the file at `path`.
+pub fn remove_file(path: str): Result::<(), Error> {
+    check_path(path)?;
+    if !sys::remove_file(path) {
+        return Err(Error::last_os_error());
+    }
+    return Ok(());
+}
+
+fn check_path(path: str): Result::<(), Error> {
+    if path.is_empty() || path.contains("\0") {
+        return Err(Error::new(ErrorKind::InvalidInput));
+    }
+    return Ok(());
+}
+
+fn open(path: str, write: bool): Result::<isize, Error> {
+    check_path(path)?;
+    let h = sys::open_file(path, write);
+    if h < 0 {
+        return Err(Error::last_os_error());
+    }
+    return Ok(h);
+}

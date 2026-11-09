@@ -1,0 +1,66 @@
+// std::fs: whole-file reads and writes, and their errors.
+
+use std::fs;
+use std::io::ErrorKind;
+
+fn kind(k: ErrorKind): str {
+    return match k {
+        ErrorKind::NotFound => "not found",
+        ErrorKind::PermissionDenied => "permission denied",
+        ErrorKind::InvalidInput => "invalid input",
+        ErrorKind::InvalidData => "invalid data",
+        ErrorKind::Other => "other",
+    };
+}
+
+fn main() {
+    let path = "lunar-files-test.tmp";
+
+    // Text round trip, including multi-byte characters.
+    let text = "héllo, wörld\nline two\n";
+    fs::write(path, text.as_bytes()).unwrap();
+    let back = fs::read_to_string(path).unwrap();
+    println("{back.len()} bytes, same: {back.as_str() == text}");
+
+    // A file bigger than one read, as bytes.
+    let mut big = String::new();
+    let mut i = 0;
+    while i < 5000 {
+        big.write("{i},");
+        i += 1;
+    }
+    fs::write(path, big.as_bytes()).unwrap();
+    let bytes = fs::read(path).unwrap();
+    println("{bytes.len()} == {big.len()}, last: {bytes[bytes.len() - 2]}");
+
+    // Not UTF-8.
+    let bad: [u8; 3] = [b'a', b'\xff', b'b'];
+    fs::write(path, bad[..]).unwrap();
+    match fs::read_to_string(path) {
+        Ok(_) => println("read invalid UTF-8?"),
+        Err(e) => println("invalid: {kind(e.kind())}"),
+    }
+    println("raw: {fs::read(path).unwrap().len()}");
+
+    fs::remove_file(path).unwrap();
+    match fs::read_to_string(path) {
+        Ok(_) => println("still there?"),
+        Err(e) => println("removed: {kind(e.kind())}, os code set: {e.os_code() != 0}"),
+    }
+    match fs::remove_file(path) {
+        Ok(_) => println("removed twice?"),
+        Err(e) => println("remove again: {kind(e.kind())}"),
+    }
+    match fs::read("") {
+        Ok(_) => println("empty path?"),
+        Err(e) => println("empty path: {e}"),
+    }
+
+    // UTF-8 checks.
+    let good = "ok ✓";
+    println("{str::from_utf8(good.as_bytes()).is_some()} {str::from_utf8(bad[..]).is_none()}");
+    let overlong: [u8; 2] = [b'\xc0', b'\xaf'];
+    let surrogate: [u8; 3] = [b'\xed', b'\xa0', b'\x80'];
+    let cut: [u8; 2] = [b'\xe2', b'\x9c'];
+    println("{str::from_utf8(overlong[..]).is_none()} {str::from_utf8(surrogate[..]).is_none()} {str::from_utf8(cut[..]).is_none()}");
+}

@@ -12,6 +12,103 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64): *mut u8;
     fn mprotect(addr: *mut u8, len: usize, prot: i32): i32;
     fn munmap(addr: *mut u8, len: usize): i32;
+    // `open` is variadic in C; it is only called without the mode argument,
+    // which is the same call as this declaration on every ABI. Creating a
+    // file needs the mode, so it goes through `creat` instead.
+    fn open(path: *u8, flags: i32): i32;
+    fn creat(path: *u8, mode: u32): i32;
+    fn close(fd: i32): i32;
+    fn unlink(path: *u8): i32;
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn __error(): *mut i32;
+}
+
+#[cfg(target_os = "macos")]
+pub fn last_error(): i32 {
+    return unsafe { intrinsics::ptr_read(__error() as *i32) };
+}
+
+#[cfg(not(target_os = "macos"))]
+extern "C" {
+    fn __errno_location(): *mut i32;
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn last_error(): i32 {
+    return unsafe { intrinsics::ptr_read(__errno_location() as *i32) };
+}
+
+const EPERM: i32 = 1;
+const ENOENT: i32 = 2;
+const EINTR: i32 = 4;
+const EACCES: i32 = 13;
+
+pub fn error_kind(code: i32): crater::io::ErrorKind {
+    if code == ENOENT {
+        return crater::io::ErrorKind::NotFound;
+    }
+    if code == EPERM || code == EACCES {
+        return crater::io::ErrorKind::PermissionDenied;
+    }
+    return crater::io::ErrorKind::Other;
+}
+
+/// Open `path` for reading, or create or truncate it for writing. Returns
+/// the file descriptor, or -1 (see `last_error`).
+pub fn open_file(path: str, write: bool): isize {
+    let c = c_path(path);
+    let p = c.as_bytes().as_ptr();
+    // 0o644: rw-r--r--, less the umask.
+    let fd = if write { unsafe { creat(p, 420) } } else { unsafe { open(p, 0) } };
+    return fd as isize;
+}
+
+/// Read into `buf`: the number of bytes read, 0 at the end, or -1.
+pub fn read_file(h: isize, buf: [u8; &mut]): isize {
+    loop {
+        let n = unsafe { c_read(h as i32, buf.as_mut_ptr(), buf.len()) };
+        if n >= 0 || last_error() != EINTR {
+            return n;
+        }
+    }
+}
+
+/// Write all of `bytes`; false on failure.
+pub fn write_file(h: isize, bytes: [u8; &]): bool {
+    let mut off: usize = 0;
+    while off < bytes.len() {
+        let n = unsafe { c_write(h as i32, intrinsics::ptr_offset(bytes.as_ptr(), off as isize), bytes.len() - off) };
+        if n < 0 {
+            if last_error() == EINTR {
+                continue;
+            }
+            return false;
+        }
+        off += n as usize;
+    }
+    return true;
+}
+
+pub fn close_file(h: isize) {
+    unsafe {
+        close(h as i32);
+    }
+}
+
+/// Delete the file at `path`; false on failure.
+pub fn remove_file(path: str): bool {
+    let c = c_path(path);
+    return unsafe { unlink(c.as_bytes().as_ptr()) } == 0;
+}
+
+/// `path` with a NUL terminator, for C.
+fn c_path(path: str): String {
+    let mut c = String::from(path);
+    c.push('\0');
+    return c;
 }
 
 const PROT_NONE: i32 = 0;
