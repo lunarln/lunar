@@ -6,8 +6,11 @@
 mod expr;
 mod item;
 mod lit;
+mod macros;
 mod pat;
 mod ty;
+
+pub use macros::{Ctxs, Expansion, ExpansionKind, FragmentKind, parse_expansion, parse_fragment, source_token_trees};
 
 use ln_ast::*;
 use ln_diag::{Diagnostic, FileId, codes::syntax};
@@ -25,6 +28,12 @@ pub struct IdGen {
 impl IdGen {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Ids from `first` on; for code parsed after loading (macro
+    /// expansions), so its ids never collide with the loaded files'.
+    pub fn starting_at(first: u32) -> Self {
+        Self { next: first }
     }
 
     pub fn next(&mut self) -> NodeId {
@@ -253,11 +262,24 @@ pub(crate) struct P<'s, 't, 'i> {
     pub(crate) diags: Vec<Diagnostic>,
     /// Doc comments not yet attached to an item.
     pub(crate) docs: Docs,
+    /// Hygiene contexts of identifiers, for macro expansions (empty for
+    /// source files, where every identifier is `ROOT`).
+    pub(crate) ctxs: macros::Ctxs,
 }
 
 impl<'s, 't, 'i> P<'s, 't, 'i> {
     fn new(src: &'s str, base: u32, toks: &'t [Tok<Token>], docs: Docs, file: FileId, ids: &'i mut IdGen, eof: u32) -> Self {
-        Self { k: ln_parse_kit::Parser::new(toks, eof), src, base, file, ids, diags: Vec::new(), docs }
+        Self { k: ln_parse_kit::Parser::new(toks, eof), src, base, file, ids, diags: Vec::new(), docs, ctxs: macros::Ctxs::new() }
+    }
+
+    /// The hygiene context of the token starting at `start`.
+    pub(crate) fn ctx_at(&self, start: u32) -> SyntaxCtx {
+        self.ctxs.get(&start).copied().unwrap_or_default()
+    }
+
+    /// An identifier from token `t`, with its hygiene context.
+    pub(crate) fn tok_ident(&self, t: Tok<Token>) -> Ident {
+        Ident { name: self.tok_text(t).to_string(), span: self.tok_span(t), ctx: self.ctx_at(t.start) }
     }
 
     fn finish(mut self) -> Vec<Diagnostic> {
@@ -330,7 +352,7 @@ impl<'s, 't, 'i> P<'s, 't, 'i> {
 
     pub(crate) fn ident(&mut self) -> PResult<Ident> {
         let t = self.k.expect(Token::Ident)?;
-        Ok(Ident::new(self.tok_text(t), self.tok_span(t)))
+        Ok(self.tok_ident(t))
     }
 
     pub(crate) fn error(&mut self, d: Diagnostic) {

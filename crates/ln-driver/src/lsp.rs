@@ -205,7 +205,7 @@ impl Server {
         let mut per_file: HashMap<FileId, Vec<lsp_types::Diagnostic>> = files.iter().map(|(id, _)| (*id, Vec::new())).collect();
         let root_file = ide::file_for_path(&analysis.map, root);
         for d in &analysis.diags {
-            let file = if d.span.is_dummy() { root_file } else { Some(d.span.file) };
+            let file = if d.span.is_dummy() { root_file } else { Some(user_span(&analysis, d.span).file) };
             if let Some(file) = file
                 && let Some(list) = per_file.get_mut(&file)
             {
@@ -379,10 +379,20 @@ fn std_source_request(req: Request) -> Result<serde_json::Value, Error> {
     Ok(serde_json::Value::String(text.to_string()))
 }
 
+/// Where `span` is in a file the editor has: spans inside macro expansions
+/// (which exist only in memory) move to the invocation.
+fn user_span(a: &Analysis, span: Span) -> Span {
+    a.program.as_ref().map_or(span, |p| p.source_span(span))
+}
+
 fn to_lsp_diag(a: &Analysis, d: &Diagnostic, uris: &Uris) -> lsp_types::Diagnostic {
     let mut message = d.message.clone();
     if let Some(l) = &d.primary_label {
         message.push_str(&format!(" ({l})"));
+    }
+    let span = if d.span.is_dummy() { d.span } else { user_span(a, d.span) };
+    if span != d.span {
+        message.push_str(&format!("\nnote: inside the expansion `{}`:\n{}", a.map.get(d.span.file).name, a.map.get(d.span.file).text));
     }
     for n in &d.notes {
         message.push_str(&format!("\nnote: {n}"));
@@ -394,9 +404,9 @@ fn to_lsp_diag(a: &Analysis, d: &Diagnostic, uris: &Uris) -> lsp_types::Diagnost
         .labels
         .iter()
         .filter(|l| !l.span.is_dummy())
-        .filter_map(|l| Some(DiagnosticRelatedInformation { location: location(a, l.span, uris)?, message: l.message.clone() }))
+        .filter_map(|l| Some(DiagnosticRelatedInformation { location: location(a, user_span(a, l.span), uris)?, message: l.message.clone() }))
         .collect();
-    let r = if d.span.is_dummy() { Range::default() } else { range(a, d.span) };
+    let r = if span.is_dummy() { Range::default() } else { range(a, span) };
     lsp_types::Diagnostic {
         range: r,
         severity: Some(match d.severity {

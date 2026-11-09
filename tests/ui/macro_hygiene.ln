@@ -1,0 +1,17 @@
+// error: name::unresolved
+// Items a macro defines are hidden unless `#[export]`ed, and a macro's
+// body cannot see the caller's locals.
+macro make() {
+    fn hidden(): i32 { return 1; }
+    #[export]
+    fn shown(): i32 { return hidden() + 1; }
+}
+
+make!();
+
+macro uses_t() { t }
+
+fn main() {
+    let t = 1;
+    println("{shown()} {hidden()} {uses_t!()} {t}");
+}

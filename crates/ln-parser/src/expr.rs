@@ -418,7 +418,13 @@ impl P<'_, '_, '_> {
             T::Number(_) | T::Str | T::Char | T::Byte | T::True | T::False => ExprKind::Lit(self.literal()?),
             T::Ident | T::SelfValue | T::SelfType | T::Crater | T::Super => {
                 let path = self.path_ty_style()?;
-                if self.k.at(T::LBrace) && !r.no_struct && self.looks_like_struct_lit(&path) { self.struct_lit(path)? } else { ExprKind::Path(path) }
+                if self.at_mac_bang() {
+                    ExprKind::MacCall(self.mac_call(path)?)
+                } else if self.k.at(T::LBrace) && !r.no_struct && self.looks_like_struct_lit(&path) {
+                    self.struct_lit(path)?
+                } else {
+                    ExprKind::Path(path)
+                }
             }
             T::LParen => {
                 self.k.bump();

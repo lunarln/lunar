@@ -155,6 +155,24 @@ impl<'a> Sema<'a> {
                 ast::Meta::Word(n) if n.name == "intrinsic" => out.intrinsic = true,
                 ast::Meta::Word(n) if n.name == "test" => out.test = true,
                 ast::Meta::Word(n) if n.name == "inline" => out.inline = true,
+                ast::Meta::Word(n) if n.name == "derive_macro" => out.derive_macro = true,
+                ast::Meta::Word(n) if n.name == "export" => {
+                    if n.ctx.is_root() {
+                        self.err(
+                            Diagnostic::error(syntax::BAD_ATTRIBUTE, a.span, "`#[export]` only applies to items written in a macro's body")
+                                .with_note("it makes an item a macro defines visible where the macro is invoked; items written by hand are visible anyway"),
+                        );
+                    }
+                    out.export = true;
+                }
+                ast::Meta::List(n, list) if n.name == "derive" => {
+                    for m in list {
+                        match m {
+                            ast::Meta::Word(d) => out.derive.push(d.clone()),
+                            _ => self.err(Diagnostic::error(syntax::BAD_ATTRIBUTE, a.span, "write derives by name: `#[derive(Eq, Debug)]`")),
+                        }
+                    }
+                }
                 ast::Meta::NameValue(n, _) if n.name == "doc" => {}
                 m => {
                     let n = m.name();
@@ -169,13 +187,16 @@ impl<'a> Sema<'a> {
                         "doc" => Some("#[doc = \"text\"] (or a `///` comment)"),
                         "cfg" => Some("#[cfg(predicate)]"),
                         "allow" => Some("#[allow(lint_name)]"),
+                        "derive" => Some("#[derive(Trait, ...)]"),
+                        "derive_macro" => Some("#[derive_macro]"),
+                        "export" => Some("#[export]"),
                         _ => None,
                     };
                     let d = match usage {
                         Some(u) => Diagnostic::error(syntax::BAD_ATTRIBUTE, a.span, format!("malformed `{}` attribute", n.name))
                             .with_help(format!("write it as `{u}`")),
                         None => Diagnostic::error(syntax::BAD_ATTRIBUTE, a.span, format!("unknown attribute `{}`", n.name))
-                            .with_note("known attributes: cfg, test, inline, lang, intrinsic, link_name, allow, doc"),
+                            .with_note("known attributes: cfg, test, inline, lang, intrinsic, link_name, allow, doc, derive, derive_macro, export"),
                     };
                     self.err(d);
                 }
@@ -208,6 +229,17 @@ impl<'a> Sema<'a> {
             return;
         }
         let attrs = self.item_attrs(&item.attrs);
+        // Hygiene: an item a macro's body names is hidden from other code
+        // unless it is `#[export]`ed (docs/design/macros.md, section 4).
+        let export = attrs.export;
+        let key = |id: &ast::Ident| if id.ctx.is_root() || export { id.name.clone() } else { crate::resolve::hidden_name(&id.name, id.ctx) };
+        for d in &attrs.derive {
+            if !matches!(item.kind, ast::ItemKind::Struct(_) | ast::ItemKind::Enum(_)) {
+                self.err(Diagnostic::error(syntax::BAD_ATTRIBUTE, d.span, "`#[derive]` applies only to structs and enums"));
+                break;
+            }
+            self.pending_macros.push(crate::expand::Pending::Derive { module, item, name: d.clone() });
+        }
         match &item.kind {
             ast::ItemKind::Fn(f) => {
                 let id = self.new_def(&f.name.name, DefKind::Fn, Some(module), f.name.span, AstRef::Fn(f, extern_abi.is_some()));
@@ -218,7 +250,7 @@ impl<'a> Sema<'a> {
                     self.p.tests.push(id);
                 }
                 self.finish_def(id, item, attrs);
-                self.bind(module, Ns::Value, &f.name.name, id, item.is_pub, f.name.span);
+                self.bind(module, Ns::Value, &key(&f.name), id, item.is_pub, f.name.span);
                 if let Some(body) = &f.body {
                     self.collect_block_items(module, body, src);
                 }
@@ -226,15 +258,15 @@ impl<'a> Sema<'a> {
             ast::ItemKind::Struct(s) => {
                 let id = self.new_def(&s.name.name, DefKind::Struct, Some(module), s.name.span, AstRef::Struct(s));
                 self.finish_def(id, item, attrs);
-                self.bind(module, Ns::Type, &s.name.name, id, item.is_pub, s.name.span);
+                self.bind(module, Ns::Type, &key(&s.name), id, item.is_pub, s.name.span);
                 if !matches!(s.kind, ast::VariantData::Named(_)) {
-                    self.bind(module, Ns::Value, &s.name.name, id, item.is_pub, s.name.span);
+                    self.bind(module, Ns::Value, &key(&s.name), id, item.is_pub, s.name.span);
                 }
             }
             ast::ItemKind::Enum(e) => {
                 let id = self.new_def(&e.name.name, DefKind::Enum, Some(module), e.name.span, AstRef::Enum(e));
                 self.finish_def(id, item, attrs);
-                self.bind(module, Ns::Type, &e.name.name, id, item.is_pub, e.name.span);
+                self.bind(module, Ns::Type, &key(&e.name), id, item.is_pub, e.name.span);
                 let mut variants = Vec::new();
                 for (i, v) in e.variants.iter().enumerate() {
                     let vid = self.new_def(&v.name.name, DefKind::Variant, Some(module), v.name.span, AstRef::Variant(v));
@@ -257,55 +289,25 @@ impl<'a> Sema<'a> {
             ast::ItemKind::Trait(t) => {
                 let id = self.new_def(&t.name.name, DefKind::Trait, Some(module), t.name.span, AstRef::Trait(t));
                 self.finish_def(id, item, attrs);
-                self.bind(module, Ns::Type, &t.name.name, id, item.is_pub, t.name.span);
-                let mut methods = Vec::new();
-                for ti in &t.items {
-                    if !self.cfg_enabled(&ti.attrs) {
-                        continue;
-                    }
-                    let ast::ItemKind::Fn(f) = &ti.kind else {
-                        self.err(Diagnostic::error(syntax::UNEXPECTED_TOKEN, ti.span, "only functions are allowed inside traits"));
-                        continue;
-                    };
-                    let fattrs = self.item_attrs(&ti.attrs);
-                    let fid = self.new_def(&f.name.name, DefKind::Fn, Some(module), f.name.span, AstRef::Fn(f, false));
-                    self.p.defs[fid.0 as usize].parent = Some(id);
-                    self.p.defs[fid.0 as usize].is_pub = true;
-                    self.p.defs[fid.0 as usize].attrs = fattrs;
-                    if methods.iter().any(|m: &TraitMethod| m.name == f.name.name) {
-                        self.err(Diagnostic::error(name::DUPLICATE, f.name.span, format!("method `{}` is defined multiple times", f.name.name)));
-                    }
-                    methods.push(TraitMethod { name: f.name.name.clone(), def: fid, has_default: f.body.is_some() });
-                    if let Some(body) = &f.body {
-                        self.collect_block_items(module, body, src);
-                    }
-                }
+                self.bind(module, Ns::Type, &key(&t.name), id, item.is_pub, t.name.span);
                 self.p.defs[id.0 as usize].data =
-                    DefData::Trait(Box::new(TraitData { generics: Generics::default(), supertraits: Vec::new(), methods, auto: false }));
+                    DefData::Trait(Box::new(TraitData { generics: Generics::default(), supertraits: Vec::new(), methods: Vec::new(), auto: false }));
+                self.collect_trait_items(id, module, &t.items, src);
             }
             ast::ItemKind::Impl(im) => {
                 let id = self.new_def("<impl>", DefKind::Impl, Some(module), item.span, AstRef::Impl(im));
                 self.finish_def(id, item, attrs);
                 self.p.impls.push(id);
-                for ii in &im.items {
-                    if !self.cfg_enabled(&ii.attrs) {
-                        continue;
-                    }
-                    let ast::ItemKind::Fn(f) = &ii.kind else {
-                        self.err(Diagnostic::error(syntax::UNEXPECTED_TOKEN, ii.span, "only functions are allowed inside impls"));
-                        continue;
-                    };
-                    let fattrs = self.item_attrs(&ii.attrs);
-                    let fid = self.new_def(&f.name.name, DefKind::Fn, Some(module), f.name.span, AstRef::Fn(f, false));
-                    let d = &mut self.p.defs[fid.0 as usize];
-                    d.parent = Some(id);
-                    d.is_pub = ii.is_pub || im.trait_ref.is_some();
-                    d.attrs = fattrs;
-                    self.impl_items.entry(id).or_default().push(fid);
-                    if let Some(body) = &f.body {
-                        self.collect_block_items(module, body, src);
-                    }
-                }
+                self.collect_impl_items(id, module, &im.items, src);
+            }
+            ast::ItemKind::Macro(m) => {
+                let id = self.new_def(&m.name.name, DefKind::Macro, Some(module), m.name.span, AstRef::Macro(m));
+                self.finish_def(id, item, attrs);
+                self.bind(module, Ns::Macro, &key(&m.name), id, item.is_pub, m.name.span);
+                self.define_macro(id, m);
+            }
+            ast::ItemKind::MacCall(call) => {
+                self.pending_macros.push(crate::expand::Pending::Call { module, call, owner: crate::expand::Owner::Module });
             }
             ast::ItemKind::Use(tree) => self.pending_uses.push((module, tree, item.is_pub)),
             ast::ItemKind::Mod(m) => {
@@ -317,7 +319,7 @@ impl<'a> Sema<'a> {
                     md.krate = krate;
                 }
                 self.finish_def(id, item, attrs);
-                self.bind(module, Ns::Type, &m.name.name, id, item.is_pub, m.name.span);
+                self.bind(module, Ns::Type, &key(&m.name), id, item.is_pub, m.name.span);
                 match &m.items {
                     Some(items) => {
                         chain.push(m.name.name.clone());
@@ -336,12 +338,12 @@ impl<'a> Sema<'a> {
             ast::ItemKind::Const(c) => {
                 let id = self.new_def(&c.name.name, DefKind::Const, Some(module), c.name.span, AstRef::Const(c));
                 self.finish_def(id, item, attrs);
-                self.bind(module, Ns::Value, &c.name.name, id, item.is_pub, c.name.span);
+                self.bind(module, Ns::Value, &key(&c.name), id, item.is_pub, c.name.span);
             }
             ast::ItemKind::Static(s) => {
                 let id = self.new_def(&s.name.name, DefKind::Static, Some(module), s.name.span, AstRef::Static(s));
                 self.finish_def(id, item, attrs);
-                self.bind(module, Ns::Value, &s.name.name, id, item.is_pub, s.name.span);
+                self.bind(module, Ns::Value, &key(&s.name), id, item.is_pub, s.name.span);
             }
             ast::ItemKind::Extern(block) => {
                 let abi = block.abi.as_deref().unwrap_or("C");
@@ -362,7 +364,77 @@ impl<'a> Sema<'a> {
             ast::ItemKind::TypeAlias(t) => {
                 let id = self.new_def(&t.name.name, DefKind::TypeAlias, Some(module), t.name.span, AstRef::Alias(t));
                 self.finish_def(id, item, attrs);
-                self.bind(module, Ns::Type, &t.name.name, id, item.is_pub, t.name.span);
+                self.bind(module, Ns::Type, &key(&t.name), id, item.is_pub, t.name.span);
+            }
+        }
+    }
+
+    /// An item a macro expanded to, in item position of `module`.
+    pub(crate) fn collect_expanded_item(&mut self, module: DefId, item: &'a ast::Item, src: &'a ModSource) {
+        self.collect_item(module, item, src, &mut Vec::new(), None);
+    }
+
+    /// The functions of trait `id` (also those a macro in its body expands to).
+    pub(crate) fn collect_trait_items(&mut self, id: DefId, module: DefId, items: &'a [ast::Item], src: &'a ModSource) {
+        for ti in items {
+            if !self.cfg_enabled(&ti.attrs) {
+                continue;
+            }
+            let f = match &ti.kind {
+                ast::ItemKind::Fn(f) => f,
+                ast::ItemKind::MacCall(call) => {
+                    self.pending_macros.push(crate::expand::Pending::Call { module, call, owner: crate::expand::Owner::Trait(id) });
+                    continue;
+                }
+                _ => {
+                    self.err(Diagnostic::error(syntax::UNEXPECTED_TOKEN, ti.span, "only functions are allowed inside traits"));
+                    continue;
+                }
+            };
+            let fattrs = self.item_attrs(&ti.attrs);
+            let fid = self.new_def(&f.name.name, DefKind::Fn, Some(module), f.name.span, AstRef::Fn(f, false));
+            self.p.defs[fid.0 as usize].parent = Some(id);
+            self.p.defs[fid.0 as usize].is_pub = true;
+            self.p.defs[fid.0 as usize].attrs = fattrs;
+            let DefData::Trait(t) = &mut self.p.defs[id.0 as usize].data else { unreachable!("not a trait") };
+            let dup = t.methods.iter().any(|m| m.name == f.name.name);
+            t.methods.push(TraitMethod { name: f.name.name.clone(), def: fid, has_default: f.body.is_some() });
+            if dup {
+                self.err(Diagnostic::error(name::DUPLICATE, f.name.span, format!("method `{}` is defined multiple times", f.name.name)));
+            }
+            if let Some(body) = &f.body {
+                self.collect_block_items(module, body, src);
+            }
+        }
+    }
+
+    /// The functions of impl `id` (also those a macro in its body expands to).
+    pub(crate) fn collect_impl_items(&mut self, id: DefId, module: DefId, items: &'a [ast::Item], src: &'a ModSource) {
+        let is_trait_impl = matches!(self.asts[id.0 as usize], AstRef::Impl(im) if im.trait_ref.is_some());
+        for ii in items {
+            if !self.cfg_enabled(&ii.attrs) {
+                continue;
+            }
+            let f = match &ii.kind {
+                ast::ItemKind::Fn(f) => f,
+                ast::ItemKind::MacCall(call) => {
+                    self.pending_macros.push(crate::expand::Pending::Call { module, call, owner: crate::expand::Owner::Impl(id) });
+                    continue;
+                }
+                _ => {
+                    self.err(Diagnostic::error(syntax::UNEXPECTED_TOKEN, ii.span, "only functions are allowed inside impls"));
+                    continue;
+                }
+            };
+            let fattrs = self.item_attrs(&ii.attrs);
+            let fid = self.new_def(&f.name.name, DefKind::Fn, Some(module), f.name.span, AstRef::Fn(f, false));
+            let d = &mut self.p.defs[fid.0 as usize];
+            d.parent = Some(id);
+            d.is_pub = ii.is_pub || is_trait_impl;
+            d.attrs = fattrs;
+            self.impl_items.entry(id).or_default().push(fid);
+            if let Some(body) = &f.body {
+                self.collect_block_items(module, body, src);
             }
         }
     }

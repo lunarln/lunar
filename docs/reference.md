@@ -69,6 +69,50 @@ Struct fields are private unless `pub`.
 * `#[link_name = "..."]` on extern functions.
 * `#[inline]`, `#[allow(...)]`, `#[doc = "..."]` are accepted.
 * `#[lang = "..."]` and `#[intrinsic]` are used by the standard library.
+* `#[derive(Name, ...)]` on a struct or enum runs those derive macros;
+  `#[derive_macro]` marks a macro as a derive; `#[export]` makes an item a
+  macro defines visible where it is invoked (see Macros).
+
+### Macros
+
+Macros are hygienic and declarative, and are items like functions
+(`pub`, `use`, usable before their definition). The full design is in
+[design/macros.md](design/macros.md).
+
+```lunar
+pub macro square($x:expr) {
+    let t = $x;     // cannot clash with the caller's `t`
+    t * t
+}
+
+macro max {
+    ($x:expr) => { $x },
+    ($x:expr, $($rest:expr),+) => {
+        let a = $x;
+        let b = max!($($rest),+);
+        if a > b { a } else { b }
+    },
+}
+
+let m = max!(3, square!(2), 1);
+```
+
+* Invoked as `name!(...)`, `name![...]` or `name!{...}` in expression,
+  statement, item (also inside `impl` and `trait` bodies), pattern and type
+  position. In expression position the expansion is a block, so it may
+  contain statements.
+* Matchers use `$name:fragment` with the fragments `ident`, `path`, `expr`,
+  `ty`, `pat`, `block`, `stmt`, `item`, `lit`, `vis`, `meta`, `tt` and
+  `generics`, and repetitions `$( ... ) sep op` with `*`, `+` or `?`.
+* `$g:generics` matches `::<T: A, U>` (or nothing); in a body, `$g`,
+  `$g.args` (`::<T, U>`) and `$g.bound(Trait)` (`::<T: A + Trait, U: Trait>`).
+* Hygiene: names in a macro's body resolve where the macro is defined, its
+  `let`s are invisible to the caller and vice versa, and items it defines
+  are hidden from the caller unless marked `#[export]`.
+* A derive is a macro marked `#[derive_macro]`; `#[derive(Name)]` passes it
+  the struct or enum's tokens, and it may only add items (an `impl`).
+* Macro errors are `macro::...`; an expansion's code is shown as a file
+  named after the macro (`<square!>`).
 
 ## 3. Types
 

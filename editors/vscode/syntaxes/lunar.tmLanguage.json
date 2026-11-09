@@ -180,7 +180,22 @@
         },
         {
           "name": "keyword.other.lunar",
-          "match": "\\b(fn|let|struct|enum|impl|trait|type|mod|use|as)\\b"
+          "match": "\\b(fn|let|struct|enum|impl|trait|type|mod|use|as|macro)\\b"
+        },
+        {
+          "comment": "A macro invocation: `vec!(`, `tokens! {`",
+          "name": "entity.name.function.macro.lunar",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*!(?=\\s*[(\\[{])"
+        },
+        {
+          "comment": "Macro variables and repetitions: `$x`, `$x:expr`, `$(`",
+          "match": "(\\$)([A-Za-z_][A-Za-z0-9_]*)?(?:(:)(ident|path|expr|ty|pat|block|stmt|item|lit|vis|meta|tt|generics)\\b)?",
+          "captures": {
+            "1": { "name": "keyword.operator.macro.lunar" },
+            "2": { "name": "variable.other.macro.lunar" },
+            "3": { "name": "punctuation.separator.lunar" },
+            "4": { "name": "storage.type.fragment.lunar" }
+          }
         },
         {
           "name": "variable.language.self.lunar",

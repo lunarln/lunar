@@ -397,6 +397,7 @@ name = "ln-ast"
 version = "0.1.0"
 dependencies = [
  "ln-diag",
+ "ln-lexer",
 ]
 
 [[package]]
@@ -465,6 +466,7 @@ version = "0.1.0"
 dependencies = [
  "ln-ast",
  "ln-diag",
+ "ln-lexer",
  "ln-parser",
 ]
 

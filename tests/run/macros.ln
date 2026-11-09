@@ -1,0 +1,124 @@
+// Declarative macros: every position, repetitions, recursion, hygiene,
+// `#[export]`, and a derive written in Lunar.
+
+macro square($x:expr) {
+    let t = $x;
+    t * t
+}
+
+macro max {
+    ($x:expr) => { $x },
+    ($x:expr, $($rest:expr),+) => {
+        let a = $x;
+        let b = max!($($rest),+);
+        if a > b { a } else { b }
+    },
+}
+
+macro sum($($x:expr),* $(,)?) {
+    0 $(+ $x)*
+}
+
+// Item position: an exported enum and function, and a private helper.
+macro tokens {
+    ($($name:ident $text:lit),* $(,)?) => {
+        #[export]
+        enum Tok { $($name),* }
+
+        #[export]
+        fn text(t: Tok): str {
+            return describe(t);
+        }
+
+        fn describe(t: Tok): str {
+            return match t { $(Tok::$name => $text),* };
+        }
+    },
+}
+
+tokens! { LParen "(", RParen ")", Plus "+" }
+
+macro digit() { b'0'..=b'9' }
+macro Pair($a:ty, $b:ty) { ($a, $b) }
+
+trait Describe {
+    fn describe(&self): String;
+}
+
+impl Describe for i32 {
+    fn describe(&self): String {
+        let mut s = String::new();
+        s.write("{self}");
+        return s;
+    }
+}
+
+/// Describes each field, in order.
+#[derive_macro]
+macro Describe {
+    ($v:vis struct $n:ident $g:generics { $($fv:vis $f:ident: $t:ty),* $(,)? }) => {
+        impl $g.bound(Describe) Describe for $n $g.args {
+            fn describe(&self): String {
+                let mut out = String::new();
+                $(
+                    out.push_str(self.$f.describe().as_str());
+                    out.push(' ');
+                )*
+                return out;
+            }
+        }
+    },
+}
+
+#[derive(Describe)]
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+#[derive(Describe)]
+struct Wrapped::<T: Dull> {
+    pub inner: T,
+}
+
+struct Counter {
+    n: i32,
+}
+
+// Item position inside an impl.
+macro getter($name:ident, $field:ident) {
+    fn $name(&self): i32 {
+        return self.$field;
+    }
+}
+
+impl Counter {
+    getter!(count, n);
+}
+
+fn classify(c: u8): str {
+    return match c {
+        digit!() => "digit",
+        _ => "other",
+    };
+}
+
+fn swap(p: Pair![i32, str]): Pair![str, i32] {
+    let (a, b) = p;
+    return (b, a);
+}
+
+fn main() {
+    let t = 10;
+    println("{square!(t + 1)} {t}");
+    println("{max!(3, 9, 4)} {sum!(1, 2, 3,)} {sum!()}");
+    println("{text(Tok::Plus)}{text(Tok::LParen)}{text(Tok::RParen)}");
+    println("{classify(b'7')} {classify(b'x')}");
+    let (s, n) = swap((5, "five"));
+    println("{s} {n}");
+    let p = Point { x: 1, y: 2 };
+    let w: Wrapped::<i32> = Wrapped { inner: 7 };
+    println("{p.describe()}| {w.describe()}");
+    let c = Counter { n: 3 };
+    println("{c.count()}");
+}

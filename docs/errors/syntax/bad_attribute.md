@@ -5,15 +5,17 @@ incorrectly. This code is reported for:
 
 * an unknown attribute, or a known one in the wrong form. The accepted
   attributes are `#[cfg(...)]`, `#[test]`, `#[inline]`, `#[lang = "..."]`,
-  `#[intrinsic]`, `#[link_name = "..."]`, `#[allow(...)]` and
-  `#[doc = "..."]`;
+  `#[intrinsic]`, `#[link_name = "..."]`, `#[allow(...)]`, `#[doc = "..."]`
+  (also written as a `///` comment), `#[derive(...)]`, `#[derive_macro]`
+  and `#[export]`;
 * `#[cfg(...)]` with zero or several predicates (combine them with `all`,
   `any` or `not` instead);
 * an unknown predicate function inside `cfg`, such as `cfg(foo(x))`;
+* `#[derive(...)]` on something other than a struct or enum, or with
+  something other than names inside;
+* `#[export]` on an item written by hand: it only makes sense on an item a
+  macro defines (see `docs/design/macros.md`);
 * an `extern` block with an ABI other than `"C"`.
-
-Lunar has no `derive`: traits such as `Eq`, `Clone` or `Display` are
-implemented with an explicit `impl`.
 
 An unknown `cfg` name or value such as `#[cfg(linux)]` is not an error: it
 is false, so the item is compiled out, and the compiler warns about it with
@@ -22,30 +24,26 @@ is false, so the item is compiled out, and the compiler warns about it with
 ## Erroneous example
 
 ```lunar
-#[derive(Eq)]
-struct Point { x: i32, y: i32 }
+#[must_use]
+fn double(x: i32): i32 {
+    return x * 2;
+}
 
 fn main() {
-    let a = Point { x: 1, y: 2 };
-    println("{a == Point { x: 1, y: 2 }}");
+    println("{double(2)}");
 }
 ```
 
 ## Fixed
 
-`Eq` is implemented by hand:
+Lunar has no `must_use`; the attribute is removed:
 
 ```lunar
-struct Point { x: i32, y: i32 }
-
-impl Eq for Point {
-    fn eq(&self, other: &Point): bool {
-        return self.x == other.x && self.y == other.y;
-    }
+fn double(x: i32): i32 {
+    return x * 2;
 }
 
 fn main() {
-    let a = Point { x: 1, y: 2 };
-    println("{a == Point { x: 1, y: 2 }}");
+    println("{double(2)}");
 }
 ```

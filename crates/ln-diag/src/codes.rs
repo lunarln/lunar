@@ -104,6 +104,15 @@ codes! {
         WRONG_MARKER = "wrong_marker",
         NOT_AN_ARGUMENT = "not_an_argument",
     }
+    macro_ ("macro") => {
+        UNDEFINED = "undefined",
+        NO_MATCH = "no_match",
+        BAD_MATCHER = "bad_matcher",
+        REPETITION = "repetition",
+        RECURSION_LIMIT = "recursion_limit",
+        DERIVE_OUTPUT = "derive_output",
+        NOT_SUPPORTED = "not_supported",
+    }
     unsafe_ ("unsafe") => {
         OUTSIDE_UNSAFE = "outside_unsafe",
         IN_UNSAFE_FN = "in_unsafe_fn",

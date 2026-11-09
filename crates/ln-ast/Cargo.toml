@@ -7,3 +7,4 @@ license.workspace = true
 
 [dependencies]
 ln-diag.workspace = true
+ln-lexer.workspace = true

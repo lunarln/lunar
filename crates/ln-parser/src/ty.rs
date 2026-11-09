@@ -65,7 +65,10 @@ impl P<'_, '_, '_> {
     pub(crate) fn ty(&mut self) -> PResult<Ty> {
         let start = self.start();
         let kind = match self.k.peek() {
-            Some(T::Ident | T::SelfType | T::Crater | T::Super | T::SelfValue) => TyKind::Path(self.path_ty_style()?),
+            Some(T::Ident | T::SelfType | T::Crater | T::Super | T::SelfValue) => {
+                let path = self.path_ty_style()?;
+                if self.at_mac_bang() { TyKind::MacCall(self.mac_call(path)?) } else { TyKind::Path(path) }
+            }
             Some(T::Placeholder) => {
                 self.k.bump();
                 TyKind::Infer

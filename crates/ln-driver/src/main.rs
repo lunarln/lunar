@@ -142,7 +142,26 @@ enum Cmd {
     },
 }
 
+/// The compiler recurses over nested expressions and macro expansions (up
+/// to 128 deep), more than a main thread's stack (1 MiB on Windows) holds,
+/// so it runs on a thread with a larger one. The memory is only reserved,
+/// and used as needed.
+const STACK_SIZE: usize = 256 << 20;
+
 fn main() -> ExitCode {
+    let worker = std::thread::Builder::new().name("lunar".into()).stack_size(STACK_SIZE).spawn(run);
+    match worker.map(|w| w.join()) {
+        Ok(Ok(code)) => code,
+        // A panic was already reported by the panic hook.
+        Ok(Err(_)) => ExitCode::from(101),
+        Err(e) => {
+            eprintln!("error: could not start the compiler thread: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> ExitCode {
     let cli = Cli::parse();
     let color = std::io::stderr().is_terminal();
     let result = match cli.command {

@@ -20,11 +20,13 @@ pub enum DefKind {
     Const,
     Static,
     TypeAlias,
+    Macro,
 }
 
 impl DefKind {
     pub fn describe(self) -> &'static str {
         match self {
+            DefKind::Macro => "macro",
             DefKind::Mod => "module",
             DefKind::Fn => "function",
             DefKind::Struct => "struct",
@@ -47,12 +49,20 @@ pub struct ItemAttrs {
     pub test: bool,
     pub inline: bool,
     pub link_name: Option<String>,
+    /// `#[derive(A, B)]`: derive macros to run on this struct or enum.
+    pub derive: Vec<ln_ast::Ident>,
+    /// `#[derive_macro]`: this macro is a derive.
+    pub derive_macro: bool,
+    /// `#[export]`: an item a macro defines is visible where it is invoked.
+    pub export: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ns {
     Type,
     Value,
+    /// Macros (`vec!`, derives); a trait and its derive share a path.
+    Macro,
 }
 
 /// A name bound in a module (an item or an import).
@@ -67,6 +77,7 @@ pub struct Binding {
 pub struct ModData {
     pub types: HashMap<String, Binding>,
     pub values: HashMap<String, Binding>,
+    pub macros: HashMap<String, Binding>,
     /// `use path::*;` targets (module or enum), with visibility.
     pub globs: Vec<(DefId, bool)>,
     /// Parent module (`super`); `None` for crate roots.
@@ -82,6 +93,7 @@ impl ModData {
         match ns {
             Ns::Type => &self.types,
             Ns::Value => &self.values,
+            Ns::Macro => &self.macros,
         }
     }
 
@@ -89,6 +101,7 @@ impl ModData {
         match ns {
             Ns::Type => &mut self.types,
             Ns::Value => &mut self.values,
+            Ns::Macro => &mut self.macros,
         }
     }
 }
@@ -131,6 +144,8 @@ pub enum Abi {
 #[derive(Clone, Debug)]
 pub struct Param {
     pub name: String,
+    /// The name's hygiene context (it may come from a macro's body).
+    pub ctx: ln_ast::SyntaxCtx,
     pub ty: Ty,
     pub mode: ParamMode,
     /// `x: &mut T`: passed by reference (in-out). Same as `mode == InOut`.

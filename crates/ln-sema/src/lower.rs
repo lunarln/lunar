@@ -502,7 +502,11 @@ impl<'a> Sema<'a> {
                     generics_span: f.generics.span,
                 });
             }
-            params.push(Param { name: pname, ty, mode: p.mode, inout: p.mode == ast::ParamMode::InOut, mutable: p.is_mut, is_self, span: p.span });
+            let ctx = match &p.kind {
+                ast::ParamKind::Named(n) => n.ctx,
+                _ => ast::SyntaxCtx::ROOT,
+            };
+            params.push(Param { name: pname, ctx, ty, mode: p.mode, inout: p.mode == ast::ParamMode::InOut, mutable: p.is_mut, is_self, span: p.span });
         }
         let (ret, ret_span) = match &f.ret {
             Some(t) => (self.lower_ty(&cx, t, TyPos::Other), t.span),
@@ -579,6 +583,12 @@ impl<'a> Sema<'a> {
     pub(crate) fn lower_ty(&mut self, cx: &LowerCx, t: &ast::Ty, pos: TyPos) -> Ty {
         let ty = match &t.kind {
             ast::TyKind::Path(p) => self.lower_path_ty(cx, p),
+            ast::TyKind::MacCall(m) => {
+                return match self.expand_ty(cx.module, m) {
+                    Some(t) => self.lower_ty(cx, t, pos),
+                    None => Ty::Error,
+                };
+            }
             ast::TyKind::Infer => {
                 if !cx.allow_infer {
                     self.err(Diagnostic::error(tyc::ANNOTATIONS_NEEDED, t.span, "`_` is not allowed in item signatures"));

@@ -1,6 +1,10 @@
 # Macros and derive
 
-Status: design, decided 2026-11-09. Not implemented yet.
+Status: decided 2026-11-09. Sections 1 to 6 are implemented (the macro
+engine, hygiene, the macro namespace, expansion in every position,
+derives); sections 7 and 8 (`Debug`, `{x:?}` and the derives in `core`) are
+next. Not yet supported: items in a macro expanded in expression position
+(`macro::not_supported`).
 
 The goal is that **no trait is derived by the compiler**. `Eq`, `Debug`,
 `Display`, `Clone`, `Default` and `Ord` are derived by ordinary macros

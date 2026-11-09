@@ -1,8 +1,9 @@
 # syntax::unknown_char: the source contains characters that are not part of any token
 
 The lexer found one or more characters that do not start any Lunar token,
-such as `$`, `` ` ``, `§` or a non-ASCII symbol outside a string or comment.
-A run of adjacent unknown characters is reported as one error.
+such as `` ` ``, `§` or a non-ASCII symbol outside a string or comment.
+A run of adjacent unknown characters is reported as one error. (`$` is a
+token: it marks variables in macro definitions.)
 
 Identifiers are limited to ASCII letters, digits and `_`, so non-ASCII
 letters in names are also reported here. Text in string and character
@@ -16,13 +17,13 @@ if removing them leaves invalid code.
 ```lunar
 fn main() {
     let total = 10;
-    println("{total}");$
+    println("{total}");§
 }
 ```
 
 ## Fixed
 
-The stray `$` is removed:
+The stray `§` is removed:
 
 ```lunar
 fn main() {

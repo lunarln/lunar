@@ -167,7 +167,8 @@ fn decl_in_item<'a>(item: &'a ast::Item, name: Span, parent: Option<&'a ast::Ite
         K::TypeAlias(t) if t.name.span == name => Some(here),
         K::TypeAlias(t) => params(&t.generics),
         K::Extern(b) => decl_in_items(&b.items, name, None, Some(b.abi.as_deref().unwrap_or("C"))),
-        K::Use(_) => None,
+        K::Macro(m) => (m.name.span == name).then_some(here),
+        K::Use(_) | K::MacCall(_) => None,
     }
 }
 

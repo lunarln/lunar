@@ -5,6 +5,7 @@
 pub mod borrowck;
 mod collect;
 pub mod defs;
+mod expand;
 pub mod layout;
 pub mod loader;
 mod lower;
@@ -84,6 +85,19 @@ pub struct Program {
     pub tests: Vec<DefId>,
     /// Every resolved name, in resolution order (may contain duplicates).
     pub refs: Vec<Ref>,
+    /// For each macro expansion's file, where the macro was invoked.
+    pub expansion_sites: HashMap<ln_diag::FileId, ln_diag::Span>,
+}
+
+impl Program {
+    /// Where `span` is in code the user wrote: spans inside macro
+    /// expansions map to the invocation (repeatedly, for nested ones).
+    pub fn source_span(&self, mut span: ln_diag::Span) -> ln_diag::Span {
+        while let Some(site) = self.expansion_sites.get(&span.file) {
+            span = *site;
+        }
+        span
+    }
 }
 
 impl Program {
@@ -187,6 +201,7 @@ pub(crate) enum AstRef<'a> {
     Const(&'a ast::ConstDecl),
     Static(&'a ast::StaticDecl),
     Alias(&'a ast::TypeAlias),
+    Macro(&'a ast::MacroDef),
 }
 
 pub(crate) struct Sema<'a> {
@@ -203,6 +218,21 @@ pub(crate) struct Sema<'a> {
     pub(crate) alias_stack: Vec<DefId>,
     /// For each crater root, the craters it may name and under what name.
     pub(crate) crater_deps: HashMap<DefId, Vec<(String, DefId)>>,
+
+    // ----- macros (see `expand`) -----
+    /// The sources, plus a file for each expansion (taken from the caller
+    /// for the analysis and handed back).
+    pub(crate) map: ln_diag::SourceMap,
+    /// Syntax contexts of identifiers in expansion files.
+    pub(crate) file_ctxs: HashMap<ln_diag::FileId, ln_parser::Ctxs>,
+    /// Node ids for expanded syntax.
+    pub(crate) ids: ln_parser::IdGen,
+    /// One per expansion; index 0 stands for `SyntaxCtx::ROOT`.
+    pub(crate) marks: Vec<expand::Mark>,
+    pub(crate) macro_rules: HashMap<DefId, Vec<expand::Rule<'a>>>,
+    pub(crate) pending_macros: Vec<expand::Pending<'a>>,
+    pub(crate) arenas: &'a expand::Arenas,
+    pub(crate) ty_expansions: HashMap<(ln_diag::FileId, u32), Option<&'a ast::Ty>>,
 }
 
 impl<'a> Sema<'a> {
@@ -213,9 +243,19 @@ impl<'a> Sema<'a> {
 
 /// Analyze a set of crates. The first crate is the user's; `core` and `std`
 /// must be among them. Returns the program (if there were no errors) and all
-/// diagnostics.
-pub fn analyze(crates: &[CrateSource], opts: Options) -> (Option<Program>, Vec<Diagnostic>) {
+/// diagnostics. Macro expansions are added to `map` as files of their own.
+pub fn analyze(crates: &[CrateSource], map: &mut ln_diag::SourceMap, opts: Options) -> (Option<Program>, Vec<Diagnostic>) {
+    let arenas = expand::Arenas::default();
     let mut s = Sema {
+        map: std::mem::take(map),
+        file_ctxs: HashMap::new(),
+        // Loaded files number their nodes from 0; expansions start far above.
+        ids: ln_parser::IdGen::starting_at(1 << 30),
+        marks: vec![expand::Mark { def_module: DefId(0), def_ctx: ast::SyntaxCtx::ROOT, depth: 0 }],
+        macro_rules: HashMap::new(),
+        pending_macros: Vec::new(),
+        arenas: &arenas,
+        ty_expansions: HashMap::new(),
         p: Program::default(),
         asts: Vec::new(),
         diags: Diagnostics::new(),
@@ -247,6 +287,7 @@ pub fn analyze(crates: &[CrateSource], opts: Options) -> (Option<Program>, Vec<D
         s.prelude = Some(b.def);
     }
     s.resolve_imports();
+    s.expand_items();
     s.lower_all();
     if let Some(root) = user_root
         && let Some(b) = s.lookup_in(root, "main", Ns::Value)
@@ -257,6 +298,7 @@ pub fn analyze(crates: &[CrateSource], opts: Options) -> (Option<Program>, Vec<D
     if !s.diags.has_errors() || s.opts.keep_going {
         s.check_bodies();
     }
+    *map = std::mem::take(&mut s.map);
     let diags = s.diags.into_vec();
     let ok = !diags.iter().any(|d| d.is_error());
     (if ok || s.opts.keep_going { Some(s.p) } else { None }, diags)

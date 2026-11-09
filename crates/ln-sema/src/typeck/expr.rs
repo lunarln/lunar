@@ -101,7 +101,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             ast::ExprKind::Paren(x) => self.check_place(x),
             ast::ExprKind::Path(p) if p.is_single() => {
                 let n = &p.segments[0].ident.name;
-                if let Some(l) = self.lookup_local(n) {
+                if let Some(l) = self.lookup_local(n, p.segments[0].ident.ctx) {
                     self.record_local(p.segments[0].ident.span, l);
                     let ty = self.locals[l.0 as usize].ty.clone();
                     return Some(self.mk(ExprKind::Local(l), ty, e.span));
@@ -203,7 +203,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let module = self.module();
         // Silent lookup: only statics become places.
         let def = if idents.len() == 1 {
-            match self.s.lookup_unqualified(module, &idents[0].name, Ns::Value) {
+            match self.s.lookup_ident(module, &idents[0], Ns::Value) {
                 Some(crate::resolve::ModRes::Def(d)) => d,
                 _ => return None,
             }
@@ -285,6 +285,13 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             K::Paren(x) => self.check_expr_mode(x, expect, mode),
             K::Path(p) => self.check_path_value(p, expect, span),
             K::Unary(op, x) => self.check_unary(*op, x, expect, span),
+            K::MacCall(m) => {
+                let module = self.module();
+                match self.s.expand_expr(module, m) {
+                    Some(x) => self.check_expr_mode(x, expect, mode),
+                    None => self.error_expr(span),
+                }
+            }
             // Call arguments are handled by `check_args`; anywhere else a
             // borrow has nothing to lend to.
             K::Borrow { expr, .. } => {
@@ -1161,7 +1168,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             let (var, extra) = match &pat.kind {
                 ast::PatKind::Binding { is_mut, name } => {
                     let l = self.new_local(&name.name, st.clone(), *is_mut, LocalKind::Let, name.span, depth);
-                    self.bind_name(&name.name, l);
+                    self.bind_name(&name.name, name.ctx, l);
                     (l, None)
                 }
                 ast::PatKind::Wild => (self.new_local("_", st.clone(), false, LocalKind::Let, pat.span, depth), None),

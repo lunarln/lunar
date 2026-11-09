@@ -151,7 +151,7 @@ pub fn analyze_craters(craters: &[CraterSpec], o: &AnalyzeOptions) -> Analysis {
         opts.target_os = os.to_string();
         opts.target_family = if os == "windows" { "windows" } else { "unix" }.to_string();
     }
-    let (program, mut d) = ln_sema::analyze(&crates, opts);
+    let (program, mut d) = ln_sema::analyze(&crates, &mut map, opts);
     diags.append(&mut d);
     Analysis { map, program, diags, sources: crates }
 }

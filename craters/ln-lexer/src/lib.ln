@@ -66,6 +66,8 @@ pub enum Token {
     Question,
     Hash,
     At,
+    /// `$`: a macro metavariable (`$x:expr`) or repetition (`$(...)*`).
+    Dollar,
     Placeholder,
 
     // ----- keywords -----
@@ -85,6 +87,7 @@ pub enum Token {
     In,
     Let,
     Loop,
+    Macro,
     Match,
     Mod,
     Mut,
@@ -327,6 +330,7 @@ fn punct(b: [u8; &], i: usize): (Option::<Token>, usize) {
         b'?' => tok(Token::Question, one),
         b'#' => tok(Token::Hash, one),
         b'@' => tok(Token::At, one),
+        b'$' => tok(Token::Dollar, one),
         _ => (None, i + char_len(c)),
     };
 }
@@ -363,6 +367,7 @@ fn word(s: str): Token {
         "in" => Token::In,
         "let" => Token::Let,
         "loop" => Token::Loop,
+        "macro" => Token::Macro,
         "match" => Token::Match,
         "mod" => Token::Mod,
         "mut" => Token::Mut,
@@ -685,6 +690,7 @@ impl Token {
             Token::Question => "`?`",
             Token::Hash => "`#`",
             Token::At => "`@`",
+            Token::Dollar => "`$`",
             Token::Placeholder => "`_`",
             Token::As => "`as`",
             Token::Break => "`break`",
@@ -702,6 +708,7 @@ impl Token {
             Token::In => "`in`",
             Token::Let => "`let`",
             Token::Loop => "`loop`",
+            Token::Macro => "`macro`",
             Token::Match => "`match`",
             Token::Mod => "`mod`",
             Token::Mut => "`mut`",
@@ -787,6 +794,7 @@ impl Token {
             Token::Question => "Question",
             Token::Hash => "Hash",
             Token::At => "At",
+            Token::Dollar => "Dollar",
             Token::Placeholder => "Placeholder",
             Token::As => "As",
             Token::Break => "Break",
@@ -804,6 +812,7 @@ impl Token {
             Token::In => "In",
             Token::Let => "Let",
             Token::Loop => "Loop",
+            Token::Macro => "Macro",
             Token::Match => "Match",
             Token::Mod => "Mod",
             Token::Mut => "Mut",
@@ -924,6 +933,16 @@ fn doc_comments() {
 #[test]
 fn generics_do_not_fuse_closers() {
     std::test::assert_eq(&kinds("A::<B::<C>>").as_str(), &"Ident PathSep LAngle Ident PathSep LAngle Ident RAngle RAngle", "closers");
+}
+
+#[test]
+fn macros() {
+    std::test::assert_eq(
+        &kinds("macro m($x:expr) { $($x),* }").as_str(),
+        &"Macro Ident LParen Dollar Ident Colon Ident RParen LBrace Dollar LParen Dollar Ident RParen Comma Star RBrace",
+        "macro definition",
+    );
+    std::test::assert_eq(&kinds("vec![1] macros").as_str(), &"Ident Bang LBracket Number(Int) RBracket Ident", "invocation");
 }
 
 #[test]

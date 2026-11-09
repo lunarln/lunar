@@ -6,6 +6,13 @@ use crate::ty::{FloatTy, IntTy, Ty};
 use ln_ast as ast;
 use ln_diag::{Diagnostic, Span, codes::name};
 
+/// The name an item a macro expansion defines is bound under, unless it is
+/// `#[export]`ed: `#` cannot appear in an identifier, so only names from the
+/// same expansion (same context) find it.
+pub(crate) fn hidden_name(name: &str, ctx: ast::SyntaxCtx) -> String {
+    format!("{name}#{}", ctx.0)
+}
+
 /// What a module-level path resolves to.
 #[derive(Clone, Debug)]
 pub(crate) enum ModRes {
@@ -118,17 +125,48 @@ impl<'a> Sema<'a> {
         None
     }
 
+    /// Unqualified lookup of an identifier, with hygiene (docs/design/macros.md
+    /// section 4). A name written by hand resolves from `from`. A name a
+    /// macro's body wrote resolves first among the items that same
+    /// expansion defined (bound under a hidden name, so nothing else sees
+    /// them), then where the macro is defined.
+    pub(crate) fn lookup_ident(&self, from: DefId, id: &ast::Ident, ns: Ns) -> Option<ModRes> {
+        if id.ctx.is_root() {
+            return self.lookup_unqualified(from, &id.name, ns);
+        }
+        if let Some(r) = self.lookup_unqualified(from, &hidden_name(&id.name, id.ctx), ns) {
+            return Some(r);
+        }
+        let mark = &self.marks[id.ctx.0 as usize];
+        let at_def = ast::Ident { name: id.name.clone(), span: id.span, ctx: mark.def_ctx };
+        self.lookup_ident(mark.def_module, &at_def, ns)
+    }
+
+    /// The module `crater`, `self` and `super` in a path are relative to:
+    /// for a name a macro's body wrote, the module the macro is defined in.
+    fn path_base(&self, from: DefId, first: &ast::Ident) -> DefId {
+        let mut from = from;
+        let mut ctx = first.ctx;
+        while !ctx.is_root() {
+            let mark = &self.marks[ctx.0 as usize];
+            from = mark.def_module;
+            ctx = mark.def_ctx;
+        }
+        from
+    }
+
     /// Resolve the longest module-level prefix of `segs`. Returns the result
     /// and how many segments were consumed; remaining segments are
     /// type-relative (associated items). Reports errors.
     pub(crate) fn resolve_prefix(&mut self, from: DefId, segs: &[ast::Ident], last_ns: Ns) -> Option<(ModRes, usize)> {
         let first = &segs[0];
         let first_ns = if segs.len() == 1 { last_ns } else { Ns::Type };
+        let base = self.path_base(from, first);
         let mut cur = match first.name.as_str() {
-            "crater" => DefId(self.mod_data(from).krate.0),
-            "self" if segs.len() > 1 => self.normal_module(from),
+            "crater" => DefId(self.mod_data(base).krate.0),
+            "self" if segs.len() > 1 => self.normal_module(base),
             "super" => {
-                let m = self.normal_module(from);
+                let m = self.normal_module(base);
                 match self.mod_data(m).parent {
                     Some(p) => p,
                     None => {
@@ -137,7 +175,7 @@ impl<'a> Sema<'a> {
                     }
                 }
             }
-            n => match self.lookup_unqualified(from, n, first_ns) {
+            _ => match self.lookup_ident(from, first, first_ns) {
                 Some(ModRes::Def(d)) => d,
                 Some(ModRes::Prim(t)) => return Some((ModRes::Prim(t), 1)),
                 None => {
@@ -162,7 +200,7 @@ impl<'a> Sema<'a> {
             let ns = if i + 1 == segs.len() { last_ns } else { Ns::Type };
             let other = match ns {
                 Ns::Type => Ns::Value,
-                Ns::Value => Ns::Type,
+                Ns::Value | Ns::Macro => Ns::Type,
             };
             // Enum variants live in both namespaces. In a module, a name
             // found only in the other namespace is still returned, so the
@@ -202,6 +240,7 @@ impl<'a> Sema<'a> {
         let what = match ns {
             Ns::Type => "type or module",
             Ns::Value => "value",
+            Ns::Macro => "macro",
         };
         let mut d = Diagnostic::error(name::UNRESOLVED, id.span, format!("cannot find {what} `{}` in this scope", id.name));
         if id.name == "crate" {
@@ -220,7 +259,8 @@ impl<'a> Sema<'a> {
         let mut best: Option<(usize, &String)> = None;
         let prelude = self.prelude.map(|p| self.mod_data(p));
         let cands = md.ns(ns).keys().chain(prelude.into_iter().flat_map(|p| p.ns(ns).keys()));
-        for c in cands {
+        // Names hidden by macro hygiene (`name#3`) are never suggested.
+        for c in cands.filter(|c| !c.contains('#')) {
             let dist = edit_distance(name, c);
             if dist <= (name.len() / 3).max(1) && best.is_none_or(|(b, _)| dist < b) {
                 best = Some((dist, c));
@@ -277,21 +317,10 @@ impl<'a> Sema<'a> {
         if path.is_empty() {
             return true;
         }
-        // Silent resolution attempt.
-        let Some(target_ty) = self.silent_resolve(m, path, Ns::Type) else {
-            if glob {
-                return false;
-            }
-            // Maybe only a value exists.
-            return match self.silent_resolve(m, path, Ns::Value) {
-                Some(v) => {
-                    self.add_import(m, path, tree, is_pub, None, Some(v));
-                    true
-                }
-                None => false,
-            };
-        };
+        // Silent resolution attempt, in every namespace the name exists in.
+        let target_ty = self.silent_resolve(m, path, Ns::Type);
         if glob {
+            let Some(target_ty) = target_ty else { return false };
             let md = self.mod_data_mut(m);
             if !md.globs.iter().any(|(g, _)| *g == target_ty) {
                 md.globs.push((target_ty, is_pub));
@@ -299,17 +328,21 @@ impl<'a> Sema<'a> {
             return true;
         }
         let v = self.silent_resolve(m, path, Ns::Value);
-        self.add_import(m, path, tree, is_pub, Some(target_ty), v);
+        let mac = self.silent_resolve(m, path, Ns::Macro);
+        if target_ty.is_none() && v.is_none() && mac.is_none() {
+            return false;
+        }
+        self.add_import(m, path, tree, is_pub, [target_ty, v, mac]);
         true
     }
 
-    fn add_import(&mut self, m: DefId, path: &[ast::Ident], tree: &ast::UseTree, is_pub: bool, t: Option<DefId>, v: Option<DefId>) {
+    fn add_import(&mut self, m: DefId, path: &[ast::Ident], tree: &ast::UseTree, is_pub: bool, defs: [Option<DefId>; 3]) {
         let last = path.last().unwrap();
         let (local_name, span) = match &tree.kind {
             ast::UseKind::Simple(Some(rename)) => (rename.name.clone(), rename.span),
             _ => (last.name.clone(), last.span),
         };
-        for (ns, def) in [(Ns::Type, t), (Ns::Value, v)] {
+        for (ns, def) in [Ns::Type, Ns::Value, Ns::Macro].into_iter().zip(defs) {
             let Some(def) = def else { continue };
             let md = self.mod_data(m);
             if let Some(prev) = md.ns(ns).get(&local_name) {
@@ -331,11 +364,12 @@ impl<'a> Sema<'a> {
     fn silent_resolve(&self, from: DefId, segs: &[ast::Ident], last_ns: Ns) -> Option<DefId> {
         let first = &segs[0];
         let first_ns = if segs.len() == 1 { last_ns } else { Ns::Type };
+        let base = self.path_base(from, first);
         let mut cur = match first.name.as_str() {
-            "crater" => self.mod_data(from).krate,
-            "self" => self.normal_module(from),
-            "super" => self.mod_data(self.normal_module(from)).parent?,
-            n => match self.lookup_unqualified(from, n, first_ns)? {
+            "crater" => self.mod_data(base).krate,
+            "self" => self.normal_module(base),
+            "super" => self.mod_data(self.normal_module(base)).parent?,
+            _ => match self.lookup_ident(from, first, first_ns)? {
                 ModRes::Def(d) => d,
                 ModRes::Prim(_) => return None,
             },
@@ -354,6 +388,7 @@ impl<'a> Sema<'a> {
         let ok = match last_ns {
             Ns::Type => matches!(kind, DefKind::Mod | DefKind::Struct | DefKind::Enum | DefKind::Trait | DefKind::TypeAlias | DefKind::Variant),
             Ns::Value => matches!(kind, DefKind::Fn | DefKind::Const | DefKind::Static | DefKind::Struct | DefKind::Variant),
+            Ns::Macro => kind == DefKind::Macro,
         };
         ok.then_some(cur)
     }

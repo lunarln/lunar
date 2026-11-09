@@ -83,7 +83,9 @@ impl P<'_, '_, '_> {
             }
             Some(T::Ident | T::SelfType | T::Crater | T::Super) => {
                 let path = self.path_ty_style()?;
-                if self.k.at(T::LParen) {
+                if self.at_mac_bang() {
+                    PatKind::MacCall(self.mac_call(path)?)
+                } else if self.k.at(T::LParen) {
                     self.k.bump();
                     let mut pats = Vec::new();
                     loop {

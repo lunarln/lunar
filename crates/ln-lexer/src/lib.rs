@@ -116,6 +116,9 @@ pub enum Token {
     Hash,
     #[token("@")]
     At,
+    /// `$`: a macro metavariable (`$x:expr`) or repetition (`$(...)*`).
+    #[token("$")]
+    Dollar,
     #[token("_", priority = 20)]
     Placeholder,
 
@@ -152,6 +155,8 @@ pub enum Token {
     Let,
     #[token("loop")]
     Loop,
+    #[token("macro")]
+    Macro,
     #[token("match")]
     Match,
     #[token("mod")]
@@ -451,6 +456,7 @@ impl Token {
             Question => "`?`",
             Hash => "`#`",
             At => "`@`",
+            Dollar => "`$`",
             Placeholder => "`_`",
             As => "`as`",
             Break => "`break`",
@@ -468,6 +474,7 @@ impl Token {
             In => "`in`",
             Let => "`let`",
             Loop => "`loop`",
+            Macro => "`macro`",
             Match => "`match`",
             Mod => "`mod`",
             Mut => "`mut`",
@@ -553,6 +560,16 @@ mod tests {
     fn generics_do_not_fuse_closers() {
         use Token::*;
         assert_eq!(kinds("A::<B::<C>>"), vec![Ident, PathSep, LAngle, Ident, PathSep, LAngle, Ident, RAngle, RAngle]);
+    }
+
+    #[test]
+    fn macros() {
+        use Token::*;
+        assert_eq!(
+            kinds("macro m($x:expr) { $($x),* }"),
+            vec![Macro, Ident, LParen, Dollar, Ident, Colon, Ident, RParen, LBrace, Dollar, LParen, Dollar, Ident, RParen, Comma, Star, RBrace]
+        );
+        assert_eq!(kinds("vec![1] macros"), vec![Ident, Bang, LBracket, Number(NumKind::Int), RBracket, Ident]);
     }
 
     #[test]

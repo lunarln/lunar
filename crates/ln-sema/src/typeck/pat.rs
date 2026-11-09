@@ -35,6 +35,13 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let sty = self.shallow(ty);
         let sty = sty.strip_bang().clone();
         let kind = match &p.kind {
+            ast::PatKind::MacCall(m) => {
+                let module = self.module();
+                return match self.s.expand_pat(module, m) {
+                    Some(x) => self.check_pat(x, ty, _is_let),
+                    None => Pat { kind: PatKind::Wild, ty: ty.clone(), span },
+                };
+            }
             ast::PatKind::Wild | ast::PatKind::Rest => PatKind::Wild,
             ast::PatKind::Binding { is_mut, name } => self.binding(name, *is_mut, ty, span),
             ast::PatKind::Lit(l, neg) => self.lit_pat(l, *neg, ty, span),
@@ -181,8 +188,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
 
     /// Whether a single-segment path names a constructor or constant (no errors).
     fn silent_value_kind(&self, path: &ast::Path) -> Option<DefKind> {
-        let n = &path.segments[0].ident.name;
-        match self.s.lookup_unqualified(self.module(), n, Ns::Value) {
+        match self.s.lookup_ident(self.module(), &path.segments[0].ident, Ns::Value) {
             Some(crate::resolve::ModRes::Def(d)) => {
                 let k = self.s.p.def(d).kind;
                 matches!(k, DefKind::Variant | DefKind::Struct | DefKind::Const).then_some(k)
@@ -194,7 +200,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     fn binding(&mut self, name: &ast::Ident, is_mut: bool, ty: &Ty, span: Span) -> PatKind {
         let depth = self.depth();
         let l = self.new_local(&name.name, ty.clone(), is_mut, LocalKind::Let, span, depth);
-        self.bind_name(&name.name, l);
+        self.bind_name(&name.name, name.ctx, l);
         let r = self.resolve(ty);
         let mode = if !r.has_infer() && self.s.p.is_copy(&r, &self.env) { ReadMode::Copy } else { ReadMode::Move };
         PatKind::Binding { local: l, mode, sub: None }

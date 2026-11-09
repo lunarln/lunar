@@ -93,6 +93,34 @@ fn missing_semicolon_is_an_error() {
 }
 
 #[test]
+fn macros_parse_in_every_position() {
+    let f = parse_ok(
+        "pub macro square($x:expr) { let t = $x; t * t }
+         macro max {
+             ($x:expr) => { $x },
+             ($x:expr, $($rest:expr),+) => { { let a = $x; let b = max!($($rest),+); if a > b { a } else { b } } },
+         }
+         tokens! { LParen \"(\", RParen \")\" }
+         fn f(x: Pair![i32, str]) {
+             let v = vec![1, 2, 3];
+             assert_eq!(v.len(), 3);
+             match c { digit!() => 1, _ => 0 };
+         }",
+    );
+    let ItemKind::Macro(m) = &f.items[0].kind else { panic!("{:?}", f.items[0].kind) };
+    assert_eq!((m.name.name.as_str(), m.rules.len(), m.rules[0].matcher.len()), ("square", 1, 4));
+    let ItemKind::Macro(m) = &f.items[1].kind else { panic!() };
+    assert_eq!(m.rules.len(), 2);
+    let ItemKind::MacCall(call) = &f.items[2].kind else { panic!() };
+    assert_eq!((call.path.to_string_lossy().as_str(), call.delim, call.tokens.len()), ("tokens", Delim::Brace, 5));
+    let ItemKind::Fn(func) = &f.items[3].kind else { panic!() };
+    assert!(matches!(&func.params[0].ty.as_ref().unwrap().kind, TyKind::MacCall(m) if m.delim == Delim::Bracket));
+    let body = func.body.as_ref().unwrap();
+    assert!(matches!(&body.stmts[0].kind, StmtKind::Let { init: Some(Expr { kind: ExprKind::MacCall(_), .. }), .. }));
+    assert_eq!(ln_ast::pretty::tokens(&call.tokens), "LParen \"(\", RParen \")\"");
+}
+
+#[test]
 fn recovers_after_errors() {
     let d = parse_err("fn a( { } fn b() { let = 3; } struct S { x: }");
     assert!(d.len() >= 2, "{d:?}");

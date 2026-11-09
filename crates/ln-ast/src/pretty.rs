@@ -50,7 +50,35 @@ pub fn ty(t: &Ty) -> String {
         }
         TyKind::Never => "!".into(),
         TyKind::Infer => "_".into(),
+        TyKind::MacCall(m) => mac_call(m),
     }
+}
+
+/// `path!(tokens)`.
+pub fn mac_call(m: &MacCall) -> String {
+    format!("{}!{}{}{}", path(&m.path), m.delim.open(), tokens(&m.tokens), m.delim.close())
+}
+
+/// Token trees as source text, one space between tokens except where that
+/// would look odd (`a::b`, `f(x)`, `x.y`, `$x`).
+pub fn tokens(trees: &[TokenTree]) -> String {
+    let mut out = String::new();
+    let mut prev_glues = true;
+    for t in trees {
+        let (text, glue_before, glue_after) = match t {
+            TokenTree::Token(tok) => {
+                let glue = matches!(tok.text.as_str(), "::" | "." | "," | ";" | ":" | "?" | "!");
+                (tok.text.clone(), glue, matches!(tok.text.as_str(), "::" | "." | "$" | "&" | "#"))
+            }
+            TokenTree::Group { delim, trees, .. } => (format!("{}{}{}", delim.open(), tokens(trees), delim.close()), *delim != Delim::Brace, false),
+        };
+        if !out.is_empty() && !prev_glues && !glue_before {
+            out.push(' ');
+        }
+        out.push_str(&text);
+        prev_glues = glue_after;
+    }
+    out
 }
 
 fn mode_prefix(mode: ParamMode) -> &'static str {
@@ -170,6 +198,8 @@ pub fn item(item: &Item, extern_abi: Option<&str>) -> String {
         ItemKind::Static(s) => format!("{vis}static {}{}: {} = {}", if s.is_mut { "mut " } else { "" }, s.name.name, ty(&s.ty), expr(&s.value)),
         ItemKind::TypeAlias(a) => format!("{vis}type {}{} = {}", a.name.name, generics(&a.generics), ty(&a.ty)),
         ItemKind::Extern(b) => format!("extern {:?}", b.abi.as_deref().unwrap_or("C")),
+        ItemKind::Macro(m) => format!("{vis}macro {}", m.name.name),
+        ItemKind::MacCall(m) => mac_call(m),
         ItemKind::Use(_) => "use ...".into(),
     }
 }

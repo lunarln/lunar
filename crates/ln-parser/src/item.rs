@@ -7,7 +7,8 @@ use ln_lexer::{NumKind, Token as T};
 use ln_parse_kit::{Expected, Fatal, PResult};
 
 /// Tokens that can begin an item (used for recovery and statement dispatch).
-pub(crate) const ITEM_START: &[T] = &[T::Fn, T::Struct, T::Enum, T::Trait, T::Impl, T::Use, T::Mod, T::Const, T::Static, T::Extern, T::Type, T::Pub, T::Hash];
+pub(crate) const ITEM_START: &[T] =
+    &[T::Fn, T::Struct, T::Enum, T::Trait, T::Impl, T::Use, T::Mod, T::Const, T::Static, T::Extern, T::Type, T::Pub, T::Hash, T::Macro];
 
 impl P<'_, '_, '_> {
     pub(crate) fn items_until_eof(&mut self) -> Vec<Item> {
@@ -106,7 +107,7 @@ impl P<'_, '_, '_> {
             _ => return Err(self.k.error_expected_named("attribute name")),
         };
         self.k.bump();
-        Ok(Ident::new(self.tok_text(t), self.tok_span(t)))
+        Ok(self.tok_ident(t))
     }
 
     pub(crate) fn item(&mut self) -> PResult<Item> {
@@ -181,6 +182,20 @@ impl P<'_, '_, '_> {
                 let ty = self.ty()?;
                 self.expect_item_semi("type alias")?;
                 ItemKind::TypeAlias(TypeAlias { name, generics, ty })
+            }
+            Some(T::Macro) => ItemKind::Macro(self.macro_def()?),
+            // `path!(...)` in item position.
+            Some(T::Ident | T::Crater | T::SelfValue | T::Super) => {
+                let path = self.path_ty_style()?;
+                if !self.at_mac_bang() {
+                    self.k.expect_note(Expected::Named("item"));
+                    return Err(self.k.error_expected());
+                }
+                let call = self.mac_call(path)?;
+                if call.delim != Delim::Brace {
+                    self.expect_item_semi("macro invocation")?;
+                }
+                ItemKind::MacCall(call)
             }
             _ => {
                 self.k.expect_note(Expected::Named("item"));
@@ -438,7 +453,7 @@ impl P<'_, '_, '_> {
         match self.k.peek() {
             Some(t) if t == T::Ident || t.is_path_keyword() => {
                 let tok = self.k.bump();
-                Ok(Ident::new(self.tok_text(tok), self.tok_span(tok)))
+                Ok(self.tok_ident(tok))
             }
             _ => {
                 self.k.expect_note(Expected::Token(T::Ident));

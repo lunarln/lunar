@@ -120,7 +120,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     fn resolve_value_path_inner(&mut self, p: &ast::Path, span: Span) -> Option<ValueRes> {
         let segs = &p.segments;
         if p.is_single()
-            && let Some(l) = self.lookup_local(&segs[0].ident.name)
+            && let Some(l) = self.lookup_local(&segs[0].ident.name, segs[0].ident.ctx)
         {
             return Some(ValueRes::Local(l));
         }
@@ -149,7 +149,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let Some((res, used)) = res else {
             if idents.len() == 1 {
                 // Maybe it names a type, e.g. a named-field struct used as a value.
-                let d = match self.s.lookup_unqualified(module, &idents[0].name, Ns::Type) {
+                let d = match self.s.lookup_ident(module, &idents[0], Ns::Type) {
                     Some(ModRes::Def(def)) => self.not_a_value(def, &idents[0].name, span),
                     Some(ModRes::Prim(_)) => Diagnostic::error(name::NOT_A_VALUE, span, format!("expected a value, found builtin type `{}`", idents[0].name)),
                     None => self.s.unresolved_diag(module, &idents[0], Ns::Value),
@@ -461,7 +461,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
 
     pub(crate) fn check_call(&mut self, f: &ast::Expr, args: &[ast::Expr], expect: Option<&Ty>, span: Span) -> Expr {
         if let ast::ExprKind::Path(p) = &f.kind {
-            let local_fnptr = p.is_single() && self.lookup_local(&p.segments[0].ident.name).is_some();
+            let local_fnptr = p.is_single() && self.lookup_local(&p.segments[0].ident.name, p.segments[0].ident.ctx).is_some();
             if !local_fnptr {
                 let Some(r) = self.resolve_value_path(p, f.span) else {
                     for a in args {
@@ -652,7 +652,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         if !p.is_single() {
             return None;
         }
-        let l = self.lookup_local(&p.segments[0].ident.name)?;
+        let l = self.lookup_local(&p.segments[0].ident.name, p.segments[0].ident.ctx)?;
         match self.local_kind(l) {
             thir::LocalKind::Param { inout: true, .. } => Some(ParamMode::InOut),
             thir::LocalKind::Param { owned: false, .. } => Some(ParamMode::Borrow),

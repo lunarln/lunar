@@ -14,12 +14,106 @@ pub struct NodeId(pub u32);
 pub struct Ident {
     pub name: String,
     pub span: Span,
+    /// Which macro expansion wrote this identifier, for hygiene.
+    pub ctx: SyntaxCtx,
 }
 
 impl Ident {
     pub fn new(name: impl Into<String>, span: Span) -> Self {
-        Self { name: name.into(), span }
+        Self { name: name.into(), span, ctx: SyntaxCtx::ROOT }
     }
+}
+
+/// Hygiene: where an identifier was written. `ROOT` for source files; each
+/// macro expansion gives the tokens it copies from the macro's body a fresh
+/// context, so its names resolve where the macro is defined and cannot
+/// clash with the caller's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SyntaxCtx(pub u32);
+
+impl SyntaxCtx {
+    pub const ROOT: SyntaxCtx = SyntaxCtx(0);
+
+    pub fn is_root(self) -> bool {
+        self == SyntaxCtx::ROOT
+    }
+}
+
+// ===================================================================== macros
+
+/// The delimiter of a token group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Delim {
+    Paren,
+    Bracket,
+    Brace,
+}
+
+impl Delim {
+    pub fn open(self) -> &'static str {
+        match self {
+            Delim::Paren => "(",
+            Delim::Bracket => "[",
+            Delim::Brace => "{",
+        }
+    }
+
+    pub fn close(self) -> &'static str {
+        match self {
+            Delim::Paren => ")",
+            Delim::Bracket => "]",
+            Delim::Brace => "}",
+        }
+    }
+}
+
+/// One token, with its text and where it was written.
+#[derive(Clone, Debug)]
+pub struct Tt {
+    pub kind: ln_lexer::Token,
+    pub text: String,
+    pub span: Span,
+    pub ctx: SyntaxCtx,
+}
+
+/// The input and body of macros: tokens, with delimited groups nested.
+#[derive(Clone, Debug)]
+pub enum TokenTree {
+    Token(Tt),
+    Group { delim: Delim, open: Span, close: Span, trees: Vec<TokenTree> },
+}
+
+impl TokenTree {
+    pub fn span(&self) -> Span {
+        match self {
+            TokenTree::Token(t) => t.span,
+            TokenTree::Group { open, close, .. } => open.to(*close),
+        }
+    }
+}
+
+/// `path!(...)`, `path![...]` or `path!{...}`.
+#[derive(Clone, Debug)]
+pub struct MacCall {
+    pub path: Path,
+    pub delim: Delim,
+    pub tokens: Vec<TokenTree>,
+    pub span: Span,
+}
+
+/// `macro name($x:expr) { ... }` or `macro name { (...) => { ... }, ... }`.
+#[derive(Clone, Debug)]
+pub struct MacroDef {
+    pub name: Ident,
+    pub rules: Vec<MacroRule>,
+}
+
+/// One rule: the tokens it matches and the tokens it expands to.
+#[derive(Clone, Debug)]
+pub struct MacroRule {
+    pub matcher: Vec<TokenTree>,
+    pub body: Vec<TokenTree>,
+    pub span: Span,
 }
 
 // ===================================================================== items
@@ -87,6 +181,9 @@ pub enum ItemKind {
     Static(StaticDecl),
     Extern(ExternBlock),
     TypeAlias(TypeAlias),
+    Macro(MacroDef),
+    /// A macro invoked in item position, expanding to items.
+    MacCall(MacCall),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -328,6 +425,8 @@ pub enum TyKind {
     Never,
     /// `_` (only valid where inference is allowed).
     Infer,
+    /// A macro expanding to a type.
+    MacCall(MacCall),
 }
 
 #[derive(Clone, Debug)]
@@ -521,6 +620,8 @@ pub enum ExprKind {
     Paren(Box<Expr>),
     /// `expr?`
     Try(Box<Expr>),
+    /// A macro expanding to an expression (or, as a statement, statements).
+    MacCall(MacCall),
     /// Placeholder produced after a parse error.
     Error,
 }
@@ -539,6 +640,7 @@ impl ExprKind {
                 | ExprKind::WhileLet { .. }
                 | ExprKind::Loop(_)
                 | ExprKind::For { .. }
+                | ExprKind::MacCall(MacCall { delim: Delim::Brace, .. })
         )
     }
 }
@@ -635,6 +737,8 @@ pub enum PatKind {
     Or(Vec<Pat>),
     /// `..` inside tuple patterns.
     Rest,
+    /// A macro expanding to a pattern.
+    MacCall(MacCall),
 }
 
 #[derive(Clone, Debug)]

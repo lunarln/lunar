@@ -35,7 +35,7 @@ enum LenVar {
 
 /// A lexical scope inside a function body.
 struct Scope {
-    names: Vec<(String, LocalId)>,
+    names: Vec<(String, ast::SyntaxCtx, LocalId)>,
     /// Anonymous module for items declared in this block.
     module: Option<DefId>,
 }
@@ -136,7 +136,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             let mutable = p.inout || (owned && p.mutable);
             let id = fcx.new_local(&p.name, p.ty.clone(), mutable, LocalKind::Param { index: i, inout: p.inout, bang, owned }, p.span, 0);
             if p.name != "_" {
-                fcx.bind_name(&p.name, id);
+                fcx.bind_name(&p.name, p.ctx, id);
             }
             params.push(id);
         }
@@ -228,17 +228,22 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         self.s.record(span, d);
     }
 
-    pub(crate) fn bind_name(&mut self, name: &str, id: LocalId) {
-        self.scopes.last_mut().unwrap().names.push((name.to_string(), id));
+    /// Bind a local. Hygiene: a binding only answers to names with the same
+    /// syntax context, so a macro's `let t` and the caller's `t` never meet.
+    /// `self` is the exception: it is the receiver wherever it is written.
+    pub(crate) fn bind_name(&mut self, name: &str, ctx: ast::SyntaxCtx, id: LocalId) {
+        let ctx = if name == "self" { ast::SyntaxCtx::ROOT } else { ctx };
+        self.scopes.last_mut().unwrap().names.push((name.to_string(), ctx, id));
     }
 
     pub(crate) fn local_kind(&self, id: LocalId) -> thir::LocalKind {
         self.locals[id.0 as usize].kind
     }
 
-    pub(crate) fn lookup_local(&self, name: &str) -> Option<LocalId> {
+    pub(crate) fn lookup_local(&self, name: &str, ctx: ast::SyntaxCtx) -> Option<LocalId> {
+        let ctx = if name == "self" { ast::SyntaxCtx::ROOT } else { ctx };
         for s in self.scopes.iter().rev() {
-            if let Some((_, id)) = s.names.iter().rev().find(|(n, _)| n == name) {
+            if let Some((_, _, id)) = s.names.iter().rev().find(|(n, c, _)| n == name && *c == ctx) {
                 return Some(*id);
             }
         }
