@@ -725,6 +725,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         {
             return self.mk(ExprKind::Array(Vec::new()), Ty::Array(e.clone(), *k), span);
         }
+        let annotated = matches!(&exp, Some(Ty::Array(_, k)) if !k.is_slice());
         let (elem_ty, kind) = match &exp {
             Some(Ty::Array(e, k)) if !k.is_slice() => ((**e).clone(), *k),
             _ => (self.new_var(span), ArrKind::Fixed(elems.len() as u64)),
@@ -749,7 +750,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             }
             k => k,
         };
-        self.dull_checks.push((elem_ty.clone(), span));
+        if !annotated {
+            self.dull_checks.push((elem_ty.clone(), span));
+        }
         self.mk(ExprKind::Array(out), Ty::Array(Box::new(elem_ty), kind), span)
     }
 
@@ -759,6 +762,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             Some(Ty::Array(e, k)) if !k.is_slice() => ((**e).clone(), Some(*k)),
             _ => (self.new_var(span), None),
         };
+        let annotated = kind.is_some();
         let value = self.check_expr(v, Some(&elem_ty));
         let value = self.coerce(value, &elem_ty, v.span);
         let value = self.read_if_place(value);
@@ -784,7 +788,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             }
         };
         let count = self.check_expr_coerce(n, &Ty::usize());
-        self.dull_checks.push((elem_ty.clone(), span));
+        if !annotated {
+            self.dull_checks.push((elem_ty.clone(), span));
+        }
         self.mk(ExprKind::ArrayRepeat { value: Box::new(value), count: Box::new(count) }, Ty::Array(Box::new(elem_ty), kind), span)
     }
 

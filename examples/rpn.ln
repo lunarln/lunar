@@ -1,0 +1,79 @@
+// A reverse Polish notation calculator on a shrinkable data-stack array.
+
+enum Token {
+    Num(f64),
+    Op(u8),
+}
+
+/// Split `src` on spaces and classify each word.
+fn tokenize(src: str, mut out: [Token; ..+]): bool {
+    let b = src.as_bytes();
+    let mut i: usize = 0;
+    while i < b.len() {
+        if b[i] == 32 {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && b[i] != 32 {
+            i += 1;
+        }
+        let word = src[start..i];
+        if word.len() == 1 && (word == "+" || word == "-" || word == "*" || word == "/") {
+            out.push(Token::Op(b[start]));
+        } else {
+            match word.parse_i64() {
+                Some(v) => out.push(Token::Num(v as f64)),
+                None => {
+                    println("  bad token `{word}`");
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/// Evaluate; `stack` may shrink, so it is taken as `!`.
+fn eval(tokens: [Token; &], mut stack: ![f64; -..+]): Option::<f64> {
+    for t in tokens {
+        match t {
+            Token::Num(v) => stack.push(v),
+            Token::Op(op) => {
+                let b = stack.pop()?;
+                let a = stack.pop()?;
+                stack.push(match op {
+                    43 => a + b,
+                    45 => a - b,
+                    42 => a * b,
+                    _ => a / b,
+                });
+            }
+        }
+    }
+    let result = stack.pop()?;
+    if stack.len() != 0 {
+        return None;
+    }
+    return Some(result);
+}
+
+fn main() {
+    run("3 4 + 2 *");
+    run("5 1 2 + 4 * + 3 -");
+    run("2 3 4 * 5 6 + * +");
+    run("1 +");
+    run("10 3 /");
+}
+
+fn run(src: str) {
+    let mut tokens: [Token; ..+] = [];
+    if !tokenize(src, tokens) {
+        return;
+    }
+    let mut stack: [f64; -..+] = [];
+    match eval(tokens[..], stack) {
+        Some(v) => println("{src} = {v}"),
+        None => println("{src} = <stack underflow>"),
+    }
+}
