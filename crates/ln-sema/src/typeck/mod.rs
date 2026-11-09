@@ -92,7 +92,9 @@ impl<'a> Sema<'a> {
                     crate::borrowck::check(&self.p, &b, &mut self.diags);
                     let krate = self.mod_data(self.p.defs[i].module).krate;
                     let is_std = self.p.crate_roots.iter().any(|(n, r)| *r == krate && (n == "core" || n == "std"));
-                    if !is_std {
+                    // Lints on a function with borrow errors would only add
+                    // noise (and may be wrong about code that will change).
+                    if !is_std && self.diags.error_count() == errs_before {
                         crate::borrowck::lint(&b, &mut self.diags);
                     }
                 }

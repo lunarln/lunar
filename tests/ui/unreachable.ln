@@ -1,0 +1,12 @@
+// warning: lint::unreachable
+// once: lint::unreachable
+fn total(a: i32, b: i32): i32 {
+    return a;
+    let sum = a + b;
+    println("{sum}");
+    return sum;
+}
+
+fn main() {
+    println("{total(1, 2)}");
+}

@@ -105,6 +105,7 @@ codes! {
         UNUSED_VARIABLE = "unused_variable",
         UNREACHABLE = "unreachable",
         UNUSED_MUT = "unused_mut",
+        UNKNOWN_CFG = "unknown_cfg",
     }
     build ("build") => {
         LINK = "link",

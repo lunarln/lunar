@@ -46,10 +46,18 @@ pub fn lint(body: &Body, diags: &mut Diagnostics) {
             ExprKind::Local(l) => {
                 used.insert(*l);
             }
-            ExprKind::Assign { place, .. } | ExprKind::AssignOp { place, .. } => {
+            // Assigning to a variable is not a use of it (`x = 2;`,
+            // `x += 1;`), as in Rust: only reads count. Writing into a part
+            // of it (`a[i] = v`, `s.f = v`) does count, as in Rust.
+            ExprKind::Assign { place, value } | ExprKind::AssignOp { place, value, .. } => {
                 if let Some(l) = root(place) {
                     mutated.insert(l);
                 }
+                if !matches!(place.kind, ExprKind::Local(_)) {
+                    walk(place, used, mutated);
+                }
+                walk(value, used, mutated);
+                return;
             }
             ExprKind::Call { args, .. } => {
                 for a in args {
@@ -76,9 +84,14 @@ pub fn lint(body: &Body, diags: &mut Diagnostics) {
             continue;
         }
         if !used.contains(&id) {
+            let (msg, label) = if mutated.contains(&id) {
+                (format!("variable `{}` is assigned to, but never read", l.name), "assigned to but never read")
+            } else {
+                (format!("unused variable `{}`", l.name), "never used")
+            };
             diags.push(
-                Diagnostic::warning(lint::UNUSED_VARIABLE, l.span, format!("unused variable `{}`", l.name))
-                    .with_label("never used")
+                Diagnostic::warning(lint::UNUSED_VARIABLE, l.span, msg)
+                    .with_label(label)
                     .with_help(format!("if this is intentional, prefix it with an underscore: `_{}`", l.name)),
             );
         } else if l.mutable && !mutated.contains(&id) {
@@ -88,6 +101,72 @@ pub fn lint(body: &Body, diags: &mut Diagnostics) {
                     .with_help("remove the `mut`"),
             );
         }
+    }
+    unreachable_block(&body.block, diags);
+}
+
+/// Whether evaluating `e` never finishes normally (`return`, `break`,
+/// `continue`, a call returning `!`, a `loop` without `break`, or a block,
+/// `if` or `match` all of whose paths do one of those).
+fn diverges(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Coerce { kind: Coercion::NeverToAny, expr } => diverges(expr),
+        _ => matches!(e.ty, Ty::Never),
+    }
+}
+
+/// `lint::unreachable`: warn once per block, at the first statement (or the
+/// tail) after one that always diverges. Code after that point is not
+/// searched further, so one mistake gives one warning.
+fn unreachable_block(b: &Block, diags: &mut Diagnostics) {
+    for (i, s) in b.stmts.iter().enumerate() {
+        let e = match s {
+            Stmt::Let { init: Some(e), .. } | Stmt::Expr(e) => e,
+            Stmt::Let { init: None, .. } => continue,
+        };
+        unreachable_expr(e, diags);
+        if !diverges(e) {
+            continue;
+        }
+        let next = match b.stmts.get(i + 1) {
+            Some(Stmt::Let { span, .. }) => Some((*span, "statement")),
+            Some(Stmt::Expr(n)) => Some((n.span, "statement")),
+            None => b.tail.as_ref().map(|t| (t.span, "expression")),
+        };
+        if let Some((span, what)) = next
+            && !span.is_dummy()
+            && !e.span.is_dummy()
+        {
+            diags.push(
+                Diagnostic::warning(lint::UNREACHABLE, span, format!("unreachable {what}"))
+                    .with_label(format!("this {what} can never run"))
+                    .with_secondary(e.span, "any code following this expression is unreachable, because it never finishes"),
+            );
+        }
+        return;
+    }
+    if let Some(t) = &b.tail {
+        unreachable_expr(t, diags);
+    }
+}
+
+fn unreachable_expr(e: &Expr, diags: &mut Diagnostics) {
+    match &e.kind {
+        ExprKind::Block(b) | ExprKind::Loop { body: b, .. } => unreachable_block(b, diags),
+        ExprKind::While { cond, body, .. } => {
+            unreachable_expr(cond, diags);
+            unreachable_block(body, diags);
+        }
+        ExprKind::ForRange { start, end, body, .. } => {
+            unreachable_expr(start, diags);
+            unreachable_expr(end, diags);
+            unreachable_block(body, diags);
+        }
+        ExprKind::ForArray { array, body, .. } => {
+            unreachable_expr(array, diags);
+            unreachable_block(body, diags);
+        }
+        _ => visit_children(e, &mut |c| unreachable_expr(c, diags)),
     }
 }
 
