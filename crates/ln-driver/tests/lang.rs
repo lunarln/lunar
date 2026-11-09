@@ -151,3 +151,129 @@ fn fatal_tests_fail_cleanly() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
+
+mod lsp {
+    use super::lunar;
+    use serde_json::{Value, json};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::{ChildStdin, ChildStdout, Stdio};
+
+    struct Client {
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+        next_id: i64,
+        /// Notifications received while waiting for responses.
+        notes: Vec<Value>,
+    }
+
+    impl Client {
+        fn send(&mut self, msg: Value) {
+            let body = msg.to_string();
+            write!(self.stdin, "Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            self.stdin.flush().unwrap();
+        }
+
+        fn recv(&mut self) -> Value {
+            let mut len = 0;
+            loop {
+                let mut line = String::new();
+                self.stdout.read_line(&mut line).unwrap();
+                let line = line.trim();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(n) = line.strip_prefix("Content-Length: ") {
+                    len = n.parse().unwrap();
+                }
+            }
+            let mut buf = vec![0; len];
+            self.stdout.read_exact(&mut buf).unwrap();
+            serde_json::from_slice(&buf).unwrap()
+        }
+
+        fn request(&mut self, method: &str, params: Value) -> Value {
+            self.next_id += 1;
+            let id = self.next_id;
+            self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+            loop {
+                let m = self.recv();
+                if m.get("id") == Some(&json!(id)) {
+                    return m["result"].clone();
+                }
+                self.notes.push(m);
+            }
+        }
+
+        fn notify(&mut self, method: &str, params: Value) {
+            self.send(json!({ "jsonrpc": "2.0", "method": method, "params": params }));
+        }
+
+        /// Wait for diagnostics published for `uri`.
+        fn diagnostics_for(&mut self, uri: &str) -> Vec<Value> {
+            loop {
+                if let Some(i) = self.notes.iter().position(|n| n["method"] == "textDocument/publishDiagnostics" && n["params"]["uri"] == uri) {
+                    let n = self.notes.remove(i);
+                    return n["params"]["diagnostics"].as_array().unwrap().clone();
+                }
+                let m = self.recv();
+                self.notes.push(m);
+            }
+        }
+    }
+
+    fn uri_of(path: &std::path::Path) -> String {
+        let s = path.to_string_lossy().replace('\\', "/");
+        let s = s.trim_start_matches("//?/").to_string();
+        if s.starts_with('/') { format!("file://{s}") } else { format!("file:///{s}") }
+    }
+
+    #[test]
+    fn diagnostics_hover_and_definition() {
+        let dir = std::env::temp_dir().join(format!("lunar-lsp-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.ln");
+        let src = "struct Stack {\n    items: [i32; -..+],\n}\n\n/// Adds two numbers.\nfn add(a: i32, b: i32): i32 {\n    return a + b;\n}\n\nfn main() {\n    let total = add(1, 2);\n    let s = Stack { items: [] };\n    let n = s.items.len();\n    println(\"{total} {n}\");\n    let oops: i32 = undefined_name;\n}\n";
+        std::fs::write(&file, "").unwrap(); // the editor buffer, not the disk, must be analyzed
+        let uri = uri_of(&file);
+
+        let mut child = lunar().arg("lsp").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut c = Client { stdin: child.stdin.take().unwrap(), stdout: BufReader::new(child.stdout.take().unwrap()), next_id: 0, notes: Vec::new() };
+        let init = c.request("initialize", json!({ "processId": null, "rootUri": null, "capabilities": {} }));
+        assert_eq!(init["capabilities"]["hoverProvider"], json!(true));
+        c.notify("initialized", json!({}));
+        c.notify("textDocument/didOpen", json!({ "textDocument": { "uri": uri, "languageId": "lunar", "version": 1, "text": src } }));
+
+        let diags = c.diagnostics_for(&uri);
+        assert!(diags.iter().any(|d| d["code"] == "name::unresolved"), "expected an unresolved-name error, got {diags:#?}");
+
+        let pos = |line: u32, col: u32| json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": col } });
+        // `add` in `let total = add(1, 2);` (line 10).
+        let h = c.request("textDocument/hover", pos(10, 17));
+        let text = h["contents"]["value"].as_str().unwrap_or_default().to_string();
+        assert!(text.contains("fn add(a: i32, b: i32): i32") && text.contains("Adds two numbers."), "hover on fn: {h:#?}");
+        // `total` declaration.
+        let h = c.request("textDocument/hover", pos(10, 9));
+        assert!(h["contents"]["value"].as_str().unwrap_or_default().contains("let total: i32"), "hover on local: {h:#?}");
+        // `items` field access (line 12).
+        let h = c.request("textDocument/hover", pos(12, 15));
+        assert!(h["contents"]["value"].as_str().unwrap_or_default().contains("items: [i32; -..+]"), "hover on field: {h:#?}");
+
+        // Go to `add`'s definition (line 5), and into the standard library.
+        let d = c.request("textDocument/definition", pos(10, 17));
+        assert_eq!(d["range"]["start"]["line"], json!(5), "definition of add: {d:#?}");
+        let d = c.request("textDocument/definition", pos(13, 6));
+        let target = d["uri"].as_str().unwrap_or_default();
+        assert!(target.contains("lunar-std-") && target.ends_with("io.ln"), "definition of println: {d:#?}");
+
+        // Fixing the error clears it.
+        let fixed = src.replace("undefined_name", "n as i32");
+        c.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 2 }, "contentChanges": [{ "text": fixed }] }));
+        let diags = c.diagnostics_for(&uri);
+        assert!(!diags.iter().any(|d| d["severity"] == json!(1)), "errors remain after the fix: {diags:#?}");
+
+        let _ = c.request("shutdown", Value::Null);
+        c.notify("exit", Value::Null);
+        assert!(child.wait().unwrap().success());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -57,6 +57,8 @@ enum Cmd {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// Run the language server (LSP over stdio), for editors.
+    Lsp,
     /// Compile and run the `#[test]` functions in a program.
     Test {
         file: PathBuf,
@@ -116,6 +118,13 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Cmd::Lsp => match ln_driver::lsp::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: language server failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Cmd::Test { file, filter, release } => run_tests(&file, filter.as_deref(), release, color),
     }
 }

@@ -20,5 +20,11 @@ ln-parser.workspace = true
 ln-sema.workspace = true
 ln-codegen.workspace = true
 clap = { version = "4.6", features = ["derive"] }
+lsp-server = "0.7"
+lsp-types = "0.95"
+serde_json = "1"
 
 cc.workspace = true
+
+[dev-dependencies]
+serde_json = "1"
