@@ -14,7 +14,7 @@
 use crate::Program;
 use crate::thir::*;
 use crate::ty::Ty;
-use ln_diag::{Diagnostic, Diagnostics, Span, codes::borrow};
+use ln_diag::{Diagnostic, Diagnostics, Span, codes::borrow, codes::lint};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -29,6 +29,63 @@ type LiveSet = BTreeSet<LocalId>;
 
 /// A place path: root local plus field projections.
 type PathP = (LocalId, Vec<usize>);
+
+/// Warn about unused variables and needless `mut`.
+pub fn lint(body: &Body, diags: &mut Diagnostics) {
+    let mut used = HashSet::new();
+    let mut mutated = HashSet::new();
+    fn root(e: &Expr) -> Option<LocalId> {
+        match &e.kind {
+            ExprKind::Local(l) => Some(*l),
+            ExprKind::Field { base, .. } | ExprKind::Index { base, .. } => root(base),
+            _ => None,
+        }
+    }
+    fn walk(e: &Expr, used: &mut HashSet<LocalId>, mutated: &mut HashSet<LocalId>) {
+        match &e.kind {
+            ExprKind::Local(l) => {
+                used.insert(*l);
+            }
+            ExprKind::Assign { place, .. } | ExprKind::AssignOp { place, .. } => {
+                if let Some(l) = root(place) {
+                    mutated.insert(l);
+                }
+            }
+            ExprKind::Call { args, .. } => {
+                for a in args {
+                    if let Arg::InOut(p) = a
+                        && let Some(l) = root(p)
+                    {
+                        mutated.insert(l);
+                    }
+                }
+            }
+            ExprKind::Slice { base, mutable: true, .. } | ExprKind::Coerce { kind: Coercion::ToSlice { mutable: true }, expr: base } => {
+                if let Some(l) = root(base) {
+                    mutated.insert(l);
+                }
+            }
+            _ => {}
+        }
+        visit_children(e, &mut |c| walk(c, used, mutated));
+    }
+    visit_block(&body.block, &mut |e| walk(e, &mut used, &mut mutated));
+    for (i, l) in body.locals.iter().enumerate() {
+        let id = LocalId(i as u32);
+        if l.kind != LocalKind::Let || l.name.starts_with('_') || l.name.starts_with('<') || l.span.is_dummy() {
+            continue;
+        }
+        if !used.contains(&id) {
+            diags.push(
+                Diagnostic::warning(lint::UNUSED_VARIABLE, l.span, format!("unused variable `{}`", l.name))
+                    .with_label("never used")
+                    .with_help(format!("if this is intentional, prefix it with an underscore: `_{}`", l.name)),
+            );
+        } else if l.mutable && !mutated.contains(&id) {
+            diags.push(Diagnostic::warning(lint::UNUSED_MUT, l.span, format!("variable `{}` does not need to be mutable", l.name)).with_label("never mutated").with_help("remove the `mut`"));
+        }
+    }
+}
 
 pub fn check(p: &Program, body: &Body, diags: &mut Diagnostics) {
     let mut cx = Cx { p, body, diags, roots: HashMap::new(), reported: HashSet::new(), loop_exit: HashMap::new(), loop_head: HashMap::new(), held: Vec::new() };

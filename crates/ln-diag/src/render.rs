@@ -49,10 +49,8 @@ pub fn render(map: &SourceMap, diags: &[Diagnostic], color: bool, out: &mut dyn 
         let range = d.span.start as usize..d.span.end as usize;
         let mut report = Report::build(ReportKind::Custom(&head, c), (d.span.file, range.clone())).with_config(config).with_message(&d.message);
         let primary = Label::new((d.span.file, range)).with_color(c);
-        let primary = match &d.primary_label {
-            Some(m) => primary.with_message(m),
-            None => primary,
-        };
+        // Ariadne only underlines labels that carry a message.
+        let primary = primary.with_message(d.primary_label.as_deref().unwrap_or("here"));
         report = report.with_label(primary);
         for l in &d.labels {
             if l.span.is_dummy() {

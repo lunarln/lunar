@@ -88,6 +88,11 @@ impl<'a> Sema<'a> {
                 let b = FnCtx::check_fn(self, id, f, body);
                 if self.diags.error_count() == errs_before {
                     crate::borrowck::check(&self.p, &b, &mut self.diags);
+                    let krate = self.mod_data(self.p.defs[i].module).krate;
+                    let is_std = self.p.crate_roots.iter().any(|(n, r)| *r == krate && (n == "core" || n == "std"));
+                    if !is_std {
+                        crate::borrowck::lint(&b, &mut self.diags);
+                    }
                 }
                 self.p.bodies.insert(id, b);
             }
