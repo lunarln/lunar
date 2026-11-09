@@ -6,7 +6,8 @@
 //! file that loads it as a module (`mod foo;`), otherwise as its own root.
 
 use crate::ide;
-use crate::{Analysis, AnalyzeOptions, analyze_with, path_key};
+use crate::project::{self, Target};
+use crate::{Analysis, AnalyzeOptions, analyze_craters, analyze_with, path_key};
 use ln_diag::{Diagnostic, FileId, Severity, Span};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::notification::{DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _, PublishDiagnostics};
@@ -160,7 +161,7 @@ impl Server {
     fn analyze_root(&mut self, conn: &Connection, root: &Path) -> Result<(), Error> {
         let root_key = path_key(root);
         let opts = AnalyzeOptions { keep_going: true, overlay: Some(&self.open), ..Default::default() };
-        let analysis = match std::panic::catch_unwind(AssertUnwindSafe(|| analyze_with(root, &opts))) {
+        let analysis = match std::panic::catch_unwind(AssertUnwindSafe(|| analyze_in_project(root, &opts))) {
             Ok(a) => a,
             Err(_) => {
                 eprintln!("lunar lsp: the compiler panicked while analyzing {}", root.display());
@@ -169,10 +170,13 @@ impl Server {
         };
         // Record which user files belong to this crate. A file that was its
         // own root but is now a module of this crate stops being a root.
+        // Dependencies checked out from git are not the user's to fix.
+        let checkouts = path_key(&project::lunar_home());
         let mut files: Vec<(FileId, PathBuf)> = Vec::new();
         for (id, f) in analysis.map.files() {
             if let Some(p) = &f.path
                 && std_rel_path(f).is_none()
+                && !path_key(p).starts_with(&checkouts)
             {
                 files.push((id, p.clone()));
             }
@@ -375,6 +379,38 @@ fn publish(conn: &Connection, uri: Url, diagnostics: Vec<lsp_types::Diagnostic>)
     let params = PublishDiagnosticsParams { uri, diagnostics, version: None };
     conn.sender.send(Message::Notification(Notification::new(PublishDiagnostics::METHOD.to_string(), params)))?;
     Ok(())
+}
+
+/// Analyze `root` as the crater it is in its project (`src/main.ln`,
+/// `src/lib.ln` or `tests/*.ln`, with their dependencies), or on its own if
+/// it isn't one. A broken manifest is reported on the file, which is then
+/// analyzed alone.
+fn analyze_in_project(root: &Path, opts: &AnalyzeOptions) -> Analysis {
+    let Some(dir) = root.parent().and_then(project::find_project) else { return analyze_with(root, opts) };
+    let key = path_key(root);
+    let is = |p: Option<PathBuf>| p.is_some_and(|p| path_key(&p) == key);
+    let manifest = match project::Manifest::load(&dir) {
+        Ok(m) => m,
+        Err(e) => return with_project_error(analyze_with(root, opts), e),
+    };
+    let target = if is(manifest.main_root()) {
+        Target::Main
+    } else if is(manifest.lib_root()) {
+        Target::Lib
+    } else if manifest.test_files().iter().any(|t| path_key(t) == key) {
+        Target::TestFile(root.to_path_buf())
+    } else {
+        return analyze_with(root, opts);
+    };
+    match project::resolve(&dir, false, &mut |_| {}).and_then(|g| project::craters(&g, &target)) {
+        Ok(craters) => analyze_craters(&craters, opts),
+        Err(e) => with_project_error(analyze_with(root, opts), e),
+    }
+}
+
+fn with_project_error(mut a: Analysis, e: String) -> Analysis {
+    a.diags.push(Diagnostic::error(ln_diag::codes::build::IO, Span::DUMMY, format!("{}: {e}", project::MANIFEST)));
+    a
 }
 
 /// The root of the crate that `file` belongs to. `dir/foo.ln` and

@@ -124,3 +124,86 @@ fn manifest_errors() {
 
     let _ = std::fs::remove_dir_all(&w);
 }
+
+/// The language server analyzes a project's files with their dependencies.
+#[test]
+fn language_server_sees_dependencies() {
+    use serde_json::{Value, json};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::Stdio;
+
+    let w = scratch("lsp");
+    let home = w.join("home");
+    ok(&w, &home, &["new", "app"]);
+    ok(&w, &home, &["new", "mathx", "--lib"]);
+    let app = w.join("app");
+    ok(&app, &home, &["add", "mathx", "--path", "../mathx"]);
+    let main = app.join("src").join("main.ln");
+    let text = "fn main() {\n    println(\"{mathx::add(40, 2)}\");\n}\n";
+    std::fs::write(&main, text).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lunar"))
+        .args(["lsp", "--stdio"])
+        .env("LUNAR_HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut send = |msg: Value| {
+        let body = msg.to_string();
+        write!(stdin, "Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        stdin.flush().unwrap();
+    };
+    let mut recv = || -> Value {
+        let mut len = 0;
+        loop {
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            let line = line.trim();
+            if line.is_empty() {
+                break;
+            }
+            if let Some(n) = line.strip_prefix("Content-Length: ") {
+                len = n.parse().unwrap();
+            }
+        }
+        let mut buf = vec![0; len];
+        stdout.read_exact(&mut buf).unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    };
+    let path = main.to_string_lossy().replace('\\', "/");
+    let uri = if path.starts_with('/') { format!("file://{path}") } else { format!("file:///{path}") };
+
+    send(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "processId": null, "rootUri": null, "capabilities": {} } }));
+    while recv().get("id") != Some(&json!(1)) {}
+    send(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }));
+    send(
+        json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen", "params": { "textDocument": { "uri": uri, "languageId": "lunar", "version": 1, "text": text } } }),
+    );
+    // `add` in `mathx::add(40, 2)`, line 1.
+    send(
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "textDocument/definition", "params": { "textDocument": { "uri": uri }, "position": { "line": 1, "character": 23 } } }),
+    );
+    let mut diags = None;
+    let definition = loop {
+        let m = recv();
+        if m["method"] == "textDocument/publishDiagnostics" && m["params"]["uri"].as_str().is_some_and(|u| u.ends_with("main.ln")) {
+            diags = Some(m["params"]["diagnostics"].clone());
+        }
+        if m.get("id") == Some(&json!(2)) {
+            break m["result"].clone();
+        }
+    };
+    let diags = diags.expect("diagnostics for main.ln");
+    assert_eq!(diags, json!([]), "the dependency should resolve");
+    let target = definition["uri"].as_str().unwrap_or_default();
+    assert!(target.ends_with("mathx/src/lib.ln"), "definition of mathx::add: {definition:#?}");
+
+    send(json!({ "jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": null }));
+    while recv().get("id") != Some(&json!(3)) {}
+    send(json!({ "jsonrpc": "2.0", "method": "exit", "params": null }));
+    assert!(child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(&w);
+}
