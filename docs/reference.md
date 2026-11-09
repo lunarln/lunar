@@ -220,6 +220,11 @@ methods of `[T; ..+]`, `[T]`, `[T; &mut]` and `[T; &]`, in that order, and a
 Every diagnostic has a scoped code: `err(scope::name)`. Scopes:
 `syntax`, `name`, `type`, `trait`, `borrow`, `unsafe`, `lint`, `build`.
 
+`lunar explain scope::name` (or the pasted `err(scope::name)`) explains a
+code in detail, with an erroneous and a fixed example; `lunar explain`
+alone lists every code. The explanations are the files in
+[docs/errors](errors), one per code.
+
 ## 9. Standard library overview
 
 * `core::ptr::Dull`, `core::ops`, `core::cmp::{Eq, Ord, Ordering, min, max}`,

@@ -80,6 +80,8 @@ lunar build <file.ln> [-o out] [--release] [--emit-llvm out.ll]
 lunar run   <file.ln> [--release] [-- args...]
 lunar test  <file.ln> [filter] [--release]
 lunar emit-llvm <file.ln> [-o out.ll] [--release] [--test]
+lunar explain <code>     # e.g. borrow::shrink_while_borrowed
+lunar explain [--list]
 ```
 
 `--release` enables LLVM optimizations and turns integer overflow checks into
@@ -88,6 +90,11 @@ wrapping arithmetic.
 `emit-llvm` prints the module's LLVM IR (after the optimization pipeline, so
 pass `--release` to see optimized code) to stdout without building anything.
 `build --emit-llvm out.ll` writes the same IR alongside a normal build.
+
+`explain` prints a longer write-up of a diagnostic code, with an erroneous
+and a fixed example. It also accepts the code as printed, e.g.
+`lunar explain 'err(type::mismatch)'`; without a code it lists every code.
+The explanations live in [docs/errors](docs/errors), one file per code.
 
 ## Repository layout
 
@@ -102,6 +109,7 @@ pass `--release` to see optimized code) to stdout without building anything.
 | `crates/ln-codegen` | Monomorphization and LLVM code generation (inkwell) |
 | `crates/ln-driver` | The `lunar` CLI, linking, end-to-end tests |
 | `std/core`, `std/std` | The standard library, written in Lunar (embedded in the compiler) |
+| `docs/errors` | One explanation per diagnostic code, shown by `lunar explain` (embedded in the compiler) |
 | `examples/` | Example programs (with expected output in `.out` files) |
 | `tests/ui`, `tests/run` | Diagnostics tests and run tests |
 

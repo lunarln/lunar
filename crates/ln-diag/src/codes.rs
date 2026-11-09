@@ -19,52 +19,45 @@ macro_rules! codes {
     };
 }
 
-// `type` is a keyword in Rust, so that scope lives in the `ty` module but is
-// rendered as `type`.
-pub mod ty {
-    use super::Code;
-    macro_rules! c {
-        ($k:ident = $n:literal) => {
-            pub const $k: Code = Code::new("type", $n);
-        };
-    }
-    c!(MISMATCH = "mismatch");
-    c!(ARRAY_POINTY_ITEMS = "array_pointy_items");
-    c!(BANG_OUTSIDE_PARAM = "bang_outside_param");
-    c!(BANG_NOT_SHRINKABLE = "bang_not_shrinkable");
-    c!(BANG_WITHOUT_MUT = "bang_without_mut");
-    c!(FMTARGS_OUTSIDE_PARAM = "fmtargs_outside_param");
-    c!(ANNOTATIONS_NEEDED = "annotations_needed");
-    c!(NOT_CALLABLE = "not_callable");
-    c!(ARG_COUNT = "arg_count");
-    c!(GENERIC_COUNT = "generic_count");
-    c!(NO_FIELD = "no_field");
-    c!(NO_METHOD = "no_method");
-    c!(NOT_INDEXABLE = "not_indexable");
-    c!(BAD_OPERAND = "bad_operand");
-    c!(BAD_CAST = "bad_cast");
-    c!(UNSATISFIED_BOUND = "unsatisfied_bound");
-    c!(INFINITE_SIZE = "infinite_size");
-    c!(ARRAY_LEN = "array_len");
-    c!(NOT_A_PLACE = "not_a_place");
-    c!(IMMUTABLE = "immutable");
-    c!(MISSING_FIELD = "missing_field");
-    c!(DUPLICATE_FIELD = "duplicate_field");
-    c!(NON_EXHAUSTIVE = "non_exhaustive");
-    c!(BAD_PATTERN = "bad_pattern");
-    c!(RETURN_MISSING = "return_missing");
-    c!(BREAK_OUTSIDE_LOOP = "break_outside_loop");
-    c!(LITERAL_RANGE = "literal_range");
-    c!(NOT_ITERABLE = "not_iterable");
-    c!(FFI_TYPE = "ffi_type");
-    c!(BAD_MAIN = "bad_main");
-    c!(BAD_TEST = "bad_test");
-    c!(CONST_EVAL = "const_eval");
-    c!(INTERPOLATION = "interpolation");
-    c!(RECURSIVE_OWNER = "recursive_owner");
-}
-
 codes! {
+    // `type` is a keyword in Rust, so that scope lives in the `ty` module but is
+    // rendered as `type`.
+    ty ("type") => {
+        MISMATCH = "mismatch",
+        ARRAY_POINTY_ITEMS = "array_pointy_items",
+        BANG_OUTSIDE_PARAM = "bang_outside_param",
+        BANG_NOT_SHRINKABLE = "bang_not_shrinkable",
+        BANG_WITHOUT_MUT = "bang_without_mut",
+        FMTARGS_OUTSIDE_PARAM = "fmtargs_outside_param",
+        ANNOTATIONS_NEEDED = "annotations_needed",
+        NOT_CALLABLE = "not_callable",
+        ARG_COUNT = "arg_count",
+        GENERIC_COUNT = "generic_count",
+        NO_FIELD = "no_field",
+        NO_METHOD = "no_method",
+        NOT_INDEXABLE = "not_indexable",
+        BAD_OPERAND = "bad_operand",
+        BAD_CAST = "bad_cast",
+        UNSATISFIED_BOUND = "unsatisfied_bound",
+        INFINITE_SIZE = "infinite_size",
+        ARRAY_LEN = "array_len",
+        NOT_A_PLACE = "not_a_place",
+        IMMUTABLE = "immutable",
+        MISSING_FIELD = "missing_field",
+        DUPLICATE_FIELD = "duplicate_field",
+        NON_EXHAUSTIVE = "non_exhaustive",
+        BAD_PATTERN = "bad_pattern",
+        RETURN_MISSING = "return_missing",
+        BREAK_OUTSIDE_LOOP = "break_outside_loop",
+        LITERAL_RANGE = "literal_range",
+        NOT_ITERABLE = "not_iterable",
+        FFI_TYPE = "ffi_type",
+        BAD_MAIN = "bad_main",
+        BAD_TEST = "bad_test",
+        CONST_EVAL = "const_eval",
+        INTERPOLATION = "interpolation",
+        RECURSIVE_OWNER = "recursive_owner",
+    }
     syntax ("syntax") => {
         UNEXPECTED_TOKEN = "unexpected_token",
         UNKNOWN_CHAR = "unknown_char",
