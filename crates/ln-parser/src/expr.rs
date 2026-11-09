@@ -86,6 +86,7 @@ impl P<'_, '_, '_> {
                     | T::Number(_)
                     | T::Str
                     | T::Char
+                    | T::Byte
                     | T::True
                     | T::False
                     | T::LParen
@@ -360,6 +361,24 @@ impl P<'_, '_, '_> {
                     }
                 }
             }
+            // A placeholder for an unclosed literal (already reported).
+            T::Byte if text.len() < 3 || !text.ends_with('\'') => Lit::Int { value: 0, suffix: Some("u8".into()) },
+            // A byte literal is a `u8` integer literal.
+            T::Byte => {
+                let value = match crate::lit::unescape_byte(&text[2..text.len() - 1]) {
+                    Ok(b) => b,
+                    Err((m, help)) => {
+                        let code = if m.contains("escape") { syntax::BAD_ESCAPE } else { syntax::BAD_CHAR };
+                        let mut d = Diagnostic::error(code, sp, m);
+                        if let Some(h) = help {
+                            d = d.with_help(h);
+                        }
+                        self.error(d);
+                        0
+                    }
+                };
+                Lit::Int { value: value as u128, suffix: Some("u8".into()) }
+            }
             T::Str => {
                 let raw = &text[1..text.len() - 1];
                 let value = match crate::lit::unescape(raw) {
@@ -388,7 +407,7 @@ impl P<'_, '_, '_> {
             return Err(self.k.error_expected());
         };
         let kind = match t {
-            T::Number(_) | T::Str | T::Char | T::True | T::False => ExprKind::Lit(self.literal()?),
+            T::Number(_) | T::Str | T::Char | T::Byte | T::True | T::False => ExprKind::Lit(self.literal()?),
             T::Ident | T::SelfValue | T::SelfType | T::Crater | T::Super => {
                 let path = self.path_ty_style()?;
                 if self.k.at(T::LBrace) && !r.no_struct && self.looks_like_struct_lit(&path) { self.struct_lit(path)? } else { ExprKind::Path(path) }

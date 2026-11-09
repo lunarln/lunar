@@ -194,6 +194,9 @@ pub enum Token {
     Str,
     #[regex(r#"'([^'\\\n]|\\[^\n][^'\n]*)'"#)]
     Char,
+    /// `b'a'`: a `u8`.
+    #[regex(r#"b'([^'\\\n]|\\[^\n][^'\n]*)'"#)]
+    Byte,
     #[token("/*", lex_block_comment)]
     BlockComment,
 }
@@ -481,6 +484,7 @@ impl Token {
             Number(NumKind::Float) => "float literal",
             Str => "string literal",
             Char => "character literal",
+            Byte => "byte literal",
             BlockComment => "comment",
         }
     }
@@ -526,6 +530,7 @@ mod tests {
     fn comments_and_strings() {
         use Token::*;
         assert_eq!(kinds("/* a /* b */ c */ x // y\n\"s\\\"{x}\" 'a' '\\n'"), vec![Ident, Str, Char, Char]);
+        assert_eq!(kinds("b'a' b'\\xff' b 'c' b2'd'"), vec![Byte, Byte, Ident, Char, Ident, Char]);
     }
 
     #[test]

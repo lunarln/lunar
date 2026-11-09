@@ -8,6 +8,11 @@ one character, whether written directly (`'ab'`) or with escapes
 For text, use a string literal (`"ab"`), which is a `str`. For a space write
 `' '`, and for the NUL character `'\0'`.
 
+A byte literal `b'...'` is a single `u8`, so it must hold exactly one ASCII
+character (`b'a'`) or one escape (`b'\n'`, `b'\xff'`). A non-ASCII
+character such as `b'é'` is several bytes in UTF-8 and is this error too;
+write the byte you mean as `b'\xNN'`.
+
 An invalid escape inside a character literal, such as `'\q'`, is
 `syntax::bad_escape`, and a `'` that is never closed on its line is
 `syntax::unterminated`.

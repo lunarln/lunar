@@ -28,7 +28,7 @@ impl P<'_, '_, '_> {
             self.k.bump();
         }
         match self.k.peek() {
-            Some(T::Number(_) | T::Str | T::Char | T::True | T::False) => {
+            Some(T::Number(_) | T::Str | T::Char | T::Byte | T::True | T::False) => {
                 let lit = self.literal()?;
                 Ok(Some((lit, neg)))
             }
@@ -51,7 +51,7 @@ impl P<'_, '_, '_> {
                 self.k.bump();
                 PatKind::Binding { is_mut: true, name: self.ident()? }
             }
-            Some(T::Minus | T::Number(_) | T::Str | T::Char | T::True | T::False) => {
+            Some(T::Minus | T::Number(_) | T::Str | T::Char | T::Byte | T::True | T::False) => {
                 let lo = self.lit_pat_part()?.ok_or_else(|| self.k.error_expected_named("literal"))?;
                 if self.k.at(T::DotDotEq) || self.k.at(T::DotDot) {
                     let inclusive = self.k.bump().kind == T::DotDotEq;

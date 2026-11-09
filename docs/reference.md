@@ -13,6 +13,8 @@
   `0..10` is a range, not a float.
 * Characters `'a'`, `'\n'`, `'\u{1F600}'`; strings `"..."` with escapes
   `\n \t \r \0 \\ \" \' \xHH \u{...}` and line continuations.
+* Bytes `b'a'`, `b'\n'`, `b'\xff'`: a `u8` holding one ASCII character or
+  one escape (`\xHH` up to `\xff`; no `\u`).
 
 ## 2. Items
 

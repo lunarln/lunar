@@ -121,6 +121,32 @@ pub(crate) fn unescape(raw: &str) -> Result<String, (usize, usize, String)> {
     Ok(out)
 }
 
+/// The value of a byte literal body (between `b'` and `'`): one ASCII
+/// character, or an escape up to `\xFF`. On error returns a message and
+/// an optional help.
+pub(crate) fn unescape_byte(raw: &str) -> Result<u8, (String, Option<String>)> {
+    if let Some(hex) = raw.strip_prefix("\\x") {
+        return match u8::from_str_radix(hex, 16) {
+            Ok(b) if hex.len() == 2 => Ok(b),
+            _ => Err(("`\\x` escapes in byte literals must be two hex digits".into(), None)),
+        };
+    }
+    if raw.starts_with("\\u") {
+        return Err(("unicode escapes cannot be used in byte literals".into(), Some("a byte is a single `\\x00`..`\\xFF` value".into())));
+    }
+    let s = unescape(raw).map_err(|(_, _, m)| (m, None))?;
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_ascii() => Ok(c as u8),
+        (Some(c), None) => Err((
+            format!("non-ASCII character `{c}` in a byte literal"),
+            Some(format!("its UTF-8 encoding is {} bytes; write one byte as `\\xNN`, or use the `char` literal `'{c}'`", c.len_utf8())),
+        )),
+        (None, _) => Err(("byte literal must contain exactly one byte".into(), Some("for the zero byte write `b'\\0'`".into()))),
+        _ => Err(("byte literal must contain exactly one byte".into(), None)),
+    }
+}
+
 /// Interpret a string literal body (`raw`, between the quotes, starting at
 /// byte `offset` of `file`) as a format string: `{expr}` holes, `{{`/`}}`
 /// escapes.

@@ -114,7 +114,7 @@
     },
     "chars": {
       "name": "string.quoted.single.char.lunar",
-      "match": "'(\\\\(n|r|t|0|\\\\|\"|'|x[0-9A-Fa-f]{2}|u\\{[0-9A-Fa-f_]{1,6}\\})|[^'\\\\])'",
+      "match": "(?<![\\w])b?'(\\\\(n|r|t|0|\\\\|\"|'|x[0-9A-Fa-f]{2}|u\\{[0-9A-Fa-f_]{1,6}\\})|[^'\\\\])'",
       "captures": {
         "1": { "patterns": [{ "include": "#escapes" }] }
       }

@@ -1,0 +1,24 @@
+// Byte literals: `b'x'` is a `u8`.
+
+fn classify(c: u8): str {
+    return match c {
+        b'0'..=b'9' => "digit",
+        b'a'..=b'z' | b'A'..=b'Z' | b'_' => "word",
+        b' ' | b'\t' | b'\n' => "space",
+        _ => "other",
+    };
+}
+
+fn main() {
+    let s = "x1 _\t;";
+    for c in s.bytes() {
+        println("{c}: {classify(c)}");
+    }
+    let all = [b'\0', b'\\', b'\'', b'"', b'\x7f', b'\xff'];
+    for b in all {
+        print("{b} ");
+    }
+    println("");
+    let n: u32 = (b'7' - b'0') as u32;
+    println("{n}");
+}

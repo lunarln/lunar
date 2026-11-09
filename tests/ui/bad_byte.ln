@@ -1,0 +1,12 @@
+// error: syntax::bad_char
+// error: syntax::bad_escape
+// absent: syntax::unterminated
+// absent: syntax::unknown_char
+fn main() {
+    let a = b'ab';
+    let b = b'é';
+    let c = b'\u{41}';
+    let d = b'';
+    let e = b'\x1';
+    println("{a}{b}{c}{d}{e}");
+}

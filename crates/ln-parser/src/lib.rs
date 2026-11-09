@@ -136,6 +136,7 @@ fn rejoin_char_literals(src: &str, toks: &mut Vec<ln_lexer::Spanned>, errs: &mut
             i += 1;
             continue;
         };
+        let (start, token) = with_byte_prefix(start, toks);
         toks.retain(|t| t.range.end <= start || t.range.start >= end);
         // An error inside the literal may also have swallowed text after it
         // (the lexer consumed `';` trying to match a literal): lex that
@@ -148,7 +149,7 @@ fn rejoin_char_literals(src: &str, toks: &mut Vec<ln_lexer::Spanned>, errs: &mut
             }
             !inside
         });
-        toks.push(ln_lexer::Spanned { token: Token::Char, range: start..end });
+        toks.push(ln_lexer::Spanned { token, range: start..end });
         for r in leftover {
             let (more, more_errs) = ln_lexer::lex(&src[r.clone()]);
             toks.extend(more.into_iter().map(|t| ln_lexer::Spanned { token: t.token, range: t.range.start + r.start..t.range.end + r.start }));
@@ -173,10 +174,19 @@ fn placeholder_for_unclosed_chars(src: &str, toks: &mut Vec<ln_lexer::Spanned>, 
         while end < bytes.len() && !matches!(bytes[end], b' ' | b'\t' | b'\r' | b'\n' | b';' | b',' | b')' | b']' | b'}' | b'\'') {
             end += 1;
         }
+        let (start, token) = with_byte_prefix(start, toks);
         toks.retain(|t| t.range.end <= start || t.range.start >= end);
-        toks.push(ln_lexer::Spanned { token: Token::Char, range: start..end });
+        toks.push(ln_lexer::Spanned { token, range: start..end });
     }
     toks.sort_by_key(|t| t.range.start);
+}
+
+/// A malformed literal starting with the quote at `quote`: a byte literal
+/// (`b'ab'`) when the quote directly follows an identifier `b`, else a
+/// character literal. Returns where the literal starts and its token.
+fn with_byte_prefix(quote: usize, toks: &[ln_lexer::Spanned]) -> (usize, Token) {
+    let prefixed = quote > 0 && toks.iter().any(|t| t.token == Token::Ident && t.range == (quote - 1..quote));
+    if prefixed { (quote - 1, Token::Byte) } else { (quote, Token::Char) }
 }
 
 fn lex_with_offset(src: &str, offset: u32, file: FileId) -> (Vec<Tok<Token>>, Vec<Diagnostic>) {
