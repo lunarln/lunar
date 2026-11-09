@@ -98,7 +98,17 @@ impl<'a> Sema<'a> {
             return Some(ModRes::Def(b.def));
         }
         if ns == Ns::Type {
-            if let Some((_, root)) = self.p.crate_roots.iter().find(|(n, _)| n == name) {
+            // Craters by name: this crater's declared dependencies, then
+            // `core` and `std`, which every crater can see.
+            let krate = self.mod_data(from).krate;
+            if let Some(deps) = self.crater_deps.get(&krate)
+                && let Some((_, root)) = deps.iter().find(|(n, _)| n == name)
+            {
+                return Some(ModRes::Def(*root));
+            }
+            if (name == "core" || name == "std")
+                && let Some((_, root)) = self.p.crate_roots.iter().find(|(n, _)| n == name)
+            {
                 return Some(ModRes::Def(*root));
             }
             if let Some(t) = prim_type(name) {

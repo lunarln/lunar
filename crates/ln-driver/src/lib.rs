@@ -85,20 +85,41 @@ pub fn analyze_for(path: &Path, test: bool, target_os: Option<&str>) -> Analysis
     analyze_with(path, &AnalyzeOptions { test, target_os, ..Default::default() })
 }
 
-/// The general front-end entry point.
+/// The front end for a single file (plus `core` and `std`).
 pub fn analyze_with(path: &Path, o: &AnalyzeOptions) -> Analysis {
+    let name = path.file_stem().map(|s| sanitize(&s.to_string_lossy())).unwrap_or_else(|| "main".into());
+    analyze_craters(&[CraterSpec { name, root: path.to_path_buf(), deps: Vec::new() }], o)
+}
+
+/// One crater to compile: its name, root file, and the craters it depends
+/// on (the name used in its paths, and an index into the same list).
+#[derive(Clone, Debug)]
+pub struct CraterSpec {
+    pub name: String,
+    pub root: PathBuf,
+    pub deps: Vec<(String, usize)>,
+}
+
+/// Analyze a graph of craters together with `core` and `std`. The first
+/// crater is the one being built (its `main` or its tests); the others are
+/// its dependencies, direct and indirect.
+pub fn analyze_craters(craters: &[CraterSpec], o: &AnalyzeOptions) -> Analysis {
     let mut map = SourceMap::new();
     let mut diags = Vec::new();
     let mut ids = IdGen::new();
-    let user_name = path.file_stem().map(|s| sanitize(&s.to_string_lossy())).unwrap_or_else(|| "main".into());
     let mut crates: Vec<CrateSource> = Vec::new();
     let empty = HashMap::new();
     let user_files = Overlay(o.overlay.unwrap_or(&empty));
-    match loader::load_crate(&user_name, path, "", &user_files, &mut map, &mut ids, &mut diags) {
-        Some(c) => crates.push(c),
-        None => {
-            diags.push(Diagnostic::error(ln_diag::codes::build::IO, ln_diag::Span::DUMMY, format!("could not read `{}`", path.display())));
-            return Analysis { map, program: None, diags };
+    for spec in craters {
+        match loader::load_crate(&spec.name, &spec.root, "", &user_files, &mut map, &mut ids, &mut diags) {
+            Some(mut c) => {
+                c.deps = spec.deps.clone();
+                crates.push(c);
+            }
+            None => {
+                diags.push(Diagnostic::error(ln_diag::codes::build::IO, ln_diag::Span::DUMMY, format!("could not read `{}`", spec.root.display())));
+                return Analysis { map, program: None, diags };
+            }
         }
     }
     let (provider, base, prefix) = std_provider(o.std_dir);

@@ -199,6 +199,8 @@ pub(crate) struct Sema<'a> {
     /// Array element / `!` checks deferred until all ADT fields are known.
     pub(crate) deferred: Vec<lower::Deferred>,
     pub(crate) alias_stack: Vec<DefId>,
+    /// For each crater root, the craters it may name and under what name.
+    pub(crate) crater_deps: HashMap<DefId, Vec<(String, DefId)>>,
 }
 
 impl<'a> Sema<'a> {
@@ -222,13 +224,20 @@ pub fn analyze(crates: &[CrateSource], opts: Options) -> (Option<Program>, Vec<D
         prelude: None,
         deferred: Vec::new(),
         alias_stack: Vec::new(),
+        crater_deps: HashMap::new(),
     };
     let mut user_root = None;
+    let mut roots = Vec::new();
     for (i, c) in crates.iter().enumerate() {
         let root = s.collect_crate(c);
+        roots.push(root);
         if i == 0 {
             user_root = Some(root);
         }
+    }
+    for (c, &root) in crates.iter().zip(&roots) {
+        let deps = c.deps.iter().filter_map(|(alias, i)| roots.get(*i).map(|r| (alias.clone(), *r))).collect();
+        s.crater_deps.insert(root, deps);
     }
     if let Some((_, core)) = s.p.crate_roots.iter().find(|(n, _)| n == "core").cloned()
         && let Some(b) = s.lookup_in(core, "prelude", Ns::Type)

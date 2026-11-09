@@ -48,6 +48,10 @@ pub struct ModSource {
 pub struct CrateSource {
     pub name: String,
     pub root: ModSource,
+    /// The craters this one may name: (name used in paths, index of the
+    /// crater in the list passed to `analyze`). `core` and `std` are always
+    /// visible and need not be listed.
+    pub deps: Vec<(String, usize)>,
 }
 
 /// Load the crate rooted at `root_path`, following `mod foo;` declarations to
@@ -63,7 +67,7 @@ pub fn load_crate(
 ) -> Option<CrateSource> {
     let text = files.read(root_path)?;
     let root = load_mod(root_path, text, true, display_prefix, files, map, ids, diags);
-    Some(CrateSource { name: name.to_string(), root })
+    Some(CrateSource { name: name.to_string(), root, deps: Vec::new() })
 }
 
 #[allow(clippy::too_many_arguments)]
