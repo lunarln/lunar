@@ -90,8 +90,8 @@ pub enum Callee {
     Fn { def: DefId, args: Vec<Ty> },
     /// A trait method resolved at monomorphization time from `self_ty`.
     Trait { trait_ref: TraitRef, self_ty: Ty, method: String, method_args: Vec<Ty> },
-    /// A compiler intrinsic.
-    Intrinsic { name: String, args: Vec<Ty> },
+    /// A compiler intrinsic (`def` is its `#[intrinsic]` declaration).
+    Intrinsic { def: DefId, name: String, args: Vec<Ty> },
     /// Call through a function pointer.
     Indirect(Box<Expr>),
 }
