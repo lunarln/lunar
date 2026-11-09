@@ -464,7 +464,13 @@ impl<'a> Sema<'a> {
                         .with_help(format!("declare it `{fix}`")),
                 );
             }
-            // Trait methods and their impls must keep the trait's modes.
+            // `needless_borrow` deliberately skips:
+            // * `&self`: methods conventionally borrow their receiver whatever
+            //   its type, so a type's methods read alike and the receiver can
+            //   later grow an owned field without changing every signature;
+            // * trait methods and their impls, which must keep the trait's
+            //   modes even when the implementing type is Dull;
+            // * extern functions, whose signatures follow C.
             let in_trait_item = parent.is_some_and(|pd| match &self.p.defs[pd.0 as usize].data {
                 DefData::Impl(d) => d.trait_ref.is_some(),
                 DefData::Trait(_) => true,

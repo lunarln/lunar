@@ -7,8 +7,13 @@ Borrowing it gains nothing, so take it by value instead.
 `&mut T` on a Dull type is different and is not reported: it makes the
 parameter in-out, so the function can change the caller's variable.
 
-Trait methods and their implementations are exempt, because an impl must
-match the trait's declaration even when its own types are Dull.
+Some borrows are never reported:
+
+* `&self`: methods borrow their receiver by convention, whatever its type,
+  so all of a type's methods read alike and the type can later gain an owned
+  field without every signature changing.
+* Trait methods and their implementations, because an impl must match the
+  trait's declaration even when its own types are Dull.
 
 ## Erroneous example
 

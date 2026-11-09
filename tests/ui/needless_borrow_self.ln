@@ -1,0 +1,22 @@
+// warning: lint::needless_borrow
+// once: lint::needless_borrow
+// The free function's `&i32` is reported; the `&self` receiver is not.
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+impl Point {
+    fn sum(&self): i32 {
+        return self.x + self.y;
+    }
+}
+
+fn twice(n: &i32): i32 {
+    return n * 2;
+}
+
+fn main() {
+    let p = Point { x: 1, y: 2 };
+    println("{p.sum()} {twice(3)}");
+}
