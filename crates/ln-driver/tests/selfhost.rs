@@ -36,6 +36,10 @@ fn rust_dump(src: &str) -> String {
     for e in errs {
         out.push_str(&format!("error {:?} {} {}\n", e.kind, e.range.start, e.range.end));
     }
+    let range = |r: &Option<std::ops::Range<usize>>| r.as_ref().map_or(" -".to_string(), |r| format!(" {}..{}", r.start, r.end));
+    for c in ln_lexer::conflict_markers(src) {
+        out.push_str(&format!("conflict {}..{}{}{}{}\n", c.start.start, c.start.end, range(&c.base), range(&c.mid), range(&c.end)));
+    }
     out
 }
 

@@ -1,21 +1,30 @@
-// The Lunar lexer, written in Lunar: a port of the `ln-lexer` crate that
-// produces the same tokens, checked against it by
+// Lexer for the Lunar programming language, written in Lunar: a port of
+// the Rust `ln-lexer` crate (crates/ln-lexer), with the same tokens, error
+// ranges and conflict markers, checked against it by
 // crates/ln-driver/tests/selfhost.rs.
 //
-// Tokens carry no text; slice the source with their byte range. `>` is
-// never fused with a following `>` or `=` (so `A::<B::<C>>` lexes cleanly);
-// the parser re-joins adjacent `>` tokens where an operator is expected.
+// Tokens carry no payload; consumers slice the source text with the
+// token's byte range. `>` is never fused with a following `>`/`=` here (so
+// generic argument lists like `A::<B::<C>>` lex cleanly); the parser
+// re-joins adjacent `>` tokens into `>>`, `>=` and `>>=` where an operator
+// is expected.
 
-/// What a token is.
-pub enum Kind {
-    // Delimiters.
+/// Classification of a numeric literal.
+pub enum NumKind {
+    Int,
+    Float,
+}
+
+pub enum Token {
+    // ----- delimiters -----
     LParen,
     RParen,
     LBracket,
     RBracket,
     LBrace,
     RBrace,
-    // Punctuation.
+
+    // ----- punctuation -----
     LAngle,
     RAngle,
     Le,
@@ -58,7 +67,8 @@ pub enum Kind {
     Hash,
     At,
     Placeholder,
-    // Keywords.
+
+    // ----- keywords -----
     As,
     Break,
     Const,
@@ -91,94 +101,109 @@ pub enum Kind {
     Unsafe,
     Use,
     While,
-    // Literals and identifiers.
+
+    // ----- literals & identifiers -----
     Ident,
-    Int,
-    Float,
+    Number(NumKind),
     Str,
     Char,
+    /// `b'a'`: a `u8`.
     Byte,
+    /// `/// text`: documentation for the item that follows. Exactly three
+    /// slashes; `////` is an ordinary comment. The parser attaches it to the
+    /// next item as `#[doc = "text"]`.
+    DocComment,
+    /// Never produced: block comments are skipped (or reported as errors
+    /// when unterminated). Kept so the set of tokens matches `ln-lexer`.
+    BlockComment,
 }
 
-/// A token and its byte range in the source.
-pub struct Token {
-    pub kind: Kind,
+/// A byte range in the source: `start..end`.
+pub struct Range {
     pub start: usize,
     pub end: usize,
 }
 
-pub enum ErrorKind {
+/// A lexed token and its byte range in the source.
+pub struct Spanned {
+    pub token: Token,
+    pub range: Range,
+}
+
+/// A character sequence the lexer could not understand.
+pub struct LexError {
+    pub range: Range,
+    pub kind: LexErrorKind,
+}
+
+pub enum LexErrorKind {
     /// Characters that start no token (or a malformed literal).
     Invalid,
     /// A `/*` comment without its closing `*/`; the range runs to the end.
     UnterminatedComment,
 }
 
-/// Text the lexer could not understand.
-pub struct LexError {
-    pub kind: ErrorKind,
-    pub start: usize,
-    pub end: usize,
-}
-
-/// The tokens of a source file, and what could not be lexed.
-pub struct Lexed {
-    pub tokens: [Token; -..+],
-    pub errors: [LexError; -..+],
-}
-
-/// Lex a whole source file. Whitespace and comments are skipped.
-pub fn lex(src: str): Lexed {
+/// Lex a whole source file.
+pub fn lex(src: str): ([Spanned; -..+], [LexError; -..+]) {
     let b = src.as_bytes();
-    let mut out = Lexed { tokens: [], errors: [] };
+    let mut toks: [Spanned; -..+] = [];
+    let mut errs: [LexError; -..+] = [];
     let mut i: usize = 0;
     while i < b.len() {
         let c = b[i];
+        // Whitespace: `[ \t\r\n\f]+`.
         if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' || c == b'\x0c' {
             i += 1;
             continue;
         }
+        // Line comments; `///` (exactly three slashes) is documentation.
         if c == b'/' && at(b, i + 1) == b'/' {
+            let start = i;
             while i < b.len() && b[i] != b'\n' {
                 i += 1;
             }
+            if at(b, start + 2) == b'/' && at(b, start + 3) != b'/' {
+                toks.push(Spanned { token: Token::DocComment, range: Range { start, end: i } });
+            }
             continue;
         }
+        // Nested `/* ... */` comments. An unterminated comment is an error
+        // covering the rest of the input.
         if c == b'/' && at(b, i + 1) == b'*' {
             match block_comment_end(b, i + 2) {
                 Some(end) => {
                     i = end;
                 }
                 None => {
-                    out.errors.push(LexError { kind: ErrorKind::UnterminatedComment, start: i, end: b.len() });
+                    errs.push(LexError { range: Range { start: i, end: b.len() }, kind: LexErrorKind::UnterminatedComment });
                     i = b.len();
                 }
             }
             continue;
         }
-        let (kind, end) = token_at(src, i);
-        match kind {
-            Some(k) => out.tokens.push(Token { kind: k, start: i, end }),
-            None => invalid(out.errors, i, end),
+        let (token, end) = token_at(src, i);
+        match token {
+            Some(t) => toks.push(Spanned { token: t, range: Range { start: i, end } }),
+            None => invalid(errs, i, end),
         }
         i = end;
     }
-    return out;
+    return (toks, errs);
 }
 
-/// Record invalid text, merged into an invalid run that ends where it starts.
-fn invalid(errors: &mut [LexError; -..+], start: usize, end: usize) {
-    let n = errors.len();
-    if n > 0 && errors[n - 1].end == start {
-        match errors[n - 1].kind {
-            ErrorKind::Invalid => {
-                errors[n - 1].end = end;
+/// Record invalid text. Runs of adjacent bad characters merge into one error.
+fn invalid(errs: &mut [LexError; -..+], start: usize, end: usize) {
+    let n = errs.len();
+    if n > 0 && errs[n - 1].range.end == start {
+        match errs[n - 1].kind {
+            LexErrorKind::Invalid => {
+                errs[n - 1].range.end = end;
                 return;
             }
-            ErrorKind::UnterminatedComment => {}
+            LexErrorKind::UnterminatedComment => {}
         }
     }
-    errors.push(LexError { kind: ErrorKind::Invalid, start, end });
+    errs.push(LexError { range: Range { start, end }, kind: LexErrorKind::Invalid });
 }
 
 /// The end of a nested `/* ... */` comment whose body starts at `from`.
@@ -202,9 +227,9 @@ fn block_comment_end(b: [u8; &], from: usize): Option::<usize> {
     return None;
 }
 
-/// The token starting at `i` and where it ends; no kind for invalid text
-/// (which then ends where lexing gave up, as `ln-lexer` reports it).
-fn token_at(src: str, i: usize): (Option::<Kind>, usize) {
+/// The token starting at `i` and where it ends. Invalid text has no token
+/// and ends where lexing gave up, which is the range `ln-lexer` reports.
+fn token_at(src: str, i: usize): (Option::<Token>, usize) {
     let b = src.as_bytes();
     let c = b[i];
     if is_ident_start(c) {
@@ -213,7 +238,7 @@ fn token_at(src: str, i: usize): (Option::<Kind>, usize) {
         if c == b'b' && at(b, i + 1) == b'\'' {
             match quoted_char_end(b, i + 1) {
                 Ok(end) => {
-                    return (Some(Kind::Byte), end);
+                    return (Some(Token::Byte), end);
                 }
                 Err(_) => {}
             }
@@ -225,17 +250,18 @@ fn token_at(src: str, i: usize): (Option::<Kind>, usize) {
         return (Some(word(src[i..j])), j);
     }
     if is_digit(c) {
-        return (Some(number_kind(b, i)), number_end(b, i));
+        let (kind, end) = lex_number(b, i);
+        return (Some(Token::Number(kind)), end);
     }
     if c == b'"' {
         return match string_end(b, i) {
-            Ok(end) => (Some(Kind::Str), end),
+            Ok(end) => (Some(Token::Str), end),
             Err(end) => (None, end),
         };
     }
     if c == b'\'' {
         return match quoted_char_end(b, i) {
-            Ok(end) => (Some(Kind::Char), end),
+            Ok(end) => (Some(Token::Char), end),
             Err(end) => (None, end),
         };
     }
@@ -243,74 +269,74 @@ fn token_at(src: str, i: usize): (Option::<Kind>, usize) {
 }
 
 /// Punctuation at `i`, the longest that matches (`<<=` before `<<` before `<`).
-fn punct(b: [u8; &], i: usize): (Option::<Kind>, usize) {
+fn punct(b: [u8; &], i: usize): (Option::<Token>, usize) {
     let c = b[i];
     let next = at(b, i + 1);
     let one = i + 1;
     let two = i + 2;
     return match c {
-        b'(' => tok(Kind::LParen, one),
-        b')' => tok(Kind::RParen, one),
-        b'[' => tok(Kind::LBracket, one),
-        b']' => tok(Kind::RBracket, one),
-        b'{' => tok(Kind::LBrace, one),
-        b'}' => tok(Kind::RBrace, one),
+        b'(' => tok(Token::LParen, one),
+        b')' => tok(Token::RParen, one),
+        b'[' => tok(Token::LBracket, one),
+        b']' => tok(Token::RBracket, one),
+        b'{' => tok(Token::LBrace, one),
+        b'}' => tok(Token::RBrace, one),
         b'<' => {
             if next == b'=' {
-                tok(Kind::Le, two)
+                tok(Token::Le, two)
             } else if next == b'<' {
-                if at(b, i + 2) == b'=' { tok(Kind::ShlEq, i + 3) } else { tok(Kind::Shl, two) }
+                if at(b, i + 2) == b'=' { tok(Token::ShlEq, i + 3) } else { tok(Token::Shl, two) }
             } else {
-                tok(Kind::LAngle, one)
+                tok(Token::LAngle, one)
             }
         }
-        b'>' => tok(Kind::RAngle, one),
-        b':' => if next == b':' { tok(Kind::PathSep, two) } else { tok(Kind::Colon, one) },
-        b';' => tok(Kind::Semi, one),
-        b',' => tok(Kind::Comma, one),
+        b'>' => tok(Token::RAngle, one),
+        b':' => if next == b':' { tok(Token::PathSep, two) } else { tok(Token::Colon, one) },
+        b';' => tok(Token::Semi, one),
+        b',' => tok(Token::Comma, one),
         b'.' => {
             if next != b'.' {
-                tok(Kind::Dot, one)
+                tok(Token::Dot, one)
             } else if at(b, i + 2) == b'=' {
-                tok(Kind::DotDotEq, i + 3)
+                tok(Token::DotDotEq, i + 3)
             } else if at(b, i + 2) == b'.' {
-                tok(Kind::DotDotDot, i + 3)
+                tok(Token::DotDotDot, i + 3)
             } else {
-                tok(Kind::DotDot, two)
+                tok(Token::DotDot, two)
             }
         }
         b'=' => {
             if next == b'=' {
-                tok(Kind::EqEq, two)
+                tok(Token::EqEq, two)
             } else if next == b'>' {
-                tok(Kind::FatArrow, two)
+                tok(Token::FatArrow, two)
             } else {
-                tok(Kind::Eq, one)
+                tok(Token::Eq, one)
             }
         }
-        b'!' => or_eq(next, i, Kind::Bang, Kind::BangEq),
-        b'-' => if next == b'>' { tok(Kind::Arrow, two) } else { or_eq(next, i, Kind::Minus, Kind::MinusEq) },
-        b'&' => if next == b'&' { tok(Kind::AmpAmp, two) } else { or_eq(next, i, Kind::Amp, Kind::AmpEq) },
-        b'|' => if next == b'|' { tok(Kind::PipePipe, two) } else { or_eq(next, i, Kind::Pipe, Kind::PipeEq) },
-        b'^' => or_eq(next, i, Kind::Caret, Kind::CaretEq),
-        b'+' => or_eq(next, i, Kind::Plus, Kind::PlusEq),
-        b'*' => or_eq(next, i, Kind::Star, Kind::StarEq),
-        b'/' => or_eq(next, i, Kind::Slash, Kind::SlashEq),
-        b'%' => or_eq(next, i, Kind::Percent, Kind::PercentEq),
-        b'~' => tok(Kind::Tilde, one),
-        b'?' => tok(Kind::Question, one),
-        b'#' => tok(Kind::Hash, one),
-        b'@' => tok(Kind::At, one),
+        b'!' => or_eq(next, i, Token::Bang, Token::BangEq),
+        b'-' => if next == b'>' { tok(Token::Arrow, two) } else { or_eq(next, i, Token::Minus, Token::MinusEq) },
+        b'&' => if next == b'&' { tok(Token::AmpAmp, two) } else { or_eq(next, i, Token::Amp, Token::AmpEq) },
+        b'|' => if next == b'|' { tok(Token::PipePipe, two) } else { or_eq(next, i, Token::Pipe, Token::PipeEq) },
+        b'^' => or_eq(next, i, Token::Caret, Token::CaretEq),
+        b'+' => or_eq(next, i, Token::Plus, Token::PlusEq),
+        b'*' => or_eq(next, i, Token::Star, Token::StarEq),
+        b'/' => or_eq(next, i, Token::Slash, Token::SlashEq),
+        b'%' => or_eq(next, i, Token::Percent, Token::PercentEq),
+        b'~' => tok(Token::Tilde, one),
+        b'?' => tok(Token::Question, one),
+        b'#' => tok(Token::Hash, one),
+        b'@' => tok(Token::At, one),
         _ => (None, i + char_len(c)),
     };
 }
 
-fn tok(k: Kind, end: usize): (Option::<Kind>, usize) {
-    return (Some(k), end);
+fn tok(t: Token, end: usize): (Option::<Token>, usize) {
+    return (Some(t), end);
 }
 
 /// `x` at `i`, or `x=` if `next` is `=`.
-fn or_eq(next: u8, i: usize, plain: Kind, eq: Kind): (Option::<Kind>, usize) {
+fn or_eq(next: u8, i: usize, plain: Token, eq: Token): (Option::<Token>, usize) {
     if next == b'=' {
         return (Some(eq), i + 2);
     }
@@ -318,62 +344,53 @@ fn or_eq(next: u8, i: usize, plain: Kind, eq: Kind): (Option::<Kind>, usize) {
 }
 
 /// A keyword, `_`, or an identifier.
-fn word(s: str): Kind {
+fn word(s: str): Token {
     return match s {
-        "_" => Kind::Placeholder,
-        "as" => Kind::As,
-        "break" => Kind::Break,
-        "const" => Kind::Const,
-        "continue" => Kind::Continue,
-        "crater" => Kind::Crater,
-        "else" => Kind::Else,
-        "enum" => Kind::Enum,
-        "extern" => Kind::Extern,
-        "false" => Kind::False,
-        "fn" => Kind::Fn,
-        "for" => Kind::For,
-        "if" => Kind::If,
-        "impl" => Kind::Impl,
-        "in" => Kind::In,
-        "let" => Kind::Let,
-        "loop" => Kind::Loop,
-        "match" => Kind::Match,
-        "mod" => Kind::Mod,
-        "mut" => Kind::Mut,
-        "pub" => Kind::Pub,
-        "return" => Kind::Return,
-        "self" => Kind::SelfValue,
-        "Self" => Kind::SelfType,
-        "static" => Kind::Static,
-        "struct" => Kind::Struct,
-        "super" => Kind::Super,
-        "trait" => Kind::Trait,
-        "true" => Kind::True,
-        "type" => Kind::Type,
-        "unsafe" => Kind::Unsafe,
-        "use" => Kind::Use,
-        "while" => Kind::While,
-        _ => Kind::Ident,
+        "_" => Token::Placeholder,
+        "as" => Token::As,
+        "break" => Token::Break,
+        "const" => Token::Const,
+        "continue" => Token::Continue,
+        "crater" => Token::Crater,
+        "else" => Token::Else,
+        "enum" => Token::Enum,
+        "extern" => Token::Extern,
+        "false" => Token::False,
+        "fn" => Token::Fn,
+        "for" => Token::For,
+        "if" => Token::If,
+        "impl" => Token::Impl,
+        "in" => Token::In,
+        "let" => Token::Let,
+        "loop" => Token::Loop,
+        "match" => Token::Match,
+        "mod" => Token::Mod,
+        "mut" => Token::Mut,
+        "pub" => Token::Pub,
+        "return" => Token::Return,
+        "self" => Token::SelfValue,
+        "Self" => Token::SelfType,
+        "static" => Token::Static,
+        "struct" => Token::Struct,
+        "super" => Token::Super,
+        "trait" => Token::Trait,
+        "true" => Token::True,
+        "type" => Token::Type,
+        "unsafe" => Token::Unsafe,
+        "use" => Token::Use,
+        "while" => Token::While,
+        _ => Token::Ident,
     };
 }
 
-/// The end of the number starting at `i`. Handles `0x`/`0o`/`0b` prefixes,
-/// fractions (but not `1..2` or `1.method()`), exponents and type suffixes
-/// such as `10u8` and `1.5f32`.
-fn number_end(b: [u8; &], i: usize): usize {
-    return scan_number(b, i).1;
-}
-
-fn number_kind(b: [u8; &], i: usize): Kind {
-    if scan_number(b, i).0 { Kind::Float } else { Kind::Int }
-}
-
-/// (is a float, end) of the number starting at `i`.
-fn scan_number(b: [u8; &], i: usize): (bool, usize) {
+/// Consume a number starting at `i`: its kind and end. Handles `0x`/`0o`/
+/// `0b` prefixes, fractions (but not `1..2` or `1.method()`), exponents and
+/// type suffixes such as `10u8` / `1.5f32`.
+fn lex_number(b: [u8; &], i: usize): (NumKind, usize) {
     let first = b[i];
     let n = b.len();
     let mut j = i + 1;
-    let mut float = false;
+    let mut kind = NumKind::Int;
     let radix = at(b, i + 1);
     if first == b'0' && i + 2 < n && (radix == b'x' || radix == b'o' || radix == b'b') && is_hex(b[i + 2]) {
         j = i + 2;
@@ -384,11 +401,11 @@ fn scan_number(b: [u8; &], i: usize): (bool, usize) {
         while j < n && is_digit_or_sep(b[j]) {
             j += 1;
         }
-        // Fraction: `1.` and `1.5`, but not `1..2` or `1.foo`.
+        // Fraction: `1.` / `1.5` but not `1..2` or `1.foo`.
         if j < n && b[j] == b'.' {
             let next = at(b, j + 1);
             if next != b'.' && !is_ident_start(next) {
-                float = true;
+                kind = NumKind::Float;
                 j += 1;
                 while j < n && is_digit_or_sep(b[j]) {
                     j += 1;
@@ -402,7 +419,7 @@ fn scan_number(b: [u8; &], i: usize): (bool, usize) {
                 k += 1;
             }
             if k < n && is_digit(b[k]) {
-                float = true;
+                kind = NumKind::Float;
                 j = k;
                 while j < n && is_digit_or_sep(b[j]) {
                     j += 1;
@@ -417,10 +434,10 @@ fn scan_number(b: [u8; &], i: usize): (bool, usize) {
             j += 1;
         }
         if b[s] == b'f' && !(first == b'0' && radix == b'x') {
-            float = true;
+            kind = NumKind::Float;
         }
     }
-    return (float, j);
+    return (kind, j);
 }
 
 /// The end of the string literal starting at `i`, or where it gave up.
@@ -513,133 +530,357 @@ fn is_hex(c: u8): bool {
     return is_digit(c) || (c >= b'a' && c <= b'f') || (c >= b'A' && c <= b'F');
 }
 
-impl Kind {
-    /// The name `ln-lexer` prints for this kind (its `Debug` form).
+// ===================================================================== conflict markers
+
+/// A version control conflict region left in a file by an unfinished merge
+/// or rebase. Each field is the byte range of a marker line (without its
+/// newline).
+pub struct Conflict {
+    /// `<<<<<<< ours`
+    pub start: Range,
+    /// `||||||| base` (diff3 style), if present.
+    pub base: Option::<Range>,
+    /// `=======`
+    pub mid: Option::<Range>,
+    /// `>>>>>>> theirs`
+    pub end: Option::<Range>,
+}
+
+/// Which conflict marker, if any, the line `b` is.
+fn marker_at(b: [u8; &]): Option::<u8> {
+    if b.len() < 7 {
+        return None;
+    }
+    let c = b[0];
+    if c != b'<' && c != b'|' && c != b'=' && c != b'>' {
+        return None;
+    }
+    let mut k: usize = 1;
+    while k < 7 {
+        if b[k] != c {
+            return None;
+        }
+        k += 1;
+    }
+    // Exactly seven marker characters, then the end of the line or a space
+    // (`<<<<<<< HEAD`). `=======` stands alone.
+    if b.len() == 7 || b[7] == b'\r' {
+        return Some(c);
+    }
+    if (b[7] == b' ' || b[7] == b'\t') && c != b'=' {
+        return Some(c);
+    }
+    return None;
+}
+
+/// Find conflict markers (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>` at
+/// the start of a line). Checked before lexing so that a half-merged file
+/// gets one clear error instead of a cascade of syntax errors.
+pub fn conflict_markers(src: str): [Conflict; -..+] {
+    let b = src.as_bytes();
+    let mut out: [Conflict; -..+] = [];
+    let mut open = false;
+    let mut cur = Conflict { start: Range { start: 0, end: 0 }, base: None, mid: None, end: None };
+    let mut pos: usize = 0;
+    while pos < b.len() {
+        // The line, through its `\n` if it has one.
+        let mut line_end = pos;
+        while line_end < b.len() && b[line_end] != b'\n' {
+            line_end += 1;
+        }
+        if line_end < b.len() {
+            line_end += 1;
+        }
+        // Its text, without trailing `\n`s and `\r`s.
+        let mut text_end = line_end;
+        while text_end > pos && (b[text_end - 1] == b'\n' || b[text_end - 1] == b'\r') {
+            text_end -= 1;
+        }
+        let range = Range { start: pos, end: text_end };
+        pos = line_end;
+        let m = match marker_at(b[range.start..range.end]) {
+            Some(m) => m,
+            None => 0,
+        };
+        if m == 0 {
+            continue;
+        }
+        if m == b'<' {
+            if open {
+                out.push(cur);
+            }
+            cur = Conflict { start: range, base: None, mid: None, end: None };
+            open = true;
+        } else if !open {
+            // A stray marker outside a `<<<<<<<` region: report it alone.
+            out.push(Conflict { start: range, base: None, mid: None, end: None });
+        } else if m == b'>' {
+            cur.end = Some(range);
+            out.push(cur);
+            open = false;
+        } else if cur.mid.is_none() {
+            if m == b'|' {
+                cur.base = Some(range);
+            } else {
+                cur.mid = Some(range);
+            }
+        }
+    }
+    if open {
+        out.push(cur);
+    }
+    return out;
+}
+
+// ===================================================================== token names
+
+impl Token {
+    /// Human-readable description used in "expected X" diagnostics.
+    pub fn describe(self): str {
+        return match self {
+            Token::LParen => "`(`",
+            Token::RParen => "`)`",
+            Token::LBracket => "`[`",
+            Token::RBracket => "`]`",
+            Token::LBrace => "`{`",
+            Token::RBrace => "`}`",
+            Token::LAngle => "`<`",
+            Token::RAngle => "`>`",
+            Token::Le => "`<=`",
+            Token::Shl => "`<<`",
+            Token::ShlEq => "`<<=`",
+            Token::PathSep => "`::`",
+            Token::Colon => "`:`",
+            Token::Semi => "`;`",
+            Token::Comma => "`,`",
+            Token::Dot => "`.`",
+            Token::DotDot => "`..`",
+            Token::DotDotEq => "`..=`",
+            Token::DotDotDot => "`...`",
+            Token::EqEq => "`==`",
+            Token::BangEq => "`!=`",
+            Token::Eq => "`=`",
+            Token::FatArrow => "`=>`",
+            Token::Arrow => "`->`",
+            Token::Bang => "`!`",
+            Token::AmpAmp => "`&&`",
+            Token::Amp => "`&`",
+            Token::AmpEq => "`&=`",
+            Token::PipePipe => "`||`",
+            Token::Pipe => "`|`",
+            Token::PipeEq => "`|=`",
+            Token::Caret => "`^`",
+            Token::CaretEq => "`^=`",
+            Token::Plus => "`+`",
+            Token::PlusEq => "`+=`",
+            Token::Minus => "`-`",
+            Token::MinusEq => "`-=`",
+            Token::Star => "`*`",
+            Token::StarEq => "`*=`",
+            Token::Slash => "`/`",
+            Token::SlashEq => "`/=`",
+            Token::Percent => "`%`",
+            Token::PercentEq => "`%=`",
+            Token::Tilde => "`~`",
+            Token::Question => "`?`",
+            Token::Hash => "`#`",
+            Token::At => "`@`",
+            Token::Placeholder => "`_`",
+            Token::As => "`as`",
+            Token::Break => "`break`",
+            Token::Const => "`const`",
+            Token::Continue => "`continue`",
+            Token::Crater => "`crater`",
+            Token::Else => "`else`",
+            Token::Enum => "`enum`",
+            Token::Extern => "`extern`",
+            Token::False => "`false`",
+            Token::Fn => "`fn`",
+            Token::For => "`for`",
+            Token::If => "`if`",
+            Token::Impl => "`impl`",
+            Token::In => "`in`",
+            Token::Let => "`let`",
+            Token::Loop => "`loop`",
+            Token::Match => "`match`",
+            Token::Mod => "`mod`",
+            Token::Mut => "`mut`",
+            Token::Pub => "`pub`",
+            Token::Return => "`return`",
+            Token::SelfValue => "`self`",
+            Token::SelfType => "`Self`",
+            Token::Static => "`static`",
+            Token::Struct => "`struct`",
+            Token::Super => "`super`",
+            Token::Trait => "`trait`",
+            Token::True => "`true`",
+            Token::Type => "`type`",
+            Token::Unsafe => "`unsafe`",
+            Token::Use => "`use`",
+            Token::While => "`while`",
+            Token::Ident => "identifier",
+            Token::Number(NumKind::Int) => "integer literal",
+            Token::Number(NumKind::Float) => "float literal",
+            Token::Str => "string literal",
+            Token::Char => "character literal",
+            Token::Byte => "byte literal",
+            Token::DocComment => "doc comment",
+            Token::BlockComment => "comment",
+        };
+    }
+
+    /// Whether this token is a keyword that may also appear as a path segment.
+    pub fn is_path_keyword(self): bool {
+        return match self {
+            Token::Crater | Token::SelfValue | Token::SelfType | Token::Super => true,
+            _ => false,
+        };
+    }
+
+    /// The token's name as `ln-lexer` prints it (Rust's `Debug` form).
     pub fn name(self): str {
         return match self {
-            Kind::LParen => "LParen",
-            Kind::RParen => "RParen",
-            Kind::LBracket => "LBracket",
-            Kind::RBracket => "RBracket",
-            Kind::LBrace => "LBrace",
-            Kind::RBrace => "RBrace",
-            Kind::LAngle => "LAngle",
-            Kind::RAngle => "RAngle",
-            Kind::Le => "Le",
-            Kind::Shl => "Shl",
-            Kind::ShlEq => "ShlEq",
-            Kind::PathSep => "PathSep",
-            Kind::Colon => "Colon",
-            Kind::Semi => "Semi",
-            Kind::Comma => "Comma",
-            Kind::Dot => "Dot",
-            Kind::DotDot => "DotDot",
-            Kind::DotDotEq => "DotDotEq",
-            Kind::DotDotDot => "DotDotDot",
-            Kind::EqEq => "EqEq",
-            Kind::BangEq => "BangEq",
-            Kind::Eq => "Eq",
-            Kind::FatArrow => "FatArrow",
-            Kind::Arrow => "Arrow",
-            Kind::Bang => "Bang",
-            Kind::AmpAmp => "AmpAmp",
-            Kind::Amp => "Amp",
-            Kind::AmpEq => "AmpEq",
-            Kind::PipePipe => "PipePipe",
-            Kind::Pipe => "Pipe",
-            Kind::PipeEq => "PipeEq",
-            Kind::Caret => "Caret",
-            Kind::CaretEq => "CaretEq",
-            Kind::Plus => "Plus",
-            Kind::PlusEq => "PlusEq",
-            Kind::Minus => "Minus",
-            Kind::MinusEq => "MinusEq",
-            Kind::Star => "Star",
-            Kind::StarEq => "StarEq",
-            Kind::Slash => "Slash",
-            Kind::SlashEq => "SlashEq",
-            Kind::Percent => "Percent",
-            Kind::PercentEq => "PercentEq",
-            Kind::Tilde => "Tilde",
-            Kind::Question => "Question",
-            Kind::Hash => "Hash",
-            Kind::At => "At",
-            Kind::Placeholder => "Placeholder",
-            Kind::As => "As",
-            Kind::Break => "Break",
-            Kind::Const => "Const",
-            Kind::Continue => "Continue",
-            Kind::Crater => "Crater",
-            Kind::Else => "Else",
-            Kind::Enum => "Enum",
-            Kind::Extern => "Extern",
-            Kind::False => "False",
-            Kind::Fn => "Fn",
-            Kind::For => "For",
-            Kind::If => "If",
-            Kind::Impl => "Impl",
-            Kind::In => "In",
-            Kind::Let => "Let",
-            Kind::Loop => "Loop",
-            Kind::Match => "Match",
-            Kind::Mod => "Mod",
-            Kind::Mut => "Mut",
-            Kind::Pub => "Pub",
-            Kind::Return => "Return",
-            Kind::SelfValue => "SelfValue",
-            Kind::SelfType => "SelfType",
-            Kind::Static => "Static",
-            Kind::Struct => "Struct",
-            Kind::Super => "Super",
-            Kind::Trait => "Trait",
-            Kind::True => "True",
-            Kind::Type => "Type",
-            Kind::Unsafe => "Unsafe",
-            Kind::Use => "Use",
-            Kind::While => "While",
-            Kind::Ident => "Ident",
-            Kind::Int => "Number(Int)",
-            Kind::Float => "Number(Float)",
-            Kind::Str => "Str",
-            Kind::Char => "Char",
-            Kind::Byte => "Byte",
+            Token::LParen => "LParen",
+            Token::RParen => "RParen",
+            Token::LBracket => "LBracket",
+            Token::RBracket => "RBracket",
+            Token::LBrace => "LBrace",
+            Token::RBrace => "RBrace",
+            Token::LAngle => "LAngle",
+            Token::RAngle => "RAngle",
+            Token::Le => "Le",
+            Token::Shl => "Shl",
+            Token::ShlEq => "ShlEq",
+            Token::PathSep => "PathSep",
+            Token::Colon => "Colon",
+            Token::Semi => "Semi",
+            Token::Comma => "Comma",
+            Token::Dot => "Dot",
+            Token::DotDot => "DotDot",
+            Token::DotDotEq => "DotDotEq",
+            Token::DotDotDot => "DotDotDot",
+            Token::EqEq => "EqEq",
+            Token::BangEq => "BangEq",
+            Token::Eq => "Eq",
+            Token::FatArrow => "FatArrow",
+            Token::Arrow => "Arrow",
+            Token::Bang => "Bang",
+            Token::AmpAmp => "AmpAmp",
+            Token::Amp => "Amp",
+            Token::AmpEq => "AmpEq",
+            Token::PipePipe => "PipePipe",
+            Token::Pipe => "Pipe",
+            Token::PipeEq => "PipeEq",
+            Token::Caret => "Caret",
+            Token::CaretEq => "CaretEq",
+            Token::Plus => "Plus",
+            Token::PlusEq => "PlusEq",
+            Token::Minus => "Minus",
+            Token::MinusEq => "MinusEq",
+            Token::Star => "Star",
+            Token::StarEq => "StarEq",
+            Token::Slash => "Slash",
+            Token::SlashEq => "SlashEq",
+            Token::Percent => "Percent",
+            Token::PercentEq => "PercentEq",
+            Token::Tilde => "Tilde",
+            Token::Question => "Question",
+            Token::Hash => "Hash",
+            Token::At => "At",
+            Token::Placeholder => "Placeholder",
+            Token::As => "As",
+            Token::Break => "Break",
+            Token::Const => "Const",
+            Token::Continue => "Continue",
+            Token::Crater => "Crater",
+            Token::Else => "Else",
+            Token::Enum => "Enum",
+            Token::Extern => "Extern",
+            Token::False => "False",
+            Token::Fn => "Fn",
+            Token::For => "For",
+            Token::If => "If",
+            Token::Impl => "Impl",
+            Token::In => "In",
+            Token::Let => "Let",
+            Token::Loop => "Loop",
+            Token::Match => "Match",
+            Token::Mod => "Mod",
+            Token::Mut => "Mut",
+            Token::Pub => "Pub",
+            Token::Return => "Return",
+            Token::SelfValue => "SelfValue",
+            Token::SelfType => "SelfType",
+            Token::Static => "Static",
+            Token::Struct => "Struct",
+            Token::Super => "Super",
+            Token::Trait => "Trait",
+            Token::True => "True",
+            Token::Type => "Type",
+            Token::Unsafe => "Unsafe",
+            Token::Use => "Use",
+            Token::While => "While",
+            Token::Ident => "Ident",
+            Token::Number(NumKind::Int) => "Number(Int)",
+            Token::Number(NumKind::Float) => "Number(Float)",
+            Token::Str => "Str",
+            Token::Char => "Char",
+            Token::Byte => "Byte",
+            Token::DocComment => "DocComment",
+            Token::BlockComment => "BlockComment",
         };
     }
 }
 
-impl ErrorKind {
+impl LexErrorKind {
+    /// The kind's name as `ln-lexer` prints it.
     pub fn name(self): str {
         return match self {
-            ErrorKind::Invalid => "Invalid",
-            ErrorKind::UnterminatedComment => "UnterminatedComment",
+            LexErrorKind::Invalid => "Invalid",
+            LexErrorKind::UnterminatedComment => "UnterminatedComment",
         };
     }
 }
 
-/// One line per token (`Ident 0 3`) and per error (`error Invalid 4 5`),
-/// with `ln-lexer`'s names, for comparing the two lexers.
+/// Everything the lexer finds in `src`, one per line, in the format
+/// crates/ln-driver/tests/selfhost.rs compares against `ln-lexer`:
+/// `Ident 0 3`, `error Invalid 4 5`, `conflict 0..12 - 20..27 40..53`.
 pub fn dump(src: str, out: &mut String) {
-    let lexed = lex(src);
-    for t in lexed.tokens {
-        out.write("{t.kind.name()} {t.start} {t.end}\n");
+    let (toks, errs) = lex(src);
+    for t in toks {
+        out.write("{t.token.name()} {t.range.start} {t.range.end}\n");
     }
-    for e in lexed.errors {
-        out.write("error {e.kind.name()} {e.start} {e.end}\n");
+    for e in errs {
+        out.write("error {e.kind.name()} {e.range.start} {e.range.end}\n");
+    }
+    for c in conflict_markers(src) {
+        out.write("conflict {c.start.start}..{c.start.end}");
+        dump_range(c.base, out);
+        dump_range(c.mid, out);
+        dump_range(c.end, out);
+        out.push('\n');
+    }
+}
+
+fn dump_range(r: Option::<Range>, out: &mut String) {
+    match r {
+        Some(r) => out.write(" {r.start}..{r.end}"),
+        None => out.push_str(" -"),
     }
 }
 
 // ===================================================================== tests
 
-/// The token kinds of `src`, space-separated; there must be no errors.
+/// The token names of `src`, space-separated; there must be no errors.
 fn kinds(src: str): String {
-    let lexed = lex(src);
-    std::test::assert_eq(lexed.errors.len(), 0, "lex errors");
+    let (toks, errs) = lex(src);
+    std::test::assert_eq(errs.len(), 0, "lex errors");
     let mut out = String::new();
-    for t in lexed.tokens {
+    for t in toks {
         if !out.is_empty() {
             out.push(' ');
         }
-        out.push_str(t.kind.name());
+        out.push_str(t.token.name());
     }
     return out;
 }
@@ -671,15 +912,46 @@ fn comments_and_strings() {
 }
 
 #[test]
+fn doc_comments() {
+    std::test::assert_eq(kinds("/// docs\nfn").as_str(), "DocComment Fn", "docs");
+    std::test::assert_eq(kinds("///\nx").as_str(), "DocComment Ident", "empty docs");
+    std::test::assert_eq(kinds("//// not docs\n// nor this\nx").as_str(), "Ident", "not docs");
+    let (toks, _) = lex("/// a b\n");
+    std::test::assert_eq(toks[0].range.start, 0, "doc start");
+    std::test::assert_eq(toks[0].range.end, 7, "doc end");
+}
+
+#[test]
 fn generics_do_not_fuse_closers() {
     std::test::assert_eq(kinds("A::<B::<C>>").as_str(), "Ident PathSep LAngle Ident PathSep LAngle Ident RAngle RAngle", "closers");
 }
 
 #[test]
 fn unterminated_block_comment() {
-    let lexed = lex("a /* x /* y */ b");
-    std::test::assert_eq(lexed.tokens.len(), 1, "only `a`");
-    std::test::assert_eq(lexed.errors.len(), 1, "one error");
-    std::test::assert_eq(lexed.errors[0].start, 2, "from the `/*`");
-    std::test::assert_eq(lexed.errors[0].end, 16, "to the end");
+    let (toks, errs) = lex("a /* x /* y */ b");
+    std::test::assert_eq(toks.len(), 1, "only `a`");
+    std::test::assert_eq(errs.len(), 1, "one error");
+    std::test::assert_eq(errs[0].range.start, 2, "from the `/*`");
+    std::test::assert_eq(errs[0].range.end, 16, "to the end");
+    std::test::assert_eq(errs[0].kind.name(), "UnterminatedComment", "kind");
+    let (_, errs) = lex("a /* x /* y */ b */ c");
+    std::test::assert_eq(errs.len(), 0, "closed");
+}
+
+#[test]
+fn conflict_markers_found_only_at_line_start() {
+    let src = "fn f() {\n<<<<<<< HEAD\n    1\n=======\n    2\n>>>>>>> topic\n}\n";
+    let c = conflict_markers(src);
+    std::test::assert_eq(c.len(), 1, "one conflict");
+    std::test::assert_eq(src[c[0].start.start..c[0].start.end], "<<<<<<< HEAD", "start");
+    let mid = c[0].mid.unwrap();
+    std::test::assert_eq(src[mid.start..mid.end], "=======", "mid");
+    let end = c[0].end.unwrap();
+    std::test::assert_eq(src[end.start..end.end], ">>>>>>> topic", "end");
+    // CRLF line endings.
+    std::test::assert_eq(conflict_markers("fn f() {\r\n<<<<<<< HEAD\r\n    1\r\n=======\r\n    2\r\n>>>>>>> topic\r\n}\r\n").len(), 1, "CRLF");
+    // Not markers: indented, too many characters, inside an expression.
+    std::test::assert_eq(conflict_markers("  <<<<<<< x\n========\na <<<<<<< b\n").len(), 0, "not markers");
+    // A stray marker on its own is still reported.
+    std::test::assert_eq(conflict_markers("x\n>>>>>>> other\n").len(), 1, "stray marker");
 }
