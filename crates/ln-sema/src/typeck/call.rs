@@ -68,6 +68,20 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     // ===================================================================== value paths
 
     pub(crate) fn resolve_value_path(&mut self, p: &ast::Path, span: Span) -> Option<ValueRes> {
+        let r = self.resolve_value_path_inner(p, span)?;
+        let last = p.segments.last().unwrap().ident.span;
+        match &r {
+            ValueRes::Local(l) => self.record_local(last, *l),
+            ValueRes::Fn { def, .. } | ValueRes::Const(def) | ValueRes::Static(def) | ValueRes::TraitMethod { def, .. } => self.record_def(last, *def),
+            ValueRes::Ctor { adt, variant, .. } => {
+                let v = self.s.p.adt(*adt).variants[*variant].def;
+                self.record_def(last, v);
+            }
+        }
+        Some(r)
+    }
+
+    fn resolve_value_path_inner(&mut self, p: &ast::Path, span: Span) -> Option<ValueRes> {
         let segs = &p.segments;
         if p.is_single()
             && let Some(l) = self.lookup_local(&segs[0].ident.name)
@@ -625,6 +639,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             }
             return self.error_expr(span);
         };
+        self.record_def(name.span, pick.def);
         let fd = self.s.p.fn_data(pick.def).clone();
         let mut all = pick.args.clone();
         let own = self.own_args(pick.def, generics, name.span);
@@ -741,6 +756,13 @@ impl<'s, 'a> FnCtx<'s, 'a> {
 
     /// Resolve the path of a struct literal or struct pattern: (adt, variant, generic args).
     pub(crate) fn resolve_struct_path(&mut self, path: &ast::Path, span: Span) -> Option<(DefId, usize, Vec<Ty>)> {
+        let r = self.resolve_struct_path_inner(path, span)?;
+        let v = self.s.p.adt(r.0).variants[r.1].def;
+        self.record_def(path.segments.last().unwrap().ident.span, v);
+        Some(r)
+    }
+
+    fn resolve_struct_path_inner(&mut self, path: &ast::Path, span: Span) -> Option<(DefId, usize, Vec<Ty>)> {
         if path.is_single() && path.segments[0].ident.name == "Self" {
             return match self.cx.self_ty.clone() {
                 Some(Ty::Adt(d, args)) if !self.s.p.is_enum(d) => Some((d, 0, args)),

@@ -31,14 +31,41 @@ pub struct Options {
     pub target_arch: String,
     /// Building the test harness (`lunar test`).
     pub test: bool,
+    /// Type-check function bodies even after errors in item signatures, and
+    /// return the (partial) program despite errors. For editor tooling.
+    pub keep_going: bool,
 }
 
 impl Options {
     pub fn host(test: bool) -> Self {
         let os = std::env::consts::OS.to_string();
         let family = if cfg!(windows) { "windows" } else { "unix" }.to_string();
-        Self { target_os: os, target_family: family, target_arch: std::env::consts::ARCH.to_string(), test }
+        Self { target_os: os, target_family: family, target_arch: std::env::consts::ARCH.to_string(), test, keep_going: false }
     }
+}
+
+/// A resolved name occurrence in the source, for editor tooling.
+#[derive(Clone, Debug)]
+pub struct Ref {
+    /// The identifier (or path segment) that was resolved.
+    pub span: ln_diag::Span,
+    pub target: RefTarget,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefTarget {
+    Def(DefId),
+    /// Field `field` of variant `variant` of struct/enum `adt`.
+    Field {
+        adt: DefId,
+        variant: usize,
+        field: usize,
+    },
+    /// A local of the body of `body`.
+    Local {
+        body: DefId,
+        local: thir::LocalId,
+    },
 }
 
 /// The analyzed program handed to code generation.
@@ -52,6 +79,8 @@ pub struct Program {
     pub impls: Vec<DefId>,
     pub main: Option<DefId>,
     pub tests: Vec<DefId>,
+    /// Every resolved name, in resolution order (may contain duplicates).
+    pub refs: Vec<Ref>,
 }
 
 impl Program {
@@ -201,10 +230,10 @@ pub fn analyze(crates: &[CrateSource], opts: Options) -> (Option<Program>, Vec<D
     {
         s.p.main = Some(b.def);
     }
-    if !s.diags.has_errors() {
+    if !s.diags.has_errors() || s.opts.keep_going {
         s.check_bodies();
     }
     let diags = s.diags.into_vec();
     let ok = !diags.iter().any(|d| d.is_error());
-    (ok.then_some(s.p), diags)
+    (if ok || s.opts.keep_going { Some(s.p) } else { None }, diags)
 }

@@ -50,6 +50,8 @@ struct LoopCtx {
 
 pub(crate) struct FnCtx<'s, 'a> {
     s: &'s mut Sema<'a>,
+    /// The function whose body is being checked.
+    def: DefId,
     cx: LowerCx,
     env: Vec<Pred>,
     locals: Vec<Local>,
@@ -108,6 +110,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let env = s.p.elaborate(&cx.env);
         let mut fcx = FnCtx {
             s,
+            def,
             cx,
             env,
             locals: Vec::new(),
@@ -206,7 +209,19 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     pub(crate) fn new_local(&mut self, name: &str, ty: Ty, mutable: bool, kind: LocalKind, span: Span, depth: u32) -> LocalId {
         let id = LocalId(self.locals.len() as u32);
         self.locals.push(Local { name: name.to_string(), ty, mutable, kind, span, depth });
+        if kind != LocalKind::Temp {
+            self.record_local(span, id);
+        }
         id
+    }
+
+    /// Remember that `span` names local `l` (editor tooling).
+    pub(crate) fn record_local(&mut self, span: Span, l: LocalId) {
+        self.s.p.refs.push(crate::Ref { span, target: crate::RefTarget::Local { body: self.def, local: l } });
+    }
+
+    pub(crate) fn record_def(&mut self, span: Span, d: DefId) {
+        self.s.record(span, d);
     }
 
     pub(crate) fn bind_name(&mut self, name: &str, id: LocalId) {

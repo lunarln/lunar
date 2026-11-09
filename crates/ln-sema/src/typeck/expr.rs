@@ -91,6 +91,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             ast::ExprKind::Path(p) if p.is_single() => {
                 let n = &p.segments[0].ident.name;
                 if let Some(l) = self.lookup_local(n) {
+                    self.record_local(p.segments[0].ident.span, l);
                     let ty = self.locals[l.0 as usize].ty.clone();
                     return Some(self.mk(ExprKind::Local(l), ty, e.span));
                 }
@@ -232,6 +233,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                         );
                     }
                     let t = f.ty.subst(args);
+                    self.s.p.refs.push(crate::Ref { span: field.span, target: crate::RefTarget::Field { adt: *d, variant: 0, field: i } });
                     return self.mk(ExprKind::Field { base: Box::new(b), variant: 0, field: i }, t, span);
                 }
                 let names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();

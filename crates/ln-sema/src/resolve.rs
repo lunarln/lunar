@@ -141,6 +141,7 @@ impl<'a> Sema<'a> {
                 }
             },
         };
+        self.record(first.span, cur);
         let mut i = 1;
         while i < segs.len() {
             let kind = self.p.defs[cur.0 as usize].kind;
@@ -171,9 +172,15 @@ impl<'a> Sema<'a> {
                 );
             }
             cur = b.def;
+            self.record(seg.span, cur);
             i += 1;
         }
         Some((ModRes::Def(cur), i))
+    }
+
+    /// Remember that the identifier at `span` names `def` (editor tooling).
+    pub(crate) fn record(&mut self, span: Span, def: DefId) {
+        self.p.refs.push(crate::Ref { span, target: crate::RefTarget::Def(def) });
     }
 
     pub(crate) fn unresolved_diag(&self, from: DefId, id: &ast::Ident, ns: Ns) -> Diagnostic {
