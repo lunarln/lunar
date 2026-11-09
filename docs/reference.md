@@ -251,6 +251,13 @@ inside `unsafe { ... }`:
   not in an `unsafe` block. Marking a function `unsafe` only makes it unsafe
   to call; its body gets no implicit unsafe context.
 
+Inside `unsafe`, the program is responsible for memory safety. Reading or
+writing outside a live value (for example, past the length of an array
+through a raw pointer) is **undefined behaviour**: it may crash, corrupt
+other data, or appear to work. In particular, arrays sit next to each other
+in memory and the space past an array's length is not guaranteed to fault,
+so an overrun is not reliably caught at run time.
+
 ## 7. Traits
 
 Traits work like Rust's: `trait Name::<Params>: Supertraits { fn m(self); }`
