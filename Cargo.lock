@@ -403,6 +403,7 @@ dependencies = [
  "clap",
  "ln-codegen",
  "ln-diag",
+ "ln-lexer",
  "ln-parser",
  "ln-sema",
  "lsp-server",
