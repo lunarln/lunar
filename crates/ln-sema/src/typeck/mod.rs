@@ -1,6 +1,7 @@
 //! Phase 3: type check function bodies and lower them to THIR.
 
 mod call;
+mod closure;
 mod expr;
 mod pat;
 
@@ -69,6 +70,8 @@ pub(crate) struct FnCtx<'s, 'a> {
     /// Integer literals to range-check once their type is known.
     lit_checks: Vec<(Ty, i128, Span)>,
     reported_annotations: bool,
+    /// Closures written in this function, finished with it.
+    closures: Vec<closure::PendingClosure>,
 }
 
 impl<'a> Sema<'a> {
@@ -87,30 +90,41 @@ impl<'a> Sema<'a> {
                     }
                 }
                 let errs_before = self.diags.error_count();
-                let b = FnCtx::check_fn(self, id, f, body);
-                if self.diags.error_count() == errs_before {
-                    crate::borrowck::check(&self.p, &b, &mut self.diags);
-                    let krate = self.mod_data(self.p.defs[i].module).krate;
-                    let is_std = self.p.crate_roots.iter().any(|(n, r)| *r == krate && (n == "core" || n == "std"));
-                    // Lints on a function with borrow errors would only add
-                    // noise (and may be wrong about code that will change).
-                    if !is_std && self.diags.error_count() == errs_before {
-                        let mut lints = ln_diag::Diagnostics::new();
-                        crate::borrowck::lint(&b, &mut lints);
-                        // Through `err`, which drops lints inside expansions.
-                        for d in lints.into_vec() {
-                            self.err(d);
-                        }
-                    }
+                let (b, closures) = FnCtx::check_fn(self, id, f, body);
+                let krate = self.mod_data(self.p.defs[i].module).krate;
+                let is_std = self.p.crate_roots.iter().any(|(n, r)| *r == krate && (n == "core" || n == "std"));
+                // Closures first: their bodies are part of this function's.
+                for c in closures {
+                    self.finish_body(c, errs_before, is_std);
                 }
-                self.p.bodies.insert(id, b);
+                self.finish_body(b, errs_before, is_std);
             }
         }
+    }
+
+    /// Borrow check and lint a checked body (if type checking its function
+    /// found no errors), then keep it.
+    fn finish_body(&mut self, b: thir::Body, errs_before: usize, is_std: bool) {
+        if self.diags.error_count() == errs_before {
+            crate::borrowck::check(&self.p, &b, &mut self.diags);
+            // Lints on a function with borrow errors would only add
+            // noise (and may be wrong about code that will change).
+            if !is_std && self.diags.error_count() == errs_before {
+                let mut lints = ln_diag::Diagnostics::new();
+                crate::borrowck::lint(&b, &mut lints);
+                // Through `err`, which drops lints inside expansions.
+                for d in lints.into_vec() {
+                    self.err(d);
+                }
+            }
+        }
+        self.p.bodies.insert(b.def, b);
     }
 }
 
 impl<'s, 'a> FnCtx<'s, 'a> {
-    fn check_fn(s: &'s mut Sema<'a>, def: DefId, f: &'a ast::FnDecl, body: &'a ast::Block) -> thir::Body {
+    /// The function's body, and the bodies of the closures written in it.
+    fn check_fn(s: &'s mut Sema<'a>, def: DefId, f: &'a ast::FnDecl, body: &'a ast::Block) -> (thir::Body, Vec<thir::Body>) {
         let mut cx = s.lower_cx(def);
         cx.allow_infer = true;
         let fd = s.p.fn_data(def).clone();
@@ -133,6 +147,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             dull_checks: Vec::new(),
             lit_checks: Vec::new(),
             reported_annotations: false,
+            closures: Vec::new(),
         };
         let mut params = Vec::new();
         for (i, p) in fd.sig.params.iter().enumerate() {
@@ -170,11 +185,13 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             _ => thir::Block { stmts: Vec::new(), tail: Some(Box::new(block)), locals: Vec::new(), span: body.span },
         };
         fcx.zonk_block(&mut b);
+        fcx.resolve_closures();
         let mut locals = std::mem::take(&mut fcx.locals);
         for l in &mut locals {
             l.ty = default_ty(&fcx.resolve(&l.ty));
         }
-        thir::Body { def, locals, params, block: b, span: body.span }
+        let closures = fcx.closure_bodies(&mut locals);
+        (thir::Body { def, locals, params, block: b, span: body.span }, closures)
     }
 
     // ===================================================================== diagnostics
@@ -696,6 +713,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 }
             }
         }
+        // Whether a closure implements an `Fn` trait depends on its
+        // signature, so record it before checking obligations.
+        self.resolve_closures();
         for (ty, tr, span) in std::mem::take(&mut self.obligations) {
             let t = self.resolve(&ty);
             let tr = TraitRef { trait_id: tr.trait_id, args: tr.args.iter().map(|a| self.resolve(a)).collect() };
@@ -704,6 +724,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 continue;
             }
             if !self.s.p.implements(&t, &tr, &self.env) {
+                if let Some(d) = self.fn_bound_diag(&t, &tr, span) {
+                    self.err(d);
+                    continue;
+                }
                 let ts = self.s.p.ty_str(&t);
                 let tn = self.s.p.def(tr.trait_id).name.clone();
                 let mut d = Diagnostic::error(tyc::UNSATISFIED_BOUND, span, format!("the trait bound `{ts}: {tn}` is not satisfied"))
@@ -814,7 +838,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                         self.zonk(self_ty);
                         method_args.iter_mut().for_each(|t| self.zonk(t));
                     }
-                    thir::Callee::Indirect(f) => self.zonk_expr(f),
+                    thir::Callee::Indirect(f) | thir::Callee::Value { callee: f, .. } => self.zonk_expr(f),
                 }
                 for a in args {
                     match a {
@@ -890,6 +914,13 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 for p in pieces {
                     if let thir::FmtPiece::Arg(x, _) = p {
                         self.zonk_expr(x);
+                    }
+                }
+            }
+            K::Closure { captures, .. } => {
+                for a in captures {
+                    match a {
+                        thir::Arg::Value(x) | thir::Arg::InOut(x) => self.zonk_expr(x),
                     }
                 }
             }

@@ -1,0 +1,7 @@
+// error: borrow::move_while_borrowed
+fn main() {
+    let s = String::from("a");
+    let f = || s.len();
+    let t = s;
+    println("{f()} {t}");
+}

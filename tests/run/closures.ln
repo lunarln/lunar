@@ -1,0 +1,106 @@
+// Closures: captures by borrow, in-out and move; the Fn traits; named
+// functions as Fn values.
+
+fn apply::<F: Fn(i32): i32>(f: F, x: i32): i32 {
+    return f(x);
+}
+
+fn apply_ref::<F: Fn(i32): i32>(f: &F, x: i32): i32 {
+    return f(x);
+}
+
+fn twice::<F: FnMut()>(f: &mut F) {
+    f();
+    f();
+}
+
+fn once::<F: FnOnce(): String>(f: F): String {
+    return f();
+}
+
+fn measure::<F: Fn(&String): usize>(s: &String, f: F): usize {
+    return f(s) + f(s);
+}
+
+fn bump_all::<F: Fn(&mut i32)>(xs: [i32; &mut], f: F) {
+    for i in 0..xs.len() {
+        f(&mut xs[i]);
+    }
+}
+
+fn double(x: i32): i32 {
+    return x * 2;
+}
+
+fn main() {
+    // No captures; types from the annotations.
+    let add = |a: i32, b: i32| a + b;
+    println("add: {add(2, 3)}");
+
+    // Reads a variable: borrows it.
+    let k = 10;
+    let plus_k = |x: i32| x + k;
+    println("plus_k: {plus_k(5)}");
+
+    // Parameter types from the expected `Fn(i32): i32`.
+    println("apply: {apply(|x| x * x, 7)}");
+    println("apply with capture: {apply(|x| x - k, 7)}");
+    println("apply_ref: {apply_ref(&plus_k, 1)}");
+
+    // Named functions are `Fn` values too.
+    println("apply fn: {apply(double, 21)}");
+
+    // Changes a variable: borrows it in-out (`FnMut`).
+    let mut count = 0;
+    let mut bump = || count += 1;
+    bump();
+    bump();
+    twice(&mut bump);
+    println("count: {count}");
+
+    // A block body with a return type.
+    let clamp = |x: i32|: i32 {
+        if x > 100 {
+            return 100;
+        }
+        return x;
+    };
+    println("clamp: {clamp(5)} {clamp(500)}");
+
+    // Takes an owner: `FnOnce`.
+    let name = String::from("lunar");
+    let give = move || name;
+    let got = once(give);
+    println("once: {got}");
+
+    // Borrows an owner.
+    let greeting = String::from("hello");
+    let greet = |who: str| println("{greeting}, {who}");
+    greet("world");
+    greet("moon");
+    println("still mine: {greeting}");
+
+    // Mode-carrying parameters.
+    println("measure: {measure(&greeting, |s| s.len())}");
+    let mut xs = [1, 2, 3];
+    bump_all(xs[..], |x| x += 100);
+    println("bumped: {xs[0]} {xs[1]} {xs[2]}");
+
+    // A `move` closure copies Dull values; the original is unchanged.
+    let mut n = 1;
+    let mut counter = move || {
+        n += 10;
+        n
+    };
+    println("counter: {counter()} {counter()} n: {n}");
+    n = 5;
+    println("n: {n}");
+
+    // Nested closures.
+    let base = 100;
+    let outer = |x: i32| {
+        let inner = |y: i32| y + base;
+        inner(x) * 2
+    };
+    println("nested: {outer(1)}");
+}

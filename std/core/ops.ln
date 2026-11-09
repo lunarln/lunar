@@ -13,6 +13,19 @@
 #[lang = "shl"] pub trait Shl { fn shl(&self, rhs: &Self): Self; }
 #[lang = "shr"] pub trait Shr { fn shr(&self, rhs: &Self): Self; }
 
+// Things that can be called: closures, functions and function pointers.
+// `Sig` is a function pointer type, written with sugar in bounds:
+// `F: Fn(i32): bool` is `F: Fn::<fn(i32): bool>`. Calls are built in, so
+// the traits have no methods.
+
+/// Can be called any number of times, and calling it changes nothing it
+/// captured.
+#[lang = "fn"] pub trait Fn::<Sig>: FnMut::<Sig> {}
+/// Can be called any number of times; a call may change what it captured.
+#[lang = "fn_mut"] pub trait FnMut::<Sig>: FnOnce::<Sig> {}
+/// Can be called at least once; the call may consume what it captured.
+#[lang = "fn_once"] pub trait FnOnce::<Sig> {}
+
 /// A half-open range `start..end`.
 #[lang = "range"]
 pub struct Range::<T> {

@@ -19,7 +19,11 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Root {
+    /// The storage a local owns (an owner's elements, a fixed array).
     Local(LocalId),
+    /// The local variable itself: a closure that borrows a capture points
+    /// at it.
+    Slot(LocalId),
     /// A statement-scoped temporary.
     Temp,
 }
@@ -59,8 +63,22 @@ pub fn lint(body: &Body, diags: &mut Diagnostics) {
                 walk(value, used, mutated);
                 return;
             }
-            ExprKind::Call { args, .. } => {
+            ExprKind::Call { args, callee } => {
                 for a in args {
+                    if let Arg::InOut(p) = a
+                        && let Some(l) = root(p)
+                    {
+                        mutated.insert(l);
+                    }
+                }
+                if let Callee::Value { callee: f, kind: crate::ClosureKind::FnMut } = callee
+                    && let Some(l) = root(f)
+                {
+                    mutated.insert(l);
+                }
+            }
+            ExprKind::Closure { captures, .. } => {
+                for a in captures {
                     if let Arg::InOut(p) = a
                         && let Some(l) = root(p)
                     {
@@ -248,6 +266,9 @@ impl<'p> Cx<'p, '_> {
                 adt.variants.iter().any(|v| v.fields.iter().any(|f| self.has_view_rec(&f.ty.subst(args), depth + 1)))
             }
             Ty::Bang(t) => self.has_view_rec(t, depth + 1),
+            Ty::Closure(d, args) => {
+                self.p.closures.get(d).is_some_and(|c| c.captures.iter().any(|cap| cap.by_ref || self.has_view_rec(&cap.ty.subst(args), depth + 1)))
+            }
             // Generic values may be instantiated with views.
             Ty::Param(..) => true,
             _ => false,
@@ -309,7 +330,7 @@ impl<'p> Cx<'p, '_> {
                 ExprKind::Temp(inner) => self.value_roots(inner),
                 _ => [Root::Temp].into(),
             },
-            None => Roots::new(),
+            Some(Root::Slot(_)) | None => Roots::new(),
         }
     }
 
@@ -322,8 +343,12 @@ impl<'p> Cx<'p, '_> {
             ExprKind::Slice { base, .. } => self.borrow_roots(base),
             ExprKind::Coerce { kind: Coercion::ToSlice { .. } | Coercion::StringToStr, expr } => self.borrow_roots(expr),
             ExprKind::Coerce { expr, .. } => self.value_roots(expr),
-            ExprKind::Call { args, .. } => {
+            ExprKind::Call { args, callee } => {
                 let mut r = Roots::new();
+                // What a closure returns may point at what it captured.
+                if let Callee::Value { callee: f, .. } = callee {
+                    r.extend(if f.is_place() { self.value_roots_of_place(f) } else { self.value_roots(f) });
+                }
                 for a in args {
                     match a {
                         Arg::InOut(p) => r.extend(self.borrow_roots(p)),
@@ -334,6 +359,33 @@ impl<'p> Cx<'p, '_> {
             }
             ExprKind::Tuple(es) | ExprKind::Array(es) => es.iter().flat_map(|x| self.value_roots(x)).collect(),
             ExprKind::Adt { fields, .. } => fields.iter().flat_map(|(_, x)| self.value_roots(x)).collect(),
+            // A borrowing closure points at the variables it borrows (and at
+            // whatever they point into); one that took a value holds that
+            // value's roots.
+            ExprKind::Closure { captures, .. } => {
+                let mut r = Roots::new();
+                for a in captures {
+                    match a {
+                        Arg::InOut(p) | Arg::Value(p) if p.is_place() => {
+                            match self.place_root(p) {
+                                Some(Root::Local(l)) => {
+                                    r.insert(Root::Slot(l));
+                                }
+                                Some(other) => {
+                                    r.insert(other);
+                                }
+                                None => {}
+                            }
+                            if self.has_view(&p.ty) {
+                                r.extend(self.value_roots_of_place(p));
+                            }
+                        }
+                        Arg::InOut(_) => {}
+                        Arg::Value(v) => r.extend(self.value_roots(v)),
+                    }
+                }
+                r
+            }
             ExprKind::Block(b) => b.tail.as_ref().map(|t| self.value_roots(t)).unwrap_or_default(),
             ExprKind::If { then, else_, .. } => {
                 let mut r = self.value_roots(then);
@@ -384,7 +436,7 @@ impl<'p> Cx<'p, '_> {
 
     fn root_name(&self, r: Root) -> String {
         match r {
-            Root::Local(l) => format!("`{}`", self.local(l).name),
+            Root::Local(l) | Root::Slot(l) => format!("`{}`", self.local(l).name),
             Root::Temp => "a temporary value".into(),
         }
     }
@@ -408,7 +460,7 @@ impl<'p> Cx<'p, '_> {
                         .with_help("bind the value to a variable first so it lives long enough"),
                     );
                 }
-                Root::Local(l) => {
+                Root::Local(l) | Root::Slot(l) => {
                     let rl = self.local(l);
                     if rl.depth > dd && !matches!(rl.kind, LocalKind::Param { .. }) {
                         if !self.reported.insert((span, l.0)) {
@@ -438,8 +490,22 @@ impl<'p> Cx<'p, '_> {
                     LocalKind::Param { owned, .. } => !owned,
                     _ => false,
                 },
-                Root::Temp => false,
+                Root::Slot(_) | Root::Temp => false,
             };
+            if let Root::Slot(l) = r
+                && self.reported.insert((span, 7))
+            {
+                let n = self.local(l).name.clone();
+                self.err(
+                    Diagnostic::error(
+                        borrow::ESCAPES_FUNCTION,
+                        span,
+                        format!("cannot return a closure that borrows `{n}`, which is freed when the function returns"),
+                    )
+                    .with_help(format!("make it a `move` closure, so it takes `{n}` with it")),
+                );
+                continue;
+            }
             if !ok && self.reported.insert((span, 7)) {
                 let n = self.root_name(r);
                 let mut d = Diagnostic::error(borrow::ESCAPES_FUNCTION, span, format!("cannot return a view of {n}, which is freed when the function returns"));
@@ -589,8 +655,13 @@ impl<'p> Cx<'p, '_> {
     /// Report views of `root` that are live after an invalidating event.
     fn invalidate(&mut self, root: LocalId, live_after: &LiveSet, span: Span, what: &str) {
         let rname = self.local(root).name.clone();
-        let violators: Vec<LocalId> =
-            live_after.iter().copied().filter(|x| *x != root && self.roots.get(x).is_some_and(|r| r.contains(&Root::Local(root)))).collect();
+        // A closure borrowing the variable itself only minds it being moved:
+        // replacing or shrinking it changes what the closure sees.
+        let violators: Vec<LocalId> = live_after
+            .iter()
+            .copied()
+            .filter(|x| *x != root && self.roots.get(x).is_some_and(|r| r.contains(&Root::Local(root)) || (what == "move" && r.contains(&Root::Slot(root)))))
+            .collect();
         for v in violators {
             if !self.reported.insert((span, v.0)) {
                 continue;
@@ -622,7 +693,7 @@ impl<'p> Cx<'p, '_> {
     fn check_bang_owner(&mut self, place: &Expr, span: Span) -> Option<LocalId> {
         let root = match self.place_root(place) {
             Some(Root::Local(l)) => l,
-            Some(Root::Temp) => return None,
+            Some(Root::Temp | Root::Slot(_)) => return None,
             None => {
                 self.err(Diagnostic::error(
                     borrow::SHRINK_NOT_OWNER,
@@ -670,7 +741,7 @@ impl<'p> Cx<'p, '_> {
                 let m = t.methods.iter().find(|m| m.name == *method)?;
                 Some(self.p.fn_data(m.def).sig.params.iter().map(|p| p.ty.clone()).collect())
             }
-            Callee::Indirect(_) => None,
+            Callee::Indirect(_) | Callee::Value { .. } => None,
         }
     }
 
@@ -715,11 +786,20 @@ impl<'p> Cx<'p, '_> {
                         Arg::Value(v) => self.live(v, live),
                     };
                 }
-                if let Callee::Indirect(f) = callee {
-                    live = self.live(f, live);
+                match callee {
+                    Callee::Indirect(f) => live = self.live(f, live),
+                    Callee::Value { callee: f, .. } => {
+                        live = if f.is_place() { self.use_place(f, live) } else { self.live(f, live) };
+                    }
+                    _ => {}
                 }
                 live
             }
+            K::Closure { captures, .. } => captures.iter().rev().fold(after, |l, a| match a {
+                Arg::InOut(p) => self.use_place(p, l),
+                Arg::Value(v) if v.is_place() => self.use_place(v, l),
+                Arg::Value(v) => self.live(v, l),
+            }),
             K::Assign { place, value } => {
                 let mut live = after.clone();
                 if self.p.has_owner(&place.ty)
@@ -889,13 +969,14 @@ pub(crate) fn visit_children(e: &Expr, f: &mut dyn FnMut(&Expr)) {
         K::Deref(x) | K::Temp(x) | K::Unary(_, x) | K::Cast(x) | K::Coerce { expr: x, .. } => f(x),
         K::Read { place, .. } => f(place),
         K::Call { callee, args } => {
-            if let Callee::Indirect(c) = callee {
+            if let Callee::Indirect(c) | Callee::Value { callee: c, .. } = callee {
                 f(c);
             }
             for a in args {
                 f(a.expr());
             }
         }
+        K::Closure { captures, .. } => captures.iter().for_each(|a| f(a.expr())),
         K::Binary(_, a, b) | K::Logical { lhs: a, rhs: b, .. } | K::Assign { place: a, value: b } | K::AssignOp { place: a, value: b, .. } => {
             f(a);
             f(b);
@@ -1122,7 +1203,7 @@ impl Moves<'_, '_, '_> {
                     s.insert(p);
                 }
             }
-            Some(Root::Temp) => {}
+            Some(Root::Temp | Root::Slot(_)) => {}
             None => {
                 if self.cx.reported.insert((span, 6 << 27)) {
                     self.cx.err(Diagnostic::error(borrow::MOVE_OUT_OF_BORROW, span, "cannot move an owned value out of a static or through a pointer"));
@@ -1195,8 +1276,10 @@ impl Moves<'_, '_, '_> {
                 self.check_use(e, st, e.span);
             }
             K::Call { callee, args } => {
-                if let Callee::Indirect(f) = callee {
-                    self.expr(f, st);
+                match callee {
+                    Callee::Indirect(f) => self.expr(f, st),
+                    Callee::Value { callee: f, .. } => self.expr(f, st),
+                    _ => {}
                 }
                 for a in args {
                     match a {
@@ -1337,6 +1420,17 @@ impl Moves<'_, '_, '_> {
                     self.expr(v, st);
                 }
                 *st = None;
+            }
+            K::Closure { captures, .. } => {
+                for a in captures {
+                    match a {
+                        Arg::Value(v) if !v.is_place() => self.expr(v, st),
+                        Arg::Value(p) | Arg::InOut(p) => {
+                            self.place_inner(p, st);
+                            self.check_use(p, st, p.span);
+                        }
+                    }
+                }
             }
             K::Lit(_) | K::FnRef { .. } | K::Error => {}
         }

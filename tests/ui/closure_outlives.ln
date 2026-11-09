@@ -1,0 +1,8 @@
+// error: borrow::outlives_root
+fn main() {
+    let f = {
+        let x = 5;
+        |y: i32| x + y
+    };
+    println("{f(1)}");
+}

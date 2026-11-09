@@ -1,0 +1,17 @@
+add: 5
+plus_k: 15
+apply: 49
+apply with capture: -3
+apply_ref: 11
+apply fn: 42
+count: 4
+clamp: 5 100
+once: lunar
+hello, world
+hello, moon
+still mine: hello
+measure: 10
+bumped: 101 102 103
+counter: 11 21 n: 1
+n: 5
+nested: 202

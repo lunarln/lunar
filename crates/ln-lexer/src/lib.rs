@@ -161,6 +161,8 @@ pub enum Token {
     Match,
     #[token("mod")]
     Mod,
+    #[token("move")]
+    Move,
     #[token("mut")]
     Mut,
     #[token("pub")]
@@ -477,6 +479,7 @@ impl Token {
             Macro => "`macro`",
             Match => "`match`",
             Mod => "`mod`",
+            Move => "`move`",
             Mut => "`mut`",
             Pub => "`pub`",
             Return => "`return`",

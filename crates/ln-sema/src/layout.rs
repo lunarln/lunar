@@ -103,6 +103,10 @@ impl Program {
                     variant(0)?
                 }
             }
+            Ty::Closure(def, args) => {
+                let fs: Option<Vec<Layout>> = self.closure_fields(*def, args).iter().map(rec).collect();
+                struct_layout(&fs?).0
+            }
             Ty::Param(..) | Ty::Infer(_) | Ty::Error => return None,
         })
     }

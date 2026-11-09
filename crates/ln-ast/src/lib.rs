@@ -623,6 +623,8 @@ pub enum ExprKind {
     Try(Box<Expr>),
     /// A macro expanding to an expression (or, as a statement, statements).
     MacCall(MacCall),
+    /// `|x, y| expr`, `move |x| expr`, `|x|: R { ... }`.
+    Closure(Box<Closure>),
     /// Placeholder produced after a parse error.
     Error,
 }
@@ -644,6 +646,29 @@ impl ExprKind {
                 | ExprKind::MacCall(MacCall { delim: Delim::Brace, .. })
         )
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct Closure {
+    /// `move |..|`: every capture is taken by value.
+    pub is_move: bool,
+    pub params: Vec<ClosureParam>,
+    /// `|..|: R { ... }`
+    pub ret: Option<Ty>,
+    pub body: Box<Expr>,
+}
+
+/// A closure parameter: `x`, `mut x`, `x: T`, `x: &T`, `_`.
+#[derive(Clone, Debug)]
+pub struct ClosureParam {
+    pub is_mut: bool,
+    /// `None` for `_`.
+    pub name: Option<Ident>,
+    /// The mode written with the type (`&T`, `&mut T`); otherwise it comes
+    /// from the expected `Fn` signature.
+    pub mode: Option<ParamMode>,
+    pub ty: Option<Ty>,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]

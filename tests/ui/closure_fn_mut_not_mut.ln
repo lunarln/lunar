@@ -1,0 +1,7 @@
+// error: type::immutable
+fn main() {
+    let mut c = 0;
+    let f = || c += 1;
+    f();
+    println("{c}");
+}

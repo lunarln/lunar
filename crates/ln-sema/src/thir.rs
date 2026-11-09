@@ -96,6 +96,11 @@ pub enum Callee {
     Intrinsic { def: DefId, name: String, args: Vec<Ty> },
     /// Call through a function pointer.
     Indirect(Box<Expr>),
+    /// Call a value whose type implements an `Fn` trait: a closure, a
+    /// function pointer, or a generic parameter bounded by one. `callee` is
+    /// a place (borrowed for `Fn`, changed for `FnMut`), or for `FnOnce` a
+    /// read that consumes it.
+    Value { callee: Box<Expr>, kind: crate::ClosureKind },
 }
 
 #[derive(Clone, Debug)]
@@ -269,6 +274,14 @@ pub enum ExprKind {
     },
     /// A string literal converted to `FmtArgs`.
     FmtArgs(Vec<FmtPiece>),
+    /// A closure value: one entry per capture (see `ClosureInfo`). A
+    /// borrowed capture is the captured place (`Arg::InOut` when the body
+    /// changes it), a taken one is a read of it (`Arg::Value`). The body is
+    /// the closure's own function (`def`).
+    Closure {
+        def: DefId,
+        captures: Vec<Arg>,
+    },
     /// Placeholder for an expression that failed to type-check.
     Error,
 }

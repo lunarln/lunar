@@ -72,6 +72,8 @@ impl Program {
                 let Some(dull) = self.lang_item("dull") else { return false };
                 self.elaborate(env).iter().any(|p| p.ty == *ty && p.trait_ref.trait_id == dull)
             }
+            // A closure is Dull when it holds only Dull values (no borrows).
+            Ty::Closure(def, args) => self.closure_fields(*def, args).iter().all(|t| self.is_dull_rec(t, env, depth + 1)),
             Ty::Str | Ty::String | Ty::FmtArgs | Ty::Array(..) | Ty::Bang(_) | Ty::Ptr(..) | Ty::FnPtr(..) | Ty::Infer(_) => false,
         }
     }
@@ -94,6 +96,7 @@ impl Program {
                 adt.variants.iter().any(|v| v.fields.iter().any(|f| self.has_owner_rec(&f.ty.subst(args), depth + 1)))
             }
             Ty::Bang(t) => self.has_owner_rec(t, depth + 1),
+            Ty::Closure(def, args) => self.closure_fields(*def, args).iter().any(|t| self.has_owner_rec(t, depth + 1)),
             _ => false,
         }
     }
@@ -141,6 +144,13 @@ impl Program {
                 adt.variants.iter().all(|v| v.fields.iter().all(|f| self.is_copy_rec(&f.ty.subst(args), env, depth + 1)))
             }
             Ty::Bang(t) => self.is_copy_rec(t, env, depth + 1),
+            // A closure that changes a variable it borrows is not copied: two
+            // copies would both change it.
+            Ty::Closure(def, args) => {
+                let changes_borrowed =
+                    self.closures.get(def).is_some_and(|c| c.captures.iter().any(|cap| cap.by_ref && cap.mode == crate::defs::ParamMode::InOut));
+                !changes_borrowed && self.closure_fields(*def, args).iter().all(|t| self.is_copy_rec(t, env, depth + 1))
+            }
             _ => true,
         }
     }
@@ -246,6 +256,16 @@ impl Program {
             if self.elaborate(env).iter().any(|p| p.ty == *ty && p.trait_ref == *tr) {
                 return true;
             }
+        }
+        // `Fn(A): R`, `FnMut(..)`, `FnOnce(..)`: closures of that kind or a
+        // weaker one, and function pointers, with exactly that signature.
+        if let Some(want) = self.lang_name(tr.trait_id).and_then(crate::ClosureKind::from_lang) {
+            let sig = tr.args.first();
+            return match ty {
+                Ty::Closure(def, args) => self.closures.get(def).is_some_and(|c| c.kind <= want) && sig.is_none_or(|s| *s == self.closure_sig(*def, args)),
+                Ty::FnPtr(..) => sig.is_none_or(|s| s == ty),
+                _ => false,
+            };
         }
         if self.builtin_impl(ty, tr.trait_id, env) {
             return true;

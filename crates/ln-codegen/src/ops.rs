@@ -42,8 +42,51 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         match callee {
             Callee::Fn { def, .. } | Callee::Intrinsic { def, .. } => Some(*def),
             Callee::Trait { trait_ref, method, .. } => self.cg.p.trait_data(trait_ref.trait_id).methods.iter().find(|m| &m.name == method).map(|m| m.def),
-            Callee::Indirect(_) => None,
+            Callee::Indirect(_) | Callee::Value { .. } => None,
         }
+    }
+
+    /// The parameter modes of a callable value of type `t` (after
+    /// instantiation): a closure's own parameters, or a function pointer's.
+    fn value_modes(&self, t: &Ty) -> Option<Vec<ParamMode>> {
+        match t {
+            Ty::Closure(def, args) => match self.cg.p.closure_sig(*def, args) {
+                Ty::FnPtr(ps, _) => Some(ps.iter().map(|(m, _)| *m).collect()),
+                _ => None,
+            },
+            Ty::FnPtr(ps, _) => Some(ps.iter().map(|(m, _)| *m).collect()),
+            _ => None,
+        }
+    }
+
+    /// Call a closure: its function takes the captures first, each from the
+    /// closure's value at `env` (through the pointer for a borrowed one,
+    /// in place for a held one), then the arguments.
+    fn call_closure(&mut self, def: DefId, targs: &[Ty], env: PointerValue<'ctx>, vals: &[BV<'ctx>]) -> Option<BV<'ctx>> {
+        let info = self.cg.p.closures[&def].clone();
+        let cty = Ty::Closure(def, targs.to_vec());
+        let lt = self.cg.llty(&cty);
+        let fields = self.cg.p.closure_fields(def, targs);
+        let mut all: Vec<BV<'ctx>> = Vec::new();
+        for (i, cap) in info.captures.iter().enumerate() {
+            let fp = self.struct_field(lt, env, i as u32);
+            let at = if cap.by_ref { self.cg.b.build_load(self.cg.ptr_ty(), fp, "").unwrap().into_pointer_value() } else { fp };
+            if self.cg.p.param_by_ref(def, i) {
+                all.push(at.into());
+            } else {
+                let t = cap.ty.subst(targs);
+                let v = self.load(at, &t);
+                if cap.mode == ParamMode::Take && self.cg.p.has_owner(&t) {
+                    // Taken by the call: the closure no longer owns it.
+                    let ft = self.cg.llty(&fields[i]);
+                    self.cg.b.build_store(at, ft.const_zero()).unwrap();
+                }
+                all.push(v);
+            }
+        }
+        all.extend_from_slice(vals);
+        let f = self.cg.instance(def, targs);
+        self.emit_call(f, &all)
     }
 
     pub fn call(&mut self, callee: &Callee, args: &[Arg], ret: &Ty, span: Span) -> Option<BV<'ctx>> {
@@ -55,10 +98,31 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         // How each argument is passed: from the callee's declaration, or for
         // a call through a pointer, from the modes in the pointer's type.
         let ptr_modes: Option<Vec<ParamMode>> = match callee {
-            Callee::Indirect(f) => match self.t(&f.ty) {
-                Ty::FnPtr(ps, _) => Some(ps.iter().map(|(m, _)| *m).collect()),
-                _ => None,
-            },
+            Callee::Indirect(f) | Callee::Value { callee: f, .. } => {
+                let t = self.t(&f.ty);
+                self.value_modes(&t)
+            }
+            _ => None,
+        };
+        // The callable value: a closure's place (or a temporary holding a
+        // consumed one), or a function pointer.
+        let value_callee = match callee {
+            Callee::Value { callee: f, .. } => {
+                let t = self.t(&f.ty);
+                Some(match &t {
+                    Ty::FnPtr(..) => tri!(self.value(f)).into_pointer_value(),
+                    _ if f.is_place() => tri!(self.place(f)),
+                    _ => {
+                        // A consumed closure: what it still holds after the
+                        // call is dropped with the statement's temporaries.
+                        let v = tri!(self.value(f));
+                        let tmp = self.alloca_for(&t, "closure");
+                        self.cg.b.build_store(tmp, v).unwrap();
+                        self.register_cleanup(tmp, &t);
+                        tmp
+                    }
+                })
+            }
             _ => None,
         };
         let n = args.len();
@@ -166,6 +230,23 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 let args: Vec<BasicMetadataValueEnum> = vals.iter().map(|v| (*v).into()).collect();
                 let cs = self.cg.b.build_indirect_call(fty, indirect.unwrap(), &args, "").unwrap();
                 cs.try_as_basic_value().basic()
+            }
+            Callee::Value { callee: f, .. } => {
+                let at = value_callee.unwrap();
+                match self.t(&f.ty) {
+                    Ty::Closure(def, targs) => self.call_closure(def, &targs, at, &vals),
+                    Ty::FnPtr(params, r) => {
+                        let ps: Vec<(Ty, bool)> = params.iter().map(|(m, t)| (t.clone(), *m != ParamMode::Take)).collect();
+                        let fty = self.cg.fn_ty(&ps, &r, false);
+                        let args: Vec<BasicMetadataValueEnum> = vals.iter().map(|v| (*v).into()).collect();
+                        self.cg.b.build_indirect_call(fty, at, &args, "").unwrap().try_as_basic_value().basic()
+                    }
+                    other => {
+                        let s = self.cg.p.ty_str(&other);
+                        self.ice(format!("call of a value of type `{s}`"));
+                        return None;
+                    }
+                }
             }
         };
         if matches!(ret, Ty::Never) {
@@ -866,9 +947,14 @@ fn glue<'ctx>(cg: &mut Cg<'ctx, '_>, t: &Ty) -> Result<FunctionValue<'ctx>, Stri
             cg.b.position_at_end(entry);
             cg.b.build_call(g, &[p.into()], "").unwrap();
         }
-        Ty::Tuple(ts) => {
+        Ty::Tuple(_) | Ty::Closure(..) => {
+            let ts = match t {
+                Ty::Tuple(ts) => ts.clone(),
+                Ty::Closure(def, args) => cg.p.closure_fields(*def, args),
+                _ => unreachable!(),
+            };
             let lt = cg.llty(t);
-            for (i, ft) in ts.clone().iter().enumerate() {
+            for (i, ft) in ts.iter().enumerate() {
                 if cg.p.has_owner(ft) {
                     let fp = cg.b.build_struct_gep(lt, p, i as u32, "").unwrap();
                     let g = glue(cg, ft)?;

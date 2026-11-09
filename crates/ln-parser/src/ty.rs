@@ -104,23 +104,7 @@ impl P<'_, '_, '_> {
             }
             Some(T::Fn) => {
                 self.k.bump();
-                self.k.expect(T::LParen)?;
-                let mut params = Vec::new();
-                loop {
-                    if self.k.eat(T::RParen) {
-                        break;
-                    }
-                    // Modes as in signatures: `T` takes, `&T` borrows,
-                    // `&mut T` is in-out.
-                    let mode = if self.k.eat(T::Amp) { if self.k.eat(T::Mut) { ParamMode::InOut } else { ParamMode::Borrow } } else { ParamMode::Take };
-                    params.push((mode, self.ty()?));
-                    if !self.k.eat(T::Comma) {
-                        self.k.expect(T::RParen)?;
-                        break;
-                    }
-                }
-                let ret = if self.k.eat(T::Colon) { Some(Box::new(self.ret_ty()?)) } else { None };
-                TyKind::Fn { params, ret }
+                self.fn_sig_tail()?
             }
             Some(T::LBracket) => {
                 self.k.bump();
@@ -141,6 +125,27 @@ impl P<'_, '_, '_> {
         };
         let id = self.id();
         Ok(Ty { kind, span: self.span_from(start), id })
+    }
+
+    /// `(A, &B, &mut C): R` after `fn` in a type, or after `Fn` in a bound.
+    pub(crate) fn fn_sig_tail(&mut self) -> PResult<TyKind> {
+        self.k.expect(T::LParen)?;
+        let mut params = Vec::new();
+        loop {
+            if self.k.eat(T::RParen) {
+                break;
+            }
+            // Modes as in signatures: `T` takes, `&T` borrows,
+            // `&mut T` is in-out.
+            let mode = if self.k.eat(T::Amp) { if self.k.eat(T::Mut) { ParamMode::InOut } else { ParamMode::Borrow } } else { ParamMode::Take };
+            params.push((mode, self.ty()?));
+            if !self.k.eat(T::Comma) {
+                self.k.expect(T::RParen)?;
+                break;
+            }
+        }
+        let ret = if self.k.eat(T::Colon) { Some(Box::new(self.ret_ty()?)) } else { None };
+        Ok(TyKind::Fn { params, ret })
     }
 
     /// The part after `;` in `[T; ...]`.

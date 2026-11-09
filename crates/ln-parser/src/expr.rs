@@ -224,6 +224,45 @@ impl P<'_, '_, '_> {
         Ok(self.mk(ExprKind::Unary(op, Box::new(inner)), start))
     }
 
+    /// `move? |params| body` or `move? |params|: R { ... }`; `||` has no
+    /// parameters.
+    fn closure(&mut self) -> PResult<Closure> {
+        let is_move = self.k.eat(T::Move);
+        let mut params = Vec::new();
+        if !self.k.eat(T::PipePipe) {
+            self.k.expect(T::Pipe)?;
+            loop {
+                if self.k.eat(T::Pipe) {
+                    break;
+                }
+                let start = self.start();
+                let is_mut = self.k.eat(T::Mut);
+                let name = if self.k.eat(T::Placeholder) { None } else { Some(self.ident()?) };
+                let (mode, ty) = if self.k.eat(T::Colon) {
+                    let mode = if self.k.eat(T::Amp) { Some(if self.k.eat(T::Mut) { ParamMode::InOut } else { ParamMode::Borrow }) } else { None };
+                    (mode, Some(self.ty()?))
+                } else {
+                    (None, None)
+                };
+                params.push(ClosureParam { is_mut, name, mode, ty, span: self.span_from(start) });
+                if !self.k.eat(T::Comma) {
+                    self.k.expect(T::Pipe)?;
+                    break;
+                }
+            }
+        }
+        // With a return type, the body must be a block.
+        if self.k.eat(T::Colon) {
+            let ret = self.ret_ty()?;
+            let start = self.start();
+            let block = self.block()?;
+            let body = self.mk(ExprKind::Block(block), start);
+            return Ok(Closure { is_move, params, ret: Some(ret), body: Box::new(body) });
+        }
+        let body = self.expr()?;
+        Ok(Closure { is_move, params, ret: None, body: Box::new(body) })
+    }
+
     fn call_args(&mut self) -> PResult<Vec<Expr>> {
         self.k.expect(T::LParen)?;
         let mut args = Vec::new();
@@ -426,6 +465,7 @@ impl P<'_, '_, '_> {
                     ExprKind::Path(path)
                 }
             }
+            T::Pipe | T::PipePipe | T::Move => ExprKind::Closure(Box::new(self.closure()?)),
             T::LParen => {
                 self.k.bump();
                 if self.k.eat(T::RParen) {

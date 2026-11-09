@@ -183,6 +183,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             },
             Ty::Bang(t) => self.llty(t),
             Ty::Ptr(..) | Ty::FnPtr(..) => self.ptr_ty().into(),
+            // The captures: a pointer to each borrowed one, each taken value.
+            Ty::Closure(def, args) => {
+                let fields: Vec<BasicTypeEnum> = self.p.closure_fields(*def, args).iter().map(|t| self.llty(t)).collect();
+                self.ctx.struct_type(&fields, false).into()
+            }
             Ty::Never | Ty::Error | Ty::Param(..) | Ty::Infer(_) => self.unit_ty().into(),
         }
     }

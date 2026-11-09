@@ -176,7 +176,7 @@
         },
         {
           "name": "storage.modifier.lunar",
-          "match": "\\b(pub|mut|const|static|extern)\\b"
+          "match": "\\b(pub|mut|const|static|extern|move)\\b"
         },
         {
           "name": "keyword.other.lunar",

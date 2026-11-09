@@ -1,0 +1,8 @@
+// error: borrow::use_after_move
+fn main() {
+    let s = String::from("a");
+    let f = move || s;
+    let a = f();
+    let b = f();
+    println("{a}{b}");
+}

@@ -10,6 +10,7 @@ pub use crater::clone::Clone;
 pub use crater::default::Default;
 pub use crater::fmt::{Display, Debug};
 pub use crater::iter::Iterator;
+pub use crater::ops::{Fn, FnMut, FnOnce};
 pub use std::io::{print, println, eprint, eprintln};
 pub use std::process::panic;
 pub use std::test::{assert, assert_eq, assert_ne};

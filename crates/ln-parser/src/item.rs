@@ -234,11 +234,26 @@ impl P<'_, '_, '_> {
 
     /// `A + B::<C> + D`
     pub(crate) fn bounds(&mut self) -> PResult<Vec<Path>> {
-        let mut out = vec![self.path_ty_style()?];
+        let mut out = vec![self.bound()?];
         while self.k.eat(T::Plus) {
-            out.push(self.path_ty_style()?);
+            out.push(self.bound()?);
         }
         Ok(out)
+    }
+
+    /// A trait in a bound. `Fn(A, &B): R` (and `FnMut`, `FnOnce`, or any
+    /// path followed by a parameter list) is the trait with the signature
+    /// `fn(A, &B): R` as its argument.
+    pub(crate) fn bound(&mut self) -> PResult<Path> {
+        let mut path = self.path_ty_style()?;
+        if self.k.at(T::LParen) {
+            let start = self.start();
+            let kind = self.fn_sig_tail()?;
+            let sig = Ty { kind, span: self.span_from(start), id: self.id() };
+            path.span = path.span.to(sig.span);
+            path.segments.last_mut().unwrap().args = Some(vec![sig]);
+        }
+        Ok(path)
     }
 
     fn fn_decl(&mut self, is_unsafe: bool) -> PResult<FnDecl> {

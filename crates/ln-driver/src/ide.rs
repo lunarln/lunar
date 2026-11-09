@@ -646,13 +646,15 @@ fn walk_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
             walk_expr(index, f);
         }
         K::Call { callee, args } => {
-            if let thir::Callee::Indirect(c) = callee {
+            if let thir::Callee::Indirect(c) | thir::Callee::Value { callee: c, .. } = callee {
                 walk_expr(c, f);
             }
             for a in args {
                 walk_expr(a.expr(), f);
             }
         }
+        // The body is the closure's own function (walked with the bodies).
+        K::Closure { captures, .. } => captures.iter().for_each(|a| walk_expr(a.expr(), f)),
         K::Binary(_, l, r) | K::Logical { lhs: l, rhs: r, .. } | K::Assign { place: l, value: r } | K::AssignOp { place: l, value: r, .. } => {
             walk_expr(l, f);
             walk_expr(r, f);

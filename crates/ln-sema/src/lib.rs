@@ -87,6 +87,84 @@ pub struct Program {
     pub refs: Vec<Ref>,
     /// For each macro expansion's file, where the macro was invoked.
     pub expansion_sites: HashMap<ln_diag::FileId, ln_diag::Span>,
+    /// Closures, by the function definition each one is compiled to.
+    pub closures: HashMap<DefId, ClosureInfo>,
+}
+
+/// A closure is compiled to a function whose leading parameters are its
+/// captures (in this order), followed by its own parameters. Its value is a
+/// struct of the captures: a pointer for each borrowed one, the value for
+/// each one it took.
+#[derive(Clone, Debug)]
+pub struct ClosureInfo {
+    /// The function the closure is written in; the closure has its generics.
+    pub parent: DefId,
+    pub captures: Vec<Capture>,
+    pub kind: ClosureKind,
+}
+
+#[derive(Clone, Debug)]
+pub struct Capture {
+    pub name: String,
+    /// The captured variable's type (in terms of the parent's generics).
+    pub ty: Ty,
+    /// Kept as a pointer to the variable, rather than moved or copied into
+    /// the closure.
+    pub by_ref: bool,
+    /// How the body uses it, which is the mode of its parameter: read
+    /// (`Borrow`), changed (`InOut`) or consumed (`Take`).
+    pub mode: defs::ParamMode,
+}
+
+/// What calling a closure may do to its captures (`Fn` < `FnMut` < `FnOnce`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ClosureKind {
+    Fn,
+    FnMut,
+    FnOnce,
+}
+
+impl ClosureKind {
+    pub fn lang(self) -> &'static str {
+        match self {
+            ClosureKind::Fn => "fn",
+            ClosureKind::FnMut => "fn_mut",
+            ClosureKind::FnOnce => "fn_once",
+        }
+    }
+
+    pub fn from_lang(name: &str) -> Option<ClosureKind> {
+        Some(match name {
+            "fn" => ClosureKind::Fn,
+            "fn_mut" => ClosureKind::FnMut,
+            "fn_once" => ClosureKind::FnOnce,
+            _ => return None,
+        })
+    }
+}
+
+impl Program {
+    /// The fields of a closure's value, for closure `def` instantiated
+    /// with `args`: a pointer per borrowed capture, the value otherwise.
+    pub fn closure_fields(&self, def: DefId, args: &[Ty]) -> Vec<Ty> {
+        let Some(c) = self.closures.get(&def) else { return Vec::new() };
+        c.captures
+            .iter()
+            .map(|cap| {
+                let t = cap.ty.subst(args);
+                if cap.by_ref { Ty::Ptr(Box::new(t), cap.mode == defs::ParamMode::InOut) } else { t }
+            })
+            .collect()
+    }
+
+    /// The signature `fn(params): ret` a closure is called with (without
+    /// its captures), for closure `def` instantiated with `args`.
+    pub fn closure_sig(&self, def: DefId, args: &[Ty]) -> Ty {
+        let fd = self.fn_data(def);
+        let n = self.closures.get(&def).map_or(0, |c| c.captures.len());
+        let params = fd.sig.params[n..].iter().map(|p| (p.mode, p.ty.subst(args))).collect();
+        Ty::FnPtr(params, Box::new(fd.sig.ret.subst(args)))
+    }
 }
 
 impl Program {

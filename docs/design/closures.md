@@ -1,7 +1,19 @@
 # Closures and `impl Trait`
 
-Status: decided 2026-11-09, not built yet. Comes before the collections
-and the parser ([trees-and-collections.md](trees-and-collections.md)).
+Status: decided 2026-11-09. Closures and the `Fn` traits are built;
+`impl Trait` in return position is next. Comes before the collections and
+the parser ([trees-and-collections.md](trees-and-collections.md)).
+
+## How it is compiled
+
+A closure is a function of its own (`<closure>`, with its enclosing
+function's generics) whose leading parameters are the captures, followed by
+the closure's parameters. A capture's parameter mode is what the body does
+with it: `&` if read, `&mut` if changed, owned if given away. The closure's
+value is a struct with a pointer to each borrowed variable and each taken
+value. Calling it passes the captures from that struct, then the arguments.
+Each closure has its own type (`{closure}` in messages), so generic code is
+monomorphized per closure, with no indirection.
 
 ## Syntax
 
@@ -58,7 +70,8 @@ functions do (`f(&a, &b)`). Calling a value of a closure type is written
 like a function call: `f(x)`.
 
 Closures are only passed through generic parameters (`F: Fn(...)`); there
-is no `impl Trait` in parameter position.
+is no `impl Trait` in parameter position. Named functions and function
+pointers implement all three traits, so `items.sort_by(compare)` works.
 
 ## Escaping: `impl Trait` in return position
 
@@ -82,8 +95,6 @@ cannot outlive the function.
 
 ## Not decided yet
 
-* Whether named functions and `fn` pointers implement the `Fn` traits (as in
-  Rust, so `items.sort_by(compare)` works). Expected: yes.
 * Stored closures in struct fields go through generics
   (`struct Button::<F: Fn()> { on_click: F }`); trait objects (`dyn Fn`)
   would need `Box` and are out of scope.

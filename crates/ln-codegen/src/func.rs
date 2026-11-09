@@ -669,6 +669,21 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 }
             },
             K::FmtArgs(pieces) => self.fmt_args(pieces),
+            // The captures: the address of each borrowed variable, the value
+            // of each taken one.
+            K::Closure { captures, .. } => {
+                let lt = self.cg.llty(&ty).into_struct_type();
+                let mut agg = lt.get_undef();
+                for (i, a) in captures.iter().enumerate() {
+                    let v: BV<'ctx> = match a {
+                        Arg::InOut(p) => tri!(self.place(p)).into(),
+                        Arg::Value(p) if p.is_place() => tri!(self.place(p)).into(),
+                        Arg::Value(v) => tri!(self.value(v)),
+                    };
+                    agg = self.cg.b.build_insert_value(agg, v, i as u32, "").unwrap().into_struct_value();
+                }
+                Some(agg.into())
+            }
             K::Error => {
                 self.ice("error expression reached code generation");
                 None

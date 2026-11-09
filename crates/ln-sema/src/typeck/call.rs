@@ -472,21 +472,8 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 return self.call_resolved(r, args, expect, f.span, span);
             }
         }
-        // Call through a function pointer value.
-        let callee = self.check_expr(f, None);
-        let ct = self.shallow(&callee.ty);
-        match ct {
-            Ty::FnPtr(params, ret) => {
-                let sig: Vec<(Ty, ParamMode)> = params.iter().map(|(m, t)| (t.clone(), *m)).collect();
-                let a = self.check_args(&sig, false, args, span);
-                self.mk(ExprKind::Call { callee: Callee::Indirect(Box::new(callee)), args: a }, *ret, span)
-            }
-            Ty::Error => self.error_expr(span),
-            t => {
-                self.err(Diagnostic::error(tyc::NOT_CALLABLE, f.span, format!("expected a function, found `{}`", self.ty_str(&t))));
-                self.error_expr(span)
-            }
-        }
+        // Call a value: a function pointer, a closure or a generic `F: Fn(..)`.
+        self.check_value_call(f, args, span)
     }
 
     fn call_resolved(&mut self, r: ValueRes, args: &[ast::Expr], expect: Option<&Ty>, fspan: Span, span: Span) -> Expr {
@@ -507,8 +494,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                     let what = if fd.abi == Abi::C { format!("calling extern function `{n}`") } else { format!("calling unsafe function `{n}`") };
                     self.require_unsafe(fspan, &what);
                 }
-                let a = self.check_args(&sig, fd.variadic, args, span);
+                // Bounds first: a closure argument learns its parameter
+                // types from them (`F: Fn(i32): i32`).
                 self.oblige_preds(def, &gargs, fspan);
+                let a = self.check_args(&sig, fd.variadic, args, span);
                 let callee = if self.s.p.def(def).attrs.intrinsic {
                     Callee::Intrinsic { def, name: self.s.p.def(def).name.clone(), args: gargs }
                 } else {
@@ -810,8 +799,8 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let (self_ty, self_mode) = params[0].clone();
         let recv_arg = self.adjust_receiver(r, &rt, &step_ty, step_idx, &self_ty, self_mode, recv.span);
         let mut out = vec![recv_arg];
-        out.extend(self.check_args(&params[1..], false, args, span));
         self.oblige_preds(pick.def, &all, name.span);
+        out.extend(self.check_args(&params[1..], false, args, span));
         let callee = match pick.trait_call {
             Some((tr, st)) => Callee::Trait { trait_ref: tr, self_ty: st, method: name.name.clone(), method_args: own },
             None if self.s.p.def(pick.def).attrs.intrinsic => Callee::Intrinsic { def: pick.def, name: self.s.p.def(pick.def).name.clone(), args: all },

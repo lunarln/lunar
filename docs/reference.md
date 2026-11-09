@@ -316,6 +316,35 @@ let n = text.find("x")?; // `?` on Option and Result
 * Integer overflow panics in debug builds and wraps in `--release`.
   Division by zero always panics.
 
+### Closures
+
+`|params| body` is a closure; `|x: i32|: i32 { ... }` gives a return type
+(with a block body), `||` takes no parameters. Parameter types may be left
+out where the expected `Fn` type supplies them.
+
+```lunar
+let k = 10;
+let plus_k = |x: i32| x + k;          // borrows `k`
+let mut count = 0;
+let mut bump = || count += 1;         // borrows `count` in-out
+let name = String::from("x");
+let give = move || name;              // takes `name`
+```
+
+A closure captures the variables its body uses: it borrows what it reads,
+borrows in-out what it changes, and takes what it moves. `move` takes every
+capture (moving owners, copying Dull values). A closure that borrows is a
+view: it cannot outlive what it borrows, and what it borrows cannot be
+moved while it is used.
+
+What a call may do to the captures decides which of the core traits a
+closure implements: `Fn` (reads them), `FnMut` (changes them; the closure
+must be `let mut`) or `FnOnce` (gives one away; calling consumes the
+closure). Functions are generic over them: `fn apply::<F: Fn(i32): i32>(f:
+F, x: i32)`; the parameter types in `Fn(...)` carry modes (`Fn(&String)`,
+`FnMut(&mut i32)`). Named functions and function pointers implement all
+three.
+
 ### Format strings
 
 A string literal is interpolated only when it is passed to a `FmtArgs`

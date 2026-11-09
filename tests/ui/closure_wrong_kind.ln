@@ -1,0 +1,11 @@
+// error: type::unsatisfied_bound
+fn call_twice::<F: Fn()>(f: F) {
+    f();
+    f();
+}
+
+fn main() {
+    let mut c = 0;
+    call_twice(|| c += 1);
+    println("{c}");
+}
