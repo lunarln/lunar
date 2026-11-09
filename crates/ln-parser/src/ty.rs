@@ -58,7 +58,7 @@ impl P<'_, '_, '_> {
     fn ty_can_start(&mut self, n: usize) -> bool {
         matches!(
             self.k.nth(n),
-            Some(T::Ident | T::SelfType | T::Crater | T::Super | T::SelfValue | T::LBracket | T::LParen | T::Star | T::Bang | T::Fn | T::Placeholder)
+            Some(T::Ident | T::SelfType | T::Crater | T::Super | T::SelfValue | T::LBracket | T::LParen | T::Star | T::Bang | T::Fn | T::Placeholder | T::Impl)
         )
     }
 
@@ -105,6 +105,10 @@ impl P<'_, '_, '_> {
             Some(T::Fn) => {
                 self.k.bump();
                 self.fn_sig_tail()?
+            }
+            Some(T::Impl) => {
+                self.k.bump();
+                TyKind::ImplTrait(self.bounds()?)
             }
             Some(T::LBracket) => {
                 self.k.bump();

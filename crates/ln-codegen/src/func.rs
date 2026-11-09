@@ -99,7 +99,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         if let Some(v) = v
             && !fc.terminated()
         {
-            let ret = fc.cg.p.fn_data(body.def).sig.ret.subst(args);
+            let ret = fc.t(&fc.cg.p.fn_data(body.def).sig.ret);
             if Cg::is_void(&ret) {
                 if matches!(ret, ln_sema::ty::Ty::Never) {
                     fc.cg.b.build_unreachable().unwrap();
@@ -126,9 +126,10 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         }
     }
 
-    /// Substitute the instance's generic arguments.
+    /// Substitute the instance's generic arguments, and reveal the types
+    /// behind `impl Trait`.
     pub fn t(&self, t: &Ty) -> Ty {
-        t.subst(&self.args)
+        self.cg.p.reveal(&t.subst(&self.args))
     }
 
     /// An alloca in the entry block.
@@ -644,7 +645,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                     None => self.unit(),
                 };
                 self.emit_cleanups(0);
-                let ret = self.cg.p.fn_data(self.body.def).sig.ret.subst(&self.args);
+                let ret = self.t(&self.cg.p.fn_data(self.body.def).sig.ret);
                 if Cg::is_void(&ret) {
                     self.cg.b.build_return(None).unwrap();
                 } else {

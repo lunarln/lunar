@@ -47,11 +47,22 @@ pub(crate) struct LowerCx {
     pub env: Vec<Pred>,
     pub allow_infer: bool,
     pub generics_span: Span,
+    /// Lowering this function's return type, where `impl Trait` is allowed.
+    pub opaque_owner: Option<DefId>,
 }
 
 impl LowerCx {
     pub fn new(module: DefId) -> Self {
-        Self { module, generic_names: Vec::new(), generic_spans: Vec::new(), self_ty: None, env: Vec::new(), allow_infer: false, generics_span: Span::DUMMY }
+        Self {
+            module,
+            generic_names: Vec::new(),
+            generic_spans: Vec::new(),
+            self_ty: None,
+            env: Vec::new(),
+            allow_infer: false,
+            generics_span: Span::DUMMY,
+            opaque_owner: None,
+        }
     }
 }
 
@@ -169,6 +180,7 @@ impl<'a> Sema<'a> {
             env: self.env_of(id),
             allow_infer: false,
             generics_span: gspan,
+            opaque_owner: None,
         }
     }
 
@@ -342,6 +354,25 @@ impl<'a> Sema<'a> {
         }
     }
 
+    /// `impl A + B` in a function's return type: a new opaque type with
+    /// those bounds, standing for whatever the function's body returns.
+    fn lower_impl_trait(&mut self, cx: &LowerCx, bounds: &[ast::Path], span: Span) -> Ty {
+        let Some(owner) = cx.opaque_owner else {
+            self.err(
+                Diagnostic::error(tyc::IMPL_TRAIT_POSITION, span, "`impl Trait` is only allowed as the return type of a function")
+                    .with_help("to accept any type with these bounds, add a generic parameter: `fn f::<T: Trait>(x: T)`"),
+            );
+            return Ty::Error;
+        };
+        let mut inner = cx.clone();
+        inner.opaque_owner = None;
+        let trait_refs: Vec<TraitRef> = bounds.iter().filter_map(|b| self.lower_trait_ref(&inner, b)).collect();
+        let idx = self.p.opaques.keys().filter(|(d, _)| *d == owner).count() as u32;
+        self.p.opaques.insert((owner, idx), crate::OpaqueInfo { bounds: trait_refs, concrete: None, span });
+        let args = cx.generic_names.iter().enumerate().map(|(i, n)| Ty::Param(i as u32, n.clone())).collect();
+        Ty::Opaque(owner, idx, args)
+    }
+
     pub(crate) fn lower_trait_ref(&mut self, cx: &LowerCx, path: &ast::Path) -> Option<TraitRef> {
         let idents: Vec<ast::Ident> = path.segments.iter().map(|s| s.ident.clone()).collect();
         let res = self.resolve_prefix(cx.module, &idents, Ns::Type);
@@ -508,8 +539,20 @@ impl<'a> Sema<'a> {
             };
             params.push(Param { name: pname, ctx, ty, mode: p.mode, inout: p.mode == ast::ParamMode::InOut, mutable: p.is_mut, is_self, span: p.span });
         }
+        // `impl Trait` is allowed in the return type of functions with a
+        // body that are not part of a trait (a trait's implementations
+        // could not agree on one type).
+        let in_trait_item = parent.is_some_and(|pd| match &self.p.defs[pd.0 as usize].data {
+            DefData::Impl(d) => d.trait_ref.is_some(),
+            DefData::Trait(_) => true,
+            _ => false,
+        });
+        let mut rcx = cx.clone();
+        if f.body.is_some() && !in_trait_item {
+            rcx.opaque_owner = Some(id);
+        }
         let (ret, ret_span) = match &f.ret {
-            Some(t) => (self.lower_ty(&cx, t, TyPos::Other), t.span),
+            Some(t) => (self.lower_ty(&rcx, t, TyPos::Other), t.span),
             None => (Ty::unit(), f.sig_span.shrink_to_hi()),
         };
         if is_extern {
@@ -597,6 +640,7 @@ impl<'a> Sema<'a> {
                 return Ty::Infer(u32::MAX);
             }
             ast::TyKind::Never => Ty::Never,
+            ast::TyKind::ImplTrait(bounds) => return self.lower_impl_trait(cx, bounds, t.span),
             ast::TyKind::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.lower_ty(cx, t, TyPos::Other)).collect()),
             ast::TyKind::Ptr { is_mut, inner } => Ty::Ptr(Box::new(self.lower_ty(cx, inner, TyPos::Other)), *is_mut),
             ast::TyKind::Fn { params, ret } => {

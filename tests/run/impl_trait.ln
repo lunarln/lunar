@@ -1,0 +1,79 @@
+// `impl Trait` return types: escaping closures, iterators, and any trait.
+
+fn make_adder(n: i32): impl Fn(i32): i32 {
+    return move |x| x + n;
+}
+
+fn make_counter(): impl FnMut(): i32 {
+    let mut count = 0;
+    return move || {
+        count += 1;
+        count
+    };
+}
+
+fn greeter(name: String): impl FnOnce(): String {
+    return move || {
+        let mut s = String::from("hello, ");
+        s.push_str(name.as_str());
+        s
+    };
+}
+
+struct Countdown {
+    n: i32,
+}
+
+impl Iterator::<i32> for Countdown {
+    fn next(&mut self): Option::<i32> {
+        if self.n == 0 {
+            return None;
+        }
+        self.n -= 1;
+        return Some(self.n + 1);
+    }
+}
+
+fn countdown(from: i32): impl Iterator::<i32> {
+    return Countdown { n: from };
+}
+
+fn shown(x: i32): impl Display + Debug {
+    return x * 10;
+}
+
+// Generic: the concrete type depends on `T`.
+fn constant::<T: Dull + Display>(v: T): impl Fn(): T {
+    return move || v;
+}
+
+fn twice::<F: Fn(i32): i32>(f: F, x: i32): i32 {
+    return f(f(x));
+}
+
+fn main() {
+    let add5 = make_adder(5);
+    println("add5: {add5(1)} {add5(10)}");
+    println("twice: {twice(make_adder(3), 1)}");
+
+    let mut next = make_counter();
+    next();
+    next();
+    println("counter: {next()}");
+
+    let hi = greeter(String::from("moon"));
+    println("{hi()}");
+
+    let mut total = 0;
+    for x in countdown(4) {
+        total += x;
+    }
+    println("countdown sum: {total}");
+
+    let s = shown(4);
+    println("shown: {s} {s:?}");
+
+    let c = constant(7);
+    let d = constant(true);
+    println("constant: {c()} {d()}");
+}

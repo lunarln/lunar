@@ -144,6 +144,10 @@ pub enum Ty {
     /// The type of one closure expression (its function definition), with
     /// the generic arguments of the function it is written in.
     Closure(DefId, Vec<Ty>),
+    /// `impl Trait` number `idx` in the return type of function `def`, with
+    /// that function's generic arguments. Callers only know its bounds; code
+    /// generation uses the type the function's body returns.
+    Opaque(DefId, u32, Vec<Ty>),
     /// Generic parameter number `idx` of the enclosing item (impl params come first).
     Param(u32, String),
     /// Inference variable.
@@ -201,7 +205,7 @@ impl Ty {
     pub fn walk(&self, f: &mut impl FnMut(&Ty)) {
         f(self);
         match self {
-            Ty::Tuple(ts) | Ty::Adt(_, ts) | Ty::Closure(_, ts) => ts.iter().for_each(|t| t.walk(f)),
+            Ty::Tuple(ts) | Ty::Adt(_, ts) | Ty::Closure(_, ts) | Ty::Opaque(_, _, ts) => ts.iter().for_each(|t| t.walk(f)),
             Ty::Array(t, _) | Ty::Bang(t) | Ty::Ptr(t, _) => t.walk(f),
             Ty::FnPtr(ps, r) => {
                 ps.iter().for_each(|(_, t)| t.walk(f));
@@ -235,6 +239,7 @@ impl Ty {
             Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| t.map(f)).collect()),
             Ty::Adt(d, ts) => Ty::Adt(*d, ts.iter().map(|t| t.map(f)).collect()),
             Ty::Closure(d, ts) => Ty::Closure(*d, ts.iter().map(|t| t.map(f)).collect()),
+            Ty::Opaque(d, i, ts) => Ty::Opaque(*d, *i, ts.iter().map(|t| t.map(f)).collect()),
             Ty::Array(t, k) => Ty::Array(Box::new(t.map(f)), *k),
             Ty::Bang(t) => Ty::Bang(Box::new(t.map(f))),
             Ty::Ptr(t, m) => Ty::Ptr(Box::new(t.map(f)), *m),
@@ -273,11 +278,13 @@ impl TraitRef {
 pub struct TyDisplay<'a> {
     pub ty: &'a Ty,
     pub names: &'a dyn Fn(DefId) -> String,
+    /// How to show `impl Trait` (its bounds).
+    pub opaque: &'a dyn Fn(DefId, u32, &[Ty]) -> String,
 }
 
 impl fmt::Display for TyDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let d = |t: &Ty| TyDisplay { ty: t, names: self.names }.to_string();
+        let d = |t: &Ty| TyDisplay { ty: t, names: self.names, opaque: self.opaque }.to_string();
         let list = |ts: &[Ty]| ts.iter().map(d).collect::<Vec<_>>().join(", ");
         match self.ty {
             Ty::Int(i) => write!(f, "{}", i.name()),
@@ -321,6 +328,7 @@ impl fmt::Display for TyDisplay<'_> {
                 Ok(())
             }
             Ty::Closure(..) => write!(f, "{{closure}}"),
+            Ty::Opaque(def, i, args) => write!(f, "{}", (self.opaque)(*def, *i, args)),
             Ty::Param(_, n) => write!(f, "{n}"),
             Ty::Infer(_) => write!(f, "_"),
             Ty::Never => write!(f, "!"),

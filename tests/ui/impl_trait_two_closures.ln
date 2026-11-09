@@ -1,0 +1,12 @@
+// error: type::opaque_mismatch
+fn pick(up: bool): impl Fn(i32): i32 {
+    if up {
+        return move |x| x + 1;
+    }
+    return move |x| x - 1;
+}
+
+fn main() {
+    let f = pick(true);
+    println("{f(1)}");
+}

@@ -1,0 +1,9 @@
+// error: borrow::escapes_function
+fn make(n: i32): impl Fn(i32): i32 {
+    return |x| x + n;
+}
+
+fn main() {
+    let f = make(1);
+    println("{f(2)}");
+}

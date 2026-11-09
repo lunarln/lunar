@@ -345,6 +345,11 @@ F, x: i32)`; the parameter types in `Fn(...)` carry modes (`Fn(&String)`,
 `FnMut(&mut i32)`). Named functions and function pointers implement all
 three.
 
+A function can return a closure (or any value) without naming its type:
+`fn make_adder(n: i32): impl Fn(i32): i32 { return move |x| x + n; }`.
+Callers see only the bounds after `impl`; the body returns one concrete
+type. A returned closure must be `move`.
+
 ### Format strings
 
 A string literal is interpolated only when it is passed to a `FmtArgs`

@@ -56,6 +56,8 @@ codes! {
         BAD_TEST = "bad_test",
         CONST_EVAL = "const_eval",
         VARIADIC_NOT_EXTERN = "variadic_not_extern",
+        IMPL_TRAIT_POSITION = "impl_trait_position",
+        OPAQUE_MISMATCH = "opaque_mismatch",
     }
     syntax ("syntax") => {
         UNEXPECTED_TOKEN = "unexpected_token",

@@ -188,6 +188,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let fields: Vec<BasicTypeEnum> = self.p.closure_fields(*def, args).iter().map(|t| self.llty(t)).collect();
                 self.ctx.struct_type(&fields, false).into()
             }
+            Ty::Opaque(..) => {
+                let r = self.p.reveal(t);
+                self.llty(&r)
+            }
             Ty::Never | Ty::Error | Ty::Param(..) | Ty::Infer(_) => self.unit_ty().into(),
         }
     }
@@ -268,8 +272,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             return *f;
         }
         let fd = self.p.fn_data(def).clone();
-        let params: Vec<(Ty, bool)> = fd.sig.params.iter().enumerate().map(|(i, p)| (p.ty.subst(args), self.p.param_by_ref(def, i))).collect();
-        let ret = fd.sig.ret.subst(args);
+        let params: Vec<(Ty, bool)> = fd.sig.params.iter().enumerate().map(|(i, p)| (self.p.reveal(&p.ty.subst(args)), self.p.param_by_ref(def, i))).collect();
+        let ret = self.p.reveal(&fd.sig.ret.subst(args));
         let fty = self.fn_ty(&params, &ret, fd.variadic);
         let f = if fd.abi == Abi::C {
             let attrs = &self.p.def(def).attrs;

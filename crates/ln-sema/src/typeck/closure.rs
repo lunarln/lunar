@@ -57,13 +57,25 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             Ty::FnPtr(ps, r) => Some((ps.clone(), *r.clone())),
             _ => None,
         };
+        let is_fn = |id: DefId| self.s.p.lang_name(id).and_then(ClosureKind::from_lang).is_some();
         match &t {
             Ty::FnPtr(ps, r) => Some((ps.clone(), *r.clone())),
-            Ty::Infer(_) => self.obligations.iter().find_map(|(ty, tr, _)| {
-                let is_fn = self.s.p.lang_name(tr.trait_id).and_then(ClosureKind::from_lang).is_some();
-                if is_fn && self.shallow(ty) == t { tr.args.first().and_then(from) } else { None }
-            }),
-            Ty::Param(..) => self.s.p.elaborate(&self.env).iter().find_map(|p| {
+            // Where another closure is expected (both returned as one
+            // `impl Fn`), take its signature; the types will still differ.
+            Ty::Closure(def, args) if self.s.p.closures.contains_key(def) => from(&self.s.p.closure_sig(*def, args)),
+            Ty::Infer(_) => {
+                let bound = self
+                    .obligations
+                    .iter()
+                    .find_map(|(ty, tr, _)| if is_fn(tr.trait_id) && self.shallow(ty) == t { tr.args.first().and_then(from) } else { None });
+                // A closure this function returns as `impl Fn(..)`.
+                bound.or_else(|| {
+                    let (i, _, _) = self.opaque_vars.iter().find(|(_, v, _)| self.shallow(v) == t)?;
+                    let o = self.s.p.opaques.get(&(self.def, *i))?;
+                    o.bounds.iter().find(|b| is_fn(b.trait_id)).and_then(|b| b.args.first()).and_then(from)
+                })
+            }
+            Ty::Opaque(..) | Ty::Param(..) => self.known_preds(&t).iter().find_map(|p| {
                 let is_fn = self.s.p.lang_name(p.trait_ref.trait_id).and_then(ClosureKind::from_lang).is_some();
                 if is_fn && p.ty == t { p.trait_ref.args.first().and_then(from) } else { None }
             }),
@@ -387,10 +399,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 Some((ps, *r, kind))
             }
             Ty::FnPtr(ps, r) => Some((ps.clone(), *r.clone(), ClosureKind::Fn)),
-            Ty::Param(..) => {
+            Ty::Param(..) | Ty::Opaque(..) => {
                 // The weakest bound that applies: `Fn` before `FnMut` before `FnOnce`.
                 let mut best: Option<CallSig> = None;
-                for p in self.s.p.elaborate(&self.env) {
+                for p in self.known_preds(&t) {
                     let Some(kind) = self.s.p.lang_name(p.trait_ref.trait_id).and_then(ClosureKind::from_lang) else { continue };
                     if p.ty != t {
                         continue;

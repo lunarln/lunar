@@ -107,6 +107,13 @@ impl Program {
                 let fs: Option<Vec<Layout>> = self.closure_fields(*def, args).iter().map(rec).collect();
                 struct_layout(&fs?).0
             }
+            Ty::Opaque(..) => {
+                let r = self.reveal(t);
+                if r.has_error() {
+                    return None;
+                }
+                return rec(&r);
+            }
             Ty::Param(..) | Ty::Infer(_) | Ty::Error => return None,
         })
     }

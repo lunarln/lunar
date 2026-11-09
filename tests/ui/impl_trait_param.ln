@@ -1,0 +1,8 @@
+// error: type::impl_trait_position
+fn apply(f: impl Fn(i32): i32): i32 {
+    return f(1);
+}
+
+fn main() {
+    println("{apply(|x| x + 1)}");
+}

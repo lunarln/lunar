@@ -51,7 +51,21 @@ pub fn ty(t: &Ty) -> String {
         TyKind::Never => "!".into(),
         TyKind::Infer => "_".into(),
         TyKind::MacCall(m) => mac_call(m),
+        TyKind::ImplTrait(bounds) => format!("impl {}", bounds.iter().map(bound).collect::<Vec<_>>().join(" + ")),
     }
+}
+
+/// A trait in a bound, with the `Fn(A): R` sugar where it was written so.
+pub fn bound(p: &Path) -> String {
+    if let Some(last) = p.segments.last()
+        && let Some([Ty { kind: TyKind::Fn { .. }, .. }]) = last.args.as_deref()
+        && let Some(sig) = last.args.as_ref().and_then(|a| a.first())
+    {
+        let mut head = p.clone();
+        head.segments.last_mut().unwrap().args = None;
+        return format!("{}{}", path(&head), ty(sig).trim_start_matches("fn"));
+    }
+    path(p)
 }
 
 /// `path!(tokens)`.
@@ -94,7 +108,7 @@ pub fn generic_param(p: &GenericParam) -> String {
     if p.bounds.is_empty() {
         return p.name.name.clone();
     }
-    format!("{}: {}", p.name.name, p.bounds.iter().map(path).collect::<Vec<_>>().join(" + "))
+    format!("{}: {}", p.name.name, p.bounds.iter().map(bound).collect::<Vec<_>>().join(" + "))
 }
 
 /// `::<T: Ord, U>`, or nothing without parameters.

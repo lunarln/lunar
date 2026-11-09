@@ -1,0 +1,25 @@
+// error: type::no_method
+struct Meters {
+    v: i32,
+}
+
+impl Meters {
+    fn value(&self): i32 {
+        return self.v;
+    }
+}
+
+impl Display for Meters {
+    fn fmt(&self, out: &mut String) {
+        out.write("{self.v}m");
+    }
+}
+
+fn length(): impl Display {
+    return Meters { v: 3 };
+}
+
+fn main() {
+    let m = length();
+    println("{m} {m.value()}");
+}

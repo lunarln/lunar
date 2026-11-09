@@ -89,6 +89,18 @@ pub struct Program {
     pub expansion_sites: HashMap<ln_diag::FileId, ln_diag::Span>,
     /// Closures, by the function definition each one is compiled to.
     pub closures: HashMap<DefId, ClosureInfo>,
+    /// `impl Trait` return types, by function and position (`Ty::Opaque`).
+    pub opaques: HashMap<(DefId, u32), OpaqueInfo>,
+}
+
+/// An `impl Trait` in a function's return type.
+#[derive(Clone, Debug)]
+pub struct OpaqueInfo {
+    /// What callers know about it (in terms of the function's generics).
+    pub bounds: Vec<ty::TraitRef>,
+    /// The type the function's body returns there, once checked.
+    pub concrete: Option<Ty>,
+    pub span: ln_diag::Span,
 }
 
 /// A closure is compiled to a function whose leading parameters are its
@@ -164,6 +176,48 @@ impl Program {
         let n = self.closures.get(&def).map_or(0, |c| c.captures.len());
         let params = fd.sig.params[n..].iter().map(|p| (p.mode, p.ty.subst(args))).collect();
         Ty::FnPtr(params, Box::new(fd.sig.ret.subst(args)))
+    }
+
+    /// What is known about an `impl Trait` type: its bounds, as predicates
+    /// on it.
+    pub fn opaque_preds(&self, def: DefId, idx: u32, args: &[Ty]) -> Vec<defs::Pred> {
+        let Some(o) = self.opaques.get(&(def, idx)) else { return Vec::new() };
+        let ty = Ty::Opaque(def, idx, args.to_vec());
+        o.bounds.iter().map(|b| defs::Pred { ty: ty.clone(), trait_ref: b.subst(args), span: o.span }).collect()
+    }
+
+    /// `t` with every `impl Trait` replaced by the type it stands for (for
+    /// code generation, after the functions returning them are checked).
+    pub fn reveal(&self, t: &Ty) -> Ty {
+        let mut depth = 0;
+        let mut t = t.clone();
+        while depth < 32 && {
+            let mut any = false;
+            t.walk(&mut |x| any |= matches!(x, Ty::Opaque(..)));
+            any
+        } {
+            t = t.map(&mut |x| match x {
+                Ty::Opaque(d, i, args) => match self.opaques.get(&(d, i)).and_then(|o| o.concrete.as_ref()) {
+                    Some(c) => c.subst(&args),
+                    None => Ty::Error,
+                },
+                x => x,
+            });
+            depth += 1;
+        }
+        t
+    }
+
+    /// A trait with its arguments, as written in a bound: `Iterator::<i32>`,
+    /// or with the `Fn` sugar, `Fn(i32): bool`.
+    pub fn trait_ref_str(&self, tr: &ty::TraitRef) -> String {
+        let name = self.def(tr.trait_id).name.clone();
+        let fn_like = self.lang_name(tr.trait_id).and_then(ClosureKind::from_lang).is_some();
+        match tr.args.as_slice() {
+            [] => name,
+            [sig @ Ty::FnPtr(..)] if fn_like => format!("{name}{}", self.ty_str(sig).trim_start_matches("fn")),
+            args => format!("{name}::<{}>", args.iter().map(|a| self.ty_str(a)).collect::<Vec<_>>().join(", ")),
+        }
     }
 }
 
@@ -256,7 +310,11 @@ impl Program {
 
     pub fn ty_str(&self, t: &Ty) -> String {
         let names = |id: DefId| self.def(id).name.clone();
-        ty::TyDisplay { ty: t, names: &names }.to_string()
+        let opaque = |def: DefId, idx: u32, args: &[Ty]| {
+            let bounds: Vec<String> = self.opaque_preds(def, idx, args).iter().map(|p| self.trait_ref_str(&p.trait_ref)).collect();
+            format!("impl {}", bounds.join(" + "))
+        };
+        ty::TyDisplay { ty: t, names: &names, opaque: &opaque }.to_string()
     }
 
     pub fn is_enum(&self, id: DefId) -> bool {

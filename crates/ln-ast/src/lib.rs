@@ -428,6 +428,8 @@ pub enum TyKind {
     Infer,
     /// A macro expanding to a type.
     MacCall(MacCall),
+    /// `impl A + B` (only in a function's return type).
+    ImplTrait(Vec<Path>),
 }
 
 #[derive(Clone, Debug)]

@@ -1280,7 +1280,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
 
     fn iterator_item(&mut self, t: &Ty, iter_trait: DefId) -> Option<Ty> {
         let t = self.resolve(t);
-        for p in self.env.clone() {
+        for p in self.known_preds(&t) {
             if p.ty == t && p.trait_ref.trait_id == iter_trait {
                 return p.trait_ref.args.first().cloned();
             }

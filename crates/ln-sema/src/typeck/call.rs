@@ -345,8 +345,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             if need_self && !self.s.p.fn_data(mdef).has_self {
                 continue;
             }
-            // Bounds in scope (generic params and `Self`).
-            if let Some(p) = self.env.iter().find(|p| p.ty == ty && p.trait_ref.trait_id == tid) {
+            // Bounds in scope (generic params and `Self`), and what an
+            // `impl Trait` promises.
+            if let Some(p) = self.known_preds(&ty).into_iter().find(|p| p.ty == ty && p.trait_ref.trait_id == tid) {
                 found.push((p.trait_ref.clone(), mdef));
                 continue;
             }
@@ -776,6 +777,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             }
             if matches!(rt, Ty::Param(..)) {
                 d = d.with_help("add a trait bound that provides this method");
+            }
+            if matches!(rt, Ty::Opaque(..)) {
+                d = d.with_note(format!("`{t}` only offers what its bounds provide; the type behind it is private to the function returning it"));
             }
             self.err(d);
             for a in args {

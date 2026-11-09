@@ -1,8 +1,8 @@
 # Closures and `impl Trait`
 
-Status: decided 2026-11-09. Closures and the `Fn` traits are built;
-`impl Trait` in return position is next. Comes before the collections and
-the parser ([trees-and-collections.md](trees-and-collections.md)).
+Status: built (2026-11-09): closures, the `Fn` traits and `impl Trait` in
+return position. Comes before the collections and the parser
+([trees-and-collections.md](trees-and-collections.md)).
 
 ## How it is compiled
 
@@ -92,6 +92,12 @@ The type is opaque, as in Rust: the body decides one concrete type (every
 the concrete type (no indirection). It works for any trait, not only the
 `Fn` traits. An escaping closure must be `move`, since a borrowing closure
 cannot outlive the function.
+
+Callers know only the bounds: an `impl Trait` is Dull (copied) only if the
+bounds include `Dull`, and it may hold views of the arguments (the borrow
+checker treats it like a generic value). It is allowed in the return type of
+functions and inherent methods, not of trait methods (each implementation
+would return its own type), and nowhere else.
 
 ## Not decided yet
 

@@ -35,7 +35,7 @@ type LiveSet = BTreeSet<LocalId>;
 type PathP = (LocalId, Vec<usize>);
 
 /// Warn about unused variables and needless `mut`.
-pub fn lint(body: &Body, diags: &mut Diagnostics) {
+pub fn lint(p: &Program, body: &Body, diags: &mut Diagnostics) {
     let mut used = HashSet::new();
     let mut mutated = HashSet::new();
     fn root(e: &Expr) -> Option<LocalId> {
@@ -45,7 +45,9 @@ pub fn lint(body: &Body, diags: &mut Diagnostics) {
             _ => None,
         }
     }
-    fn walk(e: &Expr, used: &mut HashSet<LocalId>, mutated: &mut HashSet<LocalId>) {
+    let walk = |e: &Expr, used: &mut HashSet<LocalId>, mutated: &mut HashSet<LocalId>| lint_walk(p, e, used, mutated);
+    fn lint_walk(p: &Program, e: &Expr, used: &mut HashSet<LocalId>, mutated: &mut HashSet<LocalId>) {
+        let walk = |e: &Expr, used: &mut HashSet<LocalId>, mutated: &mut HashSet<LocalId>| lint_walk(p, e, used, mutated);
         match &e.kind {
             ExprKind::Local(l) => {
                 used.insert(*l);
@@ -77,10 +79,17 @@ pub fn lint(body: &Body, diags: &mut Diagnostics) {
                     mutated.insert(l);
                 }
             }
-            ExprKind::Closure { captures, .. } => {
-                for a in captures {
-                    if let Arg::InOut(p) = a
-                        && let Some(l) = root(p)
+            // A closure that changes a capture changes the variable (if it
+            // borrowed it) or needs it `mut` to change its own copy.
+            ExprKind::Closure { def, captures } => {
+                let caps = p.closures.get(def).map(|c| c.captures.as_slice()).unwrap_or_default();
+                for (a, cap) in captures.iter().zip(caps) {
+                    let place = match a.expr() {
+                        Expr { kind: ExprKind::Read { place, .. }, .. } => place,
+                        x => x,
+                    };
+                    if cap.mode == crate::defs::ParamMode::InOut
+                        && let Some(l) = root(place)
                     {
                         mutated.insert(l);
                     }
@@ -269,8 +278,9 @@ impl<'p> Cx<'p, '_> {
             Ty::Closure(d, args) => {
                 self.p.closures.get(d).is_some_and(|c| c.captures.iter().any(|cap| cap.by_ref || self.has_view_rec(&cap.ty.subst(args), depth + 1)))
             }
-            // Generic values may be instantiated with views.
-            Ty::Param(..) => true,
+            // Generic values may be instantiated with views, and `impl Trait`
+            // may stand for one.
+            Ty::Param(..) | Ty::Opaque(..) => true,
             _ => false,
         }
     }

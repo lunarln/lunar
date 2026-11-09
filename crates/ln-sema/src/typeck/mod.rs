@@ -72,6 +72,9 @@ pub(crate) struct FnCtx<'s, 'a> {
     reported_annotations: bool,
     /// Closures written in this function, finished with it.
     closures: Vec<closure::PendingClosure>,
+    /// This function's `impl Trait` return types: the variable standing
+    /// for each inside the body (the type it returns there).
+    opaque_vars: Vec<(u32, Ty, Span)>,
 }
 
 impl<'a> Sema<'a> {
@@ -111,7 +114,7 @@ impl<'a> Sema<'a> {
             // noise (and may be wrong about code that will change).
             if !is_std && self.diags.error_count() == errs_before {
                 let mut lints = ln_diag::Diagnostics::new();
-                crate::borrowck::lint(&b, &mut lints);
+                crate::borrowck::lint(&self.p, &b, &mut lints);
                 // Through `err`, which drops lints inside expansions.
                 for d in lints.into_vec() {
                     self.err(d);
@@ -148,7 +151,21 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             lit_checks: Vec::new(),
             reported_annotations: false,
             closures: Vec::new(),
+            opaque_vars: Vec::new(),
         };
+        // Inside the body, each `impl Trait` it returns is the type it
+        // actually returns: a variable to infer.
+        let mut opened = Vec::new();
+        fcx.ret_ty = fd.sig.ret.map(&mut |t| match t {
+            Ty::Opaque(d, i, _) if d == def => {
+                let span = fcx.s.p.opaques.get(&(d, i)).map_or(f.sig_span, |o| o.span);
+                let v = fcx.new_var(span);
+                opened.push((i, v.clone(), span));
+                v
+            }
+            t => t,
+        });
+        fcx.opaque_vars = opened;
         let mut params = Vec::new();
         for (i, p) in fd.sig.params.iter().enumerate() {
             let bang = matches!(p.ty, Ty::Bang(_));
@@ -220,6 +237,13 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             (Ty::String, Ty::Str) => d = d.with_help("use `String::from(...)` to build an owned `String`"),
             (Ty::Array(_, a), Ty::Array(_, b)) if a.is_owner() && b.is_owner() => {
                 d = d.with_note("array kinds only convert implicitly when passed to a parameter");
+            }
+            (Ty::Closure(..), Ty::Closure(..)) => {
+                d = d.with_note("every closure has a type of its own, even when two are written alike");
+                if self.opaque_vars.iter().any(|(_, v, _)| self.resolve(v) == re) {
+                    d.code = tyc::OPAQUE_MISMATCH;
+                    d = d.with_help("a function returning `impl Trait` returns one type: return a single closure and decide inside it");
+                }
             }
             _ => {}
         }
@@ -698,6 +722,16 @@ impl<'s, 'a> FnCtx<'s, 'a> {
 
     // ===================================================================== obligations
 
+    /// The bounds known to hold here: the function's (with supertraits),
+    /// and for an `impl Trait` type, what it promises.
+    pub(crate) fn known_preds(&self, ty: &Ty) -> Vec<Pred> {
+        let mut out = self.env.clone();
+        if let Ty::Opaque(d, i, args) = ty {
+            out.extend(self.s.p.elaborate(&self.s.p.opaque_preds(*d, *i, args)));
+        }
+        out
+    }
+
     pub(crate) fn oblige(&mut self, ty: Ty, tr: TraitRef, span: Span) {
         self.obligations.push((ty, tr, span));
     }
@@ -740,6 +774,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 self.err(d);
             }
         }
+        self.finish_opaques();
         for (ty, span) in std::mem::take(&mut self.dull_checks) {
             let t = self.resolve(&ty);
             if t.has_infer() || t.has_error() {
@@ -772,6 +807,46 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         for i in 0..self.lens.len() {
             if matches!(self.lens[i], LenVar::Unbound) {
                 self.lens[i] = LenVar::Bound(0);
+            }
+        }
+    }
+
+    /// Record the type each `impl Trait` of this function stands for, and
+    /// check that it has the promised bounds.
+    fn finish_opaques(&mut self) {
+        for (i, var, span) in std::mem::take(&mut self.opaque_vars) {
+            let c = self.resolve(&var);
+            if c.has_infer() {
+                // Only a body that never returns leaves it open.
+                if matches!(self.shallow(&var), Ty::Infer(_)) {
+                    self.unify(&var, &Ty::unit());
+                } else {
+                    self.annotations_needed(span);
+                    continue;
+                }
+            }
+            let c = default_ty(&self.resolve(&var));
+            let bounds = self.s.p.opaques.get(&(self.def, i)).map(|o| o.bounds.clone()).unwrap_or_default();
+            for b in &bounds {
+                if c.has_error() || self.s.p.implements(&c, b, &self.env) {
+                    continue;
+                }
+                let (cs, bs) = (self.s.p.ty_str(&c), self.s.p.trait_ref_str(b));
+                // For a closure, say why at the closure.
+                let at = match &c {
+                    Ty::Closure(cd, _) => self.s.p.def(*cd).span,
+                    _ => span,
+                };
+                let mut d = match self.fn_bound_diag(&c, b, at) {
+                    Some(fd) => fd.with_secondary(span, format!("the function promises `{bs}`")),
+                    None => Diagnostic::error(tyc::OPAQUE_MISMATCH, span, format!("this function returns `{cs}`, which does not implement `{bs}`"))
+                        .with_label(format!("promises `{bs}`")),
+                };
+                d.code = tyc::OPAQUE_MISMATCH;
+                self.err(d);
+            }
+            if let Some(o) = self.s.p.opaques.get_mut(&(self.def, i)) {
+                o.concrete = Some(c);
             }
         }
     }

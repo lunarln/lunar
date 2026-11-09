@@ -105,6 +105,9 @@ impl P<'_, '_, '_> {
                     | T::Loop
                     | T::While
                     | T::For
+                    | T::Move
+                    | T::Pipe
+                    | T::PipePipe
             )
         )
     }

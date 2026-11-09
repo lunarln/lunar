@@ -74,6 +74,11 @@ impl Program {
             }
             // A closure is Dull when it holds only Dull values (no borrows).
             Ty::Closure(def, args) => self.closure_fields(*def, args).iter().all(|t| self.is_dull_rec(t, env, depth + 1)),
+            // `impl Trait` is Dull when its bounds say so.
+            Ty::Opaque(def, i, args) => {
+                let Some(dull) = self.lang_item("dull") else { return false };
+                self.elaborate(&self.opaque_preds(*def, *i, args)).iter().any(|p| p.trait_ref.trait_id == dull)
+            }
             Ty::Str | Ty::String | Ty::FmtArgs | Ty::Array(..) | Ty::Bang(_) | Ty::Ptr(..) | Ty::FnPtr(..) | Ty::Infer(_) => false,
         }
     }
@@ -114,7 +119,7 @@ impl Program {
         match ty {
             Ty::String | Ty::Array(_, ArrKind::Shrink) => true,
             // A generic parameter might be instantiated with a shrinkable type.
-            Ty::Param(..) => !self.is_dull(ty, env),
+            Ty::Param(..) | Ty::Opaque(..) => !self.is_dull(ty, env),
             Ty::Tuple(ts) => ts.iter().any(|t| self.has_shrinkable_rec(t, env, depth + 1)),
             Ty::Adt(id, args) => {
                 let adt = self.adt(*id);
@@ -137,7 +142,7 @@ impl Program {
         match ty {
             Ty::String => false,
             Ty::Array(e, k) => !k.is_owner() && self.is_copy_rec(e, env, depth + 1),
-            Ty::Param(..) => self.is_dull(ty, env),
+            Ty::Param(..) | Ty::Opaque(..) => self.is_dull(ty, env),
             Ty::Tuple(ts) => ts.iter().all(|t| self.is_copy_rec(t, env, depth + 1)),
             Ty::Adt(id, args) => {
                 let adt = self.adt(*id);
@@ -256,6 +261,10 @@ impl Program {
             if self.elaborate(env).iter().any(|p| p.ty == *ty && p.trait_ref == *tr) {
                 return true;
             }
+        }
+        // `impl Trait`: only what its bounds promise.
+        if let Ty::Opaque(def, i, args) = ty {
+            return self.elaborate(&self.opaque_preds(*def, *i, args)).iter().any(|p| p.trait_ref == *tr);
         }
         // `Fn(A): R`, `FnMut(..)`, `FnOnce(..)`: closures of that kind or a
         // weaker one, and function pointers, with exactly that signature.
