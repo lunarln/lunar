@@ -109,7 +109,7 @@ fn main() -> ExitCode {
             let status = std::process::Command::new(&out).args(&args).status();
             let _ = std::fs::remove_file(&out);
             match status {
-                Ok(s) => ExitCode::from(s.code().unwrap_or(1).clamp(0, 255) as u8),
+                Ok(s) => exit_code_of(s),
                 Err(e) => {
                     eprintln!("error: could not run program: {e}");
                     ExitCode::FAILURE
@@ -140,6 +140,22 @@ fn compile(file: &Path, out: &Path, release: bool, test: bool, emit_llvm: Option
     }
     let opts = BuildOptions { release, test, output: out.to_path_buf(), emit_llvm, overflow_checks: !release };
     build(&a, &opts).map_err(|e| eprintln!("error: {e}"))
+}
+
+/// Forward a program's exit status. A crash (a signal on Unix, an NTSTATUS
+/// such as `0xC0000005` on Windows) must never be reported as success.
+fn exit_code_of(s: std::process::ExitStatus) -> ExitCode {
+    match s.code() {
+        Some(c @ 0..=255) => ExitCode::from(c as u8),
+        Some(c) => {
+            eprintln!("error: program crashed with status {:#010X}", c as u32);
+            ExitCode::from(101)
+        }
+        None => {
+            eprintln!("error: program was terminated: {s}");
+            ExitCode::from(101)
+        }
+    }
 }
 
 fn emit_ir(file: &Path, release: bool, test: bool, color: bool) -> Result<String, ()> {
