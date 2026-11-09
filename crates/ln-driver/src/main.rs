@@ -16,7 +16,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Type-check a program without generating code.
-    Check { file: PathBuf },
+    Check {
+        file: PathBuf,
+        /// Evaluate `#[cfg]` for this OS instead of the host (linux, macos, windows).
+        #[arg(long)]
+        target_os: Option<String>,
+    },
     /// Compile a program to an executable.
     Build {
         file: PathBuf,
@@ -53,8 +58,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let color = std::io::stderr().is_terminal();
     match cli.command {
-        Cmd::Check { file } => {
-            let a = analyze(&file, false);
+        Cmd::Check { file, target_os } => {
+            let a = ln_driver::analyze_for(&file, false, target_os.as_deref());
             match finish_front(&a, color) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(()) => ExitCode::FAILURE,

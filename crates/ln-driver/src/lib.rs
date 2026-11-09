@@ -30,8 +30,15 @@ pub struct Analysis {
     pub diags: Vec<Diagnostic>,
 }
 
-/// Parse and analyze `path` together with `core` and `std`.
+/// Parse and analyze `path` together with `core` and `std` for the host.
 pub fn analyze(path: &Path, test: bool) -> Analysis {
+    analyze_for(path, test, None)
+}
+
+/// Like [`analyze`], but evaluating `#[cfg]` for another OS (`linux`,
+/// `macos`, `windows`). Only useful for checking; code generation always
+/// targets the host.
+pub fn analyze_for(path: &Path, test: bool, target_os: Option<&str>) -> Analysis {
     let mut map = SourceMap::new();
     let mut diags = Vec::new();
     let mut ids = IdGen::new();
@@ -58,7 +65,12 @@ pub fn analyze(path: &Path, test: bool) -> Analysis {
     if diags.iter().any(|d| d.is_error()) {
         return Analysis { map, program: None, diags };
     }
-    let (program, mut d) = ln_sema::analyze(&crates, ln_sema::Options::host(test));
+    let mut opts = ln_sema::Options::host(test);
+    if let Some(os) = target_os {
+        opts.target_os = os.to_string();
+        opts.target_family = if os == "windows" { "windows" } else { "unix" }.to_string();
+    }
+    let (program, mut d) = ln_sema::analyze(&crates, opts);
     diags.append(&mut d);
     Analysis { map, program, diags }
 }
