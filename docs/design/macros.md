@@ -125,8 +125,28 @@ resolves where the macro is defined, whatever is in scope where it is used:
   macro's defining module, even if the caller shadows them, so no `$crate`
   is needed;
 * items the body defines under names written in the body are not
-  reachable from the caller. To create an item the caller can name, take
-  the name as a parameter (`$name:ident`).
+  reachable from the caller, unless the item is marked `#[export]`. To
+  create an item the caller can name, either mark it `#[export]` or take
+  its name as a parameter (`$name:ident`):
+
+```lunar
+pub macro tokens {
+    ($($name:ident $text:lit),*) => {
+        #[export]
+        pub enum Token { $($name),* }   // the caller can use `Token`
+
+        fn text(t: Token): str { ... }  // private to the expansion
+    },
+}
+
+tokens! { LParen "(", RParen ")" }
+let t = Token::LParen;   // fine
+// text(t)               // error: `text` is not visible here
+```
+
+  `#[export]` makes the item's own name resolve at the call site; names
+  inside the item (its fields, variants, and the paths in its body) keep
+  their def-site meaning.
 
 Names that come in through `$parameters` keep the caller's meaning.
 
