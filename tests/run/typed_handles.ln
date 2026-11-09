@@ -1,0 +1,26 @@
+// A recursive type through an index handle is not infinite: `Id::<Expr>`
+// stores a `u32`, whatever `Expr` is. The type parameter only labels it.
+
+struct Id::<T> {
+    index: u32,
+}
+
+enum Expr {
+    Int(i64),
+    Add(Id::<Expr>, Id::<Expr>),
+}
+
+fn eval(nodes: [Expr; &], e: Id::<Expr>): i64 {
+    return match nodes[e.index as usize] {
+        Expr::Int(v) => v,
+        Expr::Add(a, b) => eval(nodes, a) + eval(nodes, b),
+    };
+}
+
+fn main() {
+    let mut nodes: [Expr; -..+] = [];
+    nodes.push(Expr::Int(2));
+    nodes.push(Expr::Int(40));
+    nodes.push(Expr::Add(Id { index: 0 }, Id { index: 1 }));
+    println("{eval(nodes[..], Id { index: 2 })}");
+}

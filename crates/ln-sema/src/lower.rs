@@ -886,30 +886,34 @@ impl<'a> Sema<'a> {
         }
     }
 
+    /// Whether ADT `cur` stores a `root` inside itself, by value.
     fn adt_contains(&self, root: DefId, cur: DefId, seen: &mut Vec<DefId>) -> bool {
-        if seen.contains(&cur) {
-            return false;
-        }
-        seen.push(cur);
-        let DefData::Adt(a) = &self.p.defs[cur.0 as usize].data else { return false };
-        for v in &a.variants {
-            for f in &v.fields {
-                let mut found = false;
-                f.ty.walk(&mut |t| {
-                    if let Ty::Adt(d, _) = t {
-                        if *d == root || self.adt_contains(root, *d, &mut seen.clone()) {
-                            found = true;
-                        }
-                    }
-                });
-                // Owners and pointers break the cycle.
-                let through_indirection = matches!(f.ty, Ty::Array(_, k) if k.is_owner() || k.is_slice()) || matches!(f.ty, Ty::Ptr(..));
-                if found && !through_indirection {
+        self.contains_by_value(root, &Ty::Adt(cur, Vec::new()), seen, true)
+    }
+
+    /// Whether a value of type `ty` stores a `root` inside itself. Only what
+    /// is stored inline counts: fields (with the type's arguments
+    /// substituted, so `Id::<Expr>` holding a `u32` does not contain an
+    /// `Expr`), tuple elements and fixed-size array items. Owners, slices
+    /// and pointers break the cycle.
+    fn contains_by_value(&self, root: DefId, ty: &Ty, seen: &mut Vec<DefId>, top: bool) -> bool {
+        match ty {
+            Ty::Adt(d, args) => {
+                if *d == root && !top {
                     return true;
                 }
+                if seen.contains(d) {
+                    return false;
+                }
+                seen.push(*d);
+                let DefData::Adt(a) = &self.p.defs[d.0 as usize].data else { return false };
+                a.variants.iter().flat_map(|v| &v.fields).any(|f| self.contains_by_value(root, &f.ty.subst(args), seen, false))
             }
+            Ty::Tuple(ts) => ts.iter().any(|t| self.contains_by_value(root, t, seen, false)),
+            Ty::Array(e, k) if !(k.is_owner() || k.is_slice()) => self.contains_by_value(root, e, seen, false),
+            Ty::Bang(t) => self.contains_by_value(root, t, seen, false),
+            _ => false,
         }
-        false
     }
 
     /// Two impls of the same trait that can apply to the same type would make
