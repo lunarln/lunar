@@ -12,11 +12,8 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64): *mut u8;
     fn mprotect(addr: *mut u8, len: usize, prot: i32): i32;
     fn munmap(addr: *mut u8, len: usize): i32;
-    // `open` is variadic in C; it is only called without the mode argument,
-    // which is the same call as this declaration on every ABI. Creating a
-    // file needs the mode, so it goes through `creat` instead.
-    fn open(path: *u8, flags: i32): i32;
-    fn creat(path: *u8, mode: u32): i32;
+    // The mode (for `O_CREAT`) is a variadic argument.
+    fn open(path: *u8, flags: i32, ...): i32;
     fn close(fd: i32): i32;
     fn unlink(path: *u8): i32;
 }
@@ -41,6 +38,23 @@ pub fn last_error(): i32 {
     return unsafe { intrinsics::ptr_read(__errno_location() as *i32) };
 }
 
+const O_RDONLY: i32 = 0;
+const O_WRONLY: i32 = 1;
+
+#[cfg(target_os = "macos")]
+const O_CREAT: i32 = 512;
+#[cfg(target_os = "macos")]
+const O_TRUNC: i32 = 1024;
+#[cfg(target_os = "macos")]
+const O_CLOEXEC: i32 = 16777216;
+
+#[cfg(not(target_os = "macos"))]
+const O_CREAT: i32 = 64;
+#[cfg(not(target_os = "macos"))]
+const O_TRUNC: i32 = 512;
+#[cfg(not(target_os = "macos"))]
+const O_CLOEXEC: i32 = 524288;
+
 const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
 const EINTR: i32 = 4;
@@ -61,8 +75,13 @@ pub fn error_kind(code: i32): crater::io::ErrorKind {
 pub fn open_file(path: str, write: bool): isize {
     let c = c_path(path);
     let p = c.as_bytes().as_ptr();
-    // 0o644: rw-r--r--, less the umask.
-    let fd = if write { unsafe { creat(p, 420) } } else { unsafe { open(p, 0) } };
+    let fd = if write {
+        // 0o644: rw-r--r--, less the umask.
+        let mode: u32 = 420;
+        unsafe { open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode) }
+    } else {
+        unsafe { open(p, O_RDONLY | O_CLOEXEC) }
+    };
     return fd as isize;
 }
 
