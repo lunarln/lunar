@@ -32,6 +32,7 @@ pub mod ty {
     c!(ARRAY_POINTY_ITEMS = "array_pointy_items");
     c!(BANG_OUTSIDE_PARAM = "bang_outside_param");
     c!(BANG_NOT_SHRINKABLE = "bang_not_shrinkable");
+    c!(BANG_WITHOUT_MUT = "bang_without_mut");
     c!(FMTARGS_OUTSIDE_PARAM = "fmtargs_outside_param");
     c!(ANNOTATIONS_NEEDED = "annotations_needed");
     c!(NOT_CALLABLE = "not_callable");

@@ -1,0 +1,10 @@
+// error: type::bang_without_mut
+fn f(s: ![i32; -..+]) {
+    let _ = s.len();
+}
+
+fn main() {
+    let mut a: [i32; -..+] = [1];
+    f(a);
+    a.push(2);
+}

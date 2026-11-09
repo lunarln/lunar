@@ -70,7 +70,7 @@ Struct fields are private unless `pub`.
 | `[T; ..+]` | owning array that can grow but never shrinks |
 | `[T; -..+]` | owning array that can grow and shrink |
 | `[T; &]`, `[T; &mut]` | read-only / mutable slices (views) |
-| `![T; -..+]` | parameter only: the argument may be shrunk |
+| `!T` | `mut` parameters and receivers only, where `T` contains something shrinkable (`[U; -..+]`, `String`, or a type containing one): the argument may be shrunk (see §4) |
 | `str` | UTF-8 view (like Rust's `&str`) |
 | `String` | owned UTF-8 text (a `[u8; -..+]` with a UTF-8 invariant) |
 | `FmtArgs` | parameter only: an interpolated string literal |
@@ -104,20 +104,38 @@ reserved address space whose pages are committed as the array grows.
 
 * **Growing never moves elements.** Slices taken from a `[T; ..+]` stay
   valid after any number of `push`es.
-* **Shrinking can invalidate slices.** Functions that may shrink an array
-  take it as `![T; -..+]`. Passing an array to a `!` parameter is only
-  allowed:
-  * for the array's **owner** (a local variable, or a parameter that is
+* **Shrinking can invalidate slices.** A function that may shrink its
+  argument takes it as `!T`, where `T` is `[U; -..+]`, `String`, or any
+  struct, enum or tuple containing one at any depth:
+
+  ```lunar
+  fn clear_all(mut a: ![i32; -..+]) { ... }
+  fn drain(mut s: !Stack): i32 { ... }      // struct Stack { items: [i32; -..+] }
+
+  impl Stack {
+      fn pop(mut self: !Self): Option::<i32> { ... }   // a shrinking method
+  }
+  ```
+
+  Methods that may shrink their receiver declare it `mut self: !Self`, as
+  `pop`, `truncate` and `clear` on `[T; -..+]` and `String` do. Calling
+  such a method follows the same rules as passing the receiver to a `!`
+  parameter.
+* `!` always comes with `mut`: shrinking is mutation, so a `!` parameter
+  without `mut` is `err(type::bang_without_mut)`. A `!` on a type with
+  nothing shrinkable in it is `err(type::bang_not_shrinkable)`.
+* Passing a value to a `!` parameter (or calling a `!Self` method on it) is
+  only allowed:
+  * for the value's **owner** (a local variable, or a parameter that is
     itself declared `!`): `err(borrow::shrink_not_owner)` otherwise;
-  * when **no live slice** points into the array: the compiler's liveness
+  * when **no live view** points into the value: the compiler's liveness
     analysis reports `err(borrow::shrink_while_borrowed)` if a view is used
     after the shrink.
-* A `!` array can be passed anywhere a plain array is expected.
-* `!` also applies to `String` and to any struct, enum or tuple that
-  contains something shrinkable, at any depth: `fn drain(mut s: !Stack)`
-  for `struct Stack { items: [i32; -..+] }`. A `!` on a type with nothing
-  shrinkable in it is `err(type::bang_not_shrinkable)`, and a view into
-  any field counts as a view into the whole value.
+* A `!T` can be passed anywhere a plain `T` is expected.
+* Views are tracked per variable, not per field: a view into any part of a
+  value blocks shrinking the whole value, even a disjoint field (a slice of
+  `stack.name` blocks `drain(stack)`). This is conservative but sound;
+  tracking disjoint fields separately is planned.
 * Owners are freed when they go out of scope (also on `return`, `break`,
   `continue`). Moving out of a variable makes it unusable
   (`err(borrow::use_after_move)`).
@@ -183,7 +201,7 @@ inside `unsafe { ... }`:
 * `err(unsafe::outside_unsafe)`: the operation is outside any unsafe block.
 * `err(unsafe::in_unsafe_fn)`: the operation is inside an `unsafe fn` but
   not in an `unsafe` block. Marking a function `unsafe` only makes it unsafe
-  to call; it is not a hard-to-notice warning, it is an error.
+  to call; its body gets no implicit unsafe context.
 
 ## 7. Traits
 

@@ -449,6 +449,15 @@ impl<'a> Sema<'a> {
             if is_extern {
                 self.check_ffi_ty(&ty, p.span);
             }
+            if matches!(ty, Ty::Bang(_)) && !p.is_mut {
+                let what = if is_self { "self".to_string() } else { pname.clone() };
+                self.err(
+                    Diagnostic::error(tyc::BANG_WITHOUT_MUT, p.span, format!("`!` parameter `{what}` is not `mut`"))
+                        .with_label("this function could never shrink it")
+                        .with_note("`!` marks an argument the function may shrink, and shrinking is mutation")
+                        .with_help(format!("declare it `mut {what}`")),
+                );
+            }
             params.push(Param { name: pname, ty, inout: p.is_mut, is_self, span: p.span });
         }
         let (ret, ret_span) = match &f.ret {

@@ -31,9 +31,11 @@ fn main() {
 * **Array kinds**: `[T; 4]` (inline), `[T; _]` (inferred length), `[T]`
   (sized once, then frozen), `[T; ..+]` (grow-only), `[T; -..+]` (grow and
   shrink), `[T; &]` / `[T; &mut]` (slices).
-* **`!` parameters**: functions that may shrink an array take `![T; -..+]`.
-  Only the array's owner can make that conversion, and only while no live
-  slice points into it. The compiler checks this.
+* **`!` parameters**: functions that may shrink a value take it as
+  `mut x: !T` (`![i32; -..+]`, `!String`, or a struct containing one), and
+  shrinking methods take `mut self: !Self`. Only the owner can make that
+  conversion, and only while no live view points into it. The compiler
+  checks this.
 * **`Dull`**: a compiler-implemented trait for types without pointers or
   arrays. Only Dull types can be array items:
   `err(type::array_pointy_items)`.
