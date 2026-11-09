@@ -6,6 +6,8 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod explain;
+
 #[derive(Parser)]
 #[command(name = "lunar", version, about = "The Lunar programming language compiler")]
 struct Cli {
@@ -65,6 +67,15 @@ enum Cmd {
         #[arg(long)]
         release: bool,
     },
+    /// Explain a diagnostic code, e.g. `borrow::shrink_while_borrowed`.
+    Explain {
+        /// The code, as `scope::name` or pasted as `err(scope::name)`.
+        /// Without one, list every code.
+        code: Option<String>,
+        /// List every code with a one-line summary.
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -117,6 +128,7 @@ fn main() -> ExitCode {
             }
         }
         Cmd::Test { file, filter, release } => run_tests(&file, filter.as_deref(), release, color),
+        Cmd::Explain { code, list } => explain::run(code.as_deref(), list),
     }
 }
 
@@ -126,6 +138,9 @@ fn finish_front(a: &Analysis, color: bool) -> Result<(), ()> {
     let errors = a.diags.iter().filter(|d| d.is_error()).count();
     if errors > 0 || a.program.is_none() {
         eprintln!("error: could not compile due to {errors} previous error{}", if errors == 1 { "" } else { "s" });
+        if let Some(hint) = explain::hint(&a.diags) {
+            eprintln!("\n{hint}");
+        }
         return Err(());
     }
     Ok(())
