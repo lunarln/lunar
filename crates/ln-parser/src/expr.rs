@@ -649,7 +649,18 @@ impl P<'_, '_, '_> {
                 let pat = self.pat()?;
                 let guard = if self.k.eat(T::If) { Some(self.expr()?) } else { None };
                 self.k.expect(T::FatArrow)?;
-                let body = self.expr()?;
+                // A block-like body ends the arm, as a block-like statement
+                // ends a statement: `X => { .. } (a, b) => ..` is two arms,
+                // not a call. `.`, `?` and `as` still continue it.
+                let body_start = self.start();
+                let block_start = matches!(self.k.peek(), Some(T::If | T::Match | T::While | T::Loop | T::For | T::LBrace))
+                    || (self.k.at(T::Unsafe) && self.k.nth_at(1, T::LBrace));
+                let body = if block_start {
+                    let e = self.primary(Restr::default())?;
+                    if self.k.at(T::Dot) || self.k.at(T::Question) || self.k.at(T::As) { self.continue_expr(e, body_start)? } else { e }
+                } else {
+                    self.expr()?
+                };
                 Ok(Arm { pat, guard, body, span: self.span_from(start) })
             })();
             match arm {
