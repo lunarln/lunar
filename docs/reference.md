@@ -308,12 +308,14 @@ points into the caller's data and may be returned:
 
 #### What a returned view points into
 
-Which arguments a call's result may point into is inferred from the body of
-the function called, not from its signature. Here the result points into
-`x` only, so `y` may change or move while it is in use:
+Which arguments a call's result may point into is part of the called
+function's signature, like `kept`: callers are checked against the
+signature, never the body, so changing a body cannot break them. A `from`
+clause after the return type names the parameters (or `self`). Here the
+result points into `x` only, so `y` may change or move while it is in use:
 
 ```lunar
-fn first(a: &String, b: &String): str {
+fn first(a: &String, b: &String): str from a {
     if b.len() > 3 { return a.as_str()[1..]; }
     return a.as_str();
 }
@@ -324,37 +326,47 @@ x.clear();               // err(borrow::shrink_while_borrowed)
 println("{v}");
 ```
 
-* Every value the body returns counts: its tail, its `return`s, and through
-  them the `break`s of loops and the arms of `if` and `match`. A view into
-  a borrowed (or in-out) parameter's own data points into that argument. A
-  view the parameter holds (a `str` argument, an item of a
-  `&[str; ..+]`, a `str` field of `&self`) points wherever the argument's
-  views point, so the argument itself may still be changed:
-  `fn rest(&self): str { return self.src[self.pos..]; }` leaves `self` free
-  to change while the result is in use.
-* Recursive and mutually recursive functions get the smallest answer that
-  agrees with all their bodies.
-* Closures are inferred the same way. Calling one gives a view into a
-  variable it borrows only if its body returns one, so a closure may
-  capture a borrowed parameter and return a view of it
+* A parameter can be named if a view could come from it: a borrowed one
+  (`&T`, `&mut T`, `&self`, ...), or one that holds views itself (a `str`,
+  a slice, a struct holding one, a generic `T` not bounded by `Dull`).
+  Naming another, or giving a `from` clause to a function whose return
+  type holds no views, is `err(type::from_without_views)`.
+* `from static` says the result points into no parameter, only into
+  static data such as string literals:
+  `fn kind(a: &String, b: &String): str from static`.
+* Without a clause, a method that borrows its receiver (`&self`, `&mut
+  self`, `&mut +self`) returns views into `self` only, whatever its other
+  parameters. Any other function returns views into every parameter a view
+  could come from; with just one, that is the one. A return type that
+  holds no views needs nothing.
+* The body is checked against the signature: every value it returns (its
+  tail, its `return`s, and through them the `break`s of loops and the arms
+  of `if` and `match`) may point only into the parameters declared, or
+  `err(borrow::escapes_via_return)`.
+* At a call, a result may point into the declared arguments' own data
+  (and wherever their views point). A function whose declared return type
+  has no view of its own (`pop(&mut self): Option::<T>`) never points into
+  its arguments' own data, only where their items point.
+* A trait method's clause is part of the trait: a call on a generic
+  receiver (`t.name()` with `T: Named`) uses the trait's, and a call on a
+  concrete type the implementation's (or the default body's). An
+  implementation may point into no more than the trait declares
+  (`err(trait::signature)`).
+* Calls through function pointers may point into every argument; their
+  types have no `from` clause.
+* Closures are not part of any signature, so a closure's result is
+  inferred from its body. Calling one gives a view into a variable it
+  borrows only if its body returns one, so a closure may capture a
+  borrowed parameter and return a view of it
   (`let tail = |i: usize| s.as_str()[i..];`), and a result that does not
-  come from an argument does not borrow it.
-* Where there is no body to look at, the result may point into every
-  argument (and, for a closure, everything it borrows): calls through
-  function pointers, trait methods on a generic receiver (`t.name()` with
-  `T: Named`, whatever implementations exist; on a concrete type, the
-  implementation's body is used, or the trait's default body), closures
-  whose type is not known (a parameter `f: F` with `F: Fn(): str`),
-  `extern` functions and intrinsics, and functions that make views from raw
-  pointers. A generic function's body is inferred once, for all
-  instantiations.
-* A function whose declared return type has no view of its own
-  (`pop(&mut self): Option::<T>`) never points into its arguments' own
-  data, only where their items point.
+  come from an argument does not borrow it. A closure whose type is not
+  known (a parameter `f: F` with `F: Fn(): str`) may return a view into
+  everything it borrows.
 
-`kept` is never inferred: it is part of the signature. When a borrow error
-comes from an inferred result, it points at the argument: "the value
-returned by `first` points into `x`".
+When a borrow error comes from a call's result, it points at the argument:
+"the value returned by `first` points into `x`". `from` is a word only
+after a return type: functions, methods and parameters may still be named
+`from`.
 
 Function pointer types record each parameter's mode, written as in
 signatures: `fn(&String): usize`, `fn(&mut i32)`, `fn(String): usize`. A

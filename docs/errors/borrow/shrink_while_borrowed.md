@@ -24,10 +24,11 @@ by lending the whole struct.
 The same error is reported when one argument of a call may shrink a value
 that another argument of the same call points into.
 
-A view returned by a function points into the arguments that the
-function's body returns views of (and, through a function pointer or a
-trait method on a generic receiver, into all of them). When the view comes
-from what a function's body returns, the error also points at that
+A view returned by a function points into the arguments its signature
+says (its `from` clause; without one, `self` for a method that borrows it,
+else every argument it could point into), and a closure's into what its
+body returns views of (through a function pointer, into every argument).
+When the view comes from a call's result, the error also points at that
 argument: "the value returned by `f` points into `x`".
 
 ## Erroneous example
