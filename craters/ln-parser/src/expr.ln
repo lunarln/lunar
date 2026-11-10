@@ -181,7 +181,7 @@ impl Parser {
                         let s = self.start();
                         let mut m = String::new();
                         m.write("comparison operators cannot be chained (`{b2.op.as_str()}` after `{b.op.as_str()}`)");
-                        self.diag(Code::UnexpectedToken, Span::new(s, s + 1), m.as_str());
+                        self.diag_with(Code::UnexpectedToken, Span::new(s, s + 1), m.as_str(), None, Some("split the comparison with `&&`, e.g. `a < b && b < c`"));
                     }
                 }
             }
@@ -704,7 +704,7 @@ impl Parser {
         if ex.kind.is_block_like() {
             return Ok(StmtOrTail::Stmt(Stmt { kind: StmtKind::Expr(e), span: self.span_from(start) }));
         }
-        self.diag(Code::MissingSemi, ex.span.shrink_to_hi(), "expected `;` after expression");
+        self.diag_with(Code::MissingSemi, ex.span.shrink_to_hi(), "expected `;` after expression", Some("add `;` here"), None);
         return Ok(StmtOrTail::Stmt(Stmt { kind: StmtKind::Expr(e), span: self.span_from(start) }));
     }
 
@@ -713,7 +713,7 @@ impl Parser {
             return Ok(());
         }
         let at = self.prev_end();
-        self.diag(Code::MissingSemi, Span::new(at, at), "expected `;`");
+        self.diag_with(Code::MissingSemi, Span::new(at, at), "expected `;`", Some("add `;` here"), None);
         return Ok(());
     }
 }

@@ -42,6 +42,21 @@ pub fn env(name: *u8): *u8 {
 }
 
 extern "C" {
+    fn isatty(fd: i32): i32;
+}
+
+/// Whether `fd` is a terminal.
+pub fn is_terminal(fd: i32): bool {
+    return unsafe { isatty(fd) } != 0;
+}
+
+/// Whether ANSI escape codes written to `fd` show as colors: Unix
+/// terminals interpret them.
+pub fn enable_ansi(fd: i32): bool {
+    return is_terminal(fd);
+}
+
+extern "C" {
     #[link_name = "write"]
     fn c_write(fd: i32, buf: *u8, n: usize): isize;
     #[link_name = "read"]

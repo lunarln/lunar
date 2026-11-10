@@ -290,6 +290,9 @@ pub fn begin_syntax(p: &mut Program, d: Diag) {
     if let Some(l) = d.label {
         p.diags.label(l);
     }
+    if let Some(h) = d.help {
+        p.diags.help(h);
+    }
     if p.text(d.message) == "unterminated block comment" {
         let l = p.sym("this comment is never closed");
         p.diags.label(l);

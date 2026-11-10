@@ -1,102 +1,188 @@
-// Rendering diagnostics as text (the Rust compiler uses ariadne; this is a
-// plainer layout with the same header):
+// Rendering diagnostics: the glue between `Diags` and ln-ariadne, as
+// crates/ln-diag/src/render.rs drives ariadne. With color off the text is
+// the Rust compiler's, byte for byte:
 //
-//     err(type::mismatch): mismatched types
-//       --> src/main.ln:3:9
-//        |
-//      3 |     let x: i32 = "a";
-//        |                  ^^^ expected `i32`, found `str`
-//        = note: ...
-//        = help: ...
+//     err(type::mismatch): mismatched types: expected `i32`, found `str`
+//        ╭─[ src/main.ln:3:18 ]
+//        │
+//      3 │     let x: i32 = "nope";
+//        │                  ───┬──
+//        │                     ╰──── expected `i32`
+//     ───╯
+//
+// With color on, the quoted code is syntax highlighted (`highlight.ln`)
+// and the frame is drawn in the colors of `theme()`.
 
 use crater::diag::{Diag, Severity, is_dummy};
+use crater::highlight::LunarHighlighter;
 use crater::program::Program;
-use ln_ast::Span;
+use ln_ariadne::{Color, Config, IndexType, Label, Out, Report, ReportKind, Sources, SrcId, Style, Theme};
+use ln_ariadne::source::trim_end;
 
-/// `d` as text, ending in a newline.
-pub fn render(p: &Program, d: Diag, out: &mut +String) {
-    let word = if d.severity == Severity::Error { "err" } else { "warn" };
-    out.write("{word}({d.code.scope}::{d.code.name}): {p.text(d.message)}\n");
-    if !is_dummy(d.span) {
-        let span = p.source_span(d.span);
-        let label = match d.label {
-            Some(l) => p.text(l),
-            None => "",
-        };
-        excerpt(p, span, label, true, out);
+/// Renders a program's diagnostics. A file is copied into ariadne's
+/// `Sources` (and highlighted, with color on) when a diagnostic first
+/// needs it.
+pub struct Renderer {
+    color: bool,
+    srcs: Sources,
+    /// For each file of the program: its id in `srcs`, plus one (0: not
+    /// added yet).
+    ids: [u32; ..+],
+}
+
+impl Renderer {
+    pub fn new(color: bool): Renderer {
+        return Renderer { color, srcs: Sources::new(), ids: [] };
+    }
+
+    /// `d` as text, onto `out`.
+    pub fn render(&mut +self, p: &Program, d: Diag, out: &mut +String) {
+        let error = d.severity == Severity::Error;
+        let c = if error { Color::Red } else { Color::Yellow };
+        let mut head = String::new();
+        head.write("{if error { "err" } else { "warn" }}({d.code.scope}::{d.code.name})");
+        let mut notes: [str; ..+] = [];
+        for n in p.diags.texts.list(d.notes) {
+            notes.push(p.text(n));
+        }
+        let mut helps: [str; ..+] = [];
+        for h in p.diags.texts.list(d.helps) {
+            helps.push(p.text(h));
+        }
+        if is_dummy(d.span) {
+            message(head.as_str(), c, p.text(d.message), notes[..], helps[..], self.color, out);
+            return;
+        }
+
+        // The sources first: building the report needs their ids.
+        let (src, start, end) = self.locate(p, d.span);
+        let mut secondary: [(SrcId, usize, usize, str); ..+] = [];
         for l in p.diags.labels.list(d.labels) {
             if !is_dummy(l.span) {
-                excerpt(p, p.source_span(l.span), p.text(l.message), false, out);
+                let (s, a, b) = self.locate(p, l.span);
+                secondary.push((s, a, b, p.text(l.message)));
             }
         }
-    }
-    for n in p.diags.texts.list(d.notes) {
-        note(out, "note", p.text(n));
-    }
-    for h in p.diags.texts.list(d.helps) {
-        note(out, "help", p.text(h));
-    }
-}
 
-/// A `note:` or `help:` line; later lines of a multi-line text are
-/// indented under it.
-fn note(out: &mut +String, kind: str, text: str) {
-    let mut first = true;
-    for line in text.lines() {
-        if first {
-            out.write("   = {kind}: {line}\n");
-            first = false;
-        } else {
-            out.write("     {line}\n");
+        let config = Config::new().with_index_type(IndexType::Byte).with_color(self.color).with_theme(theme());
+        let mut r = Report::build(ReportKind::Custom(head.as_str(), c), src, start, end).with_config(config).with_message(p.text(d.message));
+        // Ariadne only underlines labels that carry a message.
+        let primary = match d.label {
+            Some(l) => p.text(l),
+            None => "here",
+        };
+        r.add_label(Label::new(src, start, end).with_color(c).with_message(primary));
+        for k in 0..secondary.len() {
+            let (s, a, b, m) = secondary[k];
+            r.add_label(Label::new(s, a, b).with_message(m).with_color(secondary_color(self.color)));
         }
+        for k in 0..notes.len() {
+            r.add_note(notes[k]);
+        }
+        for k in 0..helps.len() {
+            r.add_help(helps[k]);
+        }
+        let mut o = Out::new(self.color);
+        r.write(&self.srcs, &mut o);
+        out.push_str(o.text.as_str());
+    }
+
+    /// The source holding `span` and the span's byte range in it.
+    fn locate(&mut +self, p: &Program, span: ln_ast::Span): (SrcId, usize, usize) {
+        let file = p.sources.file_of(span.lo);
+        let f = p.sources.files[file as usize];
+        while self.ids.len() < p.sources.files.len() {
+            self.ids.push(0);
+        }
+        if self.ids[file as usize] == 0 {
+            let name = p.text(f.name);
+            let text = p.sources.file_text(file);
+            let id = if self.color {
+                let mut h = LunarHighlighter::new();
+                self.srcs.add_highlighted(name, text, &mut h)
+            } else {
+                self.srcs.add(name, text)
+            };
+            self.ids[file as usize] = id.index() as u32 + 1;
+        }
+        let id = SrcId::from_index(self.ids[file as usize] as usize - 1);
+        return (id, (span.lo - f.start) as usize, (span.hi - f.start) as usize);
     }
 }
 
-/// The file position, the source line, and a marker under the span.
-fn excerpt(p: &Program, span: Span, label: str, primary: bool, out: &mut +String) {
-    let file = p.sources.files[p.sources.file_of(span.lo) as usize];
-    let (line, col) = p.sources.line_col(span.lo);
-    out.write("  --> {p.text(file.name)}:{line}:{col}\n");
-    // The text of the line holding the span's start.
-    let text = p.sources.text.as_str();
-    let start = file.start as usize;
-    let end = (file.start + file.len) as usize;
-    let mut ls = span.lo as usize;
-    while ls > start && text.as_bytes()[ls - 1] != b'\n' {
-        ls -= 1;
+/// Every diagnostic of `p`, rendered.
+pub fn render_all(p: &Program, color: bool, out: &mut +String) {
+    let mut r = Renderer::new(color);
+    for d in p.diags.list {
+        r.render(p, d, out);
     }
-    let mut le = span.lo as usize;
-    while le < end && text.as_bytes()[le] != b'\n' && text.as_bytes()[le] != b'\r' {
-        le += 1;
-    }
-    let mut gutter = String::new();
-    gutter.write("{line}");
-    let pad = gutter.len();
-    spaces(out, pad + 1);
-    out.push_str("|\n");
-    out.write(" {line} | {text[ls..le]}\n");
-    spaces(out, pad + 1);
-    out.push_str("| ");
-    spaces(out, (col - 1) as usize);
-    let hi = if span.hi as usize > le { le } else { span.hi as usize };
-    let mut width: usize = 0;
-    for _ in text[span.lo as usize..if hi > span.lo as usize { hi } else { span.lo as usize }].chars() {
-        width += 1;
-    }
-    if width == 0 {
-        width = 1;
-    }
-    for _ in 0..width {
-        out.push(if primary { '^' } else { '-' });
-    }
-    if label.len() > 0 {
-        out.write(" {label}");
-    }
-    out.push('\n');
 }
 
-fn spaces(out: &mut +String, n: usize) {
-    for _ in 0..n {
-        out.push(' ');
+/// Secondary labels are blue; in color, the bright blue, which reads
+/// better on dark backgrounds.
+fn secondary_color(color: bool): Color {
+    return if color { Color::BrightBlue } else { Color::Blue };
+}
+
+/// A diagnostic that is not about a place in the source (a missing
+/// `main`, a linker failure, ...), from its header (`err(build::link)`):
+/// the header line as ariadne would print it, then its notes and helps.
+/// Multi-line text, such as a linker's output, is indented under its
+/// `note:` / `help:` prefix.
+pub fn message(head: str, c: Color, msg: str, notes: [str; &], helps: [str; &], color: bool, out: &mut +String) {
+    let t = theme();
+    let mut o = Out::new(color);
+    let mut h = String::from(head);
+    h.push(':');
+    o.paint(Some(t.kind.with_fg(c)), h.as_str());
+    o.plain(" ");
+    o.paint(Some(t.message), msg);
+    o.newline();
+    for i in 0..notes.len() + helps.len() {
+        let (kind, text, style) = if i < notes.len() { ("note", notes[i], t.note) } else { ("help", helps[i - notes.len()], t.help) };
+        o.plain("  ");
+        o.paint(Some(style), kind);
+        o.plain(": ");
+        let mut first = true;
+        for line in trim_end(text).lines() {
+            if !first {
+                o.newline();
+                for _ in 0..kind.len() + 4 {
+                    o.plain(" ");
+                }
+            }
+            o.plain(line);
+            first = false;
+        }
+        o.newline();
     }
+    out.push_str(o.text.as_str());
+}
+
+/// A diagnostic without a place in the source, from its severity and code
+/// (`build::link`).
+pub fn plain_message(severity: Severity, code: str, msg: str, notes: [str; &], helps: [str; &], color: bool, out: &mut +String) {
+    let error = severity == Severity::Error;
+    let mut head = String::new();
+    head.write("{if error { "err" } else { "warn" }}({code})");
+    message(head.as_str(), if error { Color::Red } else { Color::Yellow }, msg, notes, helps, color, out);
+}
+
+/// How diagnostics look in color: bold headers in the kind's color, a
+/// dimmed frame, labels and their messages in their color, notes in cyan
+/// and helps in green.
+pub fn theme(): Theme {
+    let mut t = Theme::ariadne();
+    t.kind = Style::plain().bold();
+    t.error = Style::fg(Color::Red).bold();
+    t.warning = Style::fg(Color::Yellow).bold();
+    t.message = Style::plain().bold();
+    t.margin = Style::fg(Color::Fixed(244));
+    t.skipped_margin = Style::fg(Color::Fixed(240));
+    t.location = Style::plain();
+    t.note = Style::fg(Color::Cyan).bold();
+    t.help = Style::fg(Color::Green).bold();
+    t.label_bold = true;
+    t.color_label_messages = true;
+    return t;
 }

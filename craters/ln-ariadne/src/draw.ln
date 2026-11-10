@@ -1,0 +1,337 @@
+// Drawing: the box-drawing characters of a character set, terminal colors
+// and styles, and `Out`, the text being written with as few escape codes
+// as it needs (ariadne's `draw.rs`, with yansi's colors).
+
+/// The characters a report is drawn with.
+pub struct Characters {
+    pub hbar: char,
+    pub vbar: char,
+    pub xbar: char,
+    pub vbar_break: char,
+    pub vbar_gap: char,
+
+    pub uarrow: char,
+    pub rarrow: char,
+
+    pub ltop: char,
+    pub mtop: char,
+    pub rtop: char,
+    pub lbot: char,
+    pub rbot: char,
+    pub mbot: char,
+
+    pub lbox: char,
+    pub rbox: char,
+
+    pub lcross: char,
+    pub rcross: char,
+
+    pub underbar: char,
+    pub underline: char,
+}
+
+impl Characters {
+    pub fn unicode(): Characters {
+        return Characters {
+            hbar: '─',
+            vbar: '│',
+            xbar: '┼',
+            vbar_break: '┆',
+            vbar_gap: '┆',
+            uarrow: '▲',
+            rarrow: '▶',
+            ltop: '╭',
+            mtop: '┬',
+            rtop: '╮',
+            lbot: '╰',
+            mbot: '┴',
+            rbot: '╯',
+            lbox: '[',
+            rbox: ']',
+            lcross: '├',
+            rcross: '┤',
+            underbar: '┬',
+            underline: '─',
+        };
+    }
+
+    pub fn ascii(): Characters {
+        return Characters {
+            hbar: '-',
+            vbar: '|',
+            xbar: '+',
+            vbar_break: '*',
+            vbar_gap: ':',
+            uarrow: '^',
+            rarrow: '>',
+            ltop: ',',
+            mtop: 'v',
+            rtop: '.',
+            lbot: '`',
+            mbot: '^',
+            rbot: '\'',
+            lbox: '[',
+            rbox: ']',
+            lcross: '|',
+            rcross: '|',
+            underbar: '|',
+            underline: '^',
+        };
+    }
+}
+
+/// A terminal color: one of the eight basic colors, their bright
+/// variants, one of the 256 colors of the extended palette, or a 24-bit
+/// color.
+#[derive(Eq, Debug)]
+pub enum Color {
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+    BrightBlack,
+    BrightRed,
+    BrightGreen,
+    BrightYellow,
+    BrightBlue,
+    BrightMagenta,
+    BrightCyan,
+    BrightWhite,
+    Fixed(u8),
+    Rgb(u8, u8, u8),
+}
+
+impl Color {
+    /// The SGR parameters that make this the foreground color.
+    fn write_fg(self, out: &mut +String) {
+        let basic: u32 = match self {
+            Color::Black => 30,
+            Color::Red => 31,
+            Color::Green => 32,
+            Color::Yellow => 33,
+            Color::Blue => 34,
+            Color::Magenta => 35,
+            Color::Cyan => 36,
+            Color::White => 37,
+            Color::BrightBlack => 90,
+            Color::BrightRed => 91,
+            Color::BrightGreen => 92,
+            Color::BrightYellow => 93,
+            Color::BrightBlue => 94,
+            Color::BrightMagenta => 95,
+            Color::BrightCyan => 96,
+            Color::BrightWhite => 97,
+            Color::Fixed(n) => {
+                out.write("38;5;{n}");
+                return;
+            }
+            Color::Rgb(r, g, b) => {
+                out.write("38;2;{r};{g};{b}");
+                return;
+            }
+        };
+        out.write("{basic}");
+    }
+}
+
+/// How text is drawn: a foreground color and attributes.
+#[derive(Eq, Debug)]
+pub struct Style {
+    pub fg: Option::<Color>,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+}
+
+impl Style {
+    /// No color, no attributes.
+    pub fn plain(): Style {
+        return Style { fg: None, bold: false, dim: false, italic: false, underline: false };
+    }
+
+    /// Text in color `c`.
+    pub fn fg(c: Color): Style {
+        let mut s = Style::plain();
+        s.fg = Some(c);
+        return s;
+    }
+
+    /// Text in color `c`, if there is one.
+    pub fn color(c: Option::<Color>): Style {
+        let mut s = Style::plain();
+        s.fg = c;
+        return s;
+    }
+
+    pub fn bold(self): Style {
+        let mut s = self;
+        s.bold = true;
+        return s;
+    }
+
+    pub fn dim(self): Style {
+        let mut s = self;
+        s.dim = true;
+        return s;
+    }
+
+    pub fn italic(self): Style {
+        let mut s = self;
+        s.italic = true;
+        return s;
+    }
+
+    pub fn underline(self): Style {
+        let mut s = self;
+        s.underline = true;
+        return s;
+    }
+
+    /// This style with the foreground color `c`.
+    pub fn with_fg(self, c: Color): Style {
+        let mut s = self;
+        s.fg = Some(c);
+        return s;
+    }
+
+    pub fn is_plain(self): bool {
+        return self.fg.is_none() && !self.bold && !self.dim && !self.italic && !self.underline;
+    }
+
+    /// The escape sequence that switches from plain text to this style.
+    fn write_sgr(self, out: &mut +String) {
+        out.push_str("\x1b[");
+        let mut first = true;
+        if self.bold {
+            out.push_str("1");
+            first = false;
+        }
+        if self.dim {
+            out.push_str(if first { "2" } else { ";2" });
+            first = false;
+        }
+        if self.italic {
+            out.push_str(if first { "3" } else { ";3" });
+            first = false;
+        }
+        if self.underline {
+            out.push_str(if first { "4" } else { ";4" });
+            first = false;
+        }
+        if let Some(c) = self.fg {
+            if !first {
+                out.push(';');
+            }
+            c.write_fg(out);
+        }
+        out.push('m');
+    }
+}
+
+/// Text being written, in color or not. With color off, styles are
+/// ignored and no escape codes are written. With color on, a style's
+/// escape code is written only where the style changes, and every line
+/// ends in plain text.
+pub struct Out {
+    pub text: String,
+    color: bool,
+    cur: Style,
+}
+
+impl Out {
+    pub fn new(color: bool): Out {
+        return Out { text: String::new(), color, cur: Style::plain() };
+    }
+
+    pub fn color(&self): bool {
+        return self.color;
+    }
+
+    /// Switch to `style` (plain if `None`).
+    pub fn set(&mut +self, style: Option::<Style>) {
+        if !self.color {
+            return;
+        }
+        let s = match style {
+            Some(s) => s,
+            None => Style::plain(),
+        };
+        if s == self.cur {
+            return;
+        }
+        if !self.cur.is_plain() {
+            self.text.push_str("\x1b[0m");
+        }
+        if !s.is_plain() {
+            s.write_sgr(&mut self.text);
+        }
+        self.cur = s;
+    }
+
+    /// Write `s` in `style`.
+    pub fn paint(&mut +self, style: Option::<Style>, s: str) {
+        if s.len() == 0 {
+            return;
+        }
+        let mut spaces = true;
+        for b in s.as_bytes() {
+            if b != b' ' {
+                spaces = false;
+            }
+        }
+        if spaces {
+            self.set_for(style, ' ');
+        } else {
+            self.set(style);
+        }
+        self.text.push_str(s);
+    }
+
+    /// Write `c` in `style`.
+    pub fn paint_char(&mut +self, style: Option::<Style>, c: char) {
+        self.set_for(style, c);
+        self.text.push(c);
+    }
+
+    /// Write `c` in `style`, `n` times.
+    pub fn repeat(&mut +self, style: Option::<Style>, c: char, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.set_for(style, c);
+        for _ in 0..n {
+            self.text.push(c);
+        }
+    }
+
+    /// Switch to `style` for writing `c`. A space looks the same in any
+    /// style without an underline, so it keeps the current one.
+    fn set_for(&mut +self, style: Option::<Style>, c: char) {
+        if c == ' ' && !self.cur.underline {
+            let under = match style {
+                Some(s) => s.underline,
+                None => false,
+            };
+            if !under {
+                return;
+            }
+        }
+        self.set(style);
+    }
+
+    /// Write plain text.
+    pub fn plain(&mut +self, s: str) {
+        self.paint(None, s);
+    }
+
+    /// End the line.
+    pub fn newline(&mut +self) {
+        self.set(None);
+        self.text.push('\n');
+    }
+}

@@ -253,7 +253,9 @@ impl<'a> Sema<'a> {
         d
     }
 
-    /// Edit-distance based suggestion from the module scope.
+    /// Edit-distance based suggestion from the module scope: the closest
+    /// name, and of equally close names the first in alphabetical order
+    /// (the scope is a hash map, whose order changes from run to run).
     fn suggest(&self, from: DefId, name: &str, ns: Ns) -> Option<String> {
         let md = self.mod_data(self.normal_module(from));
         let mut best: Option<(usize, &String)> = None;
@@ -262,7 +264,7 @@ impl<'a> Sema<'a> {
         // Names hidden by macro hygiene (`name#3`) are never suggested.
         for c in cands.filter(|c| !c.contains('#')) {
             let dist = edit_distance(name, c);
-            if dist <= (name.len() / 3).max(1) && best.is_none_or(|(b, _)| dist < b) {
+            if dist <= (name.len() / 3).max(1) && best.is_none_or(|(b, s)| (dist, c) < (b, s)) {
                 best = Some((dist, c));
             }
         }

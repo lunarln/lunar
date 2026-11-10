@@ -11,6 +11,11 @@
 //                                 per line, `err(scope::name) line:col
 //                                 message`, then their labels, notes and
 //                                 helps indented
+//     ln-driver --render [--color] FILE...
+//                                 the same analysis of each FILE, and its
+//                                 diagnostics as the compiler shows them
+//                                 (as `lunar check` does, without color
+//                                 unless `--color`), after a `== FILE` line
 //
 // and it is the compiler:
 //
@@ -21,16 +26,18 @@
 //                                 executable, with `core` and `std` from
 //                                 `$LUNAR_STD_DIR`. OUT defaults to the
 //                                 crater's name in the current directory.
+//                                 Diagnostics are in color when stderr is
+//                                 a terminal and `NO_COLOR` is not set.
 
 mod project;
 mod link;
 
 use std::env;
 use std::fs;
-use ln_sema::diag::is_dummy;
+use ln_sema::diag::{Severity, is_dummy};
 use ln_sema::loader::{CraterDep, Craters, load_crate};
 use ln_sema::program::Program;
-use ln_sema::render::render;
+use ln_sema::render::{plain_message, render_all};
 use ln_sema::sema::{Options, analyze};
 
 fn main() {
@@ -40,6 +47,10 @@ fn main() {
     if env::arg_count() > 2 && env::arg(1).unwrap() == "--craters" {
         list_craters(env::arg(2).unwrap());
         return;
+    }
+    if env::arg_count() > 1 && env::arg(1).unwrap() == "--render" {
+        let color = env::arg_count() > 2 && env::arg(2).unwrap() == "--color";
+        std::process::exit(render_files(color, if color { 3 } else { 2 }));
     }
     let mut i: usize = 1;
     let mut parse = false;
@@ -122,7 +133,9 @@ fn build(): i32 {
         match load_crate(&mut p, &mut cs, name.as_str(), target.as_str(), "") {
             Some(c) => cs.list.push(c),
             None => {
-                eprintln("err(build::io): could not read `{target}`");
+                let mut m = String::new();
+                m.write("could not read `{target}`");
+                fail("build::io", m.as_str());
                 return 1;
             }
         }
@@ -130,7 +143,7 @@ fn build(): i32 {
         let mut proj = project::Project::new();
         let pkg = proj.load_package(target.as_str());
         for e in proj.errors {
-            eprintln("err(manifest): {proj.text(e)}");
+            fail("manifest", proj.text(e));
         }
         let pkg = match pkg {
             Some(k) => k,
@@ -139,7 +152,7 @@ fn build(): i32 {
         proj.craters(pkg, test);
         if proj.errors.len() > 0 {
             for e in proj.errors {
-                eprintln("err(manifest): {proj.text(e)}");
+                fail("manifest", proj.text(e));
             }
             return 1;
         }
@@ -157,7 +170,9 @@ fn build(): i32 {
                     cs.list.push(c);
                 }
                 None => {
-                    eprintln("err(build::io): could not read `{root}`");
+                    let mut m = String::new();
+                    m.write("could not read `{root}`");
+                    fail("build::io", m.as_str());
                     return 1;
                 }
             }
@@ -177,7 +192,10 @@ fn build(): i32 {
         return 1;
     }
     if !test && s.p.main.is_none() {
-        eprintln("err(build::no_main): `{target}` has no `main` function");
+        let mut m = String::new();
+        m.write("`{target}` has no `main` function");
+        let helps = ["add `fn main() { ... }` to the file; to run its `#[test]` functions instead, use `lunar test`"];
+        report_message("build::no_main", m.as_str(), [], helps[..]);
         return 1;
     }
 
@@ -200,7 +218,7 @@ fn build(): i32 {
     match ln_codegen::compile(&mut s.p, opts, obj.as_str()) {
         Ok(()) => {}
         Err(e) => {
-            eprintln("err(build::llvm): {e}");
+            fail_with_output("build::llvm", e.as_str());
             return 1;
         }
     }
@@ -213,7 +231,7 @@ fn build(): i32 {
     return match linked {
         Ok(()) => 0,
         Err(e) => {
-            eprintln("err(build::link): {e}");
+            fail_with_output("build::link", e.as_str());
             1
         }
     };
@@ -229,7 +247,9 @@ fn load_std(p: &mut Program, cs: &mut +Craters, std_dir: str): bool {
         match load_crate(p, cs, n, root.as_str(), "") {
             Some(c) => cs.list.push(c),
             None => {
-                eprintln("err(build::io): standard library crater `{n}` not found at {root}");
+                let mut m = String::new();
+                m.write("standard library crater `{n}` not found at {root}");
+                fail("build::io", m.as_str());
                 return false;
             }
         }
@@ -240,10 +260,51 @@ fn load_std(p: &mut Program, cs: &mut +Craters, std_dir: str): bool {
 /// Print the diagnostics to stderr.
 fn report(p: &Program) {
     let mut out = String::new();
-    for d in p.diags.list {
-        render(p, d, &mut out);
+    render_all(p, use_color(), &mut out);
+    std::io::ewrite_str(out.as_str());
+}
+
+/// Whether diagnostics on stderr are in color: it is a terminal that
+/// shows colors, and `NO_COLOR` is not set (or empty).
+fn use_color(): bool {
+    if let Some(v) = env::var("NO_COLOR") {
+        if v.len() > 0 {
+            return false;
+        }
     }
-    eprint("{out}");
+    return std::io::enable_colors(2);
+}
+
+/// Print an error that is not about a place in the source.
+fn report_message(code: str, msg: str, notes: [str; &], helps: [str; &]) {
+    let mut out = String::new();
+    plain_message(Severity::Error, code, msg, notes, helps, use_color(), &mut out);
+    std::io::ewrite_str(out.as_str());
+}
+
+fn fail(code: str, msg: str) {
+    report_message(code, msg, [], []);
+}
+
+/// An error whose first line is the message and whose other lines (such
+/// as a verifier's or a linker's output) are a note.
+fn fail_with_output(code: str, text: str) {
+    match text.find("\n") {
+        Some(i) => {
+            let rest = text[i + 1..];
+            let mut msg = text[..i];
+            if msg.ends_with(":") {
+                msg = msg[..msg.len() - 1];
+            }
+            if rest.trim().len() > 0 {
+                let notes = [rest];
+                report_message(code, msg, notes[..], []);
+            } else {
+                report_message(code, msg, [], []);
+            }
+        }
+        None => report_message(code, text, [], []),
+    }
 }
 
 /// `path` without a trailing `.exe`.
@@ -326,6 +387,68 @@ fn crater_name(path: str): String {
     return out;
 }
 
+/// Load the file `path` as a crater (named after the file), then `core`
+/// and `std` from `std_dir`; the error if a file cannot be read.
+fn load_checked(p: &mut Program, cs: &mut +Craters, path: str, std_dir: str): Option::<String> {
+    let name = crater_name(path);
+    match load_crate(p, cs, name.as_str(), path, "") {
+        Some(c) => cs.list.push(c),
+        None => {
+            let mut e = String::new();
+            e.write("could not read `{path}`");
+            return Some(e);
+        }
+    }
+    let names = ["core", "std"];
+    for n in names {
+        let mut root = String::new();
+        root.write("{std_dir}/{n}/lib.ln");
+        match load_crate(p, cs, n, root.as_str(), "") {
+            Some(c) => cs.list.push(c),
+            None => {
+                let mut e = String::new();
+                e.write("standard library crater `{n}` not found at {root}");
+                return Some(e);
+            }
+        }
+    }
+    return None;
+}
+
+/// `--render [--color] FILE...`: analyze each file as `--check` does and
+/// print its diagnostics rendered, after a `== FILE` line.
+fn render_files(color: bool, first: usize): i32 {
+    let std_dir = match env::var("LUNAR_STD_DIR") {
+        Some(d) => d,
+        None => {
+            eprintln("ln-driver: --render needs LUNAR_STD_DIR (the std directory)");
+            return 2;
+        }
+    };
+    let mut i = first;
+    while i < env::arg_count() {
+        let path = env::arg(i).unwrap();
+        let mut out = String::new();
+        out.write("== {path}\n");
+        let mut p = Program::new();
+        let mut cs = Craters::new();
+        match load_checked(&mut p, &mut cs, path, std_dir.as_str()) {
+            Some(e) => plain_message(Severity::Error, "build::io", e.as_str(), [], [], color, &mut out),
+            None => {
+                if p.diags.has_errors() {
+                    render_all(&p, color, &mut out);
+                } else {
+                    let s = analyze(p, cs, Options::host(false));
+                    render_all(&s.p, color, &mut out);
+                }
+            }
+        }
+        std::io::write_str(out.as_str());
+        i += 1;
+    }
+    return 0;
+}
+
 /// `--check FILE`: load FILE, `core` and `std`, analyze them, and print
 /// the diagnostics. The exit code is 1 if there were errors.
 fn check(path: str): i32 {
@@ -338,25 +461,9 @@ fn check(path: str): i32 {
     };
     let mut p = Program::new();
     let mut cs = Craters::new();
-    let name = crater_name(path);
-    match load_crate(&mut p, &mut cs, name.as_str(), path, "") {
-        Some(c) => cs.list.push(c),
-        None => {
-            println("err(build::io) 0:0 could not read `{path}`");
-            return 1;
-        }
-    }
-    let names = ["core", "std"];
-    for n in names {
-        let mut root = String::new();
-        root.write("{std_dir}/{n}/lib.ln");
-        match load_crate(&mut p, &mut cs, n, root.as_str(), "") {
-            Some(c) => cs.list.push(c),
-            None => {
-                println("err(build::io) 0:0 standard library crater `{n}` not found at {root}");
-                return 1;
-            }
-        }
+    if let Some(e) = load_checked(&mut p, &mut cs, path, std_dir.as_str()) {
+        println("err(build::io) 0:0 {e}");
+        return 1;
     }
     if p.diags.has_errors() {
         print_diags(&p);

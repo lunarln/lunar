@@ -97,6 +97,26 @@ pub fn write_str(s: str) {
     sys::write(1, s.as_bytes());
 }
 
+/// Write raw text to standard error without formatting.
+pub fn ewrite_str(s: str) {
+    sys::write(2, s.as_bytes());
+}
+
+/// Whether standard input (`fd` 0), output (1) or error (2) is a
+/// terminal (on Windows, a console, or an MSYS or Cygwin terminal such as
+/// Git Bash's).
+pub fn is_terminal(fd: i32): bool {
+    return sys::is_terminal(fd);
+}
+
+/// Whether ANSI color codes written to standard output (`fd` 1) or error
+/// (2) will show as colors: it is a terminal, and on Windows its console
+/// interprets escape codes (this switches that on, for consoles where it
+/// is off by default). It does not look at `NO_COLOR`.
+pub fn enable_colors(fd: i32): bool {
+    return sys::enable_ansi(fd);
+}
+
 /// Read one line from standard input (without the trailing newline).
 /// Returns `false` at end of input.
 pub fn read_line(out: &mut String): bool {

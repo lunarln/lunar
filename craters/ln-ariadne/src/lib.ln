@@ -1,0 +1,403 @@
+// Ariadne, in Lunar: a port of the Rust `ariadne` crate (0.6), the fancy
+// diagnostics renderer the Rust Lunar compiler uses. With the same
+// configuration it draws the same reports, byte for byte:
+//
+//     err(type::mismatch): mismatched types
+//        ╭─[ src/main.ln:3:18 ]
+//        │
+//      3 │     let x: i32 = "nope";
+//        │                  ───┬──
+//        │                     ╰──── expected `i32`
+//     ───╯
+//
+// A report has a kind, a message, labels (spans of sources, with a
+// message, a color, an order and a priority), notes and helps. Sources
+// live in a `Sources` (ariadne's `Cache`), which owns their text.
+//
+// Beyond ariadne, a `Theme` styles every part of a report (ariadne's fixed
+// colors are `Theme::ariadne()`), and a source may carry a style for each
+// of its bytes, for syntax highlighting: `Sources::add_styled`, or
+// `Sources::add_highlighted` with a `Highlighter`. Styles only show with
+// color on; with it off, reports are plain text.
+//
+//     let mut srcs = Sources::new();
+//     let src = srcs.add("main.ln", text);
+//     let r = Report::build(ReportKind::Error, src, 17, 23)
+//         .with_message("mismatched types")
+//         .with_label(Label::new(src, 17, 23).with_message("expected `i32`").with_color(Color::Red))
+//         .finish();
+//     let out = r.write_to_string(&srcs);
+
+pub mod draw;
+pub mod source;
+pub mod width;
+mod write;
+#[cfg(test)]
+mod tests;
+
+pub use crater::draw::{Characters, Color, Out, Style};
+pub use crater::source::{Highlighter, Line, Sources, SrcId};
+
+/// The kind of a report, shown (in its color) at the start of its header.
+#[derive(Eq, Debug)]
+pub enum ReportKind {
+    /// A critical problem that prevents the requested action.
+    Error,
+    /// A likely problem, but not one that prevents the action.
+    Warning,
+    /// Advice about an anti-pattern or another benign issue.
+    Advice,
+    /// A kind of its own: its name and color.
+    Custom(str, Color),
+}
+
+impl ReportKind {
+    /// The name in the header.
+    pub fn name(self): str {
+        return match self {
+            ReportKind::Error => "Error",
+            ReportKind::Warning => "Warning",
+            ReportKind::Advice => "Advice",
+            ReportKind::Custom(s, _) => s,
+        };
+    }
+}
+
+/// Where inline label arrows attach to their spans.
+#[derive(Eq, Debug)]
+pub enum LabelAttach {
+    Start,
+    /// The middle of the span (or as close as it gets).
+    Middle,
+    End,
+}
+
+/// The characters reports are drawn with.
+#[derive(Eq, Debug)]
+pub enum CharSet {
+    /// Box-drawing characters (commonly supported ones only).
+    Unicode,
+    Ascii,
+}
+
+/// What span offsets count.
+#[derive(Eq, Debug)]
+pub enum IndexType {
+    /// Bytes.
+    Byte,
+    /// Characters.
+    Char,
+}
+
+/// How each part of a report is drawn when color is on. Label colors come
+/// from the labels; everything else from here.
+pub struct Theme {
+    /// The kind of a report (`Error:`), for the built-in kinds; a custom
+    /// kind is drawn in its own color with `kind`'s attributes.
+    pub error: Style,
+    pub warning: Style,
+    pub advice: Style,
+    /// The attributes of every kind (its color aside).
+    pub kind: Style,
+    /// The report's message, in the header.
+    pub message: Style,
+    /// The frame: line numbers, bars and corners.
+    pub margin: Style,
+    /// The margin of lines without a line number.
+    pub skipped_margin: Style,
+    /// The `file:line:col` of a source in the frame.
+    pub location: Style,
+    /// Source text outside labels, in sources without styles.
+    pub unimportant: Style,
+    /// The `Note` and `Help` prefixes.
+    pub note: Style,
+    pub help: Style,
+    /// Source text inside a label is in the label's color, and bold if set.
+    pub label_bold: bool,
+    /// Label messages are in the label's color.
+    pub color_label_messages: bool,
+}
+
+impl Theme {
+    /// Ariadne's colors.
+    pub fn ariadne(): Theme {
+        return Theme {
+            error: Style::fg(Color::Red),
+            warning: Style::fg(Color::Yellow),
+            advice: Style::fg(Color::Fixed(147)),
+            kind: Style::plain(),
+            message: Style::plain(),
+            margin: Style::fg(Color::Fixed(246)),
+            skipped_margin: Style::fg(Color::Fixed(240)),
+            location: Style::plain(),
+            unimportant: Style::fg(Color::Fixed(249)),
+            note: Style::fg(Color::Fixed(115)),
+            help: Style::fg(Color::Fixed(115)),
+            label_bold: false,
+            color_label_messages: false,
+        };
+    }
+}
+
+/// How reports are drawn.
+pub struct Config {
+    pub cross_gap: bool,
+    pub label_attach: LabelAttach,
+    pub compact: bool,
+    pub underlines: bool,
+    pub multiline_arrows: bool,
+    pub color: bool,
+    pub tab_width: usize,
+    pub char_set: CharSet,
+    pub index_type: IndexType,
+    pub theme: Theme,
+}
+
+impl Config {
+    /// The defaults: no crossing characters between label lines, arrows
+    /// attached to the middle of spans, gaps, underlines, arrows for
+    /// multi-line spans, color, tabs 4 columns wide, Unicode characters,
+    /// character offsets, ariadne's colors.
+    pub fn new(): Config {
+        return Config {
+            cross_gap: true,
+            label_attach: LabelAttach::Middle,
+            compact: false,
+            underlines: true,
+            multiline_arrows: true,
+            color: true,
+            tab_width: 4,
+            char_set: CharSet::Unicode,
+            index_type: IndexType::Char,
+            theme: Theme::ariadne(),
+        };
+    }
+
+    /// When label lines cross one another, leave a gap (rather than draw
+    /// crossing characters, which go badly with label colors).
+    pub fn with_cross_gap(self, cross_gap: bool): Config {
+        let mut c = self;
+        c.cross_gap = cross_gap;
+        return c;
+    }
+
+    /// Where inline labels attach to their spans.
+    pub fn with_label_attach(self, label_attach: LabelAttach): Config {
+        let mut c = self;
+        c.label_attach = label_attach;
+        return c;
+    }
+
+    /// Leave out gaps to save space.
+    pub fn with_compact(self, compact: bool): Config {
+        let mut c = self;
+        c.compact = compact;
+        return c;
+    }
+
+    /// Underline label spans where possible.
+    pub fn with_underlines(self, underlines: bool): Config {
+        let mut c = self;
+        c.underlines = underlines;
+        return c;
+    }
+
+    /// Point arrows at the ends of multi-line spans.
+    pub fn with_multiline_arrows(self, multiline_arrows: bool): Config {
+        let mut c = self;
+        c.multiline_arrows = multiline_arrows;
+        return c;
+    }
+
+    /// Write colors and styles (as ANSI escape codes).
+    pub fn with_color(self, color: bool): Config {
+        let mut c = self;
+        c.color = color;
+        return c;
+    }
+
+    /// How many columns a tab takes.
+    pub fn with_tab_width(self, tab_width: usize): Config {
+        let mut c = self;
+        c.tab_width = tab_width;
+        return c;
+    }
+
+    /// The characters to draw boxes and arrows with.
+    pub fn with_char_set(self, char_set: CharSet): Config {
+        let mut c = self;
+        c.char_set = char_set;
+        return c;
+    }
+
+    /// Whether span offsets count bytes or characters.
+    pub fn with_index_type(self, index_type: IndexType): Config {
+        let mut c = self;
+        c.index_type = index_type;
+        return c;
+    }
+
+    /// The styles for color output.
+    pub fn with_theme(self, theme: Theme): Config {
+        let mut c = self;
+        c.theme = theme;
+        return c;
+    }
+
+    /// What to draw for `c` at column `col`, and how many times: a tab is
+    /// spaces to the next tab stop, other whitespace one space.
+    pub fn char_width(self, c: char, col: usize): (char, usize) {
+        if c == '\t' {
+            let tab_end = (col / self.tab_width + 1) * self.tab_width;
+            return (' ', tab_end - col);
+        }
+        if crater::width::is_whitespace(c) {
+            return (' ', 1);
+        }
+        return (c, crater::width::char_width(c).unwrap_or(1));
+    }
+}
+
+/// A span of a source, with how to show it.
+pub struct Label {
+    pub src: SrcId,
+    pub start: usize,
+    pub end: usize,
+    pub msg: Option::<str>,
+    pub color: Option::<Color>,
+    pub order: i32,
+    pub priority: i32,
+}
+
+impl Label {
+    /// A label over `start..end` (bytes or characters, as the report's
+    /// `IndexType` says) of source `src`. Panics if `start > end`.
+    pub fn new(src: SrcId, start: usize, end: usize): Label {
+        if start > end {
+            panic("Label start is after its end");
+        }
+        return Label { src, start, end, msg: None, color: None, order: 0, priority: 0 };
+    }
+
+    /// Give the label a message. Ariadne only draws arrows to labels with
+    /// one.
+    pub fn with_message(self, msg: str): Label {
+        let mut l = self;
+        l.msg = Some(msg);
+        return l;
+    }
+
+    /// Draw the span, its arrow and underline in `color`.
+    pub fn with_color(self, color: Color): Label {
+        let mut l = self;
+        l.color = Some(color);
+        return l;
+    }
+
+    /// Order relative to other labels: lower comes first. Labels of the
+    /// same order are arranged as their spans and layout suit.
+    pub fn with_order(self, order: i32): Label {
+        let mut l = self;
+        l.order = order;
+        return l;
+    }
+
+    /// Priority when spans overlap: higher wins (by default, shorter
+    /// spans win).
+    pub fn with_priority(self, priority: i32): Label {
+        let mut l = self;
+        l.priority = priority;
+        return l;
+    }
+}
+
+/// A diagnostic, ready to be written.
+pub struct Report {
+    pub kind: ReportKind,
+    pub code: Option::<str>,
+    pub msg: Option::<str>,
+    pub notes: [str; ..+],
+    pub helps: [str; ..+],
+    /// The primary location: its source and span.
+    pub src: SrcId,
+    pub start: usize,
+    pub end: usize,
+    pub labels: [Label; ..+],
+    pub config: Config,
+}
+
+impl Report {
+    /// Start a report whose primary location is `start..end` of `src`.
+    pub fn build(kind: ReportKind, src: SrcId, start: usize, end: usize): Report {
+        return Report { kind, code: None, msg: None, notes: [], helps: [], src, start, end, labels: [], config: Config::new() };
+    }
+
+    /// A code, shown in brackets before the kind (`[E01] Error:`).
+    pub fn with_code(mut self, code: str): Report {
+        self.code = Some(code);
+        return self;
+    }
+
+    pub fn with_message(mut self, msg: str): Report {
+        self.msg = Some(msg);
+        return self;
+    }
+
+    pub fn with_note(mut self, note: str): Report {
+        self.notes.push(note);
+        return self;
+    }
+
+    pub fn with_help(mut self, help: str): Report {
+        self.helps.push(help);
+        return self;
+    }
+
+    pub fn with_label(mut self, label: Label): Report {
+        self.add_label(label);
+        return self;
+    }
+
+    pub fn with_config(mut self, config: Config): Report {
+        self.config = config;
+        return self;
+    }
+
+    pub fn set_message(&mut +self, kept msg: str) {
+        self.msg = Some(msg);
+    }
+
+    pub fn add_note(&mut +self, kept note: str) {
+        self.notes.push(note);
+    }
+
+    pub fn add_help(&mut +self, kept help: str) {
+        self.helps.push(help);
+    }
+
+    /// Add a label. Without color, its color is dropped (as ariadne does).
+    pub fn add_label(&mut +self, kept label: Label) {
+        let mut l = label;
+        if !self.config.color {
+            l.color = None;
+        }
+        self.labels.push(l);
+    }
+
+    /// The report, done (for ariadne's `ReportBuilder::finish`).
+    pub fn finish(self): Report {
+        return self;
+    }
+
+    /// Write the report onto `out`.
+    pub fn write(&self, srcs: &Sources, out: &mut +Out) {
+        crater::write::write(self, srcs, out);
+    }
+
+    /// The report as text (with escape codes if color is on).
+    pub fn write_to_string(&self, srcs: &Sources): String {
+        let mut out = Out::new(self.config.color);
+        crater::write::write(self, srcs, &mut out);
+        return out.text;
+    }
+}

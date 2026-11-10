@@ -1,0 +1,396 @@
+// Ariadne's own tests (the snapshots in `write.rs`), ported: ASCII
+// characters, no color, trailing spaces trimmed.
+
+use crater::{CharSet, Color, Config, IndexType, Label, Report, ReportKind, Sources, SrcId, Theme};
+use crater::source::trim_end;
+
+fn no_color_and_ascii(): Config {
+    return Config::new().with_color(false).with_char_set(CharSet::Ascii);
+}
+
+/// `r` written, without trailing spaces.
+fn render(r: Report, srcs: &Sources): String {
+    let text = r.write_to_string(srcs);
+    let mut out = String::new();
+    for line in text.as_str().lines() {
+        out.push_str(trim_end(line));
+        out.push('\n');
+    }
+    return out;
+}
+
+fn check(got: String, want: str) {
+    if got.as_str() != want {
+        panic("report differs:\n--- got\n{got}--- want\n{want}");
+    }
+}
+
+fn one(text: str): (Sources, SrcId) {
+    let mut s = Sources::new();
+    let id = s.add("<unknown>", text);
+    return (s, id);
+}
+
+#[test]
+fn one_message() {
+    let (srcs, id) = one("");
+    let r = Report::build(ReportKind::Error, id, 0, 0)
+        .with_config(no_color_and_ascii())
+        .with_message("can't compare apples with oranges")
+        .finish();
+    check(render(r, &srcs), "Error: can't compare apples with oranges\n");
+}
+
+#[test]
+fn two_labels_without_messages() {
+    let (srcs, id) = one("apple == orange;");
+    let r = Report::build(ReportKind::Error, id, 0, 0)
+        .with_config(no_color_and_ascii())
+        .with_message("can't compare apples with oranges")
+        .with_label(Label::new(id, 0, 5))
+        .with_label(Label::new(id, 9, 15))
+        .finish();
+    check(render(r, &srcs), "Error: can't compare apples with oranges
+   ,-[ <unknown>:1:1 ]
+   |
+ 1 | apple == orange;
+---'
+");
+}
+
+#[test]
+fn two_labels_with_messages() {
+    let (srcs, id) = one("apple == orange;");
+    let r = Report::build(ReportKind::Error, id, 0, 0)
+        .with_config(no_color_and_ascii())
+        .with_message("can't compare apples with oranges")
+        .with_label(Label::new(id, 0, 5).with_message("This is an apple"))
+        .with_label(Label::new(id, 9, 15).with_message("This is an orange"))
+        .finish();
+    check(render(r, &srcs), "Error: can't compare apples with oranges
+   ,-[ <unknown>:1:1 ]
+   |
+ 1 | apple == orange;
+   | ^^|^^    ^^^|^^
+   |   `-------------- This is an apple
+   |             |
+   |             `---- This is an orange
+---'
+");
+}
+
+#[test]
+fn multi_byte_chars() {
+    let (srcs, id) = one("äpplë == örängë;");
+    let r = Report::build(ReportKind::Error, id, 0, 0)
+        .with_config(no_color_and_ascii().with_index_type(IndexType::Char))
+        .with_message("can't compare äpplës with örängës")
+        .with_label(Label::new(id, 0, 5).with_message("This is an äpplë"))
+        .with_label(Label::new(id, 9, 15).with_message("This is an örängë"))
+        .finish();
+    check(render(r, &srcs), "Error: can't compare äpplës with örängës
+   ,-[ <unknown>:1:1 ]
+   |
+ 1 | äpplë == örängë;
+   | ^^|^^    ^^^|^^
+   |   `-------------- This is an äpplë
+   |             |
+   |             `---- This is an örängë
+---'
+");
+}
+
+#[test]
+fn byte_label() {
+    let (srcs, id) = one("äpplë == örängë;");
+    let r = Report::build(ReportKind::Error, id, 0, 0)
+        .with_config(no_color_and_ascii().with_index_type(IndexType::Byte))
+        .with_message("can't compare äpplës with örängës")
+        .with_label(Label::new(id, 0, 7).with_message("This is an äpplë"))
+        .with_label(Label::new(id, 11, 20).with_message("This is an örängë"))
+        .finish();
+    check(render(r, &srcs), "Error: can't compare äpplës with örängës
+   ,-[ <unknown>:1:1 ]
+   |
+ 1 | äpplë == örängë;
+   | ^^|^^    ^^^|^^
+   |   `-------------- This is an äpplë
+   |             |
+   |             `---- This is an örängë
+---'
+");
+}
+
+#[test]
+fn byte_column() {
+    let (srcs, id) = one("äpplë == örängë;");
+    let r = Report::build(ReportKind::Error, id, 11, 11)
+        .with_config(no_color_and_ascii().with_index_type(IndexType::Byte))
+        .with_message("can't compare äpplës with örängës")
+        .with_label(Label::new(id, 0, 7).with_message("This is an äpplë"))
+        .with_label(Label::new(id, 11, 20).with_message("This is an örängë"))
+        .finish();
+    check(render(r, &srcs), "Error: can't compare äpplës with örängës
+   ,-[ <unknown>:1:10 ]
+   |
+ 1 | äpplë == örängë;
+   | ^^|^^    ^^^|^^
+   |   `-------------- This is an äpplë
+   |             |
+   |             `---- This is an örängë
+---'
+");
+}
+
+#[test]
+fn label_of_width_zero_at_end_of_line() {
+    let (srcs, id) = one("apple ==\n");
+    let r = Report::build(ReportKind::Error, id, 0, 0)
+        .with_config(no_color_and_ascii().with_index_type(IndexType::Byte))
+        .with_message("unexpected end of file")
+        .with_label(Label::new(id, 9, 9).with_message("Unexpected end of file"))
+        .finish();
+    check(render(r, &srcs), "Error: unexpected end of file
+   ,-[ <unknown>:1:1 ]
+   |
+ 1 | apple ==
+   |          |
+   |          `- Unexpected end of file
+---'
+");
+}
+
+#[test]
+fn empty_input() {
+    let (srcs, id) = one("");
+    let r = Report::build(ReportKind::Error, id, 0, 0)
+        .with_config(no_color_and_ascii())
+        .with_message("unexpected end of file")
+        .with_label(Label::new(id, 0, 0).with_message("No more fruit!"))
+        .finish();
+    check(render(r, &srcs), "Error: unexpected end of file
+   ,-[ <unknown>:1:1 ]
+   |
+ 1 |
+   | |
+   | `- No more fruit!
+---'
+");
+}
+
+#[test]
+fn empty_input_help_note() {
+    let (srcs, id) = one("");
+    let r = Report::build(ReportKind::Error, id, 0, 0)
+        .with_config(no_color_and_ascii())
+        .with_message("unexpected end of file")
+        .with_label(Label::new(id, 0, 0).with_message("No more fruit!"))
+        .with_note("eat your greens!")
+        .with_help("have you tried going to the farmer's market?")
+        .finish();
+    check(render(r, &srcs), "Error: unexpected end of file
+   ,-[ <unknown>:1:1 ]
+   |
+ 1 |
+   | |
+   | `- No more fruit!
+   |
+   | Help: have you tried going to the farmer's market?
+   |
+   | Note: eat your greens!
+---'
+");
+}
+
+#[test]
+fn byte_spans_never_crash() {
+    let text = "apple\np\n\nempty\n";
+    let (srcs, id) = one(text);
+    for i in 0..text.len() + 1 {
+        for j in i..text.len() + 1 {
+            let r = Report::build(ReportKind::Error, id, 0, 0)
+                .with_config(no_color_and_ascii().with_index_type(IndexType::Byte))
+                .with_message("Label")
+                .with_label(Label::new(id, i, j).with_message("Label"))
+                .finish();
+            let _ = render(r, &srcs);
+        }
+    }
+}
+
+#[test]
+fn multiline_label() {
+    let text = "apple\n==\norange";
+    let (srcs, id) = one(text);
+    let r = Report::build(ReportKind::Error, id, 0, 0)
+        .with_config(no_color_and_ascii())
+        .with_label(Label::new(id, 0, text.len()).with_message("illegal comparison"))
+        .finish();
+    check(render(r, &srcs), "Error:
+   ,-[ <unknown>:1:1 ]
+   |
+ 1 | ,-> apple
+   : :
+ 3 | |-> orange
+   | |
+   | `----------- illegal comparison
+---'
+");
+}
+
+#[test]
+fn partially_overlapping_labels() {
+    let text = "https://example.com/";
+    let (srcs, id) = one(text);
+    let r = Report::build(ReportKind::Error, id, 0, 0)
+        .with_config(no_color_and_ascii())
+        .with_label(Label::new(id, 0, text.len()).with_message("URL"))
+        .with_label(Label::new(id, 0, 5).with_message("scheme"))
+        .finish();
+    check(render(r, &srcs), "Error:
+   ,-[ <unknown>:1:1 ]
+   |
+ 1 | https://example.com/
+   | ^^|^^^^^^^|^^^^^^^^^
+   |   `------------------- scheme
+   |           |
+   |           `----------- URL
+---'
+");
+}
+
+#[test]
+fn multiple_labels_same_span() {
+    let (srcs, id) = one("apple == orange;");
+    let r = Report::build(ReportKind::Error, id, 0, 0)
+        .with_config(no_color_and_ascii())
+        .with_message("can't compare apples with oranges")
+        .with_label(Label::new(id, 0, 5).with_message("This is an apple"))
+        .with_label(Label::new(id, 0, 5).with_message("Have I mentioned that this is an apple?"))
+        .with_label(Label::new(id, 0, 5).with_message("No really, have I mentioned that?"))
+        .with_label(Label::new(id, 9, 15).with_message("This is an orange"))
+        .with_label(Label::new(id, 9, 15).with_message("Have I mentioned that this is an orange?"))
+        .with_label(Label::new(id, 9, 15).with_message("No really, have I mentioned that?"))
+        .finish();
+    check(render(r, &srcs), "Error: can't compare apples with oranges
+   ,-[ <unknown>:1:1 ]
+   |
+ 1 | apple == orange;
+   | ^^|^^    ^^^|^^
+   |   `-------------- This is an apple
+   |   |         |
+   |   `-------------- Have I mentioned that this is an apple?
+   |   |         |
+   |   `-------------- No really, have I mentioned that?
+   |             |
+   |             `---- This is an orange
+   |             |
+   |             `---- Have I mentioned that this is an orange?
+   |             |
+   |             `---- No really, have I mentioned that?
+---'
+");
+}
+
+#[test]
+fn multi_notes_multi_lines() {
+    let (srcs, id) = one("apple == orange;");
+    let r = Report::build(ReportKind::Error, id, 0, 0)
+        .with_config(no_color_and_ascii())
+        .with_message("can't compare apples with oranges")
+        .with_label(Label::new(id, 0, 15).with_message("This is a strange comparison"))
+        .with_note("No need to try, they can't be compared.")
+        .with_note("Yeah, really, please stop.\nIt has no resemblance.")
+        .finish();
+    check(render(r, &srcs), "Error: can't compare apples with oranges
+   ,-[ <unknown>:1:1 ]
+   |
+ 1 | apple == orange;
+   | ^^^^^^^|^^^^^^^
+   |        `--------- This is a strange comparison
+   |
+   | Note 1: No need to try, they can't be compared.
+   |
+   | Note 2: Yeah, really, please stop.
+   |         It has no resemblance.
+---'
+");
+}
+
+#[test]
+fn ordered_labels() {
+    let mut srcs = Sources::new();
+    let blank = srcs.add("", "");
+    let a = srcs.add("a", "second\nthird");
+    let b = srcs.add("b", "fourth\nfifth\nfirst");
+    let r = Report::build(ReportKind::Error, blank, 0, 0)
+        .with_config(no_color_and_ascii())
+        .with_label(Label::new(b, 13, 18).with_order(1).with_message("1"))
+        .with_label(Label::new(a, 0, 6).with_order(2).with_message("2"))
+        .with_label(Label::new(a, 7, 12).with_order(3).with_message("3"))
+        .with_label(Label::new(b, 0, 6).with_order(4).with_message("4"))
+        .with_label(Label::new(b, 7, 12).with_order(5).with_message("5"))
+        .finish();
+    check(render(r, &srcs), "Error:
+   ,-[ b:3:1 ]
+   |
+ 3 | first
+   | ^^|^^
+   |   `---- 1
+   |
+   |-[ a:1:1 ]
+   |
+ 1 | second
+   | ^^^|^^
+   |    `---- 2
+ 2 | third
+   | ^^|^^
+   |   `---- 3
+   |
+   |-[ b:1:1 ]
+   |
+ 1 | fourth
+   | ^^^|^^
+   |    `---- 4
+ 2 | fifth
+   | ^^|^^
+   |   `---- 5
+---'
+");
+}
+
+/// The Unicode characters, and a report the Rust compiler would draw.
+#[test]
+fn unicode_frame() {
+    let (srcs, id) = one("fn main() {\n    let x: i32 = \"nope\";\n}\n");
+    let r = Report::build(ReportKind::Custom("err(type::mismatch)", Color::Red), id, 29, 35)
+        .with_config(Config::new().with_color(false).with_index_type(IndexType::Byte))
+        .with_message("mismatched types: expected `i32`, found `str`")
+        .with_label(Label::new(id, 29, 35).with_message("expected `i32`").with_color(Color::Red))
+        .finish();
+    check(r.write_to_string(&srcs), "err(type::mismatch): mismatched types: expected `i32`, found `str`
+   ╭─[ <unknown>:2:18 ]
+   │
+ 2 │     let x: i32 = \"nope\";
+   │                  ───┬──\x20\x20
+   │                     ╰──── expected `i32`
+───╯
+");
+}
+
+/// With color, styles change only where they must and every line ends
+/// plain.
+#[test]
+fn colors() {
+    let (srcs, id) = one("a == b;");
+    let r = Report::build(ReportKind::Error, id, 0, 1)
+        .with_config(Config::new().with_char_set(CharSet::Ascii).with_theme(Theme::ariadne()))
+        .with_message("no")
+        .with_label(Label::new(id, 0, 1).with_message("here").with_color(Color::Red))
+        .finish();
+    let out = r.write_to_string(&srcs);
+    // A space keeps the style before it: it looks the same in any.
+    if !out.as_str().starts_with("\x1b[31mError: \x1b[0mno\n") || !out.as_str().ends_with("\x1b[0m\n") {
+        panic("colors: {out:?}");
+    }
+}

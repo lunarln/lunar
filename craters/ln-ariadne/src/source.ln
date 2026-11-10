@@ -1,0 +1,346 @@
+// Sources: the texts reports quote, split into lines (ariadne's
+// `source.rs`). `Sources` is ariadne's `Cache`: it owns a copy of every
+// text added to it, with an optional style for each byte (syntax
+// highlighting, supplied by the caller).
+
+use crater::draw::Style;
+use crater::width::is_whitespace;
+
+/// A line of a source: where it starts, in characters and in bytes, and
+/// its length, including its line ending.
+#[derive(Eq, Debug)]
+pub struct Line {
+    pub offset: usize,
+    pub char_len: usize,
+    pub byte_offset: usize,
+    pub byte_len: usize,
+}
+
+impl Line {
+    /// The length in characters.
+    pub fn len(self): usize {
+        return self.char_len;
+    }
+
+    pub fn is_empty(self): bool {
+        return self.char_len == 0;
+    }
+
+    /// The character offset just past the line.
+    pub fn end(self): usize {
+        return self.offset + self.char_len;
+    }
+
+    /// Whether character offset `x` is on this line.
+    pub fn contains(self, x: usize): bool {
+        return self.offset <= x && x < self.offset + self.char_len;
+    }
+}
+
+/// A source in a `Sources`.
+#[derive(Eq, Hash, Debug)]
+pub struct SrcId {
+    index: u32,
+}
+
+impl SrcId {
+    /// The id of the `index`th source added to a `Sources`.
+    pub fn from_index(index: usize): SrcId {
+        return SrcId { index: index as u32 };
+    }
+
+    pub fn index(self): usize {
+        return self.index as usize;
+    }
+}
+
+struct SrcInfo {
+    name_start: usize,
+    name_len: usize,
+    text_start: usize,
+    text_len: usize,
+    lines_start: usize,
+    lines_len: usize,
+    /// Length in characters.
+    len: usize,
+    display_line_offset: usize,
+    /// Where its styles start in `Sources::styles`, if it has them.
+    styles: Option::<usize>,
+}
+
+/// Something that styles source text for display, one style per byte:
+/// a syntax highlighter.
+pub trait Highlighter {
+    /// Push a style for each byte of `text` onto `out`.
+    fn highlight(&mut self, text: str, out: &mut +[Style; ..+]);
+}
+
+/// The sources reports are about. Reports refer to them by `SrcId`.
+pub struct Sources {
+    text: String,
+    names: String,
+    files: [SrcInfo; ..+],
+    lines: [Line; ..+],
+    styles: [Style; ..+],
+}
+
+impl Sources {
+    pub fn new(): Sources {
+        return Sources { text: String::new(), names: String::new(), files: [], lines: [], styles: [] };
+    }
+
+    /// Add a source named `name` (shown in the report's frame).
+    pub fn add(&mut +self, name: str, text: str): SrcId {
+        let text_start = self.text.len();
+        self.text.push_str(text);
+        let name_start = self.names.len();
+        self.names.push_str(name);
+        let lines_start = self.lines.len();
+        let len = split_lines(text, &mut self.lines);
+        let id = SrcId { index: self.files.len() as u32 };
+        self.files.push(SrcInfo {
+            name_start,
+            name_len: name.len(),
+            text_start,
+            text_len: text.len(),
+            lines_start,
+            lines_len: self.lines.len() - lines_start,
+            len,
+            display_line_offset: 0,
+            styles: None,
+        });
+        return id;
+    }
+
+    /// Add a source with a style for each of its bytes (`styles` must be
+    /// as long as `text`).
+    pub fn add_styled(&mut +self, name: str, text: str, styles: [Style; &]): SrcId {
+        let id = self.add(name, text);
+        if styles.len() == text.len() {
+            self.files[id.index()].styles = Some(self.styles.len());
+            self.styles.extend(styles);
+        }
+        return id;
+    }
+
+    /// Add a source, styled by `h`.
+    pub fn add_highlighted::<H: Highlighter>(&mut +self, name: str, text: str, h: &mut H): SrcId {
+        let id = self.add(name, text);
+        let start = self.styles.len();
+        h.highlight(text, &mut self.styles);
+        while self.styles.len() < start + text.len() {
+            self.styles.push(Style::plain());
+        }
+        self.files[id.index()].styles = Some(start);
+        return id;
+    }
+
+    /// Add `offset` to the line numbers shown for source `id`.
+    pub fn set_display_line_offset(&mut +self, id: SrcId, offset: usize) {
+        self.files[id.index()].display_line_offset = offset;
+    }
+
+    pub fn display_line_offset(&self, id: SrcId): usize {
+        return self.files[id.index()].display_line_offset;
+    }
+
+    /// The number of sources.
+    pub fn len(&self): usize {
+        return self.files.len();
+    }
+
+    pub fn contains(&self, id: SrcId): bool {
+        return id.index() < self.files.len();
+    }
+
+    pub fn name(&self, id: SrcId): str {
+        let f = self.files[id.index()];
+        return self.names.as_str()[f.name_start..f.name_start + f.name_len];
+    }
+
+    pub fn text(&self, id: SrcId): str {
+        let f = self.files[id.index()];
+        return self.text.as_str()[f.text_start..f.text_start + f.text_len];
+    }
+
+    /// The length of source `id` in characters.
+    pub fn char_len(&self, id: SrcId): usize {
+        return self.files[id.index()].len;
+    }
+
+    /// The length of source `id` in bytes.
+    pub fn byte_len(&self, id: SrcId): usize {
+        return self.files[id.index()].text_len;
+    }
+
+    pub fn line_count(&self, id: SrcId): usize {
+        return self.files[id.index()].lines_len;
+    }
+
+    /// Line `idx` (from 0) of source `id`.
+    pub fn line(&self, id: SrcId, idx: usize): Option::<Line> {
+        let f = self.files[id.index()];
+        if idx >= f.lines_len {
+            return None;
+        }
+        return Some(self.lines[f.lines_start + idx]);
+    }
+
+    /// The text of a line, with its line ending.
+    pub fn line_text(&self, id: SrcId, line: Line): str {
+        let f = self.files[id.index()];
+        let start = f.text_start + line.byte_offset;
+        return self.text.as_str()[start..start + line.byte_len];
+    }
+
+    /// The style of byte `offset` of source `id`, if it has styles.
+    pub fn style_at(&self, id: SrcId, offset: usize): Option::<Style> {
+        let f = self.files[id.index()];
+        return match f.styles {
+            Some(s) => if offset < f.text_len { Some(self.styles[s + offset]) } else { None },
+            None => None,
+        };
+    }
+
+    /// The line holding character `offset`: the line, its index and the
+    /// offset's column (in characters), all from 0.
+    pub fn get_offset_line(&self, id: SrcId, offset: usize): Option::<(Line, usize, usize)> {
+        let f = self.files[id.index()];
+        if offset > f.len {
+            return None;
+        }
+        let idx = self.search(f, offset, false);
+        let line = self.lines[f.lines_start + idx];
+        return Some((line, idx, offset - line.offset));
+    }
+
+    /// The line holding byte `offset`: the line, its index and the
+    /// offset's column (in bytes), all from 0.
+    pub fn get_byte_line(&self, id: SrcId, offset: usize): Option::<(Line, usize, usize)> {
+        let f = self.files[id.index()];
+        if offset > f.text_len {
+            return None;
+        }
+        let idx = self.search(f, offset, true);
+        let line = self.lines[f.lines_start + idx];
+        return Some((line, idx, offset - line.byte_offset));
+    }
+
+    /// The index of the last line of `f` starting at or before `offset`
+    /// (in bytes or characters).
+    fn search(&self, f: SrcInfo, offset: usize, bytes: bool): usize {
+        let mut lo: usize = 0;
+        let mut hi = f.lines_len;
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            let l = self.lines[f.lines_start + mid];
+            let at = if bytes { l.byte_offset } else { l.offset };
+            if at <= offset {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
+    /// The lines that the characters `start..end` run across, as
+    /// `(first, past_last)`.
+    pub fn get_line_range(&self, id: SrcId, start: usize, end: usize): (usize, usize) {
+        let first = match self.get_offset_line(id, start) {
+            Some((_, l, _)) => l,
+            None => 0,
+        };
+        let last = if end > 0 { end - 1 } else { 0 };
+        let past = match self.get_offset_line(id, if last > start { last } else { start }) {
+            Some((_, l, _)) => l + 1,
+            None => self.line_count(id),
+        };
+        return (first, past);
+    }
+}
+
+/// Split `text` into lines (onto `lines`), as ariadne does: after every
+/// `\r`, `\n`, vertical tab, form feed, U+0085, U+2028 and U+2029, with
+/// `\r\n` as one ending. An empty text is one empty line. Returns the
+/// length in characters.
+fn split_lines(text: str, lines: &mut +[Line; ..+]): usize {
+    if text.len() == 0 {
+        lines.push(Line { offset: 0, char_len: 0, byte_offset: 0, byte_len: 0 });
+        return 0;
+    }
+    let b = text.as_bytes();
+    let mut char_offset: usize = 0;
+    let mut byte_offset: usize = 0;
+    let mut chars: usize = 0;
+    let mut i: usize = 0;
+    while i < b.len() {
+        let c = decode(b, i);
+        let n = c.len_utf8();
+        i += n;
+        chars += 1;
+        let cp = c as u32;
+        let sep = cp == 13 || cp == 10 || cp == 11 || cp == 12 || cp == 0x85 || cp == 0x2028 || cp == 0x2029;
+        if sep || i == b.len() {
+            if cp == 13 && i < b.len() && b[i] == 10 {
+                i += 1;
+                chars += 1;
+            }
+            lines.push(Line { offset: char_offset, char_len: chars, byte_offset, byte_len: i - byte_offset });
+            char_offset += chars;
+            byte_offset = i;
+            chars = 0;
+        }
+    }
+    return char_offset;
+}
+
+/// The character starting at byte `i` of `b` (valid UTF-8).
+pub fn decode(b: [u8; &], i: usize): char {
+    let c0 = b[i] as u32;
+    if c0 < 128 {
+        return c0 as u8 as char;
+    }
+    let (len, init) = if c0 < 224 {
+        (2, c0 & 31)
+    } else if c0 < 240 {
+        (3, c0 & 15)
+    } else {
+        (4, c0 & 7)
+    };
+    let mut cp = init;
+    let mut k: usize = 1;
+    while k < len && i + k < b.len() {
+        cp = (cp << 6) | (b[i + k] as u32 & 63);
+        k += 1;
+    }
+    return core::str::char_from_u32(cp);
+}
+
+/// The number of characters in `s`.
+pub fn char_count(s: str): usize {
+    let mut n: usize = 0;
+    for c in s.as_bytes() {
+        if c < 128 || c >= 192 {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// `s` without trailing whitespace (Unicode's, as Rust's `trim_end`).
+pub fn trim_end(s: str): str {
+    let b = s.as_bytes();
+    let mut end = b.len();
+    while end > 0 {
+        let mut start = end - 1;
+        while start > 0 && b[start] >= 128 && b[start] < 192 {
+            start -= 1;
+        }
+        if !is_whitespace(decode(b, start)) {
+            break;
+        }
+        end = start;
+    }
+    return s[..end];
+}

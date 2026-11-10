@@ -569,7 +569,7 @@ impl Parser {
             let at = self.prev_end();
             let mut m = String::new();
             m.write("expected `;` after {what}");
-            self.diag(Code::MissingSemi, Span::new(at, at), m.as_str());
+            self.diag_with(Code::MissingSemi, Span::new(at, at), m.as_str(), Some("add `;` here"), None);
             return Ok(());
         }
         self.expect(T::Semi)?;
