@@ -185,13 +185,13 @@ impl::<K: Light + Hash + Eq, V: Light> HashMap::<K, V> {
 }
 
 impl::<K: Light + Hash + Eq + Debug, V: Light + Debug> Debug for HashMap::<K, V> {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         debug_entries(self.iter(), out);
     }
 }
 
 /// `{k: v, ...}`.
-fn debug_entries::<K: Light + Debug, V: Light + Debug, I: Iterator::<(K, V)>>(mut it: I, out: &mut String) {
+fn debug_entries::<K: Light + Debug, V: Light + Debug, I: Iterator::<(K, V)>>(mut it: I, out: &mut +String) {
     out.push('{');
     let mut first = true;
     for (k, v) in it {
@@ -421,7 +421,7 @@ impl::<K: Light + Hash + Eq, V: Light> OrderedHashMap::<K, V> {
 }
 
 impl::<K: Light + Hash + Eq + Debug, V: Light + Debug> Debug for OrderedHashMap::<K, V> {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         debug_entries(self.iter(), out);
     }
 }

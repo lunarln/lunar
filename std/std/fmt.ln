@@ -8,7 +8,7 @@ extern "C" {
     fn strtod(s: *u8, end: *mut *mut u8): f64;
 }
 
-fn write_f64(out: &mut String, v: f64) {
+fn write_f64(out: &mut +String, v: f64) {
     if v != v {
         out.push_str("NaN");
         return;
@@ -64,25 +64,25 @@ pub fn parse_f64(s: str): Option::<f64> {
 }
 
 impl Display for f64 {
-    fn fmt(&self, out: &mut String) {
+    fn fmt(&self, out: &mut +String) {
         write_f64(out, self);
     }
 }
 
 impl Display for f32 {
-    fn fmt(&self, out: &mut String) {
+    fn fmt(&self, out: &mut +String) {
         write_f64(out, self as f64);
     }
 }
 
 impl core::fmt::Debug for f64 {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         write_f64(out, self);
     }
 }
 
 impl core::fmt::Debug for f32 {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         write_f64(out, self as f64);
     }
 }

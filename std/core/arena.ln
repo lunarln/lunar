@@ -52,7 +52,7 @@ impl::<T> Hash for Id::<T> {
 }
 
 impl::<T> Debug for Id::<T> {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         out.write("#{self.index}");
     }
 }
@@ -104,7 +104,7 @@ impl::<T> Hash for List::<T> {
 }
 
 impl::<T> Debug for List::<T> {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         out.write("#{self.start}+{self.len}");
     }
 }

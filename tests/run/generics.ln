@@ -47,7 +47,7 @@ enum ParseError {
 }
 
 impl Display for ParseError {
-    fn fmt(&self, out: &mut String) {
+    fn fmt(&self, out: &mut +String) {
         match self {
             ParseError::Empty => out.push_str("empty input"),
             ParseError::Bad(b) => out.write("bad byte {b}"),

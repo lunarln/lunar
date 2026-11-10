@@ -74,7 +74,7 @@ impl::<A: Eq, B: Eq, C: Eq> Eq for (A, B, C) {
 }
 
 impl crater::fmt::Display for Ordering {
-    fn fmt(&self, out: &mut String) {
+    fn fmt(&self, out: &mut +String) {
         out.push_str(match self {
             Ordering::Less => "Less",
             Ordering::Equal => "Equal",
@@ -94,7 +94,7 @@ pub fn max::<T: Ord + Light>(a: T, b: T): T {
 }
 
 impl crater::fmt::Debug for Ordering {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         self.fmt(out);
     }
 }

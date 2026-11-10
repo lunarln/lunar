@@ -42,7 +42,7 @@ struct Point {
 }
 
 impl Display for Point {
-    fn fmt(&self, out: &mut String) {
+    fn fmt(&self, out: &mut +String) {
         out.write("({self.x}, {self.y})");
     }
 }
