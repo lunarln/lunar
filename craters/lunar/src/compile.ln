@@ -91,20 +91,9 @@ fn with_std(p: Program, cs: Craters, opts: Options): Sema {
 /// Analyze the file `path` alone (with `core` and `std`), as a crater
 /// named after it.
 pub fn analyze_file(path: str, test: bool, target_os: Option::<str>): Sema {
-    let opts = options(test, target_os);
-    let mut p = Program::new();
-    let mut cs = Craters::new();
-    let name = crater_name(path);
-    match load_crate(&mut p, &mut cs, name.as_str(), path, "") {
-        Some(c) => cs.list.push(c),
-        None => {
-            let mut m = String::new();
-            m.write("could not read `{path}`");
-            error(&mut p, build::IO(), m.as_str(), "");
-            return Sema::new(p, cs, opts);
-        }
-    }
-    return with_std(p, cs, opts);
+    let mut proj = Project::new();
+    proj.single(crater_name(path).as_str(), path);
+    return analyze_specs(&proj, test, target_os);
 }
 
 /// Record an error without a place in the source.

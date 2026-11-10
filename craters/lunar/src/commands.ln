@@ -9,7 +9,7 @@ use std::env;
 use std::fs;
 use std::process;
 use ln_ast::Span;
-use ln_sema::codes::{all_codes, build, manifest};
+use ln_sema::codes::{build, manifest};
 use ln_sema::diag::dummy_span;
 use ln_sema::program::Program;
 use ln_sema::render::render_all;
@@ -43,13 +43,7 @@ pub fn report_project(e: &ProjectError) {
         }
     }
     let m = p.sym(e.message.as_str());
-    let mut code = manifest::PARSE();
-    for c in all_codes() {
-        if e.code.as_str().starts_with(c.scope) && e.code.as_str().ends_with(c.name) && e.code.len() == c.scope.len() + 2 + c.name.len() {
-            code = c;
-        }
-    }
-    p.diags.error(code, span, m);
+    p.diags.error(e.code, span, m);
     if e.label.len() > 0 {
         let l = p.sym(e.label.as_str());
         p.diags.label(l);
