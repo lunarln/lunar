@@ -93,6 +93,19 @@ fn ui_tests_report_expected_errors() {
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
+/// Of equally close names, the suggestion is the first in alphabetical
+/// order (`print` and `println` are both one edit from `printn`), whatever
+/// order the scope's hash map is in this time.
+#[test]
+fn similar_name_suggestion_is_deterministic() {
+    let path = root().join("tests/ui/unresolved.ln");
+    for _ in 0..8 {
+        let a = ln_driver::analyze(&path, false);
+        let helps: Vec<&String> = a.diags.iter().flat_map(|d| d.helps.iter()).collect();
+        assert!(helps.iter().any(|h| h.as_str() == "a similar name exists: `print`"), "{helps:?}");
+    }
+}
+
 fn run_dir(dir: &str) {
     let mut failures = Vec::new();
     for f in ln_files(&root().join(dir)) {

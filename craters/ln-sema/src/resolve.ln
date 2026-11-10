@@ -325,7 +325,8 @@ impl Sema {
         }
     }
 
-    /// Edit-distance based suggestion from the module scope.
+    /// Edit-distance based suggestion from the module scope: the closest
+    /// name, and of equally close names the first in alphabetical order.
     fn suggest(&self, from: DefId, name: Symbol, ns: Ns): Option::<String> {
         let m = self.normal_module(from);
         let text = self.p.text(name);
@@ -343,8 +344,9 @@ impl Sema {
                 continue;
             }
             let dist = edit_distance(text, c);
+            // Of equally close names, the first in alphabetical order.
             let better = match best {
-                Some(b) => dist < b.0,
+                Some(b) => dist < b.0 || (dist == b.0 && c.cmp(&self.p.text(b.1)) == Ordering::Less),
                 None => true,
             };
             if dist <= limit && better {
