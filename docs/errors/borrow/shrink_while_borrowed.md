@@ -24,6 +24,12 @@ by lending the whole struct.
 The same error is reported when one argument of a call may shrink a value
 that another argument of the same call points into.
 
+A view returned by a function points into the arguments that the
+function's body returns views of (and, through a function pointer or a
+trait method on a generic receiver, into all of them). When the view comes
+from what a function's body returns, the error also points at that
+argument: "the value returned by `f` points into `x`".
+
 ## Erroneous example
 
 ```lunar

@@ -306,6 +306,56 @@ Borrowed parameters are passed by address, so a view into a borrowed value
 points into the caller's data and may be returned:
 `fn first_two(a: &[i32; 4]): [i32; &] { return a[0..2]; }`.
 
+#### What a returned view points into
+
+Which arguments a call's result may point into is inferred from the body of
+the function called, not from its signature. Here the result points into
+`x` only, so `y` may change or move while it is in use:
+
+```lunar
+fn first(a: &String, b: &String): str {
+    if b.len() > 3 { return a.as_str()[1..]; }
+    return a.as_str();
+}
+
+let v = first(&x, &y);
+y.clear();               // fine: `v` does not point into `y`
+x.clear();               // err(borrow::shrink_while_borrowed)
+println("{v}");
+```
+
+* Every value the body returns counts: its tail, its `return`s, and through
+  them the `break`s of loops and the arms of `if` and `match`. A view into
+  a borrowed (or in-out) parameter's own data points into that argument. A
+  view the parameter holds (a `str` argument, an item of a
+  `&[str; ..+]`, a `str` field of `&self`) points wherever the argument's
+  views point, so the argument itself may still be changed:
+  `fn rest(&self): str { return self.src[self.pos..]; }` leaves `self` free
+  to change while the result is in use.
+* Recursive and mutually recursive functions get the smallest answer that
+  agrees with all their bodies.
+* Closures are inferred the same way. Calling one gives a view into a
+  variable it borrows only if its body returns one, so a closure may
+  capture a borrowed parameter and return a view of it
+  (`let tail = |i: usize| s.as_str()[i..];`), and a result that does not
+  come from an argument does not borrow it.
+* Where there is no body to look at, the result may point into every
+  argument (and, for a closure, everything it borrows): calls through
+  function pointers, trait methods on a generic receiver (`t.name()` with
+  `T: Named`, whatever implementations exist; on a concrete type, the
+  implementation's body is used, or the trait's default body), closures
+  whose type is not known (a parameter `f: F` with `F: Fn(): str`),
+  `extern` functions and intrinsics, and functions that make views from raw
+  pointers. A generic function's body is inferred once, for all
+  instantiations.
+* A function whose declared return type has no view of its own
+  (`pop(&mut self): Option::<T>`) never points into its arguments' own
+  data, only where their items point.
+
+`kept` is never inferred: it is part of the signature. When a borrow error
+comes from an inferred result, it points at the argument: "the value
+returned by `first` points into `x`".
+
 Function pointer types record each parameter's mode, written as in
 signatures: `fn(&String): usize`, `fn(&mut i32)`, `fn(String): usize`. A
 function converts to a pointer type with the same modes, and a call through
