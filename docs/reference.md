@@ -205,7 +205,9 @@ to 64 MiB in total.
 * **`&mut +T` promises to only grow.** A parameter declared `&mut +T` (or a
   receiver `&mut +self`) is never shrunk or replaced, so the caller's views
   survive the call. `push`, `extend`, `reserve`, `String::push_str`,
-  `String::write`, `Arena::add` and `Interner::intern` are `+`. Methods
+  `String::write`, `Arena::add` and `Interner::intern` are `+`, and so is
+  the `out` of `Display::fmt` and `Debug::debug`, which `String::write`
+  calls for each hole. Methods
   that move what views would see are not, even when nothing is freed:
   array `insert` shifts elements, and `HashMap::insert` may rebuild its
   table, so a loop over a map cannot insert into it:
@@ -452,6 +454,18 @@ parameter, such as `println`, `print`, `panic`, `String::write` or
 `core::fmt::format`. `{expr}` formats `expr` with `Display`; `{{` and `}}`
 are literal braces. Everywhere else a string literal is a plain `str`.
 
+A type is made printable by implementing `Display` (or `Debug`, for
+`{expr:?}`), which appends to a grow-only `String`, so that `s.write(..)`
+leaves views into `s` valid:
+
+```lunar
+impl Display for Point {
+    fn fmt(&self, out: &mut +String) {
+        out.write("({self.x}, {self.y})");
+    }
+}
+```
+
 A hole may contain string literals: `println("{m.get("k")} {greet("moon")}")`.
 Because any string literal may turn out to be a format string, the lexer
 reads a `{` as opening a hole only when what follows looks like an
@@ -484,7 +498,10 @@ so an overrun is not reliably caught at run time.
 Traits work like Rust's: `trait Name::<Params>: Supertraits { fn m(self); }`
 with default methods, static functions (`T::default()`), generic and blanket
 impls (`impl::<T: Dull> Clone for [T; ..+]`), and negative impls only for
-auto traits (and `Dull` cannot be negated). Trait method calls are resolved
+auto traits (and `Dull` cannot be negated). An implementation's methods
+take their parameters exactly as the trait declares, `+` included: an
+`out: &mut String` where the trait says `out: &mut +String` is
+`err(trait::signature)`. Trait method calls are resolved
 statically and monomorphized; there are no trait objects.
 
 Method calls *autoslice*: a method called on `[T; -..+]` also finds the
