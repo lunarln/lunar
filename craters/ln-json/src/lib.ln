@@ -1,0 +1,942 @@
+// JSON (RFC 8259): parsing, building and writing documents, for the
+// language server (what the Rust server gets from serde_json).
+//
+// A `Json` is one document. Its values are nodes in one array, reached by
+// `Value` handles, and the text of every string, key and number is in one
+// buffer. Arrays and objects link their children (an object's children
+// carry their keys), so values can be added to any of them at any time.
+//
+//     let mut j = Json::new();
+//     let o = j.object();
+//     let name = j.string("lunar");
+//     j.set(o, "name", name);
+//     j.to_string(o)                     // {"name":"lunar"}
+//
+//     let doc = ln_json::parse("{\"a\": [1, 2]}").unwrap();
+//     let a = doc.get(doc.root(), "a").unwrap();
+//     doc.as_i64(doc.at(a, 1).unwrap())  // Some(2)
+//
+// Parsing is strict about the grammar (no comments, no trailing commas)
+// and keeps numbers as written. `\u` escapes may pair into a character
+// outside the Basic Multilingual Plane; a surrogate without its other half
+// becomes U+FFFD, as JavaScript's own text may hold one. Writing is
+// compact, with serde_json's escapes.
+
+#[cfg(test)]
+mod tests;
+
+/// What a value is.
+#[derive(Eq, Debug)]
+pub enum Kind {
+    Null,
+    Bool,
+    Number,
+    String,
+    Array,
+    Object,
+}
+
+/// A value of a `Json` document.
+#[derive(Eq, Hash, Debug)]
+pub struct Value {
+    index: u32,
+}
+
+/// No node.
+const NONE: u32 = 4294967295;
+
+/// Arrays and objects nest at most this deep (as in serde_json).
+const MAX_DEPTH: u32 = 128;
+
+struct Node {
+    kind: Kind,
+    /// A `Bool`'s value.
+    flag: bool,
+    /// A string's or number's text in `Json::text`.
+    lo: u32,
+    hi: u32,
+    /// The key of an object's member, in `Json::text`.
+    key_lo: u32,
+    key_hi: u32,
+    /// The children of an array or object, linked by `next`.
+    first: u32,
+    last: u32,
+    next: u32,
+    len: u32,
+    /// In an array or object already.
+    linked: bool,
+}
+
+/// A JSON document: its values, and which one is the whole document.
+pub struct Json {
+    text: String,
+    nodes: [Node; ..+],
+    root: u32,
+}
+
+/// Why text is not JSON: what is wrong, and the byte offset where.
+pub struct ParseError {
+    pub problem: Problem,
+    pub offset: usize,
+}
+
+#[derive(Eq, Debug)]
+pub enum Problem {
+    EndOfText,
+    Trailing,
+    ExpectedValue,
+    BadNumber,
+    TooDeep,
+    UnterminatedArray,
+    ArraySeparator,
+    UnterminatedObject,
+    ObjectSeparator,
+    ExpectedKey,
+    ExpectedColon,
+    UnterminatedString,
+    ControlChar,
+    BadEscape,
+    UnterminatedUnicode,
+    BadUnicode,
+}
+
+impl ParseError {
+    pub fn message(&self): str {
+        return match self.problem {
+            Problem::EndOfText => "expected a value, found the end of the text",
+            Problem::Trailing => "trailing characters after the value",
+            Problem::ExpectedValue => "expected a value",
+            Problem::BadNumber => "invalid number",
+            Problem::TooDeep => "arrays and objects nest too deeply",
+            Problem::UnterminatedArray => "unterminated array",
+            Problem::ArraySeparator => "expected `,` or `]`",
+            Problem::UnterminatedObject => "unterminated object",
+            Problem::ObjectSeparator => "expected `,` or `}`",
+            Problem::ExpectedKey => "expected a key (a string)",
+            Problem::ExpectedColon => "expected `:`",
+            Problem::UnterminatedString => "unterminated string",
+            Problem::ControlChar => "control character in a string",
+            Problem::BadEscape => "invalid escape",
+            Problem::UnterminatedUnicode => "unterminated `\\u` escape",
+            Problem::BadUnicode => "invalid `\\u` escape",
+        };
+    }
+}
+
+impl Display for ParseError {
+    fn fmt(&self, out: &mut String) {
+        out.write("{self.message()} at byte {self.offset}");
+    }
+}
+
+impl Debug for ParseError {
+    fn debug(&self, out: &mut String) {
+        out.write("{self.message()} at byte {self.offset}");
+    }
+}
+
+impl Json {
+    /// An empty document, without a root until `set_root`.
+    pub fn new(): Json {
+        return Json { text: String::new(), nodes: [], root: NONE };
+    }
+
+    /// The whole document: the value `parse` read, or what `set_root` set.
+    pub fn root(&self): Value {
+        if self.root == NONE {
+            panic("ln_json: the document has no root value");
+        }
+        return Value { index: self.root };
+    }
+
+    pub fn set_root(&mut self, v: Value) {
+        self.root = v.index;
+    }
+
+    // ----------------------------------------------------------- building
+
+    fn add(&mut +self, kind: Kind, flag: bool, lo: u32, hi: u32): Value {
+        let index = self.nodes.len() as u32;
+        self.nodes.push(Node { kind, flag, lo, hi, key_lo: 0, key_hi: 0, first: NONE, last: NONE, next: NONE, len: 0, linked: false });
+        return Value { index };
+    }
+
+    /// Append `s` to the text buffer: where it is.
+    fn add_text(&mut +self, s: str): (u32, u32) {
+        let lo = self.text.len() as u32;
+        self.text.push_str(s);
+        return (lo, self.text.len() as u32);
+    }
+
+    pub fn null(&mut +self): Value {
+        return self.add(Kind::Null, false, 0, 0);
+    }
+
+    pub fn bool(&mut +self, b: bool): Value {
+        return self.add(Kind::Bool, b, 0, 0);
+    }
+
+    pub fn int(&mut +self, n: i64): Value {
+        let lo = self.text.len() as u32;
+        self.text.write("{n}");
+        return self.add(Kind::Number, false, lo, self.text.len() as u32);
+    }
+
+    pub fn uint(&mut +self, n: u64): Value {
+        let lo = self.text.len() as u32;
+        self.text.write("{n}");
+        return self.add(Kind::Number, false, lo, self.text.len() as u32);
+    }
+
+    /// A number with the shortest text that reads back as `x` (`1.0`,
+    /// `0.1`, `1e21`). JSON has no NaN or infinity: those are `null`, as
+    /// serde_json writes them.
+    pub fn float(&mut +self, x: f64): Value {
+        if x != x || x > 1.7976931348623157e308 || x < -1.7976931348623157e308 {
+            return self.null();
+        }
+        let mut s = String::new();
+        s.write("{x}");
+        // `%g` style (`1e+21`, `1e-07`) to JSON's (`1e21`, `1e-7`).
+        let mut t = String::new();
+        let b = s.as_bytes();
+        let mut i: usize = 0;
+        let mut has_point = false;
+        while i < b.len() {
+            let c = b[i];
+            if c == b'e' {
+                t.push('e');
+                i += 1;
+                if i < b.len() && b[i] == b'+' {
+                    i += 1;
+                } else if i < b.len() && b[i] == b'-' {
+                    t.push('-');
+                    i += 1;
+                }
+                while i + 1 < b.len() && b[i] == b'0' {
+                    i += 1;
+                }
+                has_point = true;
+                continue;
+            }
+            if c == b'.' {
+                has_point = true;
+            }
+            t.push(c as char);
+            i += 1;
+        }
+        if !has_point {
+            t.push_str(".0");
+        }
+        let (lo, hi) = self.add_text(t.as_str());
+        return self.add(Kind::Number, false, lo, hi);
+    }
+
+    /// A number written as `text`, kept as it is; `None` if `text` is not
+    /// a JSON number.
+    pub fn number(&mut +self, text: str): Option::<Value> {
+        if number_end(text.as_bytes(), 0) != Some(text.len()) {
+            return None;
+        }
+        let (lo, hi) = self.add_text(text);
+        return Some(self.add(Kind::Number, false, lo, hi));
+    }
+
+    pub fn string(&mut +self, s: str): Value {
+        let (lo, hi) = self.add_text(s);
+        return self.add(Kind::String, false, lo, hi);
+    }
+
+    /// An empty array.
+    pub fn array(&mut +self): Value {
+        return self.add(Kind::Array, false, 0, 0);
+    }
+
+    /// An empty object.
+    pub fn object(&mut +self): Value {
+        return self.add(Kind::Object, false, 0, 0);
+    }
+
+    /// Append `item` to `array`. A value can be in one array or object.
+    pub fn push(&mut +self, array: Value, item: Value) {
+        if self.nodes[array.index as usize].kind != Kind::Array {
+            panic("ln_json: push onto a value that is not an array");
+        }
+        self.link(array, item);
+    }
+
+    /// Set `object`'s member `key` to `value`: replaced where it is if
+    /// there is one, else added at the end.
+    pub fn set(&mut +self, object: Value, key: str, value: Value) {
+        if self.nodes[object.index as usize].kind != Kind::Object {
+            panic("ln_json: set on a value that is not an object");
+        }
+        // Its existing member, and the one before it.
+        let mut prev = NONE;
+        let mut cur = self.nodes[object.index as usize].first;
+        while cur != NONE {
+            let n = self.nodes[cur as usize];
+            if self.text.as_str()[n.key_lo as usize..n.key_hi as usize] == key {
+                break;
+            }
+            prev = cur;
+            cur = n.next;
+        }
+        let (lo, hi) = self.add_text(key);
+        if cur == NONE {
+            self.link(object, value);
+        } else {
+            self.claim(value);
+            let o = object.index as usize;
+            let v = value.index as usize;
+            self.nodes[v].next = self.nodes[cur as usize].next;
+            if prev == NONE {
+                self.nodes[o].first = value.index;
+            } else {
+                self.nodes[prev as usize].next = value.index;
+            }
+            if self.nodes[o].last == cur {
+                self.nodes[o].last = value.index;
+            }
+        }
+        let v = value.index as usize;
+        self.nodes[v].key_lo = lo;
+        self.nodes[v].key_hi = hi;
+    }
+
+    /// Mark `v` as in a container (it can be in only one).
+    fn claim(&mut +self, v: Value) {
+        if self.nodes[v.index as usize].linked {
+            panic("ln_json: the value is already in an array or object");
+        }
+        self.nodes[v.index as usize].linked = true;
+    }
+
+    /// Append `child` to the children of `parent`.
+    fn link(&mut +self, parent: Value, child: Value) {
+        self.claim(child);
+        let p = parent.index as usize;
+        let last = self.nodes[p].last;
+        if last == NONE {
+            self.nodes[p].first = child.index;
+        } else {
+            self.nodes[last as usize].next = child.index;
+        }
+        self.nodes[p].last = child.index;
+        self.nodes[p].len += 1;
+    }
+
+    /// `v` from `other`, copied into this document.
+    pub fn copy_from(&mut +self, other: &Json, v: Value): Value {
+        let n = other.nodes[v.index as usize];
+        return match n.kind {
+            Kind::Null => self.null(),
+            Kind::Bool => self.bool(n.flag),
+            Kind::Number => {
+                let (lo, hi) = self.add_text(other.text.as_str()[n.lo as usize..n.hi as usize]);
+                self.add(Kind::Number, false, lo, hi)
+            }
+            Kind::String => self.string(other.text.as_str()[n.lo as usize..n.hi as usize]),
+            Kind::Array => {
+                let a = self.array();
+                let mut c = n.first;
+                while c != NONE {
+                    let x = self.copy_from(other, Value { index: c });
+                    self.link(a, x);
+                    c = other.nodes[c as usize].next;
+                }
+                a
+            }
+            Kind::Object => {
+                let o = self.object();
+                let mut c = n.first;
+                while c != NONE {
+                    let cn = other.nodes[c as usize];
+                    let x = self.copy_from(other, Value { index: c });
+                    self.link(o, x);
+                    let (lo, hi) = self.add_text(other.text.as_str()[cn.key_lo as usize..cn.key_hi as usize]);
+                    self.nodes[x.index as usize].key_lo = lo;
+                    self.nodes[x.index as usize].key_hi = hi;
+                    c = cn.next;
+                }
+                o
+            }
+        };
+    }
+
+    // ----------------------------------------------------------- reading
+
+    pub fn kind(&self, v: Value): Kind {
+        return self.nodes[v.index as usize].kind;
+    }
+
+    pub fn is_null(&self, v: Value): bool {
+        return self.nodes[v.index as usize].kind == Kind::Null;
+    }
+
+    pub fn as_bool(&self, v: Value): Option::<bool> {
+        let n = self.nodes[v.index as usize];
+        if n.kind != Kind::Bool {
+            return None;
+        }
+        return Some(n.flag);
+    }
+
+    /// A string's text.
+    pub fn as_str(&self, v: Value): Option::<str> {
+        let n = self.nodes[v.index as usize];
+        if n.kind != Kind::String {
+            return None;
+        }
+        return Some(self.text.as_str()[n.lo as usize..n.hi as usize]);
+    }
+
+    /// A number as it was written.
+    pub fn number_text(&self, v: Value): Option::<str> {
+        let n = self.nodes[v.index as usize];
+        if n.kind != Kind::Number {
+            return None;
+        }
+        return Some(self.text.as_str()[n.lo as usize..n.hi as usize]);
+    }
+
+    /// A number written as an integer that fits in an `i64` (not `1.0`
+    /// or `1e3`, as serde_json's `as_i64`).
+    pub fn as_i64(&self, v: Value): Option::<i64> {
+        let t = self.number_text(v)?;
+        let b = t.as_bytes();
+        let neg = b.len() > 0 && b[0] == b'-';
+        let mag = digits_value(if neg { b[1..] } else { b })?;
+        if neg {
+            if mag > 9223372036854775808 {
+                return None;
+            }
+            return Some(0u64.wrapping_sub(mag) as i64);
+        }
+        if mag > 9223372036854775807 {
+            return None;
+        }
+        return Some(mag as i64);
+    }
+
+    /// A number written as a non-negative integer that fits in a `u64`.
+    pub fn as_u64(&self, v: Value): Option::<u64> {
+        let t = self.number_text(v)?;
+        return digits_value(t.as_bytes());
+    }
+
+    /// Any number, as the nearest `f64`.
+    pub fn as_f64(&self, v: Value): Option::<f64> {
+        let t = self.number_text(v)?;
+        return std::fmt::parse_f64(t);
+    }
+
+    /// The number of items of an array or members of an object (0 for
+    /// other values).
+    pub fn len(&self, v: Value): usize {
+        return self.nodes[v.index as usize].len as usize;
+    }
+
+    /// The first item of an array or member of an object.
+    pub fn first(&self, v: Value): Option::<Value> {
+        let f = self.nodes[v.index as usize].first;
+        if f == NONE {
+            return None;
+        }
+        return Some(Value { index: f });
+    }
+
+    /// The item or member after `v` in its array or object.
+    pub fn next(&self, v: Value): Option::<Value> {
+        let n = self.nodes[v.index as usize].next;
+        if n == NONE {
+            return None;
+        }
+        return Some(Value { index: n });
+    }
+
+    /// The key of an object's member (from `first`/`next`).
+    pub fn key(&self, member: Value): str {
+        let n = self.nodes[member.index as usize];
+        return self.text.as_str()[n.key_lo as usize..n.key_hi as usize];
+    }
+
+    /// Item `i` of an array.
+    pub fn at(&self, array: Value, i: usize): Option::<Value> {
+        if self.nodes[array.index as usize].kind != Kind::Array {
+            return None;
+        }
+        let mut c = self.nodes[array.index as usize].first;
+        let mut k: usize = 0;
+        while c != NONE {
+            if k == i {
+                return Some(Value { index: c });
+            }
+            k += 1;
+            c = self.nodes[c as usize].next;
+        }
+        return None;
+    }
+
+    /// The member `key` of an object (the last, if the text repeats it).
+    pub fn get(&self, object: Value, key: str): Option::<Value> {
+        if self.nodes[object.index as usize].kind != Kind::Object {
+            return None;
+        }
+        let mut found = NONE;
+        let mut c = self.nodes[object.index as usize].first;
+        while c != NONE {
+            let n = self.nodes[c as usize];
+            if self.text.as_str()[n.key_lo as usize..n.key_hi as usize] == key {
+                found = c;
+            }
+            c = n.next;
+        }
+        if found == NONE {
+            return None;
+        }
+        return Some(Value { index: found });
+    }
+
+    /// The value at a path of object keys: `path(v, ["a", "b"][..])` is
+    /// `v.a.b`.
+    pub fn path(&self, v: Value, keys: [str; &]): Option::<Value> {
+        let mut cur = v;
+        for k in keys {
+            cur = self.get(cur, k)?;
+        }
+        return Some(cur);
+    }
+
+    // ----------------------------------------------------------- writing
+
+    /// `v` as compact JSON text.
+    pub fn write(&self, v: Value, out: &mut +String) {
+        let n = self.nodes[v.index as usize];
+        match n.kind {
+            Kind::Null => out.push_str("null"),
+            Kind::Bool => out.push_str(if n.flag { "true" } else { "false" }),
+            Kind::Number => out.push_str(self.text.as_str()[n.lo as usize..n.hi as usize]),
+            Kind::String => write_string(out, self.text.as_str()[n.lo as usize..n.hi as usize]),
+            Kind::Array => {
+                out.push('[');
+                let mut c = n.first;
+                while c != NONE {
+                    if c != n.first {
+                        out.push(',');
+                    }
+                    self.write(Value { index: c }, out);
+                    c = self.nodes[c as usize].next;
+                }
+                out.push(']');
+            }
+            Kind::Object => {
+                out.push('{');
+                let mut c = n.first;
+                while c != NONE {
+                    if c != n.first {
+                        out.push(',');
+                    }
+                    let m = self.nodes[c as usize];
+                    write_string(out, self.text.as_str()[m.key_lo as usize..m.key_hi as usize]);
+                    out.push(':');
+                    self.write(Value { index: c }, out);
+                    c = m.next;
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    pub fn to_string(&self, v: Value): String {
+        let mut out = String::new();
+        self.write(v, &mut out);
+        return out;
+    }
+}
+
+/// The value of a run of decimal digits, if it is one and fits in a `u64`.
+fn digits_value(b: [u8; &]): Option::<u64> {
+    if b.len() == 0 {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for c in b {
+        if c < b'0' || c > b'9' {
+            return None;
+        }
+        let d = (c - b'0') as u64;
+        if v > (18446744073709551615 - d) / 10 {
+            return None;
+        }
+        v = v * 10 + d;
+    }
+    return Some(v);
+}
+
+/// `s` as a JSON string: quoted, with `"`, `\` and control characters
+/// escaped as serde_json escapes them (`\n`, `\u001b`); everything else,
+/// including non-ASCII characters, as it is.
+pub fn write_string(out: &mut +String, s: str) {
+    out.push('"');
+    let b = s.as_bytes();
+    let mut start: usize = 0;
+    for i in 0..b.len() {
+        let c = b[i];
+        if c >= 32 && c != b'"' && c != b'\\' {
+            continue;
+        }
+        out.push_str(s[start..i]);
+        start = i + 1;
+        if c == b'"' {
+            out.push_str("\\\"");
+        } else if c == b'\\' {
+            out.push_str("\\\\");
+        } else if c == 10 {
+            out.push_str("\\n");
+        } else if c == 13 {
+            out.push_str("\\r");
+        } else if c == 9 {
+            out.push_str("\\t");
+        } else if c == 8 {
+            out.push_str("\\b");
+        } else if c == 12 {
+            out.push_str("\\f");
+        } else {
+            let hex = "0123456789abcdef".as_bytes();
+            out.push_str("\\u00");
+            out.push(hex[(c >> 4) as usize] as char);
+            out.push(hex[(c & 15) as usize] as char);
+        }
+    }
+    out.push_str(s[start..]);
+    out.push('"');
+}
+
+// ===================================================================== parsing
+
+/// Parse a whole JSON text (whitespace around the value is allowed).
+pub fn parse(text: str): Result::<Json, ParseError> {
+    let mut j = Json::new();
+    let mut p = Parser { src: text, b: text.as_bytes(), pos: 0, depth: 0 };
+    let v = p.value(&mut j)?;
+    p.skip_ws();
+    if p.pos < p.b.len() {
+        return Err(p.error(Problem::Trailing));
+    }
+    j.root = v.index;
+    return Ok(j);
+}
+
+struct Parser {
+    src: str,
+    b: [u8; &],
+    pos: usize,
+    depth: u32,
+}
+
+impl Parser {
+    fn error(&self, problem: Problem): ParseError {
+        return ParseError { problem, offset: self.pos };
+    }
+
+    fn skip_ws(&mut self) {
+        while self.pos < self.b.len() {
+            let c = self.b[self.pos];
+            if c != b' ' && c != 9 && c != 10 && c != 13 {
+                return;
+            }
+            self.pos += 1;
+        }
+    }
+
+    /// Whether the text continues with `word`; if so, skip it.
+    fn eat(&mut self, word: str): bool {
+        let w = word.as_bytes();
+        if self.pos + w.len() > self.b.len() {
+            return false;
+        }
+        for i in 0..w.len() {
+            if self.b[self.pos + i] != w[i] {
+                return false;
+            }
+        }
+        self.pos += w.len();
+        return true;
+    }
+
+    fn value(&mut self, j: &mut +Json): Result::<Value, ParseError> {
+        self.skip_ws();
+        if self.pos >= self.b.len() {
+            return Err(self.error(Problem::EndOfText));
+        }
+        let c = self.b[self.pos];
+        if c == b'{' {
+            return self.object(j);
+        }
+        if c == b'[' {
+            return self.array(j);
+        }
+        if c == b'"' {
+            let (lo, hi) = self.string(j)?;
+            return Ok(j.add(Kind::String, false, lo, hi));
+        }
+        if c == b'-' || (c >= b'0' && c <= b'9') {
+            let start = self.pos;
+            match number_end(self.b, start) {
+                Some(end) => {
+                    self.pos = end;
+                    let (lo, hi) = j.add_text(self.src[start..end]);
+                    return Ok(j.add(Kind::Number, false, lo, hi));
+                }
+                None => return Err(self.error(Problem::BadNumber)),
+            }
+        }
+        if self.eat("true") {
+            return Ok(j.bool(true));
+        }
+        if self.eat("false") {
+            return Ok(j.bool(false));
+        }
+        if self.eat("null") {
+            return Ok(j.null());
+        }
+        return Err(self.error(Problem::ExpectedValue));
+    }
+
+    /// Step into an array or object (at its bracket).
+    fn enter(&mut self): Result::<(), ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(self.error(Problem::TooDeep));
+        }
+        self.pos += 1;
+        return Ok(());
+    }
+
+    fn array(&mut self, j: &mut +Json): Result::<Value, ParseError> {
+        self.enter()?;
+        let a = j.array();
+        self.skip_ws();
+        if self.pos < self.b.len() && self.b[self.pos] == b']' {
+            self.pos += 1;
+            self.depth -= 1;
+            return Ok(a);
+        }
+        loop {
+            let v = self.value(j)?;
+            j.link(a, v);
+            self.skip_ws();
+            if self.pos >= self.b.len() {
+                return Err(self.error(Problem::UnterminatedArray));
+            }
+            let c = self.b[self.pos];
+            if c == b']' {
+                self.pos += 1;
+                break;
+            }
+            if c != b',' {
+                return Err(self.error(Problem::ArraySeparator));
+            }
+            self.pos += 1;
+        }
+        self.depth -= 1;
+        return Ok(a);
+    }
+
+    fn object(&mut self, j: &mut +Json): Result::<Value, ParseError> {
+        self.enter()?;
+        let o = j.object();
+        self.skip_ws();
+        if self.pos < self.b.len() && self.b[self.pos] == b'}' {
+            self.pos += 1;
+            self.depth -= 1;
+            return Ok(o);
+        }
+        loop {
+            self.skip_ws();
+            if self.pos >= self.b.len() || self.b[self.pos] != b'"' {
+                return Err(self.error(Problem::ExpectedKey));
+            }
+            let (klo, khi) = self.string(j)?;
+            self.skip_ws();
+            if self.pos >= self.b.len() || self.b[self.pos] != b':' {
+                return Err(self.error(Problem::ExpectedColon));
+            }
+            self.pos += 1;
+            let v = self.value(j)?;
+            j.link(o, v);
+            j.nodes[v.index as usize].key_lo = klo;
+            j.nodes[v.index as usize].key_hi = khi;
+            self.skip_ws();
+            if self.pos >= self.b.len() {
+                return Err(self.error(Problem::UnterminatedObject));
+            }
+            let c = self.b[self.pos];
+            if c == b'}' {
+                self.pos += 1;
+                break;
+            }
+            if c != b',' {
+                return Err(self.error(Problem::ObjectSeparator));
+            }
+            self.pos += 1;
+        }
+        self.depth -= 1;
+        return Ok(o);
+    }
+
+    /// A string (at its opening quote), unescaped into `j`'s text: where.
+    fn string(&mut self, j: &mut +Json): Result::<(u32, u32), ParseError> {
+        self.pos += 1;
+        let lo = j.text.len() as u32;
+        let mut run = self.pos;
+        loop {
+            if self.pos >= self.b.len() {
+                return Err(self.error(Problem::UnterminatedString));
+            }
+            let c = self.b[self.pos];
+            if c == b'"' {
+                j.text.push_str(self.src[run..self.pos]);
+                self.pos += 1;
+                return Ok((lo, j.text.len() as u32));
+            }
+            if c < 32 {
+                return Err(self.error(Problem::ControlChar));
+            }
+            if c != b'\\' {
+                self.pos += 1;
+                continue;
+            }
+            j.text.push_str(self.src[run..self.pos]);
+            self.pos += 1;
+            if self.pos >= self.b.len() {
+                return Err(self.error(Problem::UnterminatedString));
+            }
+            let e = self.b[self.pos];
+            self.pos += 1;
+            if e == b'"' {
+                j.text.push('"');
+            } else if e == b'\\' {
+                j.text.push('\\');
+            } else if e == b'/' {
+                j.text.push('/');
+            } else if e == b'b' {
+                j.text.push('\u{8}');
+            } else if e == b'f' {
+                j.text.push('\u{c}');
+            } else if e == b'n' {
+                j.text.push('\n');
+            } else if e == b'r' {
+                j.text.push('\r');
+            } else if e == b't' {
+                j.text.push('\t');
+            } else if e == b'u' {
+                let ch = self.unicode_escape()?;
+                j.text.push(ch);
+            } else {
+                self.pos -= 2;
+                return Err(self.error(Problem::BadEscape));
+            }
+            run = self.pos;
+        }
+    }
+
+    /// The character of a `\u` escape (after the `u`), with the escape of
+    /// its low surrogate if it is a high one. A surrogate without its
+    /// other half is U+FFFD.
+    fn unicode_escape(&mut self): Result::<char, ParseError> {
+        let hi = self.hex4()?;
+        if hi >= 55296 && hi <= 56319 {
+            // A high surrogate: its low one should follow.
+            if self.pos + 6 <= self.b.len() && self.b[self.pos] == b'\\' && self.b[self.pos + 1] == b'u' {
+                let save = self.pos;
+                self.pos += 2;
+                let lo = self.hex4()?;
+                if lo >= 56320 && lo <= 57343 {
+                    let cp = 65536 + ((hi - 55296) << 10) + (lo - 56320);
+                    return Ok(char::from_u32(cp).unwrap());
+                }
+                // Not a low surrogate: an escape of its own.
+                self.pos = save;
+            }
+            return Ok('\u{FFFD}');
+        }
+        if hi >= 56320 && hi <= 57343 {
+            return Ok('\u{FFFD}');
+        }
+        return Ok(char::from_u32(hi).unwrap());
+    }
+
+    /// Four hexadecimal digits.
+    fn hex4(&mut self): Result::<u32, ParseError> {
+        if self.pos + 4 > self.b.len() {
+            return Err(self.error(Problem::UnterminatedUnicode));
+        }
+        let mut v: u32 = 0;
+        for _ in 0..4 {
+            let c = self.b[self.pos];
+            let d: u32 = if c >= b'0' && c <= b'9' {
+                (c - b'0') as u32
+            } else if c >= b'a' && c <= b'f' {
+                (c - b'a') as u32 + 10
+            } else if c >= b'A' && c <= b'F' {
+                (c - b'A') as u32 + 10
+            } else {
+                return Err(self.error(Problem::BadUnicode));
+            };
+            v = v * 16 + d;
+            self.pos += 1;
+        }
+        return Ok(v);
+    }
+}
+
+/// The end of the number starting at `start` in `b`: `-`, then `0` or
+/// digits not starting with `0`, then maybe a fraction and an exponent.
+fn number_end(b: [u8; &], start: usize): Option::<usize> {
+    let mut i = start;
+    if i < b.len() && b[i] == b'-' {
+        i += 1;
+    }
+    if i >= b.len() {
+        return None;
+    }
+    if b[i] == b'0' {
+        i += 1;
+    } else if b[i] >= b'1' && b[i] <= b'9' {
+        while i < b.len() && b[i] >= b'0' && b[i] <= b'9' {
+            i += 1;
+        }
+    } else {
+        return None;
+    }
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        let digits = i;
+        while i < b.len() && b[i] >= b'0' && b[i] <= b'9' {
+            i += 1;
+        }
+        if i == digits {
+            return None;
+        }
+    }
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        i += 1;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            i += 1;
+        }
+        let digits = i;
+        while i < b.len() && b[i] >= b'0' && b[i] <= b'9' {
+            i += 1;
+        }
+        if i == digits {
+            return None;
+        }
+    }
+    // A number cannot run into more digits or letters (`01`, `1x`).
+    if i < b.len() && ((b[i] >= b'0' && b[i] <= b'9') || b[i] == b'.' || (b[i] >= b'a' && b[i] <= b'z') || (b[i] >= b'A' && b[i] <= b'Z')) {
+        return None;
+    }
+    return Some(i);
+}
