@@ -38,7 +38,25 @@ highlighted from `ln-lexer`'s tokens (`ln-sema/src/highlight.ln`).
 | `ln-ariadne` | the `ariadne` crate (0.6) | complete: sources, labels (color, order, priority), reports with notes and helps, the whole `Config` and the layout algorithm, both character sets; ariadne's tests. Beyond ariadne: a `Theme` for every part of a report, and per-byte source styles (`Sources::add_styled`, `add_highlighted` with a `Highlighter`). Character widths approximate `unicode-width` (common wide and zero-width ranges) |
 | `ln-sema`    | `crates/ln-sema` and `crates/ln-diag` | complete (see below) |
 | `ln-codegen` | `crates/ln-codegen` | complete (LLVM through its C API, `llvm.ln`) |
-| `ln-driver`  | `crates/ln-driver` (the build path) | `ln-driver build` (above); also `ln-driver FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--render [--color] FILE...` the diagnostics drawn as `lunar check` draws them, `--craters DIR` the craters a package build loads |
+| `ln-json`    | what the language server gets from `serde_json` | JSON documents as arenas of linked nodes: strict parsing (escapes, `\u` surrogate pairs, numbers kept as written), building, compact writing with serde_json's escapes; tests in `src/tests.ln` |
+| `ln-driver`  | `crates/ln-driver` (the build path, `lsp.rs`, `ide.rs`) | `ln-driver build` (above); `ln-driver lsp` (below); also `ln-driver FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--render [--color] FILE...` the diagnostics drawn as `lunar check` draws them, `--craters DIR` the craters a package build loads |
+
+### The language server
+
+`ln-driver lsp [--stdio]` is `lunar lsp` (`ln-driver/src/{lsp,ide}.ln`, and
+`ln_ast::pretty` for declarations): `lsp-server`'s framing and lifecycle,
+full text synchronization, diagnostics as you type (for std itself too, when
+a file of a std source tree is open), hover with the Rust server's text,
+and go to definition. Open documents reach the loader as
+`Craters::overlay`. The standard library is `$LUNAR_STD_DIR`, else
+`<exe dir>/../lib/lunar/std`, else the `std` of the nearest ancestor of the
+executable's directory (`lsp::find_std_dir`), so definitions in it are
+`file:` locations; `lunar-std:` URIs and `lunar/stdSource` still work. It
+keeps the analyses of the four crates used last and analyzes others again
+when asked about them. The LSP tests in `crates/ln-driver/tests` (`lang`,
+`project`, `hover`, `lsp_session`) run against it with
+`LUNAR_BIN=craters/target/debug/ln-driver.exe`; `lsp_session` compares its
+answers with the Rust server's.
 
 ## The passes
 
@@ -50,6 +68,7 @@ highlighted from `ln-lexer`'s tokens (`ln-sema/src/highlight.ln`).
 | type checker | `typeck/*.rs` | `ln-sema/src/typeck/{mod,expr,call,pat,closure}.ln` | done; Rust's `FnCtx` is the `Sema::fcx` field |
 | code generation | `crates/ln-codegen` | `ln-codegen/src/{lib,func,ops,init,llvm}.ln` | done; the state of the function being lowered (Rust's `FnCg`) lives in `Cg` |
 | driver | `crates/ln-driver` (build path) | `ln-driver/src/{main,project,link}.ln` | done; std is read from disk, not embedded |
+| language server | `lsp.rs`, `ide.rs`, `ln-ast/src/pretty.rs` | `ln-driver/src/{lsp,ide}.ln`, `ln-ast/src/pretty.ln` | done; the same answers as the Rust server (`tests/lsp_session.rs`) |
 
 ### Data model
 
@@ -82,6 +101,12 @@ highlighted from `ln-lexer`'s tokens (`ln-sema/src/highlight.ln`).
 * No bindings inside `|` patterns; write separate arms.
 * Constants cannot hold structs.
 * `[T; ..+]` only grows; use `[T; -..+]` to `pop`/`truncate`/`clear`.
+* Keep fixed arrays well under 64K elements: they are copied as one LLVM
+  value, and LLVM's instruction selection crashes on `[65536 x i8]`. Use
+  an owning array for big buffers.
+* A struct holding a `Sema` (or anything with a `str` in it) counts as
+  holding views: moving one out of a field and back trips the borrow
+  checker, so keep it in place and query it there.
 * A `&mut` method may shrink what it is given, so it ends views into it;
   `&mut +self` methods only grow. Parameters whose views a function stores
   into an in-out argument are `kept`.

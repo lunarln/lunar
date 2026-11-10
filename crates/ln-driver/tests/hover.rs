@@ -49,6 +49,9 @@ fn hover_at(needle: &str, n: usize, at: usize) -> String {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("main.ln");
     std::fs::write(&path, SRC).unwrap();
+    if let Some(bin) = std::env::var_os("LUNAR_BIN") {
+        return lsp::hover_at(&bin, &path, needle, n, at);
+    }
     let a = analyze_with(&path, &AnalyzeOptions { keep_going: true, ..Default::default() });
     let errors: Vec<_> = a.diags.iter().filter(|d| d.is_error()).map(|d| format!("{}: {}", d.code, d.message)).collect();
     assert!(errors.is_empty(), "the sample has errors: {errors:#?}");
@@ -56,6 +59,71 @@ fn hover_at(needle: &str, n: usize, at: usize) -> String {
     let start = SRC.match_indices(needle).nth(n).unwrap_or_else(|| panic!("occurrence {n} of {needle:?}")).0;
     let (_, text) = ide::hover(&a, file, (start + at) as u32).unwrap_or_else(|| panic!("no hover at {needle:?}"));
     text
+}
+
+/// With `$LUNAR_BIN` (such as the compiler built from craters/), hovers
+/// come from its language server.
+mod lsp {
+    use serde_json::{Value, json};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::path::Path;
+    use std::process::{ChildStdin, ChildStdout, Command, Stdio};
+
+    fn send(w: &mut ChildStdin, msg: Value) {
+        let body = msg.to_string();
+        write!(w, "Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        w.flush().unwrap();
+    }
+
+    fn recv(r: &mut BufReader<ChildStdout>) -> Value {
+        let mut len = 0;
+        loop {
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            let line = line.trim();
+            if line.is_empty() {
+                break;
+            }
+            if let Some(n) = line.strip_prefix("Content-Length: ") {
+                len = n.parse().unwrap();
+            }
+        }
+        let mut buf = vec![0; len];
+        r.read_exact(&mut buf).unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    pub fn hover_at(bin: &std::ffi::OsStr, path: &Path, needle: &str, n: usize, at: usize) -> String {
+        let start = super::SRC.match_indices(needle).nth(n).unwrap_or_else(|| panic!("occurrence {n} of {needle:?}")).0 + at;
+        let before = &super::SRC[..start];
+        let line = before.matches('\n').count();
+        let character = before.len() - before.rfind('\n').map_or(0, |i| i + 1);
+        let uri = format!("file:///{}", path.to_string_lossy().replace('\\', "/").trim_start_matches('/'));
+        let mut child = Command::new(bin).args(["lsp", "--stdio"]).env_remove("LUNAR_STD_DIR").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut w = child.stdin.take().unwrap();
+        let mut r = BufReader::new(child.stdout.take().unwrap());
+        send(&mut w, json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "capabilities": {} } }));
+        recv(&mut r);
+        send(&mut w, json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }));
+        send(&mut w, json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen", "params": { "textDocument": { "uri": uri, "languageId": "lunar", "version": 1, "text": super::SRC } } }));
+        let pos = json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } });
+        send(&mut w, json!({ "jsonrpc": "2.0", "id": 2, "method": "textDocument/hover", "params": pos }));
+        let hover = loop {
+            let m = recv(&mut r);
+            if m["method"] == "textDocument/publishDiagnostics" {
+                let errors: Vec<&Value> = m["params"]["diagnostics"].as_array().unwrap().iter().filter(|d| d["severity"] == 1).collect();
+                assert!(errors.is_empty(), "the sample has errors: {errors:#?}");
+            }
+            if m["id"] == 2 {
+                break m;
+            }
+        };
+        send(&mut w, json!({ "jsonrpc": "2.0", "id": 3, "method": "shutdown" }));
+        while recv(&mut r)["id"] != 3 {}
+        send(&mut w, json!({ "jsonrpc": "2.0", "method": "exit" }));
+        assert!(child.wait().unwrap().success());
+        hover["result"]["contents"]["value"].as_str().unwrap_or_else(|| panic!("no hover at {needle:?}: {hover}")).to_string()
+    }
 }
 
 #[test]
