@@ -279,6 +279,13 @@ impl<'a> Sema<'a> {
         // 5. Deferred checks.
         self.run_deferred();
         self.check_infinite_size();
+        // What each function's result may point into (this needs to know
+        // which types are Dull).
+        for i in 0..n {
+            if let AstRef::Fn(f, _) = self.ast(DefId(i as u32)) {
+                self.lower_ret_from(DefId(i as u32), f);
+            }
+        }
         // 6. Impl validation.
         for i in 0..n {
             if let AstRef::Impl(im) = self.ast(DefId(i as u32)) {
@@ -1143,9 +1150,11 @@ impl<'a> Sema<'a> {
             );
             return;
         }
+        let mut same = true;
         for (tp, ip) in tf.sig.params.iter().zip(&imf.sig.params) {
             let want = tp.ty.subst(&args);
             if want != ip.ty || tp.mode != ip.mode {
+                same = false;
                 let (w, g) = (self.p.ty_str(&want), self.p.ty_str(&ip.ty));
                 let prefix = |m: ast::ParamMode| match m {
                     ast::ParamMode::Take => "",
@@ -1170,7 +1179,105 @@ impl<'a> Sema<'a> {
         if want_ret != imf.sig.ret {
             let (w, g) = (self.p.ty_str(&want_ret), self.p.ty_str(&imf.sig.ret));
             self.err(Diagnostic::error(trait_::SIGNATURE, imf.sig.ret_span, format!("return type mismatch with trait: expected `{w}`, found `{g}`")));
+            same = false;
         }
+        // Callers through the trait would not know the result points there.
+        if same
+            && let (Some(&tr), Some(&ir)) = (self.p.ret_from.get(&trait_m), self.p.ret_from.get(&impl_m))
+            && let Some(i) = (0..imf.sig.params.len().min(64)).find(|&i| (ir.set >> i) & 1 == 1 && (tr.set >> i) & 1 == 0)
+        {
+            let n = &imf.sig.params[i].name;
+            let at = if ir.span.is_dummy() { imf.sig.ret_span } else { ir.span };
+            let (tat, only) = if tr.span.is_dummy() { (tf.sig.ret_span, "without a `from` clause, the trait's result points") } else { (tr.span, "the trait's result is declared to point") };
+            let names = crate::borrowck::from_names(&self.p, trait_m, tr.set);
+            let label = if names.is_empty() { format!("{only} into no parameter") } else { format!("{only} only into {}", crate::borrowck::quoted_list(&names)) };
+            self.err(
+                Diagnostic::error(trait_::SIGNATURE, at, format!("the result may point into `{n}`, but the trait's may not"))
+                    .with_secondary(tat, label)
+                    .with_help(format!("add `{n}` to the trait method's `from` clause, or do not return views from it")),
+            );
+        }
+    }
+
+    /// What function `id`'s result may point into, into `p.ret_from`: the
+    /// parameters its `from` clause names (none for `from static`), or
+    /// without one, the receiver of a method that borrows it (`&self`,
+    /// `&mut self`), else every parameter it could point into (a borrowed
+    /// one, or one that holds views). Nothing if the return type holds no
+    /// views.
+    fn lower_ret_from(&mut self, id: DefId, f: &ast::FnDecl) {
+        let env = self.lower_cx(id).env;
+        let sig = self.p.fn_data(id).sig.clone();
+        let fname = &f.name.name;
+        let pointy = |p: &crate::Program, prm: &Param| prm.mode != ast::ParamMode::Take || crate::borrowck::ty_has_view(p, &env, &prm.ty, 0);
+        let holds = crate::borrowck::ty_has_view(&self.p, &env, &sig.ret, 0);
+        let span = match (f.ret_from.first(), f.ret_from.last()) {
+            (Some(a), Some(b)) => a.span.to(b.span),
+            _ => Span::DUMMY,
+        };
+        let mut set = 0u64;
+        if f.ret_from.is_empty() {
+            if holds {
+                match sig.params.first() {
+                    Some(s) if s.is_self && s.mode != ast::ParamMode::Take => set = 1,
+                    _ => {
+                        for (i, prm) in sig.params.iter().enumerate() {
+                            if i < 64 && pointy(&self.p, prm) {
+                                set |= 1 << i;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if !holds {
+            if !sig.ret.is_error() {
+                let r = self.p.ty_str(&sig.ret);
+                self.err(
+                    Diagnostic::error(tyc::FROM_WITHOUT_VIEWS, span, format!("`{fname}` returns `{r}`, which holds no views, so it points into no parameter"))
+                        .with_help("remove the `from` clause"),
+                );
+            }
+        } else if f.ret_from[0].name != "static" {
+            // (`from static` names no parameter, and nothing else.)
+            let mut seen: Vec<(usize, Span)> = Vec::new();
+            for n in &f.ret_from {
+                let Some(i) = sig.params.iter().position(|p| p.name == n.name && p.name != "_") else {
+                    self.err(Diagnostic::error(name::UNRESOLVED, n.span, format!("`{}` is not a parameter of `{fname}`", n.name)));
+                    continue;
+                };
+                if let Some(&(_, first)) = seen.iter().find(|s| s.0 == i) {
+                    self.err(
+                        Diagnostic::error(name::DUPLICATE, n.span, format!("`{}` is named twice in this `from` clause", n.name))
+                            .with_secondary(first, "first named here"),
+                    );
+                    continue;
+                }
+                seen.push((i, n.span));
+                let prm = &sig.params[i];
+                if !pointy(&self.p, prm) {
+                    if !prm.ty.is_error() {
+                        let t = self.p.ty_str(&prm.ty);
+                        // An owner could be borrowed and pointed into.
+                        let help = if self.p.has_owner(&prm.ty) {
+                            let borrowed = if prm.is_self { "&self".to_string() } else { format!("{}: &{t}", n.name) };
+                            format!("borrow it (`{borrowed}`), or leave it out of the `from` clause")
+                        } else {
+                            "leave it out of the `from` clause".to_string()
+                        };
+                        self.err(
+                            Diagnostic::error(tyc::FROM_WITHOUT_VIEWS, n.span, format!("the result of `{fname}` cannot point into `{}`", n.name))
+                                .with_secondary(prm.span, format!("`{}` takes a `{t}` by value, which holds no views", n.name))
+                                .with_help(help),
+                        );
+                    }
+                    continue;
+                }
+                if i < 64 {
+                    set |= 1 << i;
+                }
+            }
+        }
+        self.p.ret_from.insert(id, RetFrom { set, span });
     }
 
     fn check_main(&mut self) {

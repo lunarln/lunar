@@ -159,6 +159,16 @@ pub struct Param {
     pub span: Span,
 }
 
+/// Which parameters a function's result may point into, from its
+/// signature: bit `i` of `set` for parameter `i` (parameters from the 64th
+/// on always count). `span` covers the names of the `from` clause, and is
+/// dummy when there is none and the set follows from the parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetFrom {
+    pub set: u64,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug)]
 pub struct FnSig {
     pub params: Vec<Param>,

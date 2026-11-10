@@ -59,6 +59,7 @@ codes! {
         IMPL_TRAIT_POSITION = "impl_trait_position",
         OPAQUE_MISMATCH = "opaque_mismatch",
         LET_ELSE_FALLS_THROUGH = "let_else_falls_through",
+        FROM_WITHOUT_VIEWS = "from_without_views",
     }
     syntax ("syntax") => {
         UNEXPECTED_TOKEN = "unexpected_token",
@@ -108,6 +109,7 @@ codes! {
         MISSING_MARKER = "missing_marker",
         WRONG_MARKER = "wrong_marker",
         NOT_AN_ARGUMENT = "not_an_argument",
+        ESCAPES_VIA_RETURN = "escapes_via_return",
     }
     macro_ ("macro") => {
         UNDEFINED = "undefined",
