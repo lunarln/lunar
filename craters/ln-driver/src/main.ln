@@ -5,12 +5,22 @@
 //     ln-driver FILE...           the tokens (`ln_lexer::dump`)
 //     ln-driver --parse FILE...   the syntax tree and syntax errors
 //                                 (`ln_ast::dump`, `ln_parser::dump_diags`)
+//     ln-driver --check FILE      the front end of semantic analysis on
+//                                 FILE with `core` and `std` (from
+//                                 `$LUNAR_STD_DIR`): its diagnostics, one
+//                                 per line, `err(scope::name) line:col
+//                                 message`, then their labels, notes and
+//                                 helps indented
 
 mod project;
 mod link;
 
 use std::env;
 use std::fs;
+use ln_sema::diag::is_dummy;
+use ln_sema::loader::{Craters, load_crate};
+use ln_sema::program::Program;
+use ln_sema::sema::{Options, analyze};
 
 fn main() {
     if env::arg_count() > 2 && env::arg(1).unwrap() == "--craters" {
@@ -22,6 +32,9 @@ fn main() {
     if env::arg_count() > 1 && env::arg(1).unwrap() == "--parse" {
         parse = true;
         i = 2;
+    }
+    if env::arg_count() > 2 && env::arg(1).unwrap() == "--check" {
+        std::process::exit(check(env::arg(2).unwrap()));
     }
     while i < env::arg_count() {
         let path = env::arg(i).unwrap();
@@ -67,4 +80,131 @@ fn list_craters(dir: str) {
     for e in p.errors {
         eprintln("error: {p.text(e)}");
     }
+}
+
+/// A crater name from a file name: letters, digits and `_` (as the Rust
+/// driver's `sanitize`).
+fn crater_name(path: str): String {
+    let b = path.as_bytes();
+    let mut start = b.len();
+    while start > 0 && b[start - 1] != b'/' && b[start - 1] != b'\\' {
+        start -= 1;
+    }
+    let mut end = b.len();
+    let mut k = b.len();
+    while k > start {
+        k -= 1;
+        if b[k] == b'.' {
+            end = k;
+            break;
+        }
+    }
+    let mut out = String::new();
+    for c in path[start..end].chars() {
+        let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+        out.push(if ok { c } else { '_' });
+    }
+    if out.len() == 0 || (out.as_bytes()[0] >= b'0' && out.as_bytes()[0] <= b'9') {
+        let mut s = String::from("_");
+        s.push_str(out.as_str());
+        return s;
+    }
+    return out;
+}
+
+/// `--check FILE`: load FILE, `core` and `std`, analyze them, and print
+/// the diagnostics. The exit code is 1 if there were errors.
+fn check(path: str): i32 {
+    let std_dir = match env::var("LUNAR_STD_DIR") {
+        Some(d) => d,
+        None => {
+            eprintln("ln-driver: --check needs LUNAR_STD_DIR (the std directory)");
+            return 2;
+        }
+    };
+    let mut p = Program::new();
+    let mut cs = Craters::new();
+    let name = crater_name(path);
+    match load_crate(&mut p, &mut cs, name.as_str(), path, "") {
+        Some(c) => cs.list.push(c),
+        None => {
+            println("err(build::io) 0:0 could not read `{path}`");
+            return 1;
+        }
+    }
+    let names = ["core", "std"];
+    for n in names {
+        let mut root = String::new();
+        root.write("{std_dir}/{n}/lib.ln");
+        match load_crate(&mut p, &mut cs, n, root.as_str(), "") {
+            Some(c) => cs.list.push(c),
+            None => {
+                println("err(build::io) 0:0 standard library crater `{n}` not found at {root}");
+                return 1;
+            }
+        }
+    }
+    if p.diags.has_errors() {
+        print_diags(&p);
+        return 1;
+    }
+    let s = analyze(p, cs, Options::host(false));
+    print_diags(&s.p);
+    // `LN_EXPANSIONS=1`: also print what each macro invocation expanded to.
+    if env::var("LN_EXPANSIONS").is_some() {
+        let mut out = String::new();
+        let mut n_exp: usize = 0;
+        for i in 0..s.p.sources.files.len() {
+            let f = s.p.sources.files[i];
+            if let Some(site) = f.expansion_site {
+                n_exp += 1;
+                out.write("== {s.p.text(f.name)} at {position(&s.p, site)}\n{s.p.sources.file_text(i as u32)}\n");
+            }
+        }
+        out.write("-- {s.p.defs.len()} definitions, {s.p.impls.len()} impls, {n_exp} expansions\n");
+        std::io::write_str(out.as_str());
+    }
+    if s.p.diags.has_errors() {
+        return 1;
+    }
+    return 0;
+}
+
+fn print_diags(p: &Program) {
+    let mut out = String::new();
+    for d in p.diags.list {
+        let sev = if d.is_error() { "err" } else { "warn" };
+        out.write("{sev}({d.code.scope}::{d.code.name}) {position(p, d.span)} {p.text(d.message)}");
+        if !is_dummy(d.span) && p.sources.files.len() > 0 && p.sources.file_of(d.span.lo) != 0 {
+            let f = p.sources.files[p.sources.file_of(d.span.lo) as usize];
+            out.write("  [in {p.text(f.name)}]");
+        }
+        out.push('\n');
+        if let Some(l) = d.label {
+            out.write("    label: {p.text(l)}\n");
+        }
+        for l in p.diags.labels.list(d.labels) {
+            out.write("    {position(p, l.span)}: {p.text(l.message)}\n");
+        }
+        for n in p.diags.texts.list(d.notes) {
+            out.write("    note: {p.text(n)}\n");
+        }
+        for h in p.diags.texts.list(d.helps) {
+            out.write("    help: {p.text(h)}\n");
+        }
+    }
+    std::io::write_str(out.as_str());
+}
+
+/// `line:col` of where a span is in code someone wrote (a span inside a
+/// macro expansion is shown at the invocation).
+fn position(p: &Program, span: ln_ast::Span): String {
+    if is_dummy(span) || p.sources.files.len() == 0 {
+        return String::from("0:0");
+    }
+    let s = p.source_span(span);
+    let (line, col) = p.sources.line_col(s.lo);
+    let mut out = String::new();
+    out.write("{line}:{col}");
+    return out;
 }

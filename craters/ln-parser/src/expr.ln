@@ -347,7 +347,7 @@ impl Parser {
 
     /// `e.0`, and `e.0.1`, which lexes `0.1` as one float token.
     fn tuple_fields_of(&mut self, e: Id::<Expr>, t: Tok, kind: NumKind, start: u32): Id::<Expr> {
-        let text = tok_text(self.src, t);
+        let text = tok_text(self.src, self.base, t);
         let mut e = e;
         let mut off = t.start;
         let mut part_start: usize = 0;

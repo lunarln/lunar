@@ -60,22 +60,9 @@ impl DefKind {
     }
 }
 
-/// A macro hygiene context (`ln_ast::SyntaxCtx` in Rust): 0 is the root,
-/// code written by hand; each expansion gets its own.
-#[derive(Eq, Hash, Debug)]
-pub struct SyntaxCtx {
-    pub index: u32,
-}
-
-impl SyntaxCtx {
-    pub fn root(): SyntaxCtx {
-        return SyntaxCtx { index: 0 };
-    }
-
-    pub fn is_root(self): bool {
-        return self.index == 0;
-    }
-}
+/// A macro hygiene context: 0 is the root, code written by hand; each
+/// expansion gets its own. Defined with the identifiers that carry it.
+pub use ln_ast::SyntaxCtx;
 
 /// Recognized item attributes.
 pub struct ItemAttrs {

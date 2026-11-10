@@ -9,16 +9,16 @@ Rust `lunar`, rebuilds this workspace into an identical compiler.
 |--------------|--------------------|-------|
 | `ln-lexer`   | `crates/ln-lexer`  | complete |
 | `ln-ast`     | `crates/ln-ast`    | the syntax tree, in arenas (`core::arena`): every `Box` is an `Id`, every `Vec` a `List`, names and strings are interned |
-| `ln-parser`  | `crates/ln-parser` and `crates/ln-parse-kit` | complete for source files; macro expansion parsing (`parse_expansion`, `parse_fragment`) is not ported yet |
+| `ln-parser`  | `crates/ln-parser` and `crates/ln-parse-kit` | complete: source files (`parse_file`, and `parse_file_into` a shared `Ast` with global offsets), macro expansions (`parse_expansion`, `parse_fragment`), hygiene contexts on identifiers and tokens |
 | `ln-sema`    | `crates/ln-sema` and `crates/ln-diag` | data model done (`ty`, `defs`, `thir`, `program`, `diag`, `codes`); passes in progress (see below) |
-| `ln-codegen` | `crates/ln-codegen` | ported (LLVM through its C API, `llvm.ln`, `#[link(name = "LLVM-C")]`); tested on hand-built programs (`lunar test` in `ln-codegen`) until the front end exists |
-| `ln-driver`  | (test driver, then `lunarc`) | `ln-driver FILE...` prints tokens, `ln-driver --parse FILE...` the syntax tree and syntax errors |
+| `ln-codegen` | `crates/ln-codegen` | ported (LLVM through its C API, `llvm.ln`, `#[link(name = "LLVM-C")]`); tested on hand-built programs (`lunar test` in `ln-codegen`) |
+| `ln-driver`  | (test driver, then `lunarc`) | `ln-driver FILE...` prints tokens, `ln-driver --parse FILE...` the syntax tree and syntax errors, `ln-driver --check FILE` the front end's diagnostics (with `core` and `std` from `$LUNAR_STD_DIR`; `LN_EXPANSIONS=1` also prints every macro expansion) |
 
 ## The port of the rest
 
 | Part | Rust source | Lunar file(s) | State |
 |------|-------------|---------------|-------|
-| front end | `loader.rs`, `expand.rs`, `collect.rs`, `resolve.rs`, `lower.rs`, parser expansion parsing | `ln-sema/src/{sema,loader,expand,collect,resolve,lower}.ln` | in progress |
+| front end | `loader.rs`, `expand.rs`, `collect.rs`, `resolve.rs`, `lower.rs`, parser expansion parsing | `ln-sema/src/{sema,loader,expand,collect,resolve,lower}.ln` | done; same diagnostics as Rust on tests/ui, tests/run, examples |
 | traits, layout | `traits.rs`, `layout.rs` | `ln-sema/src/{traits,layout}.ln` | done (unit checks in `tests.ln`) |
 | borrow checker | `borrowck.rs` | `ln-sema/src/borrowck.ln` | done (unit checks on hand-built THIR in `tests.ln`) |
 | type checker | `typeck/*.rs` | `ln-sema/src/typeck*.ln` | after the front end |

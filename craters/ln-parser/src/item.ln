@@ -90,7 +90,7 @@ impl Parser {
         let mut k: u32 = 0;
         while k < run.count {
             let span = self.doc_spans[(run.first + k) as usize];
-            let raw = text_of(self.src, span.lo, span.hi);
+            let raw = text_of(self.src, self.base, span.lo, span.hi);
             let mut text = if raw.starts_with("///") { raw[3..] } else { raw };
             while text.ends_with("\r") {
                 text = text[..text.len() - 1];
@@ -99,7 +99,7 @@ impl Parser {
                 text = text[1..];
             }
             let value = self.intern(text);
-            out.push(Attr { meta: Meta::NameValue(Ident { name: doc, span }, value), span });
+            out.push(Attr { meta: Meta::NameValue(Ident::new(doc, span), value), span });
             k += 1;
         }
     }
@@ -110,7 +110,7 @@ impl Parser {
             Some(t) => t,
             None => return Err(self.error_expected_named(Named::AttributeName)),
         };
-        if t.kind != T::Ident && !word_like(tok_text(self.src, t)) {
+        if t.kind != T::Ident && !word_like(tok_text(self.src, self.base, t)) {
             return Err(self.error_expected_named(Named::AttributeName));
         }
         self.bump();
@@ -173,7 +173,7 @@ impl Parser {
                 self.bump();
                 let abi = if self.at(T::Str) {
                     let t = self.bump();
-                    let raw = tok_text(self.src, t);
+                    let raw = tok_text(self.src, self.base, t);
                     Some(self.intern(raw[1..raw.len() - 1]))
                 } else {
                     None
@@ -320,7 +320,7 @@ impl Parser {
         // `kept x: T`. `kept` is a word only here, so a parameter may still
         // be named `kept`.
         let kept_word = match self.current() {
-            Some(t) => t.kind == T::Ident && tok_text(self.src, t) == "kept",
+            Some(t) => t.kind == T::Ident && tok_text(self.src, self.base, t) == "kept",
             None => false,
         };
         let kept = kept_word && match self.nth(1) {
@@ -539,7 +539,7 @@ impl Parser {
                 Some(T::Str | T::Number(NumKind::Int) | T::Ident) => self.bump(),
                 _ => return Err(self.error_expected_named(Named::AttributeValue)),
             };
-            let raw = tok_text(self.src, t);
+            let raw = tok_text(self.src, self.base, t);
             let v = if t.kind == T::Str {
                 match unescape(raw[1..raw.len() - 1]) {
                     Ok(s) => self.intern(s.as_str()),

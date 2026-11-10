@@ -3,7 +3,7 @@
 use core::arena::{Id, List};
 use ln_ast::*;
 use ln_lexer::Token as T;
-use crater::{Parser, PResult, Named, Expected};
+use crater::{Parser, PResult, Named, Expected, Ctxs, Diag};
 
 /// A delimited group of token trees.
 struct Group {
@@ -67,7 +67,27 @@ impl Parser {
             _ => {}
         }
         let t = self.bump();
-        return Ok(TokenTree::Token(Tt { kind: t.kind, span: self.tok_span(t) }));
+        return Ok(TokenTree::Token(Tt { kind: t.kind, span: self.tok_span(t), ctx: self.ctx_at(t.start) }));
+    }
+
+    /// A statement without its trailing `;` (the `stmt` fragment).
+    fn stmt_no_semi(&mut self): PResult::<()> {
+        if self.eat(T::Let) {
+            self.pat()?;
+            if self.eat(T::Colon) {
+                self.ty()?;
+            }
+            if self.eat(T::Eq) {
+                self.expr()?;
+            }
+            return Ok(());
+        }
+        if self.at_item_start() {
+            self.item()?;
+            return Ok(());
+        }
+        self.expr()?;
+        return Ok(());
     }
 
     /// `macro name(matcher) { body }`, or several rules:
@@ -104,4 +124,139 @@ impl Parser {
         }
         return Ok(MacroDef { name, rules: self.ast.macro_rules.add_list(rules[..]) });
     }
+}
+
+// ===================================================================== expansions
+
+/// What the text of a macro expansion is parsed as.
+#[derive(Eq, Debug)]
+pub enum ExpansionKind {
+    /// Item position: zero or more items.
+    Items,
+    /// Expression or statement position: a block (the expander wraps the
+    /// tokens in braces), so expansions may contain statements.
+    Expr,
+    Pat,
+    Ty,
+}
+
+pub enum Expansion {
+    Items(List::<Id::<Item>>),
+    Expr(Id::<Expr>),
+    Pat(Id::<Pat>),
+    Ty(Id::<Ty>),
+}
+
+/// A parsed expansion (`None` if it did not parse) and its syntax errors.
+pub struct ExpansionParse {
+    pub out: Option::<Expansion>,
+    pub diags: [Diag; ..+],
+}
+
+/// Parse the text a macro expanded to, which sits at global offset `base`,
+/// into the shared `ast`. `ctxs` gives the hygiene contexts of its tokens
+/// (by global offset).
+pub fn parse_expansion(ast: &mut Ast, src: str, base: u32, ctxs: Ctxs, kind: ExpansionKind): ExpansionParse {
+    let mut p = Parser::new(src, base, core::mem::replace(ast, Ast::new()));
+    p.ctxs = ctxs;
+    p.lex_all();
+    let out = match kind {
+        ExpansionKind::Items => Some(Expansion::Items(p.items_until_eof())),
+        ExpansionKind::Expr => match p.expr() {
+            Ok(e) => Some(Expansion::Expr(e)),
+            Err(_) => None,
+        },
+        ExpansionKind::Pat => match p.pat() {
+            Ok(x) => Some(Expansion::Pat(x)),
+            Err(_) => None,
+        },
+        ExpansionKind::Ty => match p.ty() {
+            Ok(t) => Some(Expansion::Ty(t)),
+            Err(_) => None,
+        },
+    };
+    if out.is_some() && !p.at_eof() {
+        p.expect_note(Expected::Named(Named::EndOfExpansion));
+        p.error_expected();
+    }
+    let parsed = p.finish();
+    ast = parsed.ast;
+    return ExpansionParse { out, diags: parsed.diags };
+}
+
+/// A syntactic fragment a macro matcher can capture (`$x:expr`).
+#[derive(Eq, Hash, Debug)]
+pub enum FragmentKind {
+    Path,
+    Expr,
+    Ty,
+    Pat,
+    Block,
+    Stmt,
+    Item,
+    Vis,
+    Meta,
+    Generics,
+}
+
+/// A generic parameter of a `generics` fragment: where its name is, and
+/// its bounds (`bound_count` spans of `FragmentParse::bounds` from
+/// `first_bound`).
+pub struct FragParam {
+    pub name: Span,
+    pub first_bound: u32,
+    pub bound_count: u32,
+}
+
+/// What `parse_fragment` took: how many tokens, and for `generics` the
+/// parameters (spans are offsets into the fragment's text).
+pub struct FragmentParse {
+    pub tokens: usize,
+    pub params: [FragParam; ..+],
+    pub bounds: [Span; ..+],
+}
+
+/// Parse one fragment from the start of `src` (a macro's input tokens, as
+/// text). Returns how many tokens it took, and for `generics` the parsed
+/// parameters, or `None` if `src` does not start with such a fragment.
+pub fn parse_fragment(src: str, ctxs: Ctxs, kind: FragmentKind): Option::<FragmentParse> {
+    let mut p = Parser::new(src, 0, Ast::new());
+    p.ctxs = ctxs;
+    p.lex_all();
+    if !p.clean() {
+        return None;
+    }
+    let mut params: [FragParam; ..+] = [];
+    let mut bounds: [Span; ..+] = [];
+    let ok = match kind {
+        FragmentKind::Path => p.path_ty_style().is_ok(),
+        FragmentKind::Expr => p.expr().is_ok(),
+        FragmentKind::Ty => p.ty().is_ok(),
+        FragmentKind::Pat => p.pat().is_ok(),
+        FragmentKind::Block => p.block().is_ok(),
+        FragmentKind::Stmt => p.stmt_no_semi().is_ok(),
+        FragmentKind::Item => p.item().is_ok(),
+        FragmentKind::Vis => {
+            p.eat(T::Pub);
+            true
+        }
+        FragmentKind::Meta => p.meta_full().is_ok(),
+        FragmentKind::Generics => match p.generics_decl() {
+            Ok(g) => {
+                for gp in p.ast.generic_params.list(g.params) {
+                    let first = bounds.len() as u32;
+                    for b in p.ast.paths.list(gp.bounds) {
+                        bounds.push(b.span);
+                    }
+                    params.push(FragParam { name: gp.name.span, first_bound: first, bound_count: gp.bounds.len() as u32 });
+                }
+                true
+            }
+            Err(_) => false,
+        },
+    };
+    if !ok || !p.clean() {
+        return None;
+    }
+    return Some(FragmentParse { tokens: p.position(), params, bounds });
 }

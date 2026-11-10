@@ -37,6 +37,34 @@ impl Span {
 pub struct Ident {
     pub name: Symbol,
     pub span: Span,
+    /// Which macro expansion wrote this identifier, for hygiene.
+    pub ctx: SyntaxCtx,
+}
+
+impl Ident {
+    /// An identifier written by hand (`ROOT` context).
+    pub fn new(name: Symbol, span: Span): Ident {
+        return Ident { name, span, ctx: SyntaxCtx::root() };
+    }
+}
+
+/// Hygiene: where an identifier was written. `ROOT` (0) for source files;
+/// each macro expansion gives the tokens it copies from the macro's body a
+/// fresh context, so its names resolve where the macro is defined and
+/// cannot clash with the caller's.
+#[derive(Eq, Hash, Debug)]
+pub struct SyntaxCtx {
+    pub index: u32,
+}
+
+impl SyntaxCtx {
+    pub fn root(): SyntaxCtx {
+        return SyntaxCtx { index: 0 };
+    }
+
+    pub fn is_root(self): bool {
+        return self.index == 0;
+    }
 }
 
 // ===================================================================== macros
@@ -52,6 +80,35 @@ pub enum Delim {
 pub struct Tt {
     pub kind: Token,
     pub span: Span,
+    /// The hygiene context it was written in.
+    pub ctx: SyntaxCtx,
+}
+
+impl Delim {
+    pub fn open(self): str {
+        return match self {
+            Delim::Paren => "(",
+            Delim::Bracket => "[",
+            Delim::Brace => "{",
+        };
+    }
+
+    pub fn close(self): str {
+        return match self {
+            Delim::Paren => ")",
+            Delim::Bracket => "]",
+            Delim::Brace => "}",
+        };
+    }
+}
+
+impl TokenTree {
+    pub fn span(self): Span {
+        return match self {
+            TokenTree::Token(t) => t.span,
+            TokenTree::Group { open, close, .. } => open.to(close),
+        };
+    }
 }
 
 pub enum TokenTree {
@@ -607,6 +664,21 @@ impl Ast {
             return false;
         }
         return self.segments.list(p.segments)[0].args.is_none();
+    }
+
+    /// The path as written, without generic arguments: `std::io::println`
+    /// (`Path::to_string_lossy` in Rust).
+    pub fn path_text(&self, p: Path): String {
+        let mut out = String::new();
+        let mut first = true;
+        for s in self.segments.list(p.segments) {
+            if !first {
+                out.push_str("::");
+            }
+            first = false;
+            out.push_str(self.names.resolve(s.ident.name));
+        }
+        return out;
     }
 
     /// The last segment of a path.

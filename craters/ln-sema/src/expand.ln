@@ -1,0 +1,1479 @@
+// Macro expansion (docs/design/macros.md): matching an invocation's tokens
+// against a macro's rules, transcribing the matching rule's body with
+// hygiene, and parsing the result where the invocation stood. A port of
+// crates/ln-sema/src/expand.rs.
+//
+// The expanded tokens become the text of a new source file (`<vec!>`), so
+// diagnostics inside an expansion show the expanded code. Each token keeps
+// its syntax context through that text (`Sema::ctxs`, by global offset).
+//
+// Tokens here carry their text (`XTok`): the transcriber makes tokens that
+// were never in a source file (`::<`, `${concat(..)}`). Token trees,
+// compiled matchers and what matching binds live in the arenas of an
+// `Expander`; matching and transcribing only grow them (`&mut +self`), so
+// the views they work on stay valid.
+
+use core::arena::{Arena, Id, List};
+use core::collections::HashMap;
+use core::intern::Symbol;
+use crater::codes;
+use crater::defs::*;
+use crater::diag::{Code, dummy_span, is_dummy};
+use crater::loader::begin_syntax;
+use crater::resolve::ModRes;
+use crater::sema::{AstRef, Sema};
+use ln_ast::{Delim, Expr, ExprKind, Ident, Item, MacCall, Pat, Span, StmtKind, TokenTree};
+use ln_lexer::{NumKind, Token as T};
+use ln_parser::{Expansion, ExpansionKind, FragmentKind};
+
+/// Expansions nested deeper than this are an error: usually a macro that
+/// expands to an invocation of itself.
+const RECURSION_LIMIT: usize = 128;
+
+/// One expansion, which is one hygiene context.
+pub struct Mark {
+    /// The module the macro is defined in: names its body wrote resolve there.
+    pub def_module: DefId,
+    /// The syntax context of the macro definition itself (`ROOT` unless an
+    /// expansion defined the macro).
+    pub def_ctx: SyntaxCtx,
+    /// How many expansions this one is nested in.
+    pub depth: usize,
+}
+
+/// An item-position invocation or a derive, waiting until names resolve.
+pub enum Pending {
+    Call { module: DefId, call: MacCall, owner: Owner },
+    Derive { module: DefId, item: Id::<Item>, name: Ident },
+}
+
+/// Where the items an item-position macro expands to go.
+pub enum Owner {
+    Module,
+    Impl(DefId),
+    Trait(DefId),
+}
+
+// ===================================================================== tokens
+
+/// One token with its text, where it was written and its hygiene context.
+pub struct XTok {
+    pub kind: T,
+    pub text: Symbol,
+    pub span: Span,
+    pub ctx: SyntaxCtx,
+}
+
+/// Tokens, with delimited groups nested (lists in `Expander::trees`).
+pub enum XTree {
+    Token(XTok),
+    Group { delim: Delim, open: Span, close: Span, trees: List::<XTree> },
+}
+
+impl XTree {
+    pub fn span(self): Span {
+        return match self {
+            XTree::Token(t) => t.span,
+            XTree::Group { open, close, .. } => open.to(close),
+        };
+    }
+}
+
+// ===================================================================== matchers
+
+#[derive(Eq)]
+enum Frag {
+    Ident,
+    Lit,
+    Tt,
+    Parsed(FragmentKind),
+}
+
+fn frag_kind(name: str): Option::<Frag> {
+    let k = if name == "ident" {
+        Frag::Ident
+    } else if name == "lit" {
+        Frag::Lit
+    } else if name == "tt" {
+        Frag::Tt
+    } else if name == "path" {
+        Frag::Parsed(FragmentKind::Path)
+    } else if name == "expr" {
+        Frag::Parsed(FragmentKind::Expr)
+    } else if name == "ty" {
+        Frag::Parsed(FragmentKind::Ty)
+    } else if name == "pat" {
+        Frag::Parsed(FragmentKind::Pat)
+    } else if name == "block" {
+        Frag::Parsed(FragmentKind::Block)
+    } else if name == "stmt" {
+        Frag::Parsed(FragmentKind::Stmt)
+    } else if name == "item" {
+        Frag::Parsed(FragmentKind::Item)
+    } else if name == "vis" {
+        Frag::Parsed(FragmentKind::Vis)
+    } else if name == "meta" {
+        Frag::Parsed(FragmentKind::Meta)
+    } else if name == "generics" {
+        Frag::Parsed(FragmentKind::Generics)
+    } else {
+        return None;
+    };
+    return Some(k);
+}
+
+#[derive(Eq)]
+enum Op {
+    Star,
+    Plus,
+    Question,
+}
+
+/// A compiled matcher element.
+enum M {
+    Tok(XTok),
+    Group(Delim, List::<M>),
+    Frag { name: Symbol, kind: Frag },
+    Rep { inner: List::<M>, sep: Option::<XTok>, op: Op },
+}
+
+/// A rule ready to use: its compiled matcher and its body.
+pub struct Rule {
+    matcher: List::<M>,
+    body: List::<XTree>,
+}
+
+/// The code of a macro error (`macro::bad_matcher`, ...).
+#[derive(Eq)]
+enum MCode {
+    BadMatcher,
+    Repetition,
+    Error,
+}
+
+impl MCode {
+    fn code(self): Code {
+        return match self {
+            MCode::BadMatcher => codes::macro_::BAD_MATCHER(),
+            MCode::Repetition => codes::macro_::REPETITION(),
+            MCode::Error => codes::macro_::ERROR(),
+        };
+    }
+}
+
+/// A macro error: its code, where, and the message.
+pub struct MacroError {
+    code: MCode,
+    span: Span,
+    msg: String,
+}
+
+fn merr(code: MCode, span: Span, msg: String): MacroError {
+    return MacroError { code, span, msg };
+}
+
+/// The hygiene contexts of rendered tokens, by offset (plus `base`).
+fn ctx_map(pairs: [(u32, SyntaxCtx); &], base: u32): HashMap::<u32, SyntaxCtx> {
+    let mut m: HashMap::<u32, SyntaxCtx> = HashMap::new();
+    for c in pairs {
+        let (o, x) = c;
+        m.insert(base + o, x);
+    }
+    return m;
+}
+
+fn op_of(t: XTree): Option::<Op> {
+    return match t {
+        XTree::Token(x) => match x.kind {
+            T::Star => Some(Op::Star),
+            T::Plus => Some(Op::Plus),
+            T::Question => Some(Op::Question),
+            _ => None,
+        },
+        _ => None,
+    };
+}
+
+// ===================================================================== matching
+
+/// What a matcher variable captured.
+enum Bound {
+    Frag(Fragment),
+    /// One per repetition (in `Expander::bounds`).
+    Seq(List::<Bound>),
+}
+
+struct Fragment {
+    kind: Frag,
+    /// A run of the input's trees.
+    trees: List::<XTree>,
+    /// For `generics`: each parameter's name and bounds, as tokens.
+    params: List::<GParam>,
+}
+
+struct GParam {
+    name: XTok,
+    /// Each bound's tokens (lists in `Expander::toks`).
+    bounds: List::<List::<XTok>>,
+}
+
+/// A matcher variable and what it captured; later entries hide earlier
+/// ones with the same name.
+struct Bind {
+    name: Symbol,
+    bound: Bound,
+}
+
+fn lookup(b: [Bind; &], name: Symbol): Option::<Bound> {
+    let mut i = b.len();
+    while i > 0 {
+        i -= 1;
+        if b[i].name == name {
+            return Some(b[i].bound);
+        }
+    }
+    return None;
+}
+
+/// The arenas of macro expansion.
+pub struct Expander {
+    trees: Arena::<XTree>,
+    ms: Arena::<M>,
+    pub rules: Arena::<Rule>,
+    bounds: Arena::<Bound>,
+    gparams: Arena::<GParam>,
+    toks: Arena::<XTok>,
+    ranges: Arena::<List::<XTok>>,
+    binds: Arena::<Bind>,
+}
+
+impl Expander {
+    pub fn new(): Expander {
+        return Expander {
+            trees: Arena::new(),
+            ms: Arena::new(),
+            rules: Arena::new(),
+            bounds: Arena::new(),
+            gparams: Arena::new(),
+            toks: Arena::new(),
+            ranges: Arena::new(),
+            binds: Arena::new(),
+        };
+    }
+}
+
+/// Tokens rendered as source text: the text, each token's offset in it,
+/// and the contexts of tokens not written by hand (by offset).
+struct Rendered {
+    text: String,
+    offsets: [u32; ..+],
+    ctxs: [(u32, SyntaxCtx); ..+],
+}
+
+/// How many of `offsets` are below `offset`.
+fn index_of(offsets: [u32; &], offset: u32): usize {
+    let mut lo: usize = 0;
+    let mut hi = offsets.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if offsets[mid] < offset {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/// `s` without the `"` characters at its start and end.
+fn trim_quotes(s: str): str {
+    let b = s.as_bytes();
+    let mut lo: usize = 0;
+    let mut hi = b.len();
+    while lo < hi && b[lo] == b'"' {
+        lo += 1;
+    }
+    while hi > lo && b[hi - 1] == b'"' {
+        hi -= 1;
+    }
+    return s[lo..hi];
+}
+
+/// Whether `s` is an identifier: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_ident(s: str): bool {
+    let b = s.as_bytes();
+    if b.len() == 0 {
+        return false;
+    }
+    let first = b[0];
+    if !((first >= b'a' && first <= b'z') || (first >= b'A' && first <= b'Z') || first == b'_') {
+        return false;
+    }
+    for c in b {
+        if !((c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// `s` as the text of a string literal: quoted, with `\` and `"` escaped.
+fn quote(s: str): String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        if c == '\\' {
+            out.push_str("\\\\");
+        } else if c == '"' {
+            out.push_str("\\\"");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('"');
+    return out;
+}
+
+/// The tokens a fragment of `k` may be followed by (Rust's follow-set
+/// rule), space separated; empty if it does not grow.
+fn follow_set(k: FragmentKind): str {
+    return match k {
+        FragmentKind::Expr | FragmentKind::Stmt => "=> , ;",
+        FragmentKind::Ty | FragmentKind::Path => "=> , = | ; : > [ { as",
+        FragmentKind::Pat => "=> , = if in",
+        _ => "",
+    };
+}
+
+/// The transcriber's state: the expansion's mark, the invocation, and the
+/// index of each enclosing repetition (innermost last).
+struct Tx {
+    mark: SyntaxCtx,
+    call: Span,
+    indices: [usize; -..+],
+}
+
+fn copy_indices(tx: &Tx): [usize; -..+] {
+    let mut v: [usize; -..+] = [];
+    for k in tx.indices {
+        v.push(k);
+    }
+    return v;
+}
+
+impl Sema {
+    // ----------------------------------------------------------- token trees
+
+    /// A token the transcriber makes up (delimiters, `::<`, `,`).
+    fn made(&mut +self, kind: T, text: str, span: Span, ctx: SyntaxCtx): XTok {
+        let t = self.p.sym(text);
+        return XTok { kind, text: t, span, ctx };
+    }
+
+    fn tree(&self, l: List::<XTree>, i: usize): XTree {
+        return self.x.trees.list(l)[i];
+    }
+
+    fn tree_at(&self, l: List::<XTree>, i: usize): Option::<XTree> {
+        if i < l.len() {
+            return Some(self.x.trees.list(l)[i]);
+        }
+        return None;
+    }
+
+    /// A syntax tree's tokens (from the source text) as `XTree`s.
+    pub fn import_trees(&mut +self, l: List::<TokenTree>): List::<XTree> {
+        let mut out: [XTree; ..+] = [];
+        for i in 0..l.len() {
+            let t = self.p.ast.tokens.list(l)[i];
+            match t {
+                TokenTree::Token(tt) => {
+                    let text = self.p.ast.names.intern(self.p.sources.snippet(tt.span));
+                    out.push(XTree::Token(XTok { kind: tt.kind, text, span: tt.span, ctx: tt.ctx }));
+                }
+                TokenTree::Group { delim, open, close, trees } => {
+                    let inner = self.import_trees(trees);
+                    out.push(XTree::Group { delim, open, close, trees: inner });
+                }
+            }
+        }
+        return self.x.trees.add_list(out[..]);
+    }
+
+    fn delims(d: Delim): (T, T) {
+        return match d {
+            Delim::Paren => (T::LParen, T::RParen),
+            Delim::Bracket => (T::LBracket, T::RBracket),
+            Delim::Brace => (T::LBrace, T::RBrace),
+        };
+    }
+
+    /// Every token of `trees`, with group delimiters as tokens.
+    fn flatten(&mut +self, trees: List::<XTree>, out: &mut +[XTok; ..+]) {
+        for i in 0..trees.len() {
+            let t = self.tree(trees, i);
+            match t {
+                XTree::Token(x) => out.push(x),
+                XTree::Group { delim, open, close, trees: inner } => {
+                    let (o, c) = Sema::delims(delim);
+                    out.push(self.made(o, delim.open(), open, SyntaxCtx::root()));
+                    self.flatten(inner, out);
+                    out.push(self.made(c, delim.close(), close, SyntaxCtx::root()));
+                }
+            }
+        }
+    }
+
+    fn flat_len(&self, t: XTree): usize {
+        return match t {
+            XTree::Token(_) => 1,
+            XTree::Group { trees, .. } => {
+                let mut n: usize = 2;
+                for x in self.x.trees.list(trees) {
+                    n += self.flat_len(x);
+                }
+                n
+            }
+        };
+    }
+
+    /// Tokens as source text: tokens that were adjacent where they were
+    /// written stay adjacent (so `>` `>` is still a shift), others get a
+    /// space.
+    fn render(&self, toks: [XTok; &]): Rendered {
+        let mut text = String::new();
+        let mut offsets: [u32; ..+] = [];
+        let mut ctxs: [(u32, SyntaxCtx); ..+] = [];
+        for i in 0..toks.len() {
+            let t = toks[i];
+            if i > 0 {
+                let p = toks[i - 1];
+                let adjacent = p.span.hi == t.span.lo && p.ctx == t.ctx && !is_dummy(p.span);
+                if !adjacent {
+                    text.push(' ');
+                }
+            }
+            let start = text.len() as u32;
+            offsets.push(start);
+            if !t.ctx.is_root() {
+                ctxs.push((start, t.ctx));
+            }
+            text.push_str(self.p.text(t.text));
+        }
+        return Rendered { text, offsets, ctxs };
+    }
+
+    // ----------------------------------------------------------- compiling matchers
+
+    /// After `$( ... )`: an optional separator token, then `*`, `+` or `?`.
+    /// `$(..)+*` has the separator `+`; `$(..)+` has none.
+    fn rep_suffix(&self, trees: List::<XTree>, i: &mut usize, at: Span): Result::<(Option::<XTok>, Op), MacroError> {
+        let t0 = self.tree_at(trees, i);
+        let t1 = self.tree_at(trees, i + 1);
+        if let Some(XTree::Token(sep)) = t0 {
+            if let Some(op) = t1 {
+                if let Some(o) = op_of(op) {
+                    if sep.kind != T::Dollar {
+                        i += 2;
+                        return Ok((Some(sep), o));
+                    }
+                }
+            }
+        }
+        let msg = "a repetition `$( ... )` must end with `*`, `+` or `?`, after an optional separator such as `,`";
+        return match t0 {
+            Some(t) => match op_of(t) {
+                Some(o) => {
+                    i += 1;
+                    Ok((None, o))
+                }
+                None => Err(merr(MCode::BadMatcher,t.span(), String::from(msg))),
+            },
+            None => Err(merr(MCode::BadMatcher,at, String::from(msg))),
+        };
+    }
+
+    /// Compile a rule's matcher.
+    fn compile(&mut +self, trees: List::<XTree>): Result::<List::<M>, MacroError> {
+        let mut out: [M; ..+] = [];
+        let mut i: usize = 0;
+        while i < trees.len() {
+            let t = self.tree(trees, i);
+            match t {
+                XTree::Token(d) => {
+                    if d.kind != T::Dollar {
+                        out.push(M::Tok(d));
+                        i += 1;
+                        continue;
+                    }
+                    match self.tree_at(trees, i + 1) {
+                        Some(XTree::Token(n)) => {
+                            if n.kind != T::Ident {
+                                return Err(merr(MCode::BadMatcher,d.span, String::from("`$` must be followed by a name (`$x:expr`) or a repetition (`$( ... )*`)")));
+                            }
+                            let mut kind: Option::<Frag> = None;
+                            let mut kind_tok: Option::<XTok> = None;
+                            if let Some(XTree::Token(c)) = self.tree_at(trees, i + 2) {
+                                if let Some(XTree::Token(k)) = self.tree_at(trees, i + 3) {
+                                    if c.kind == T::Colon {
+                                        kind_tok = Some(k);
+                                        kind = frag_kind(self.p.text(k.text));
+                                    }
+                                }
+                            }
+                            let k = match kind_tok {
+                                Some(k) => k,
+                                None => {
+                                    let nt = self.p.text(n.text);
+                                    return Err(merr(MCode::BadMatcher,n.span, core::fmt::format("`${nt}` in a matcher needs a fragment kind, as in `${nt}:expr`")));
+                                }
+                            };
+                            let fk = match kind {
+                                Some(f) => f,
+                                None => {
+                                    let kt = self.p.text(k.text);
+                                    return Err(merr(MCode::BadMatcher,k.span, core::fmt::format("unknown fragment kind `{kt}`; use one of ident, path, expr, ty, pat, block, stmt, item, lit, vis, meta, tt, generics")));
+                                }
+                            };
+                            out.push(M::Frag { name: n.text, kind: fk });
+                            i += 4;
+                        }
+                        Some(XTree::Group { delim: Delim::Paren, trees: inner, close, .. }) => {
+                            let inner_ms = self.compile(inner)?;
+                            i += 2;
+                            let (sep, op) = self.rep_suffix(trees, &mut i, close)?;
+                            out.push(M::Rep { inner: inner_ms, sep, op });
+                        }
+                        _ => return Err(merr(MCode::BadMatcher,d.span, String::from("`$` must be followed by a name (`$x:expr`) or a repetition (`$( ... )*`)"))),
+                    }
+                }
+                XTree::Group { delim, trees: inner, .. } => {
+                    let inner_ms = self.compile(inner)?;
+                    out.push(M::Group(delim, inner_ms));
+                    i += 1;
+                }
+            }
+        }
+        let l = self.x.ms.add_list(out[..]);
+        self.check_follow(l)?;
+        return Ok(l);
+    }
+
+    /// Rust's follow-set rule, for the fragments that can grow: what comes
+    /// right after one must be a token that cannot continue it, so matching
+    /// never has to guess where it ends.
+    fn check_follow(&self, ms: List::<M>): Result::<(), MacroError> {
+        let n = ms.len();
+        let mut k: usize = 0;
+        while k + 1 < n {
+            let w0 = self.x.ms.list(ms)[k];
+            let w1 = self.x.ms.list(ms)[k + 1];
+            k += 1;
+            let (name, fk) = match w0 {
+                M::Frag { name, kind: Frag::Parsed(fk) } => (name, fk),
+                _ => continue,
+            };
+            let next = match w1 {
+                M::Tok(t) => t,
+                _ => continue,
+            };
+            let set = follow_set(fk);
+            if set.len() == 0 {
+                continue;
+            }
+            let text = self.p.text(next.text);
+            let mut ok = false;
+            let mut list = String::new();
+            for s in set.split(" ") {
+                if s == text {
+                    ok = true;
+                }
+                if list.len() > 0 {
+                    list.push_str(", ");
+                }
+                list.write("`{s}`");
+            }
+            if !ok {
+                let nm = self.p.text(name);
+                return Err(merr(MCode::BadMatcher,next.span, core::fmt::format("`{text}` cannot follow `${nm}`, which could continue past it; allowed here: {list}")));
+            }
+        }
+        for j in 0..n {
+            match self.x.ms.list(ms)[j] {
+                M::Group(_, inner) => self.check_follow(inner)?,
+                M::Rep { inner, .. } => self.check_follow(inner)?,
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+
+    // ----------------------------------------------------------- matching
+
+    fn names_in(&self, ms: List::<M>, out: &mut +[Symbol; ..+]) {
+        for m in self.x.ms.list(ms) {
+            match m {
+                M::Frag { name, .. } => out.push(name),
+                M::Group(_, inner) => self.names_in(inner, out),
+                M::Rep { inner, .. } => self.names_in(inner, out),
+                M::Tok(_) => {}
+            }
+        }
+    }
+
+    fn fragment_of(&mut +self, kind: Frag, input: List::<XTree>, pos: usize, n: usize, params: List::<GParam>): (usize, Fragment) {
+        let trees: List::<XTree> = List::from_parts(input.start() + pos, n);
+        return (n, Fragment { kind, trees, params });
+    }
+
+    /// Match a fragment of `kind` at `pos` in `input`: how many trees it
+    /// takes, and what it captured.
+    fn match_frag(&mut +self, kind: Frag, input: List::<XTree>, pos: usize): Option::<(usize, Fragment)> {
+        let n_in = input.len();
+        match kind {
+            Frag::Tt => {
+                if pos >= n_in {
+                    return None;
+                }
+                return Some(self.fragment_of(kind, input, pos, 1, List::empty()));
+            }
+            Frag::Ident => {
+                return match self.tree_at(input, pos)? {
+                    XTree::Token(t) if t.kind == T::Ident => Some(self.fragment_of(kind, input, pos, 1, List::empty())),
+                    _ => None,
+                };
+            }
+            Frag::Lit => {
+                let first = self.tree_at(input, pos)?;
+                if let XTree::Token(t) = first {
+                    let lit = match t.kind {
+                        T::Number(_) | T::Str | T::Char | T::Byte | T::True | T::False => true,
+                        _ => false,
+                    };
+                    if lit {
+                        return Some(self.fragment_of(kind, input, pos, 1, List::empty()));
+                    }
+                    if t.kind == T::Minus {
+                        if let Some(XTree::Token(n)) = self.tree_at(input, pos + 1) {
+                            if let T::Number(_) = n.kind {
+                                return Some(self.fragment_of(kind, input, pos, 2, List::empty()));
+                            }
+                        }
+                    }
+                }
+                return None;
+            }
+            Frag::Parsed(k) => {
+                if pos > n_in {
+                    return None;
+                }
+                let mut flat: [XTok; ..+] = [];
+                let rest: List::<XTree> = List::from_parts(input.start() + pos, n_in - pos);
+                self.flatten(rest, &mut flat);
+                let r = self.render(flat[..]);
+                let fp = ln_parser::parse_fragment(r.text.as_str(), ctx_map(r.ctxs[..], 0), k)?;
+                let n_flat = fp.tokens;
+                // The fragment must end between trees, never inside a group.
+                let mut n_trees: usize = 0;
+                let mut seen: usize = 0;
+                while seen < n_flat {
+                    let t = self.tree_at(input, pos + n_trees)?;
+                    seen += self.flat_len(t);
+                    n_trees += 1;
+                }
+                if seen != n_flat {
+                    return None;
+                }
+                let mut params: [GParam; ..+] = [];
+                for gp in fp.params {
+                    let name = flat[index_of(r.offsets[..], gp.name.lo)];
+                    let mut bounds: [List::<XTok>; ..+] = [];
+                    for j in 0..gp.bound_count {
+                        let b = fp.bounds[(gp.first_bound + j) as usize];
+                        let lo = index_of(r.offsets[..], b.lo);
+                        let hi = index_of(r.offsets[..], b.hi);
+                        bounds.push(self.x.toks.add_list(flat[lo..hi]));
+                    }
+                    let bl = self.x.ranges.add_list(bounds[..]);
+                    params.push(GParam { name, bounds: bl });
+                }
+                let pl = self.x.gparams.add_list(params[..]);
+                return Some(self.fragment_of(kind, input, pos, n_trees, pl));
+            }
+        }
+    }
+
+    fn same_tok(a: XTok, b: XTok): bool {
+        return a.kind == b.kind && a.text == b.text;
+    }
+
+    /// Match `ms` against `input` from `pos`; the position after the match.
+    fn match_ms(&mut +self, ms: List::<M>, input: List::<XTree>, pos: usize, b: &mut +[Bind; ..+]): Option::<usize> {
+        let mut pos = pos;
+        for mi in 0..ms.len() {
+            let m = self.x.ms.list(ms)[mi];
+            match m {
+                M::Tok(t) => match self.tree_at(input, pos) {
+                    Some(XTree::Token(x)) => {
+                        if !Sema::same_tok(x, t) {
+                            return None;
+                        }
+                        pos += 1;
+                    }
+                    _ => return None,
+                },
+                M::Group(d, inner) => match self.tree_at(input, pos) {
+                    Some(XTree::Group { delim, trees, .. }) => {
+                        if delim != d {
+                            return None;
+                        }
+                        if self.match_ms(inner, trees, 0, b)? != trees.len() {
+                            return None;
+                        }
+                        pos += 1;
+                    }
+                    _ => return None,
+                },
+                M::Frag { name, kind } => {
+                    let (n, frag) = self.match_frag(kind, input, pos)?;
+                    b.push(Bind { name, bound: Bound::Frag(frag) });
+                    pos += n;
+                }
+                M::Rep { inner, sep, op } => {
+                    let mut names: [Symbol; ..+] = [];
+                    self.names_in(inner, &mut names);
+                    let mut iters: [List::<Bind>; ..+] = [];
+                    loop {
+                        if op == Op::Question && iters.len() > 0 {
+                            break;
+                        }
+                        let mut p = pos;
+                        if iters.len() > 0 {
+                            if let Some(s) = sep {
+                                match self.tree_at(input, p) {
+                                    Some(XTree::Token(x)) => {
+                                        if !Sema::same_tok(x, s) {
+                                            break;
+                                        }
+                                        p += 1;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
+                        let mut ib: [Bind; ..+] = [];
+                        // Each repetition must take something, or it would
+                        // repeat forever.
+                        match self.match_ms(inner, input, p, &mut ib) {
+                            Some(n) => {
+                                if n <= pos {
+                                    break;
+                                }
+                                pos = n;
+                                iters.push(self.x.binds.add_list(ib[..]));
+                            }
+                            None => break,
+                        }
+                    }
+                    if op == Op::Plus && iters.len() == 0 {
+                        return None;
+                    }
+                    for name in names {
+                        let mut seq: [Bound; ..+] = [];
+                        for it in iters {
+                            match lookup(self.x.binds.list(it), name) {
+                                Some(bd) => seq.push(bd),
+                                None => seq.push(Bound::Seq(List::empty())),
+                            }
+                        }
+                        let l = self.x.bounds.add_list(seq[..]);
+                        b.push(Bind { name, bound: Bound::Seq(l) });
+                    }
+                }
+            }
+        }
+        return Some(pos);
+    }
+
+    // ----------------------------------------------------------- transcription
+
+    /// `$name` uses in a body (for the variables a repetition repeats over).
+    fn vars_in(&self, body: List::<XTree>, out: &mut +[Symbol; ..+]) {
+        for i in 0..body.len() {
+            match self.tree(body, i) {
+                XTree::Token(d) => {
+                    if d.kind == T::Dollar {
+                        if let Some(XTree::Token(n)) = self.tree_at(body, i + 1) {
+                            out.push(n.text);
+                        }
+                    }
+                }
+                XTree::Group { trees, .. } => self.vars_in(trees, out),
+            }
+        }
+    }
+
+    fn push_mark(tx: &Tx, t: XTok, out: &mut +[XTok; ..+]) {
+        out.push(XTok { kind: t.kind, text: t.text, span: t.span, ctx: tx.mark });
+    }
+
+    /// The text of a `${concat(...)}` part: an identifier, a literal, an
+    /// `ident` or `lit` variable, or `index()`.
+    fn concat_part(&self, tx: &Tx, args: List::<XTree>, i: &mut usize, b: [Bind; &]): Result::<String, MacroError> {
+        let bad = "`${concat(...)}` takes identifiers, literals, `$x` variables and `index()`";
+        let a = self.tree(args, i);
+        let next = self.tree_at(args, i + 1);
+        if let XTree::Token(d) = a {
+            if d.kind == T::Dollar {
+                if let Some(XTree::Token(n)) = next {
+                    i += 2;
+                    if let Some(Bound::Frag(f)) = lookup(b, n.text) {
+                        if f.trees.len() == 1 {
+                            return match self.x.trees.list(f.trees)[0] {
+                                XTree::Token(t) => Ok(String::from(trim_quotes(self.p.text(t.text)))),
+                                g => Err(merr(MCode::BadMatcher,g.span(), String::from(bad))),
+                            };
+                        }
+                    }
+                    let nt = self.p.text(n.text);
+                    return Err(merr(MCode::BadMatcher,n.span, core::fmt::format("`${nt}` in `${{concat(...)}}` must be a single matched identifier or literal")));
+                }
+            }
+        }
+        if let XTree::Token(n) = a {
+            if let Some(XTree::Group { delim: Delim::Paren, trees, .. }) = next {
+                if self.p.text(n.text) == "index" && trees.len() == 0 {
+                    i += 2;
+                    let k = tx.indices.len();
+                    if k == 0 {
+                        return Err(merr(MCode::Repetition,n.span, String::from("`index()` is only meaningful inside a repetition")));
+                    }
+                    return Ok(core::fmt::format("{tx.indices[k - 1]}"));
+                }
+            }
+            let word = match n.kind {
+                T::Ident | T::Number(_) | T::Str => true,
+                _ => false,
+            };
+            if word {
+                i += 1;
+                return Ok(String::from(trim_quotes(self.p.text(n.text))));
+            }
+        }
+        return Err(merr(MCode::BadMatcher,a.span(), String::from(bad)));
+    }
+
+    /// A metavariable expression `${name(args)}`: `index()`, `ignore($x)`,
+    /// `concat(...)`, `stringify(...)` or `error("...")`.
+    fn meta_expr(&mut +self, tx: &mut Tx, group: XTree, b: [Bind; &], out: &mut +[XTok; ..+]): Result::<(), MacroError> {
+        let (trees, open) = match group {
+            XTree::Group { trees, open, .. } => (trees, open),
+            XTree::Token(t) => (List::empty(), t.span),
+        };
+        let mut name_tok: Option::<XTok> = None;
+        let mut args: List::<XTree> = List::empty();
+        if trees.len() == 2 {
+            if let XTree::Token(n) = self.tree(trees, 0) {
+                if let XTree::Group { delim: Delim::Paren, trees: a, .. } = self.tree(trees, 1) {
+                    name_tok = Some(n);
+                    args = a;
+                }
+            }
+        }
+        let name = match name_tok {
+            Some(n) => n,
+            None => return Err(merr(MCode::BadMatcher,open, core::fmt::format("write a metavariable expression as `${{name(...)}}`"))),
+        };
+        let (mark, call) = (tx.mark, tx.call);
+        let text = self.p.text(name.text);
+        if text == "index" {
+            let k = tx.indices.len();
+            if k == 0 {
+                return Err(merr(MCode::Repetition,name.span, core::fmt::format("`${{index()}}` is only meaningful inside a repetition")));
+            }
+            let s = core::fmt::format("{tx.indices[k - 1]}");
+            out.push(self.made(T::Number(NumKind::Int), s.as_str(), call, mark));
+        } else if text == "ignore" {
+        } else if text == "concat" {
+            let mut s = String::new();
+            let mut i: usize = 0;
+            while i < args.len() {
+                let part = self.concat_part(tx, args, &mut i, b)?;
+                s.push_str(part.as_str());
+                if let Some(XTree::Token(t)) = self.tree_at(args, i) {
+                    if t.kind == T::Comma {
+                        i += 1;
+                    }
+                }
+            }
+            if !is_ident(s.as_str()) {
+                return Err(merr(MCode::BadMatcher,name.span, core::fmt::format("`${{concat(...)}}` made `{s}`, which is not an identifier")));
+            }
+            out.push(self.made(T::Ident, s.as_str(), call, mark));
+        } else if text == "stringify" {
+            let mut toks: [XTok; ..+] = [];
+            let mut inner = Tx { mark, call, indices: copy_indices(tx) };
+            self.tx_body(&mut inner, args, b, &mut toks)?;
+            let pretty = self.pretty_tokens(toks[..]);
+            let lit = quote(pretty.as_str());
+            out.push(self.made(T::Str, lit.as_str(), call, mark));
+        } else if text == "error" {
+            let mut msg: Option::<String> = None;
+            if args.len() == 1 {
+                if let XTree::Token(t) = self.tree(args, 0) {
+                    if t.kind == T::Str {
+                        let raw = trim_quotes(self.p.text(t.text));
+                        // `\"` in the literal is a quote in the message.
+                        let mut m = String::new();
+                        let rb = raw.as_bytes();
+                        let mut j: usize = 0;
+                        while j < rb.len() {
+                            if rb[j] == b'\\' && j + 1 < rb.len() && rb[j + 1] == b'"' {
+                                m.push('"');
+                                j += 2;
+                            } else {
+                                let start = j;
+                                j += 1;
+                                while j < rb.len() && rb[j] != b'\\' {
+                                    j += 1;
+                                }
+                                m.push_str(raw[start..j]);
+                            }
+                        }
+                        msg = Some(m);
+                    }
+                }
+            }
+            return match msg {
+                Some(m) => Err(merr(MCode::Error,call, m)),
+                None => Err(merr(MCode::BadMatcher,name.span, core::fmt::format("write `${{error(\"message\")}}`"))),
+            };
+        } else {
+            return Err(merr(MCode::BadMatcher,name.span, core::fmt::format("unknown metavariable expression `{text}`; use index, ignore, concat, stringify or error")));
+        }
+        return Ok(());
+    }
+
+    /// Tokens as text, as `ln_ast::pretty::tokens` prints them.
+    fn pretty_tokens(&self, toks: [XTok; &]): String {
+        let mut out = String::new();
+        let mut prev_glues = true;
+        for t in toks {
+            let text = self.p.text(t.text);
+            let glue_before = text == "::" || text == "." || text == "," || text == ";" || text == ":" || text == "?" || text == "!";
+            let glue_after = text == "::" || text == "." || text == "$" || text == "&" || text == "#";
+            if out.len() > 0 && !prev_glues && !glue_before {
+                out.push(' ');
+            }
+            out.push_str(text);
+            prev_glues = glue_after;
+        }
+        return out;
+    }
+
+    fn tx_body(&mut +self, tx: &mut Tx, body: List::<XTree>, b: [Bind; &], out: &mut +[XTok; ..+]): Result::<(), MacroError> {
+        let mut i: usize = 0;
+        while i < body.len() {
+            let t = self.tree(body, i);
+            let d = match t {
+                XTree::Token(d) => d,
+                XTree::Group { delim, open, close, trees } => {
+                    let (o, c) = Sema::delims(delim);
+                    out.push(self.made(o, delim.open(), open, tx.mark));
+                    self.tx_body(tx, trees, b, out)?;
+                    out.push(self.made(c, delim.close(), close, tx.mark));
+                    i += 1;
+                    continue;
+                }
+            };
+            if d.kind != T::Dollar {
+                Sema::push_mark(tx, d, out);
+                i += 1;
+                continue;
+            }
+            match self.tree_at(body, i + 1) {
+                Some(XTree::Group { delim: Delim::Brace, .. }) => {
+                    let g = self.tree(body, i + 1);
+                    self.meta_expr(tx, g, b, out)?;
+                    i += 2;
+                }
+                Some(XTree::Token(n)) => {
+                    let frag = match lookup(b, n.text) {
+                        Some(Bound::Frag(f)) => f,
+                        Some(Bound::Seq(_)) => {
+                            let nt = self.p.text(n.text);
+                            return Err(merr(MCode::Repetition,n.span, core::fmt::format("`${nt}` was matched inside a repetition, so it can only be used inside `$( ... )`")));
+                        }
+                        None => {
+                            let nt = self.p.text(n.text);
+                            return Err(merr(MCode::BadMatcher,n.span, core::fmt::format("`${nt}` is not matched by this rule's matcher")));
+                        }
+                    };
+                    i += 2;
+                    // `$g.args`, `$g.bound(Trait)` on a `generics` fragment.
+                    let mut projection: Option::<Symbol> = None;
+                    if frag.kind == Frag::Parsed(FragmentKind::Generics) {
+                        if let Some(XTree::Token(dot)) = self.tree_at(body, i) {
+                            if let Some(XTree::Token(p)) = self.tree_at(body, i + 1) {
+                                if dot.kind == T::Dot {
+                                    projection = Some(p.text);
+                                }
+                            }
+                        }
+                    }
+                    let proj = match projection {
+                        Some(p) => self.p.text(p),
+                        None => "",
+                    };
+                    if proj == "args" {
+                        i += 2;
+                        self.tx_generics(tx, frag, None, out);
+                    } else if proj == "bound" {
+                        let group = match self.tree_at(body, i + 2) {
+                            Some(XTree::Group { delim: Delim::Paren, trees, .. }) => trees,
+                            _ => {
+                                let nt = self.p.text(n.text);
+                                return Err(merr(MCode::BadMatcher,n.span, core::fmt::format("write `${nt}.bound(Trait)`")));
+                            }
+                        };
+                        i += 3;
+                        let mut bound: [XTok; ..+] = [];
+                        let mut inner = Tx { mark: tx.mark, call: tx.call, indices: copy_indices(tx) };
+                        self.tx_body(&mut inner, group, b, &mut bound)?;
+                        let bl = self.x.toks.add_list(bound[..]);
+                        self.tx_generics(tx, frag, Some(bl), out);
+                    } else {
+                        self.fragment(tx, frag, out);
+                    }
+                }
+                Some(XTree::Group { delim: Delim::Paren, trees: inner, close, .. }) => {
+                    i += 2;
+                    let (sep, _) = self.rep_suffix(body, &mut i, close)?;
+                    let mut names: [Symbol; ..+] = [];
+                    self.vars_in(inner, &mut names);
+                    let mut count: Option::<(usize, Symbol)> = None;
+                    for n in names {
+                        if let Some(Bound::Seq(v)) = lookup(b, n) {
+                            match count {
+                                None => count = Some((v.len(), n)),
+                                Some(c) => {
+                                    let (cn, first) = c;
+                                    if cn != v.len() {
+                                        let ft = self.p.text(first);
+                                        let nt = self.p.text(n);
+                                        return Err(merr(MCode::Repetition,close, core::fmt::format("`${ft}` repeats {cn} times but `${nt}` repeats {v.len()} times in the same repetition")));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let count = match count {
+                        Some(c) => c.0,
+                        None => return Err(merr(MCode::Repetition,close, String::from("this repetition uses no variable that was matched in a repetition"))),
+                    };
+                    for k in 0..count {
+                        if k > 0 {
+                            if let Some(s) = sep {
+                                Sema::push_mark(tx, s, out);
+                            }
+                        }
+                        let mut ib: [Bind; ..+] = [];
+                        ib.extend(b);
+                        for n in names {
+                            if let Some(Bound::Seq(v)) = lookup(b, n) {
+                                ib.push(Bind { name: n, bound: self.x.bounds.list(v)[k] });
+                            }
+                        }
+                        tx.indices.push(k);
+                        let r = self.tx_body(tx, inner, ib[..], out);
+                        tx.indices.pop();
+                        r?;
+                    }
+                }
+                _ => return Err(merr(MCode::BadMatcher,d.span, String::from("`$` must be followed by a matched name or a repetition `$( ... )`"))),
+            }
+        }
+        return Ok(());
+    }
+
+    /// A captured fragment, with the caller's contexts. An expression is
+    /// parenthesized so it stays one operand: `$x * 2` with `1 + 1`.
+    fn fragment(&mut +self, tx: &Tx, f: Fragment, out: &mut +[XTok; ..+]) {
+        let mut flat: [XTok; ..+] = [];
+        self.flatten(f.trees, &mut flat);
+        let wrap = f.kind == Frag::Parsed(FragmentKind::Expr) && flat.len() > 1;
+        if wrap {
+            out.push(self.made(T::LParen, "(", tx.call, tx.mark));
+        }
+        out.extend(flat[..]);
+        if wrap {
+            out.push(self.made(T::RParen, ")", tx.call, tx.mark));
+        }
+    }
+
+    /// `$g.args` (`::<T, U>`) or `$g.bound(B)` (`::<T: A + B, U: B>`).
+    fn tx_generics(&mut +self, tx: &Tx, f: Fragment, bound: Option::<List::<XTok>>, out: &mut +[XTok; ..+]) {
+        if f.params.len() == 0 {
+            return;
+        }
+        let (call, mark) = (tx.call, tx.mark);
+        out.push(self.made(T::PathSep, "::", call, mark));
+        out.push(self.made(T::LAngle, "<", call, mark));
+        for i in 0..f.params.len() {
+            let gp = self.x.gparams.list(f.params)[i];
+            if i > 0 {
+                out.push(self.made(T::Comma, ",", call, mark));
+            }
+            out.push(gp.name);
+            if let Some(extra) = bound {
+                out.push(self.made(T::Colon, ":", call, mark));
+                for j in 0..gp.bounds.len() {
+                    let bt = self.x.ranges.list(gp.bounds)[j];
+                    out.extend(self.x.toks.list(bt));
+                    out.push(self.made(T::Plus, "+", call, mark));
+                }
+                out.extend(self.x.toks.list(extra));
+            }
+        }
+        out.push(self.made(T::RAngle, ">", call, mark));
+    }
+
+    // ===================================================================== expansion
+
+    /// Compile a macro's rules when it is defined, reporting bad matchers.
+    pub fn define_macro(&mut self, def: DefId, m: ln_ast::MacroDef) {
+        let mut rules: [Rule; ..+] = [];
+        for i in 0..m.rules.len() {
+            let r = self.p.ast.macro_rules.list(m.rules)[i];
+            let matcher = self.import_trees(r.matcher);
+            match self.compile(matcher) {
+                Ok(ms) => {
+                    let body = self.import_trees(r.body);
+                    rules.push(Rule { matcher: ms, body });
+                }
+                Err(e) => {
+                    self.error(e.code.code(), e.span, "{e.msg}");
+                    self.emit();
+                }
+            }
+        }
+        let l = self.x.rules.add_list(rules[..]);
+        self.macro_rules.insert(def, l);
+    }
+
+    /// The macro an invocation's path (or a `#[derive]`) names, or an error.
+    fn resolve_macro(&mut self, module: DefId, segs: [Ident; &], span: Span, derive: bool): Option::<DefId> {
+        let mut shown = String::new();
+        for i in 0..segs.len() {
+            if i > 0 {
+                shown.push_str("::");
+            }
+            shown.push_str(self.p.text(segs[i].name));
+        }
+        let missing = if derive { core::fmt::format("cannot find derive macro `{shown}` in this scope") } else { core::fmt::format("cannot find macro `{shown}!` in this scope") };
+        match self.resolve_prefix(module, segs, Ns::Macro) {
+            Some(r) => {
+                if let ModRes::Def(d) = r.res {
+                    if r.used == segs.len() {
+                        let kind = self.p.def(d).kind;
+                        if kind == DefKind::Macro {
+                            return Some(d);
+                        }
+                        self.error(codes::macro_::UNDEFINED(), span, "`{shown}` is a {kind.describe()}, not a macro");
+                        self.emit();
+                        return None;
+                    }
+                }
+                self.error(codes::macro_::UNDEFINED(), span, "{missing}");
+                self.emit();
+                return None;
+            }
+            None => {
+                if segs.len() == 1 {
+                    self.error(codes::macro_::UNDEFINED(), span, "{missing}");
+                    self.emit();
+                }
+                return None;
+            }
+        }
+    }
+
+    /// Expand `call` in module `module`, parsing the result as `kind`.
+    pub fn expand_call(&mut self, module: DefId, call: MacCall, kind: ExpansionKind): Option::<Expansion> {
+        let mut segs: [Ident; ..+] = [];
+        for s in self.p.ast.segments.list(call.path.segments) {
+            segs.push(s.ident);
+        }
+        let def = self.resolve_macro(module, segs[..], call.path.span, false)?;
+        if self.p.def(def).attrs.derive_macro {
+            let name = self.def_name(def);
+            self.error(codes::macro_::UNDEFINED(), call.path.span, "`{name}` is a derive macro, used as `#[derive({name})]` on a struct or enum");
+            self.help("only macros without `#[derive_macro]` can be invoked with `!`");
+            self.emit();
+            return None;
+        }
+        let parent = segs[0].ctx;
+        let input = self.import_trees(call.tokens);
+        return self.expand_with(def, input, parent, call.span, kind, false);
+    }
+
+    /// Run a derive macro on `item`, whose tokens are its input.
+    pub fn expand_derive(&mut self, module: DefId, item: Id::<Item>, name: Ident): Option::<List::<Id::<Item>>> {
+        let segs = [name];
+        let def = self.resolve_macro(module, segs[..], name.span, true)?;
+        if !self.p.def(def).attrs.derive_macro {
+            let n = self.str_of(name.name);
+            self.error(codes::macro_::UNDEFINED(), name.span, "`{n}` is not a derive macro");
+            self.help("a derive is a `macro` marked `#[derive_macro]`; ordinary macros are invoked with `name!(...)`");
+            self.emit();
+            return None;
+        }
+        let input = self.derive_input(item);
+        return match self.expand_with(def, input, name.ctx, name.span, ExpansionKind::Items, true)? {
+            Expansion::Items(items) => Some(items),
+            _ => None,
+        };
+    }
+
+    /// An item's tokens, without its `#[derive(...)]` attributes. Doc
+    /// comments become `#[doc = "..."]` attributes; tokens of an expansion
+    /// keep their hygiene contexts.
+    fn derive_input(&mut +self, item: Id::<Item>): List::<XTree> {
+        let span = self.p.ast.items.get(item).span;
+        let text = String::from(self.p.sources.snippet(span));
+        let base = span.lo;
+        let (toks, _) = ln_lexer::lex(text.as_str());
+        // Open groups: (delimiter, opening span, where its trees start in `cur`).
+        let mut stack: [(Delim, Span, usize); -..+] = [];
+        let mut cur: [XTree; -..+] = [];
+        for t in toks {
+            let sp = Span::new(base + t.range.start as u32, base + t.range.end as u32);
+            let ctx = self.ctxs.get_or(sp.lo, SyntaxCtx::root());
+            let tt = text.as_str()[t.range.start..t.range.end];
+            match t.token {
+                T::LParen => stack.push((Delim::Paren, sp, cur.len())),
+                T::LBracket => stack.push((Delim::Bracket, sp, cur.len())),
+                T::LBrace => stack.push((Delim::Brace, sp, cur.len())),
+                T::RParen | T::RBracket | T::RBrace => {
+                    if let Some(top) = stack.pop() {
+                        let (delim, open, start) = top;
+                        let trees = self.x.trees.add_list(cur[start..]);
+                        cur.truncate(start);
+                        cur.push(XTree::Group { delim, open, close: sp, trees });
+                    }
+                }
+                T::DocComment => {
+                    let mut doc = if tt.starts_with("///") { tt[3..] } else { tt };
+                    while doc.ends_with("\r") {
+                        doc = doc[..doc.len() - 1];
+                    }
+                    if doc.starts_with(" ") {
+                        doc = doc[1..];
+                    }
+                    let lit = quote(doc);
+                    cur.push(XTree::Token(XTok { kind: T::Hash, text: self.p.sym("#"), span: sp, ctx }));
+                    let inner = [
+                        XTree::Token(XTok { kind: T::Ident, text: self.p.sym("doc"), span: sp, ctx }),
+                        XTree::Token(XTok { kind: T::Eq, text: self.p.sym("="), span: sp, ctx }),
+                        XTree::Token(XTok { kind: T::Str, text: self.p.sym(lit.as_str()), span: sp, ctx }),
+                    ];
+                    let l = self.x.trees.add_list(inner[..]);
+                    cur.push(XTree::Group { delim: Delim::Bracket, open: sp, close: sp, trees: l });
+                }
+                kind => {
+                    let s = self.p.sym(tt);
+                    cur.push(XTree::Token(XTok { kind, text: s, span: sp, ctx }));
+                }
+            }
+        }
+        let mut out: [XTree; ..+] = [];
+        let mut i: usize = 0;
+        while i < cur.len() {
+            let mut is_derive = false;
+            if let XTree::Token(h) = cur[i] {
+                if h.kind == T::Hash && i + 1 < cur.len() {
+                    if let XTree::Group { delim: Delim::Bracket, trees, .. } = cur[i + 1] {
+                        if trees.len() > 0 {
+                            if let XTree::Token(f) = self.x.trees.list(trees)[0] {
+                                is_derive = self.p.text(f.text) == "derive";
+                            }
+                        }
+                    }
+                }
+            }
+            if is_derive {
+                i += 2;
+                continue;
+            }
+            out.push(cur[i]);
+            i += 1;
+        }
+        return self.x.trees.add_list(out[..]);
+    }
+
+    fn expand_with(&mut self, def: DefId, input: List::<XTree>, parent: SyntaxCtx, call: Span, kind: ExpansionKind, derive: bool): Option::<Expansion> {
+        let name = self.def_name(def);
+        let depth = if parent.is_root() { 0 } else { self.marks[parent.index as usize].depth } + 1;
+        if depth > RECURSION_LIMIT {
+            self.error(codes::macro_::RECURSION_LIMIT(), call, "expanding `{name}!` nests more than {RECURSION_LIMIT} expansions deep");
+            self.help("a macro that expands to an invocation of itself needs a rule that stops");
+            self.emit();
+            return None;
+        }
+        let rules = self.macro_rules.get(def)?;
+        let n = rules.len();
+        let mut found: Option::<(List::<XTree>, List::<Bind>)> = None;
+        for i in 0..n {
+            let r = self.x.rules.list(rules)[i];
+            let mut b: [Bind; ..+] = [];
+            if self.match_ms(r.matcher, input, 0, &mut b) == Some(input.len()) {
+                found = Some((r.body, self.x.binds.add_list(b[..])));
+                break;
+            }
+        }
+        let (body, bindings) = match found {
+            Some(f) => f,
+            None => {
+                if derive {
+                    self.error(codes::macro_::NO_MATCH(), call, "`#[derive({name})]` does not apply to this item");
+                    self.note("no rule of the derive macro `{name}` matches it");
+                } else {
+                    let s = if n == 1 { "" } else { "s" };
+                    self.error(codes::macro_::NO_MATCH(), call, "no rule of `{name}!` matches these tokens");
+                    self.note("`{name}!` has {n} rule{s}; each is tried in order");
+                }
+                self.emit();
+                return None;
+            }
+        };
+        let m = match self.ast(def) {
+            AstRef::Macro(m) => m,
+            _ => return None,
+        };
+        let mark = SyntaxCtx { index: self.marks.len() as u32 };
+        let def_module = self.p.def(def).module;
+        self.marks.push(Mark { def_module, def_ctx: m.name.ctx, depth });
+        let mut toks: [XTok; ..+] = [];
+        if kind == ExpansionKind::Expr {
+            toks.push(self.made(T::LBrace, "{", dummy_span(), mark));
+        }
+        let mut tx = Tx { mark, call, indices: [] };
+        let r = self.tx_body(&mut tx, body, self.x.binds.list(bindings), &mut toks);
+        if let Err(e) = r {
+            self.error(e.code.code(), e.span, "{e.msg}");
+            // A macro's own `${error(..)}` is already reported at the call.
+            if e.span != call {
+                self.secondary(call, "in this expansion of `{name}!`");
+            }
+            self.emit();
+            return None;
+        }
+        if kind == ExpansionKind::Expr {
+            toks.push(self.made(T::RBrace, "}", dummy_span(), mark));
+        }
+        let rendered = self.render(toks[..]);
+        let file_name = self.p.sym(core::fmt::format("<{name}!>").as_str());
+        let (_, base) = self.p.sources.add(file_name, rendered.text.as_str(), Some(call));
+        for c in rendered.ctxs {
+            let (o, x) = c;
+            self.ctxs.insert(base + o, x);
+        }
+        let parsed = ln_parser::parse_expansion(&mut self.p.ast, rendered.text.as_str(), base, ctx_map(rendered.ctxs[..], base), kind);
+        if derive && parsed.diags.len() > 0 {
+            // The parse errors would only restate this from inside the
+            // derive's output.
+            self.error(codes::macro_::DERIVE_OUTPUT(), call, "the derive `{name}` expanded to something that is not a list of items");
+            self.note("a derive can only add items (usually an `impl`) next to the struct or enum it is on");
+            self.secondary(Span::new(base, base + rendered.text.len() as u32), "what it expanded to");
+            self.emit();
+            return None;
+        }
+        for d in parsed.diags {
+            begin_syntax(&mut self.p, d);
+            let t = self.intern_fmt("in this expansion of `{name}!`");
+            self.p.diags.secondary(call, t);
+            self.p.diags.finish();
+        }
+        return parsed.out;
+    }
+
+    /// Expand item-position invocations and derives until none are left,
+    /// collecting what they define and resolving the imports they add.
+    pub fn expand_items(&mut self) {
+        for _ in 0..RECURSION_LIMIT {
+            let pending = core::mem::replace(&mut self.pending_macros, []);
+            if pending.len() == 0 {
+                return;
+            }
+            for p in pending {
+                let (module, owner, items, span) = match p {
+                    Pending::Call { module, call, owner } => match self.expand_call(module, call, ExpansionKind::Items) {
+                        Some(Expansion::Items(items)) => (module, owner, items, call.span),
+                        _ => continue,
+                    },
+                    Pending::Derive { module, item, name } => match self.expand_derive(module, item, name) {
+                        Some(items) => (module, Owner::Module, items, name.span),
+                        None => continue,
+                    },
+                };
+                let at = if items.len() > 0 { self.p.ast.items.get(self.p.ast.item_ids.list(items)[0]).span.lo } else { span.lo };
+                let file = self.p.sources.file_of(at);
+                let src = self.craters.add_plain(file, items);
+                match owner {
+                    Owner::Module => {
+                        for i in 0..items.len() {
+                            let item = self.p.ast.item_ids.list(items)[i];
+                            self.collect_expanded_item(module, item, src);
+                        }
+                    }
+                    Owner::Impl(id) => self.collect_impl_items(id, module, items, src),
+                    Owner::Trait(id) => self.collect_trait_items(id, module, items, src),
+                }
+            }
+            self.resolve_imports();
+        }
+    }
+
+    /// Expand a macro in expression or statement position.
+    pub fn expand_expr(&mut self, module: DefId, call: MacCall): Option::<Id::<Expr>> {
+        let e = match self.expand_call(module, call, ExpansionKind::Expr)? {
+            Expansion::Expr(e) => e,
+            _ => return None,
+        };
+        if let ExprKind::Block(b) = self.p.ast.exprs.get(e).kind {
+            let blk = self.p.ast.blocks.get(b);
+            for i in 0..blk.stmts.len() {
+                let s = self.p.ast.stmts.list(blk.stmts)[i];
+                if let StmtKind::Item(_) = s.kind {
+                    self.error(codes::macro_::NOT_SUPPORTED(), s.span, "items in a macro expanded in expression position are not supported yet");
+                    self.secondary(call.span, "expanded here");
+                    self.help("define the items outside the macro, or invoke a macro in item position (outside any function) to define them");
+                    self.emit();
+                    return None;
+                }
+            }
+        }
+        return Some(e);
+    }
+
+    pub fn expand_pat(&mut self, module: DefId, call: MacCall): Option::<Id::<Pat>> {
+        return match self.expand_call(module, call, ExpansionKind::Pat)? {
+            Expansion::Pat(p) => Some(p),
+            _ => None,
+        };
+    }
+
+    /// Expand a macro in type position. Types are lowered more than once,
+    /// so each invocation is expanded once and remembered.
+    pub fn expand_ty(&mut self, module: DefId, call: MacCall): Option::<Id::<ln_ast::Ty>> {
+        let key = call.span.lo;
+        if let Some(t) = self.ty_expansions.get(key) {
+            return t;
+        }
+        let t = match self.expand_call(module, call, ExpansionKind::Ty) {
+            Some(Expansion::Ty(t)) => Some(t),
+            _ => None,
+        };
+        self.ty_expansions.insert(key, t);
+        return t;
+    }
+}

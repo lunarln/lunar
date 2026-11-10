@@ -4,7 +4,9 @@
 // checking, producing a typed IR (`thir`) for code generation.
 //
 // The data model (`ty`, `defs`, `thir`, `program`, `diag`) is shared by the
-// passes; see craters/README.md for the state of the port.
+// passes; see craters/README.md for the state of the port. The front end
+// (`sema`, `loader`, `collect`, `resolve`, `expand`, `lower`) loads the
+// craters, names every item, expands macros and lowers signatures.
 
 pub mod ty;
 pub mod defs;
@@ -13,8 +15,15 @@ pub mod diag;
 pub mod codes;
 pub mod program;
 pub mod render;
+pub mod sema;
+pub mod loader;
+pub mod collect;
+pub mod resolve;
+pub mod expand;
+pub mod lower;
 pub mod traits;
 pub mod layout;
 pub mod borrowck;
+pub mod typeck;
 #[cfg(test)]
 mod tests;

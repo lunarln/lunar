@@ -1,0 +1,367 @@
+// Loading a crater's module tree from disk: a port of
+// crates/ln-sema/src/loader.rs.
+//
+// Every file is added to the program's source map (`p.sources`) and parsed
+// into the shared syntax tree (`p.ast`). A module's source is a
+// `ModSource` in `Craters::mods`; its out-of-line children (`mod foo;`)
+// are found by the chain of inline module names leading to the
+// declaration, then its name (Rust keys a map by that chain).
+
+use core::arena::{Arena, Id, List};
+use core::intern::Symbol;
+use crater::codes;
+use crater::program::Program;
+use ln_ast::{Ident, Item, ItemKind, Span};
+use ln_parser::{Code, Diag};
+
+/// A parsed module and the out-of-line child modules (`mod foo;`) it
+/// declares.
+pub struct ModSource {
+    /// Its file (index into `p.sources.files`).
+    pub file: u32,
+    pub items: List::<Id::<Item>>,
+    /// In `Craters::children`.
+    pub children: List::<ModChild>,
+}
+
+/// A child module's source, by the chain of inline module names leading
+/// to its `mod` declaration, then its name (in `Craters::chains`).
+pub struct ModChild {
+    pub chain: List::<Symbol>,
+    pub src: Id::<ModSource>,
+}
+
+/// A crater this one may name: the name used in paths, and the index of
+/// the crater in `Craters::list`.
+pub struct CraterDep {
+    pub name: Symbol,
+    pub index: u32,
+}
+
+pub struct CrateSource {
+    pub name: Symbol,
+    pub root: Id::<ModSource>,
+    /// The craters this one may name (in `Craters::deps`). `core` and
+    /// `std` are always visible and need not be listed.
+    pub deps: List::<CraterDep>,
+}
+
+/// The loaded craters, the first being the one built.
+pub struct Craters {
+    pub list: [CrateSource; ..+],
+    pub mods: Arena::<ModSource>,
+    pub children: Arena::<ModChild>,
+    pub chains: Arena::<Symbol>,
+    pub deps: Arena::<CraterDep>,
+}
+
+impl Craters {
+    pub fn new(): Craters {
+        return Craters { list: [], mods: Arena::new(), children: Arena::new(), chains: Arena::new(), deps: Arena::new() };
+    }
+
+    /// The child of `src` declared by `mod` under `chain` (inline module
+    /// names, then the child's name).
+    pub fn child(&self, src: Id::<ModSource>, chain: [Symbol; &]): Option::<Id::<ModSource>> {
+        let m = self.mods.get(src);
+        for c in self.children.list(m.children) {
+            let k = self.chains.list(c.chain);
+            if k.len() != chain.len() {
+                continue;
+            }
+            let mut same = true;
+            for i in 0..k.len() {
+                if k[i] != chain[i] {
+                    same = false;
+                    break;
+                }
+            }
+            if same {
+                return Some(c.src);
+            }
+        }
+        return None;
+    }
+
+    /// A module source without children (for items a macro expanded to).
+    pub fn add_plain(&mut +self, file: u32, items: List::<Id::<Item>>): Id::<ModSource> {
+        return self.mods.add(ModSource { file, items, children: List::empty() });
+    }
+}
+
+/// `\` as `/`, so paths print alike on every system.
+pub fn normalize(p: str): String {
+    let mut out = String::new();
+    for c in p.chars() {
+        out.push(if c == '\\' { '/' } else { c });
+    }
+    return out;
+}
+
+/// The directory part of `p` (empty for a bare file name).
+fn parent(p: str): str {
+    let b = p.as_bytes();
+    let mut i = b.len();
+    while i > 0 {
+        i -= 1;
+        if b[i] == b'/' || b[i] == b'\\' {
+            return p[..i];
+        }
+    }
+    return "";
+}
+
+/// The file name of `p` without its extension.
+fn file_stem(p: str): str {
+    let b = p.as_bytes();
+    let mut start = b.len();
+    while start > 0 && b[start - 1] != b'/' && b[start - 1] != b'\\' {
+        start -= 1;
+    }
+    let name = p[start..];
+    let nb = name.as_bytes();
+    let mut dot = nb.len();
+    while dot > 0 {
+        dot -= 1;
+        if nb[dot] == b'.' {
+            if dot == 0 {
+                return name;
+            }
+            return name[..dot];
+        }
+    }
+    return name;
+}
+
+/// `dir/name` (just `name` when `dir` is empty).
+fn join(dir: str, name: str): String {
+    let mut out = String::new();
+    if dir.len() > 0 {
+        out.push_str(dir);
+        out.push('/');
+    }
+    out.push_str(name);
+    return out;
+}
+
+/// Load the crater rooted at `root_path`, following `mod foo;` declarations
+/// to `foo.ln` or `foo/mod.ln` relative to the declaring file. `None` if
+/// the root file cannot be read. The caller sets `deps` and adds the
+/// crater to `cs.list`.
+pub fn load_crate(p: &mut Program, cs: &mut +Craters, name: str, root_path: str, display_prefix: str): Option::<CrateSource> {
+    let text = match std::fs::read_to_string(root_path) {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    let root = load_mod(p, cs, root_path, text, true, display_prefix);
+    let n = p.sym(name);
+    return Some(CrateSource { name: n, root, deps: List::empty() });
+}
+
+fn load_mod(p: &mut Program, cs: &mut +Craters, path: str, text: String, is_dir_owner: bool, display_prefix: str): Id::<ModSource> {
+    let mut display = String::from(display_prefix);
+    display.push_str(normalize(path).as_str());
+    let dsym = p.sym(display.as_str());
+    let (file, base) = p.sources.add(dsym, text.as_str(), None);
+    let items = parse_source(p, text.as_str(), base);
+
+    // Directory in which child modules of this file live.
+    let mut base_dir = String::new();
+    if is_dir_owner {
+        base_dir.push_str(parent(path));
+    } else {
+        base_dir.push_str(join(parent(path), file_stem(path)).as_str());
+    }
+
+    let mut decls: [ModDecl; ..+] = [];
+    let mut chains: [Symbol; ..+] = [];
+    let mut chain: [Symbol; -..+] = [];
+    collect_mod_decls(p, items, &mut chain, &mut chains, &mut decls);
+    let mut children: [ModChild; ..+] = [];
+    for d in decls {
+        let mut dir = String::new();
+        dir.push_str(base_dir.as_str());
+        for i in 0..d.chain_len {
+            let c = chains[(d.chain_start + i) as usize];
+            dir = join(dir.as_str(), p.text(c));
+        }
+        let ident_name = String::from(p.text(d.ident.name));
+        let mut flat_name = String::new();
+        flat_name.write("{ident_name}.ln");
+        let flat = join(dir.as_str(), flat_name.as_str());
+        let nested = join(join(dir.as_str(), ident_name.as_str()).as_str(), "mod.ln");
+        let (child_path, child_text, owner) = match std::fs::read_to_string(flat.as_str()) {
+            Ok(t) => (flat, t, false),
+            Err(_) => match std::fs::read_to_string(nested.as_str()) {
+                Ok(t) => (nested, t, true),
+                Err(_) => {
+                    let msg = p.sym(core::fmt::format("file not found for module `{ident_name}`").as_str());
+                    p.diags.error(codes::name::MODULE_FILE(), d.ident.span, msg);
+                    let h = p.sym(core::fmt::format("create `{normalize(flat.as_str())}` or `{normalize(nested.as_str())}`").as_str());
+                    p.diags.help(h);
+                    p.diags.finish();
+                    continue;
+                }
+            },
+        };
+        let child = load_mod(p, cs, child_path.as_str(), child_text, owner, display_prefix);
+        let mut key: [Symbol; ..+] = [];
+        for i in 0..d.chain_len {
+            key.push(chains[(d.chain_start + i) as usize]);
+        }
+        key.push(d.ident.name);
+        let kl = cs.chains.add_list(key[..]);
+        children.push(ModChild { chain: kl, src: child });
+    }
+    let cl = cs.children.add_list(children[..]);
+    return cs.mods.add(ModSource { file, items, children: cl });
+}
+
+/// A `mod foo;` found in a file: the chain of inline modules around it
+/// (`chain_len` symbols from `chain_start`) and its name.
+struct ModDecl {
+    chain_start: u32,
+    chain_len: u32,
+    ident: Ident,
+}
+
+fn collect_mod_decls(p: &Program, items: List::<Id::<Item>>, chain: &mut [Symbol; -..+], chains: &mut +[Symbol; ..+], out: &mut +[ModDecl; ..+]) {
+    for i in 0..items.len() {
+        let id = p.ast.item_ids.list(items)[i];
+        if let ItemKind::Mod(m) = p.ast.items.get(id).kind {
+            match m.items {
+                None => {
+                    let start = chains.len() as u32;
+                    chains.extend(chain[..]);
+                    out.push(ModDecl { chain_start: start, chain_len: chain.len() as u32, ident: m.name });
+                }
+                Some(inner) => {
+                    chain.push(m.name.name);
+                    collect_mod_decls(p, inner, chain, chains, out);
+                    chain.pop();
+                }
+            }
+        }
+    }
+}
+
+/// Parse the file `text` (at global offset `base`) into `p.ast`,
+/// reporting its syntax errors. A half-merged file is not parsed: it would
+/// only produce a cascade of syntax errors.
+pub fn parse_source(p: &mut Program, text: str, base: u32): List::<Id::<Item>> {
+    let conflicts = ln_lexer::conflict_markers(text);
+    if conflicts.len() > 0 {
+        for c in conflicts {
+            conflict_diag(p, text, base, c);
+        }
+        return List::empty();
+    }
+    let parsed = ln_parser::parse_file_into(&mut p.ast, text, base);
+    for d in parsed.diags {
+        report_syntax(p, d);
+    }
+    return parsed.items;
+}
+
+/// A syntax error from the parser, as a diagnostic.
+pub fn report_syntax(p: &mut Program, d: Diag) {
+    begin_syntax(p, d);
+    p.diags.finish();
+}
+
+/// The diagnostic code of a syntax error.
+pub fn syntax_code(c: Code): crater::diag::Code {
+    return match c {
+        Code::UnexpectedToken => codes::syntax::UNEXPECTED_TOKEN(),
+        Code::UnknownChar => codes::syntax::UNKNOWN_CHAR(),
+        Code::Unterminated => codes::syntax::UNTERMINATED(),
+        Code::BadEscape => codes::syntax::BAD_ESCAPE(),
+        Code::BadNumber => codes::syntax::BAD_NUMBER(),
+        Code::MissingSemi => codes::syntax::MISSING_SEMI(),
+        Code::BadChar => codes::syntax::BAD_CHAR(),
+        Code::ConflictMarker => codes::syntax::CONFLICT_MARKER(),
+    };
+}
+
+/// Start building the diagnostic of a syntax error (the caller may add
+/// to it, then finishes it).
+pub fn begin_syntax(p: &mut Program, d: Diag) {
+    p.diags.error(syntax_code(d.code), d.span, d.message);
+    if let Some(l) = d.label {
+        p.diags.label(l);
+    }
+    if p.text(d.message) == "unterminated block comment" {
+        let l = p.sym("this comment is never closed");
+        p.diags.label(l);
+        let n = p.sym("block comments nest: every `/*` inside a comment needs its own `*/`");
+        p.diags.note(n);
+        let h = p.sym("add `*/` where the comment should end");
+        p.diags.help(h);
+    }
+}
+
+/// `err(syntax::conflict_marker)` for one conflict region.
+fn conflict_diag(p: &mut Program, src: str, base: u32, c: ln_lexer::Conflict) {
+    let kind = src[c.start.start..c.start.start + 1];
+    let ours = side(src, c.start);
+    let msg = p.sym("encountered a version control conflict marker");
+    p.diags.error(codes::syntax::CONFLICT_MARKER(), marker_span(base, c.start), msg);
+    if kind != "<" {
+        let l = p.sym("conflict marker without a matching `<<<<<<<`");
+        p.diags.label(l);
+        let h = p.sym("finish resolving the conflict, then delete every line that holds a conflict marker");
+        p.diags.help(h);
+        p.diags.finish();
+        return;
+    }
+    let label = match c.base {
+        Some(_) => core::fmt::format("between this marker and `|||||||` is our code{ours}"),
+        None => match c.mid {
+            Some(_) => core::fmt::format("between this marker and `=======` is our code{ours}"),
+            None => core::fmt::format("conflict region starts here{ours}, with no `=======` or `>>>>>>>` after it"),
+        },
+    };
+    let l = p.sym(label.as_str());
+    p.diags.label(l);
+    if let Some(b) = c.base {
+        let t = p.sym(core::fmt::format("between this marker and `=======` is the original code both sides changed{side(src, b)}").as_str());
+        p.diags.secondary(marker_span(base, b), t);
+    }
+    if let Some(m) = c.mid {
+        let theirs = match c.end {
+            Some(e) => side(src, e),
+            None => String::new(),
+        };
+        let t = p.sym(core::fmt::format("between this marker and `>>>>>>>` is the incoming code{theirs}").as_str());
+        p.diags.secondary(marker_span(base, m), t);
+    }
+    if let Some(e) = c.end {
+        let t = p.sym("this marker concludes the conflict region");
+        p.diags.secondary(marker_span(base, e), t);
+    }
+    let n1 = p.sym("conflict markers indicate that a merge was started but could not be completed due to merge conflicts");
+    p.diags.note(n1);
+    let n2 = p.sym("if you are in a merge, the top section is the code you already had checked out and the bottom section is the new code");
+    p.diags.note(n2);
+    let n3 = p.sym("if you are in a rebase, the top section is the code being rebased onto and the bottom section is the code you had checked out which is being rebased");
+    p.diags.note(n3);
+    let h = p.sym("keep the code you want from each section, then delete the lines that hold conflict markers");
+    p.diags.help(h);
+    p.diags.finish();
+}
+
+/// The marker itself: its first seven characters.
+fn marker_span(base: u32, r: ln_lexer::Range): Span {
+    let end = if r.start + 7 < r.end { r.start + 7 } else { r.end };
+    return Span::new(base + r.start as u32, base + end as u32);
+}
+
+/// The text after a marker names the side, e.g. `HEAD` or a branch.
+fn side(src: str, r: ln_lexer::Range): String {
+    let skip = if 7 < r.end - r.start { 7 } else { r.end - r.start };
+    let t = src[r.start + skip..r.end].trim();
+    if t.len() == 0 {
+        return String::new();
+    }
+    return core::fmt::format(" (`{t}`)");
+}

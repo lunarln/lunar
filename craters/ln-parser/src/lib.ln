@@ -17,6 +17,8 @@ mod macros;
 mod pat;
 mod ty;
 
+pub use crater::macros::{Expansion, ExpansionKind, ExpansionParse, FragmentKind, FragmentParse, FragParam, parse_expansion, parse_fragment};
+
 use core::arena::{Id, List};
 use core::collections::HashMap;
 use core::intern::Symbol;
@@ -88,6 +90,7 @@ enum Named {
     AttributeValue,
     Delimiter,
     ArraySize,
+    EndOfExpansion,
 }
 
 impl Named {
@@ -102,6 +105,7 @@ impl Named {
             Named::AttributeValue => "attribute value",
             Named::Delimiter => "`(`, `[` or `{`",
             Named::ArraySize => "array size (`N`, `_`, `&`, `&mut`, `..+` or `-..+`)",
+            Named::EndOfExpansion => "the end of the macro expansion",
         };
     }
 }
@@ -121,6 +125,9 @@ struct DocRun {
 /// The parser: a token cursor and the tree being built.
 pub struct Parser {
     src: str,
+    /// Where `src` starts: token offsets are global (every file of a
+    /// compilation end to end), and `src[offset - base]` is their text.
+    base: u32,
     toks: [Tok; ..+],
     pos: usize,
     /// The end of the tokens being parsed (the file's, or a format hole's).
@@ -139,8 +146,16 @@ pub struct Parser {
     /// Doc comments, by the start of the token after them.
     docs: HashMap::<u32, DocRun>,
     doc_spans: [Span; ..+],
+    /// Hygiene contexts of identifiers, by global offset, for macro
+    /// expansions (empty for source files, where every identifier is
+    /// `ROOT`).
+    ctxs: Ctxs,
     pub ast: Ast,
 }
+
+/// The syntax context of the identifier (or token) starting at each
+/// global offset of an expansion's text; offsets not listed are `ROOT`.
+pub type Ctxs = HashMap::<u32, SyntaxCtx>;
 
 /// A parsed file and its syntax errors (sorted by position).
 pub struct Parsed {
@@ -148,23 +163,91 @@ pub struct Parsed {
     pub diags: [Diag; ..+],
 }
 
+/// The items of a file parsed into a shared `Ast`, and its syntax errors
+/// (sorted by position).
+pub struct FileParse {
+    pub items: List::<Id::<Item>>,
+    pub diags: [Diag; ..+],
+}
+
+impl Parser {
+    /// A parser for `src`, whose first byte is at global offset `base`,
+    /// adding nodes to `ast`.
+    fn new(src: str, base: u32, ast: Ast): Parser {
+        return Parser {
+            src,
+            base,
+            toks: [],
+            pos: 0,
+            limit: 0,
+            eof: base + src.len() as u32,
+            expected: [],
+            n_expected: 0,
+            fuel: 1024,
+            cursor_errors: [],
+            diags: [],
+            docs: HashMap::new(),
+            doc_spans: [],
+            ctxs: HashMap::new(),
+            ast,
+        };
+    }
+
+    /// Lex all of `src` and make its tokens the input.
+    fn lex_all(&mut self) {
+        self.lex_into(self.src, self.base);
+        self.limit = self.toks.len();
+    }
+
+    /// Items up to the end of the input, recovering after errors.
+    pub fn items_until_eof(&mut self): List::<Id::<Item>> {
+        let mut items: [Id::<Item>; ..+] = [];
+        while !self.at_eof() {
+            match self.item() {
+                Ok(i) => items.push(i),
+                Err(_) => self.recover_item(),
+            }
+        }
+        return self.ast.item_ids.add_list(items[..]);
+    }
+
+    /// The hygiene context of the token starting at `start`.
+    pub fn ctx_at(&self, start: u32): SyntaxCtx {
+        return self.ctxs.get_or(start, SyntaxCtx::root());
+    }
+
+    /// Whether the parse so far has no live errors.
+    fn clean(&self): bool {
+        for d in self.diags {
+            if d.live {
+                return false;
+            }
+        }
+        for d in self.cursor_errors {
+            if d.live {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+/// Parse a complete source file into `ast`, which is shared by every file
+/// of a compilation (one name interner, one set of arenas). `src` starts at
+/// global offset `base`, so spans are global. The caller reports conflict
+/// markers (`ln_lexer::conflict_markers`) instead of parsing such a file.
+pub fn parse_file_into(ast: &mut Ast, src: str, base: u32): FileParse {
+    let mut p = Parser::new(src, base, core::mem::replace(ast, Ast::new()));
+    p.lex_all();
+    let items = p.items_until_eof();
+    let parsed = p.finish();
+    ast = parsed.ast;
+    return FileParse { items, diags: parsed.diags };
+}
+
 /// Parse a complete source file.
 pub fn parse_file(src: str): Parsed {
-    let mut p = Parser {
-        src,
-        toks: [],
-        pos: 0,
-        limit: 0,
-        eof: src.len() as u32,
-        expected: [],
-        n_expected: 0,
-        fuel: 1024,
-        cursor_errors: [],
-        diags: [],
-        docs: HashMap::new(),
-        doc_spans: [],
-        ast: Ast::new(),
-    };
+    let mut p = Parser::new(src, 0, Ast::new());
     // A half-merged file would only produce a cascade of syntax errors.
     let conflicts = ln_lexer::conflict_markers(src);
     if conflicts.len() > 0 {
@@ -174,16 +257,8 @@ pub fn parse_file(src: str): Parsed {
         }
         return p.finish();
     }
-    p.lex_into(src, 0);
-    p.limit = p.toks.len();
-    let mut items: [Id::<Item>; ..+] = [];
-    while !p.at_eof() {
-        match p.item() {
-            Ok(i) => items.push(i),
-            Err(_) => p.recover_item(),
-        }
-    }
-    p.ast.file = p.ast.item_ids.add_list(items[..]);
+    p.lex_all();
+    p.ast.file = p.items_until_eof();
     return p.finish();
 }
 
@@ -564,7 +639,7 @@ impl Parser {
         let mut span = Span::new(self.eof, self.eof);
         match self.current() {
             Some(t) => {
-                let text = tok_text(self.src, t);
+                let text = tok_text(self.src, self.base, t);
                 if t.kind == T::Ident {
                     msg.write("expected {exp}, found `{text}`");
                 } else {
@@ -638,9 +713,9 @@ impl Parser {
     }
 
     fn tok_ident(&mut self, t: Tok): Ident {
-        let text = self.src[t.start as usize..t.end as usize];
+        let text = tok_text(self.src, self.base, t);
         let name = self.ast.names.intern(text);
-        return Ident { name, span: Span::new(t.start, t.end) };
+        return Ident { name, span: Span::new(t.start, t.end), ctx: self.ctx_at(t.start) };
     }
 
     fn ident(&mut self): PResult::<Ident> {
@@ -673,13 +748,14 @@ impl Parser {
 /// The source text from `start` to `end`. These take the source rather
 /// than the parser, so the text points into the source, not the parser,
 /// and stays usable across calls that change the parser.
-fn text_of(src: str, start: u32, end: u32): str {
-    return src[start as usize..end as usize];
+/// Offsets are global; `base` is where `src` starts.
+fn text_of(src: str, base: u32, start: u32, end: u32): str {
+    return src[(start - base) as usize..(end - base) as usize];
 }
 
 /// The text of token `t`.
-fn tok_text(src: str, t: Tok): str {
-    return src[t.start as usize..t.end as usize];
+fn tok_text(src: str, base: u32, t: Tok): str {
+    return src[(t.start - base) as usize..(t.end - base) as usize];
 }
 
 /// The text of a parse's errors, as the selfhost test prints them:
