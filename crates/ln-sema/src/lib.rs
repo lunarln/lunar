@@ -91,6 +91,9 @@ pub struct Program {
     pub closures: HashMap<DefId, ClosureInfo>,
     /// `impl Trait` return types, by function and position (`Ty::Opaque`).
     pub opaques: HashMap<(DefId, u32), OpaqueInfo>,
+    /// Native libraries to link, from `#[link(name = "...")]` on `extern`
+    /// blocks, in first-seen order.
+    pub link_libs: Vec<String>,
 }
 
 /// An `impl Trait` in a function's return type.

@@ -240,7 +240,7 @@ pub fn build(analysis: &Analysis, opts: &BuildOptions) -> Result<(), Diagnostic>
     let program = analyzed(analysis)?;
     let obj_path = opts.output.with_extension(if cfg!(windows) { "obj" } else { "o" });
     ln_codegen::compile(program, &analysis.map, &codegen_options(opts), &obj_path).map_err(codegen_error)?;
-    let res = link::link(&obj_path, &opts.output);
+    let res = link::link(&obj_path, &opts.output, &program.link_libs);
     let _ = std::fs::remove_file(&obj_path);
     res
 }

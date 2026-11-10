@@ -18,3 +18,67 @@ pub fn exit(code: i32): ! {
 pub fn abort(): ! {
     core::intrinsics::abort();
 }
+
+/// Run `program` (searched for on `PATH`) with `args` and wait for it to
+/// finish. Its exit code, or an error if it could not be started.
+/// `run("clang", ["a.o", "-o", "a"][..])`
+pub fn run(program: str, args: [str; &]): Result::<i32, crater::io::Error> {
+    // Every argument, NUL-terminated, end to end in one buffer (which never
+    // moves), then pointers to each.
+    let mut text = String::new();
+    let mut starts: [usize; ..+] = [];
+    starts.push(0);
+    push_arg(&mut text, program);
+    for a in args {
+        starts.push(text.len());
+        push_arg(&mut text, a);
+    }
+    let base = text.as_bytes().as_ptr();
+    let mut argv: [*u8; ..+] = [];
+    for s in starts {
+        argv.push(core::ptr::offset(base, s as isize));
+    }
+    argv.push(core::ptr::null());
+    let code = sys::spawn_wait(argv[..]);
+    if code < 0 {
+        return Err(crater::io::Error::last_os_error());
+    }
+    return Ok(code);
+}
+
+/// `a` and a NUL.
+#[cfg(unix)]
+fn push_arg(text: &mut +String, a: str) {
+    text.push_str(a);
+    text.push('\0');
+}
+
+/// `a` and a NUL. Windows joins the arguments into one command line, so an
+/// argument with spaces or quotes is quoted (MSVC rules).
+#[cfg(windows)]
+fn push_arg(text: &mut +String, a: str) {
+    if a.len() == 0 || a.contains(" ") || a.contains("\t") || a.contains("\"") {
+        text.push('"');
+        let mut backslashes: usize = 0;
+        for c in a.chars() {
+            if c == '\\' {
+                backslashes += 1;
+                continue;
+            }
+            // Backslashes before a quote are doubled, and the quote escaped.
+            let n = if c == '"' { backslashes * 2 + 1 } else { backslashes };
+            for _ in 0..n {
+                text.push('\\');
+            }
+            backslashes = 0;
+            text.push(c);
+        }
+        for _ in 0..backslashes * 2 {
+            text.push('\\');
+        }
+        text.push('"');
+    } else {
+        text.push_str(a);
+    }
+    text.push('\0');
+}

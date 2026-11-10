@@ -21,3 +21,23 @@ pub fn null::<T>(): *T {
 pub fn null_mut::<T>(): *mut T {
     return crater::intrinsics::ptr_null_mut::<T>();
 }
+
+/// `p` moved by `n` items.
+pub fn offset::<T>(p: *T, n: isize): *T {
+    return crater::intrinsics::ptr_offset(p, n);
+}
+
+/// `p` moved by `n` items.
+pub fn offset_mut::<T>(p: *mut T, n: isize): *mut T {
+    return crater::intrinsics::ptr_offset_mut(p, n);
+}
+
+/// The value at `p`.
+pub unsafe fn read::<T>(p: *T): T {
+    return unsafe { crater::intrinsics::ptr_read(p) };
+}
+
+/// Store `value` at `p`.
+pub unsafe fn write::<T>(p: *mut T, value: T) {
+    unsafe { crater::intrinsics::ptr_write(p, value) };
+}

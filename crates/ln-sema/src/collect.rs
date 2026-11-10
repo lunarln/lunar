@@ -150,6 +150,8 @@ impl<'a> Sema<'a> {
             match &a.meta {
                 ast::Meta::List(n, _) if n.name == "cfg" => {}
                 ast::Meta::List(n, _) if n.name == "allow" => {}
+                // Read where extern blocks are collected.
+                ast::Meta::List(n, _) if n.name == "link" => {}
                 ast::Meta::NameValue(n, v) if n.name == "lang" => out.lang = Some(v.clone()),
                 ast::Meta::NameValue(n, v) if n.name == "link_name" => out.link_name = Some(v.clone()),
                 ast::Meta::Word(n) if n.name == "intrinsic" => out.intrinsic = true,
@@ -359,6 +361,21 @@ impl<'a> Sema<'a> {
                 let abi = block.abi.as_deref().unwrap_or("C");
                 if abi != "C" {
                     self.err(Diagnostic::error(syntax::BAD_ATTRIBUTE, item.span, format!("unsupported ABI `{abi}` (only \"C\" is supported)")));
+                }
+                // `#[link(name = "LLVM-C")]`: a native library to link.
+                for a in &item.attrs {
+                    if let ast::Meta::List(n, list) = &a.meta
+                        && n.name == "link"
+                    {
+                        match list.as_slice() {
+                            [ast::Meta::NameValue(k, v)] if k.name == "name" => {
+                                if !self.p.link_libs.contains(v) {
+                                    self.p.link_libs.push(v.clone());
+                                }
+                            }
+                            _ => self.err(Diagnostic::error(syntax::BAD_ATTRIBUTE, a.span, "write the library to link as `#[link(name = \"library\")]`")),
+                        }
+                    }
                 }
                 for inner in &block.items {
                     match &inner.kind {

@@ -1,0 +1,46 @@
+// C strings, for calling C libraries through `extern "C"`.
+
+use crater::ptr;
+
+/// The length in bytes of the NUL-terminated string at `p` (without the
+/// NUL).
+pub unsafe fn c_len(p: *u8): usize {
+    let mut n: usize = 0;
+    while unsafe { ptr::read(ptr::offset(p, n as isize)) } != 0 {
+        n += 1;
+    }
+    return n;
+}
+
+/// The NUL-terminated string at `p` as a `str`, without copying it. The
+/// bytes must be UTF-8 and stay alive as long as the view is used.
+pub unsafe fn c_str(p: *u8): str {
+    let n = unsafe { c_len(p) };
+    return unsafe { crater::intrinsics::str_from_bytes(crater::intrinsics::slice_from_raw(p, n)) };
+}
+
+/// `s` followed by a NUL byte, for passing to C as `c.as_ptr()`.
+pub fn c_string(s: str): CString {
+    let mut b = String::new();
+    b.push_str(s);
+    b.push('\0');
+    return CString { bytes: b };
+}
+
+/// A NUL-terminated copy of a string.
+pub struct CString {
+    bytes: String,
+}
+
+impl CString {
+    /// The address of the first byte, for C.
+    pub fn as_ptr(&self): *u8 {
+        return self.bytes.as_bytes().as_ptr();
+    }
+
+    /// The text, without the NUL.
+    pub fn as_str(&self): str {
+        let s = self.bytes.as_str();
+        return s[..s.len() - 1];
+    }
+}

@@ -77,6 +77,17 @@ impl::<T> List::<T> {
     pub fn is_empty(self): bool {
         return self.len == 0;
     }
+
+    /// The run of `len` items starting at item `start`, for containers
+    /// that keep their own item storage (such as an interner).
+    pub fn from_parts(start: usize, len: usize): List::<T> {
+        return List { start: start as u32, len: len as u32 };
+    }
+
+    /// The index of the first item.
+    pub fn start(self): usize {
+        return self.start as usize;
+    }
 }
 
 impl::<T> Eq for List::<T> {

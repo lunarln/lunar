@@ -15,6 +15,26 @@ extern "C" {
     fn GetLastError(): u32;
 }
 
+// The C runtime (libcmt), for process spawning and the environment.
+extern "C" {
+    fn _spawnvp(mode: i32, file: *u8, argv: **u8): isize;
+    fn getenv(name: *u8): *u8;
+}
+
+/// Run the program `argv[0]` (searched for on `PATH`) with the
+/// NUL-terminated arguments `argv` (ending in a null pointer), and wait
+/// for it: its exit code, or -1 if it could not be started.
+pub fn spawn_wait(argv: [*u8; &]): i32 {
+    // _P_WAIT = 0
+    let r = unsafe { _spawnvp(0, intrinsics::ptr_read(argv.as_ptr()), argv.as_ptr()) };
+    return r as i32;
+}
+
+/// The environment variable `name` (NUL-terminated), or null.
+pub fn env(name: *u8): *u8 {
+    return unsafe { getenv(name) };
+}
+
 const GENERIC_READ: u32 = 2147483648;
 const GENERIC_WRITE: u32 = 1073741824;
 const FILE_SHARE_READ_WRITE: u32 = 3;

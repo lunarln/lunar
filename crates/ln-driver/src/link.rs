@@ -6,21 +6,54 @@
 //!
 //! `$LUNAR_CC` overrides the linker driver on every platform (it is invoked
 //! like a C compiler: `$LUNAR_CC file.o -o out`).
+//!
+//! Native libraries named by `#[link(name = "...")]` are passed on
+//! (`-lname`, or `name.lib` for `link.exe`), searched for in the
+//! directories listed in `$LUNAR_LIB_PATH` (separated like `PATH`) as well
+//! as the linker's defaults.
 
 use ln_diag::{Diagnostic, Span, codes::build};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Link `obj` into the executable `out`. Failures are `build::link`
-/// diagnostics; the linker's own output is attached as a note.
-pub fn link(obj: &Path, out: &Path) -> Result<(), Diagnostic> {
+/// Link `obj` and the native libraries `libs` into the executable `out`.
+/// Failures are `build::link` diagnostics; the linker's own output is
+/// attached as a note.
+pub fn link(obj: &Path, out: &Path, libs: &[String]) -> Result<(), Diagnostic> {
+    let search = lib_path();
+    let gnu_args = |cmd: &mut Command| {
+        for d in &search {
+            cmd.arg(format!("-L{}", d.display()));
+        }
+        for l in libs {
+            cmd.arg(format!("-l{l}"));
+        }
+    };
     if let Ok(cc) = std::env::var("LUNAR_CC") {
-        return run(Command::new(cc).arg(obj).arg("-o").arg(out).args(unix_libs()));
+        let mut cmd = Command::new(cc);
+        cmd.arg(obj).arg("-o").arg(out);
+        gnu_args(&mut cmd);
+        return run(cmd.args(system_libs()));
     }
-    if cfg!(windows) { link_windows(obj, out) } else { run(Command::new("cc").arg(obj).arg("-o").arg(out).args(unix_libs())) }
+    if cfg!(windows) {
+        return link_windows(obj, out, libs, &search);
+    }
+    let mut cmd = Command::new("cc");
+    cmd.arg(obj).arg("-o").arg(out);
+    gnu_args(&mut cmd);
+    for d in &search {
+        // Shared libraries are found through the search path at run time too.
+        cmd.arg(format!("-Wl,-rpath,{}", d.display()));
+    }
+    run(cmd.args(system_libs()))
 }
 
-fn unix_libs() -> Vec<&'static str> {
+/// The directories in `$LUNAR_LIB_PATH`.
+fn lib_path() -> Vec<PathBuf> {
+    std::env::var_os("LUNAR_LIB_PATH").map(|p| std::env::split_paths(&p).filter(|d| !d.as_os_str().is_empty()).collect()).unwrap_or_default()
+}
+
+fn system_libs() -> Vec<&'static str> {
     if cfg!(target_os = "linux") {
         vec!["-lm"]
     } else if cfg!(windows) {
@@ -30,9 +63,17 @@ fn unix_libs() -> Vec<&'static str> {
     }
 }
 
-fn link_windows(obj: &Path, out: &Path) -> Result<(), Diagnostic> {
+fn link_windows(obj: &Path, out: &Path, libs: &[String], search: &[PathBuf]) -> Result<(), Diagnostic> {
     if which("clang").is_some() {
-        return run(Command::new("clang").arg(obj).arg("-o").arg(out).args(["-llegacy_stdio_definitions", "-lkernel32"]));
+        let mut cmd = Command::new("clang");
+        cmd.arg(obj).arg("-o").arg(out);
+        for d in search {
+            cmd.arg(format!("-L{}", d.display()));
+        }
+        for l in libs {
+            cmd.arg(format!("-l{l}"));
+        }
+        return run(cmd.args(["-llegacy_stdio_definitions", "-lkernel32"]));
     }
     let target = if cfg!(target_arch = "aarch64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" };
     let Some(tool) = cc::windows_registry::find_tool(target, "link.exe") else {
@@ -45,6 +86,12 @@ fn link_windows(obj: &Path, out: &Path) -> Result<(), Diagnostic> {
         "kernel32.lib",
         "legacy_stdio_definitions.lib",
     ]);
+    for d in search {
+        cmd.arg(format!("/LIBPATH:{}", d.display()));
+    }
+    for l in libs {
+        cmd.arg(format!("{l}.lib"));
+    }
     run(&mut cmd)
 }
 
