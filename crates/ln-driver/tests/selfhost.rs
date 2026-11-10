@@ -189,9 +189,11 @@ fn parser_matches_rust_parser_on_broken_programs() {
 }
 
 /// What `lunar check FILE` (run from `root`, without color) prints before
-/// its summary line (`error: could not compile ...`): the diagnostics.
+/// its summary line (`error: could not compile ...`): the diagnostics. It
+/// reads the same std directory as the Lunar driver, so labels in std
+/// (such as the trait parameter of a mismatched impl) name the same file.
 fn rust_rendered(root: &Path, file: &str) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_lunar")).args(["check", file]).current_dir(root).env_remove("LUNAR_STD_DIR").output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_lunar")).args(["check", file]).current_dir(root).env("LUNAR_STD_DIR", std_dir_of(root)).output().unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     let mut text = String::new();
     for line in stderr.lines() {

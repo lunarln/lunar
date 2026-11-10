@@ -1,0 +1,20 @@
+// error: borrow::grow_only
+// A `Debug` implementation may only pass `out` on to `&mut +` parameters.
+struct Evil {}
+
+fn shrink(out: &mut String) {
+    out.truncate(0);
+}
+
+impl Debug for Evil {
+    fn debug(&self, out: &mut +String) {
+        shrink(out);
+    }
+}
+
+fn main() {
+    let mut s = String::from("hello world");
+    let v = s.as_str()[0..5];
+    s.write("{Evil {}:?}");
+    println("s = {s}, v = {v}");
+}

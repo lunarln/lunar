@@ -1,0 +1,4 @@
+head = start
+first = (x: 1, y: -2) Point at (x: 1, y: -2)
+s = start (x: 1, y: -2) Point at (x: 1, y: -2); Shape { name: "tri", corners: [Point at (x: 0, y: 0), Point at (x: 3, y: 4)] }; Blue Blue Red Some(Point at (x: 7, y: 8)); [1, 2, 3]
+t = 54
