@@ -86,9 +86,7 @@ impl Input {
             self.buf = rest;
             self.pos = 0;
         }
-        // Not bigger: a fixed array is copied as one LLVM value, and LLVM's
-        // instruction selection crashes on one of 64 KiB.
-        let mut chunk: [u8; 16384] = [0; 16384];
+        let mut chunk: [u8; 65536] = [0; 65536];
         let n = io::read(0, chunk[..]);
         if n <= 0 {
             self.eof = true;

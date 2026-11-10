@@ -136,9 +136,6 @@ compares its answers with the Rust server's.
   argument.
 * Constants cannot hold structs.
 * `[T; ..+]` only grows; use `[T; -..+]` to `pop`/`truncate`/`clear`.
-* Keep fixed arrays well under 64K elements: they are copied as one LLVM
-  value, and LLVM's instruction selection crashes on `[65536 x i8]`. Use
-  an owning array for big buffers.
 * A struct holding a `Sema` (or anything with a `str` in it) counts as
   holding views: moving one out of a field and back trips the borrow
   checker, so keep it in place and query it there.
