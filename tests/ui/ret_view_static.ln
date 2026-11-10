@@ -1,0 +1,14 @@
+// error: borrow::escapes_via_return
+// `from static` says the result points into no parameter.
+fn label(a: &String, b: &String): str from static {
+    if a.len() > b.len() {
+        return "longer";
+    }
+    return b.as_str();
+}
+
+fn main() {
+    let x = String::from("hello");
+    let y = String::from("hi");
+    println("{label(&x, &y)}");
+}

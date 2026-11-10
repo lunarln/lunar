@@ -1,18 +1,20 @@
-// What a returned view points into is inferred from the function's body:
-// only the arguments it really comes from stay borrowed, so the others may
-// be changed or moved while the result is in use.
+// What a returned view points into is part of a function's signature: the
+// parameters its `from` clause names, or without one, `&self` on a method,
+// else every parameter it could point into. Only those arguments stay
+// borrowed, so the others may be changed or moved while the result is in
+// use.
 
 // Points into `a` only.
-fn first(a: &String, b: &String): str {
+fn first(a: &String, b: &String): str from a {
     if b.len() > 100 {
         return "long";
     }
     return a.as_str();
 }
 
-// Points where the items of `names` point, not into `names` itself.
-fn first_name(names: &[str; -..+]): str {
-    return names[0];
+// The only parameter a view could come from: no clause needed.
+fn tail(s: str, n: usize): str {
+    return s[n..];
 }
 
 // A struct holding a view into `text` only.
@@ -21,7 +23,7 @@ struct Word {
     pos: usize,
 }
 
-fn word_at(text: &String, scratch: &mut String, pos: usize): Word {
+fn word_at(text: &String, scratch: &mut String, pos: usize): Word from text {
     scratch.push_str("scanned ");
     let mut end = pos;
     while end < text.len() && text.as_bytes()[end] != 32 {
@@ -31,7 +33,7 @@ fn word_at(text: &String, scratch: &mut String, pos: usize): Word {
 }
 
 // Recursion: into `a` only, whatever the depth.
-fn skip(a: &String, b: &String, n: usize): str {
+fn skip(a: &String, b: &String, n: usize): str from a {
     if n == 0 {
         return a.as_str();
     }
@@ -39,14 +41,14 @@ fn skip(a: &String, b: &String, n: usize): str {
 }
 
 // Mutual recursion: `even` and `odd` both return views into `s` only.
-fn even(s: &String, other: &String, n: usize): str {
+fn even(s: &String, other: &String, n: usize): str from s {
     if n == 0 {
         return s.as_str();
     }
     return odd(s, other, n - 1);
 }
 
-fn odd(s: &String, other: &String, n: usize): str {
+fn odd(s: &String, other: &String, n: usize): str from s {
     if n == 0 {
         return s.as_str()[1..];
     }
@@ -54,7 +56,7 @@ fn odd(s: &String, other: &String, n: usize): str {
 }
 
 // The value of a loop is what its `break` gives.
-fn find(hay: &String, needle: &String): str {
+fn find(hay: &String, needle: &String): str from hay {
     let mut i: usize = 0;
     let v = loop {
         if i + needle.len() > hay.len() || hay.as_str()[i..i + needle.len()] == needle.as_str() {
@@ -65,24 +67,44 @@ fn find(hay: &String, needle: &String): str {
     return v;
 }
 
+// Views of nothing the caller passed.
+fn kind(a: &String, b: &String): str from static {
+    if a.len() > b.len() {
+        return "longer";
+    }
+    return "not longer";
+}
+
 struct Doc {
     title: String,
     body: String,
 }
 
 impl Doc {
-    // Into `self` only, not into `prefix`.
+    // A method's result points into `self` unless it says otherwise.
     fn title_after(&self, prefix: &String): str {
         return self.title.as_str()[prefix.len()..];
+    }
+
+    // Into `other` only: `self` may change while the result is in use.
+    fn other_title(&self, other: &Doc): str from other {
+        return other.title.as_str();
+    }
+
+    fn retitle(&mut self, t: str) {
+        self.title.clear();
+        self.title.push_str(t);
     }
 }
 
 trait Label {
-    fn label(&self, extra: &String): str;
+    fn label(&self, extra: &String): str from self, extra;
 }
 
 impl Label for Doc {
-    fn label(&self, extra: &String): str {
+    // An implementation may point into less than the trait says, and a
+    // call on a `Doc` goes by what it says.
+    fn label(&self, extra: &String): str from self {
         if extra.len() == 0 {
             return "";
         }
@@ -90,20 +112,9 @@ impl Label for Doc {
     }
 }
 
-// A view of a `str` field points where the field points, not into `self`.
-struct Lexer {
-    src: str,
-    pos: usize,
-}
-
-impl Lexer {
-    fn rest(&self): str {
-        return self.src[self.pos..];
-    }
-
-    fn bump(&mut self) {
-        self.pos += 1;
-    }
+// Through the trait, the result may point into both arguments.
+fn label_of::<T: Label>(t: &T, extra: &String): str from t, extra {
+    return t.label(extra);
 }
 
 // A closure that captures a borrowed parameter and returns a view of it.
@@ -121,10 +132,10 @@ fn main() {
     println("{v} {moved.len()}");
 
     let owner = String::from("ada grace");
-    let mut names: [str; -..+] = [owner.as_str()[0..3], owner.as_str()[4..]];
-    let n = first_name(&names);
-    names.clear();
-    println("{n} {names.len()}");
+    let mut holder = owner.as_str();
+    let n = tail(holder, 4);
+    holder = "";
+    println("{n} {holder.len()}");
 
     let text = String::from("lunar views point");
     let mut scratch = String::new();
@@ -146,18 +157,27 @@ fn main() {
     needle.clear();
     println("{f}");
 
-    let doc = Doc { title: String::from("Re: views"), body: String::from("inferred") };
+    let mut p = String::from("ab");
+    let mut q = String::from("c");
+    let k = kind(&p, &q);
+    p.clear();
+    q.clear();
+    println("{k}");
+
+    let mut doc = Doc { title: String::from("Re: views"), body: String::from("declared") };
+    let other = Doc { title: String::from("other"), body: String::new() };
     let mut prefix = String::from("Re: ");
     let t = doc.title_after(&prefix);
     let l = doc.label(&prefix);
     prefix.clear();
     println("{t} {l}");
+    let o = doc.other_title(&other);
+    doc.retitle("new");
+    println("{o} {doc.title}");
 
-    let source = String::from("tokens");
-    let mut lx = Lexer { src: source.as_str(), pos: 0 };
-    let r = lx.rest();
-    lx.bump();
-    println("{r} {lx.rest()}");
+    let extra = String::from("x");
+    let g = label_of(&doc, &extra);
+    println("{g}");
 
     let word = String::from("closures");
     let c = suffix(&word, 5);
@@ -167,7 +187,7 @@ fn main() {
     // argument.
     let mut count = String::from("1");
     let pick = |t: str| x.as_str()[t.len()..];
-    let p = pick(count.as_str());
+    let r = pick(count.as_str());
     count.clear();
-    println("{p} {count.len()}");
+    println("{r} {count.len()}");
 }

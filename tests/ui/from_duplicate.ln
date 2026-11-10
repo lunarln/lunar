@@ -1,0 +1,11 @@
+// error: name::duplicate
+// once: name::duplicate
+fn first(a: &String, b: &String): str from a, b, a {
+    return a.as_str();
+}
+
+fn main() {
+    let x = String::from("hello");
+    let y = String::from("world");
+    println("{first(&x, &y)}");
+}

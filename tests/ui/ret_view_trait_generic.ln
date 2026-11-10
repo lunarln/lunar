@@ -1,9 +1,9 @@
-// error: borrow::shrink_while_borrowed
+// error: borrow::escapes_via_return
 // A trait method called on a generic receiver may be any implementation:
-// its result may point into every argument, even though the only one
-// here returns a view into `self`.
+// its result may point into what the trait says, `scratch` too, even
+// though the only implementation here returns a view into `self`.
 trait Named {
-    fn name(&self, scratch: &String): str;
+    fn name(&self, scratch: &String): str from self, scratch;
 }
 
 struct Person {
@@ -11,12 +11,12 @@ struct Person {
 }
 
 impl Named for Person {
-    fn name(&self, scratch: &String): str {
+    fn name(&self, scratch: &String): str from self {
         return self.name.as_str();
     }
 }
 
-fn name_of::<T: Named>(t: &T, scratch: &String): str {
+fn name_of::<T: Named>(t: &T, scratch: &String): str from t {
     return t.name(scratch);
 }
 

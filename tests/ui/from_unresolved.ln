@@ -1,0 +1,11 @@
+// error: name::unresolved
+// A `from` clause names parameters of the function.
+fn first(a: &String, b: &String): str from c {
+    return a.as_str();
+}
+
+fn main() {
+    let x = String::from("hello");
+    let y = String::from("world");
+    println("{first(&x, &y)}");
+}

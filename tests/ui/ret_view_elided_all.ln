@@ -1,0 +1,14 @@
+// error: borrow::shrink_while_borrowed
+// Without a `from` clause, a function with two parameters a view could
+// come from may return a view of either: `v` keeps `y` borrowed too.
+fn first(a: &String, b: &String): str {
+    return a.as_str();
+}
+
+fn main() {
+    let x = String::from("hello");
+    let mut y = String::from("world");
+    let v = first(&x, &y);
+    y.clear();
+    println("{v}");
+}

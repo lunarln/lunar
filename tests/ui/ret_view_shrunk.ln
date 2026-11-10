@@ -1,8 +1,8 @@
 // error: borrow::shrink_while_borrowed
 // once: borrow::shrink_while_borrowed
-// `first`'s body returns a view into `a`, so `v` points into `x` (but not
+// `first` says its result points into `a`, so `v` points into `x` (but not
 // into `y`, which may change).
-fn first(a: &String, b: &String): str {
+fn first(a: &String, b: &String): str from a {
     if b.len() > 3 {
         return a.as_str()[1..];
     }
