@@ -305,6 +305,18 @@ impl Program {
         return self.fields.list(self.variants.list(a.variants)[0].fields);
     }
 
+    /// The index of the variant named `name` of struct or enum `id`
+    /// (`AdtData::variant_index` in Rust).
+    pub fn variant_index(&self, id: DefId, name: str): Option::<usize> {
+        let vs = self.variants.list(self.adt(id).variants);
+        for i in 0..vs.len() {
+            if self.text(vs[i].name) == name {
+                return Some(i);
+            }
+        }
+        return None;
+    }
+
     /// The method `name` of impl `imp`.
     pub fn impl_method(&self, imp: DefId, name: Symbol): Option::<DefId> {
         return self.impl_methods.get((imp, name));

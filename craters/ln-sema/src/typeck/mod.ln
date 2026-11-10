@@ -1,0 +1,1886 @@
+// Phase 3: type check function bodies and lower them to THIR. A port of
+// crates/ln-sema/src/typeck (mod.rs; expressions in `expr`, calls in
+// `call`, patterns in `pat`, closures in `closure`).
+//
+// Rust keeps the state of one function's check in `FnCtx<'s, 'a>`, which
+// borrows the `Sema`. Lunar structs cannot hold references, so `FnCtx` is a
+// field of `Sema` (`fcx`), reset for each function, and the checker is
+// written as `impl Sema` methods: Rust's `self.s.p.x` is `self.p.x` here and
+// `self.x` (a `FnCtx` field) is `self.fcx.x`. Closures are checked inside
+// their parent function's context, as in Rust.
+//
+// Other differences from Rust:
+// * The typed tree lives in `Program::thir`'s arenas: checking returns an
+//   `Expr` value, and a child is added to the arena (`node`) when its parent
+//   is built. Zonking rewrites the arena entries in place.
+// * Inference snapshots are an undo trail (`snapshot` / `rollback`) rather
+//   than copies of the variable tables; the effect is the same.
+// * A scope's names are a run of one stack of names (`FnCtx::names`).
+// * Diagnostics are built in `Program::diags` (`error_at`, `with_label`,
+//   ..., `emit`), so a code that Rust changes after building a diagnostic is
+//   chosen before starting it.
+// * `FnCtx::lower_cx` is `local_cx` (Sema already has a `lower_cx`), and
+//   `FnCtx::err` is the diagnostic helpers.
+
+mod call;
+mod closure;
+mod expr;
+mod pat;
+
+use core::arena::{Id, List};
+use core::intern::Symbol;
+use crater::borrowck;
+use crater::codes;
+use crater::defs::*;
+use crater::diag::{Code, Diags, dummy_span, is_dummy};
+use crater::lower::LowerCx;
+use crater::resolve::ModRes;
+use crater::program::{Program, Ref, RefTarget};
+use crater::sema::{AstRef, Sema};
+use crater::thir::{Arg, Block, Body, Callee, Coercion, Expr, ExprKind, FmtPiece, Local, LocalId, LocalKind, LoopId, Pat, PatKind, ReadMode, Stmt};
+use crater::ty::*;
+use crater::typeck::closure::PendingClosure;
+use ln_ast as ast;
+use ln_ast::{Ident, ParamMode, Span};
+
+#[derive(Eq)]
+pub enum VarKind {
+    General,
+    Int,
+    Float,
+}
+
+pub enum Var {
+    Unbound(VarKind, Span),
+    Bound(Ty),
+}
+
+pub enum LenVar {
+    Unbound,
+    Bound(u64),
+    Link(u32),
+}
+
+/// A name bound in a scope.
+pub struct ScopeName {
+    pub name: Symbol,
+    pub ctx: SyntaxCtx,
+    pub id: LocalId,
+}
+
+/// A lexical scope inside a function body. Its names are `FnCtx::names`
+/// from `start` on.
+pub struct Scope {
+    pub start: u32,
+    /// Anonymous module for items declared in this block.
+    pub module: Option::<DefId>,
+}
+
+pub struct LoopCtx {
+    pub id: LoopId,
+    /// Type of `break value` (only for `loop`).
+    pub break_ty: Option::<Ty>,
+    pub is_loop: bool,
+    pub saw_break: bool,
+}
+
+/// `ty: trait_ref`, to check once inference is done.
+pub struct Obligation {
+    pub ty: Ty,
+    pub tr: TraitRef,
+    pub span: Span,
+}
+
+/// An integer literal to range-check once its type is known: the value is
+/// `-(high * 2^64 + mag)` if `neg`, else `high * 2^64 + mag` (Rust keeps an
+/// `i128`).
+pub struct LitCheck {
+    pub ty: Ty,
+    pub neg: bool,
+    pub mag: u64,
+    pub high: u64,
+    pub span: Span,
+}
+
+/// An `impl Trait` of this function's return type, and the variable
+/// standing for it inside the body.
+pub struct OpaqueVar {
+    pub idx: u32,
+    pub var: Ty,
+    pub span: Span,
+}
+
+/// An inference table entry as it was before a change.
+pub enum Undo {
+    Var(u32, Var),
+    Len(u32, LenVar),
+}
+
+/// The state of the inference tables, to return to with `rollback`.
+pub struct Snapshot {
+    vars: usize,
+    lens: usize,
+    trail: usize,
+}
+
+/// The state of checking one function body.
+pub struct FnCtx {
+    /// The function whose body is being checked.
+    pub def: DefId,
+    pub cx: LowerCx,
+    pub env: [Pred; ..+],
+    pub locals: [Local; -..+],
+    /// The names of all open scopes, innermost last.
+    pub names: [ScopeName; -..+],
+    pub scopes: [Scope; -..+],
+    pub vars: [Var; -..+],
+    pub lens: [LenVar; -..+],
+    /// Old values of changed inference entries, for `rollback`.
+    pub trail: [Undo; -..+],
+    pub ret_ty: Ty,
+    pub loops: [LoopCtx; -..+],
+    /// Loops before this index belong to the function around the closure
+    /// being checked: they cannot be broken from inside it.
+    pub loop_base: usize,
+    pub next_loop: u32,
+    pub unsafe_depth: u32,
+    pub in_unsafe_fn: bool,
+    pub obligations: [Obligation; -..+],
+    /// Array element types to check for Light once inference is done.
+    pub dull_checks: [(Ty, Span); -..+],
+    /// Integer literals to range-check once their type is known.
+    pub lit_checks: [LitCheck; -..+],
+    pub reported_annotations: bool,
+    /// Closures written in this function, finished with it.
+    pub closures: [PendingClosure; -..+],
+    /// This function's `impl Trait` return types: the variable standing
+    /// for each inside the body (the type it returns there).
+    pub opaque_vars: [OpaqueVar; -..+],
+}
+
+impl FnCtx {
+    pub fn new(def: DefId, cx: LowerCx, ret_ty: Ty, in_unsafe_fn: bool): FnCtx {
+        return FnCtx {
+            def,
+            cx,
+            env: [],
+            locals: [],
+            names: [],
+            scopes: [Scope { start: 0, module: None }],
+            vars: [],
+            lens: [],
+            trail: [],
+            ret_ty,
+            loops: [],
+            loop_base: 0,
+            next_loop: 0,
+            unsafe_depth: 0,
+            in_unsafe_fn,
+            obligations: [],
+            dull_checks: [],
+            lit_checks: [],
+            reported_annotations: false,
+            closures: [],
+            opaque_vars: [],
+        };
+    }
+}
+
+/// A checked body waiting for the borrow checker.
+struct Checked {
+    body: Body,
+    ok: bool,
+    is_std: bool,
+}
+
+impl Sema {
+    /// The identifiers of a path's segments.
+    fn idents_of(&self, p: ast::Path): [Ident; ..+] {
+        let mut out: [Ident; ..+] = [];
+        self.path_idents(p, &mut out);
+        return out;
+    }
+
+    /// `resolve_prefix`, as the definition it reached and how many
+    /// segments that took.
+    fn resolve_prefix_pair(&mut self, from: DefId, segs: [Ident; &], last_ns: Ns): Option::<(ModRes, usize)> {
+        return match self.resolve_prefix(from, segs, last_ns) {
+            Some(r) => Some((r.res, r.used)),
+            None => None,
+        };
+    }
+
+    /// The hygiene context of an identifier.
+    pub fn ident_ctx(&self, id: Ident): SyntaxCtx {
+        return id.ctx;
+    }
+
+    pub fn check_bodies(&mut self) {
+        let n = self.p.defs.len();
+        // Borrow checking waits until every body is type checked: it looks
+        // through `impl Trait` results to the type behind them, which is
+        // only known once the function returning it is checked.
+        let mut checked: [Checked; ..+] = [];
+        for i in 0..n {
+            let id = DefId::new(i);
+            let f = match self.ast(id) {
+                AstRef::Fn(f, false) => f,
+                _ => continue,
+            };
+            let body = match f.body {
+                Some(b) => b,
+                None => continue,
+            };
+            if self.p.defs[i].attrs.test {
+                let fd = self.p.fn_data(id);
+                if fd.sig.params.len() > 0 || !self.p.types.is_unit(fd.sig.ret) || fd.generics.count() > 0 {
+                    self.error_at(codes::ty::BAD_TEST(), f.sig_span, "test functions must take no parameters, have no generics and return `()`");
+                    self.emit();
+                    continue;
+                }
+            }
+            let errs_before = self.p.diags.error_count();
+            let mut closures: [Body; -..+] = [];
+            let b = self.check_fn(id, f, body, &mut closures);
+            let krate = self.p.mod_data(self.p.defs[i].module).krate;
+            let mut is_std = false;
+            for r in self.p.crate_roots[..] {
+                let name = self.p.text(r.name);
+                if r.def == krate && (name == "core" || name == "std") {
+                    is_std = true;
+                }
+            }
+            let ok = self.p.diags.error_count() == errs_before;
+            // Closures first: their bodies are part of this function's.
+            for c in closures[..] {
+                checked.push(Checked { body: c, ok, is_std });
+            }
+            checked.push(Checked { body: b, ok, is_std });
+        }
+        for c in checked[..] {
+            self.finish_body(c.body, c.ok, c.is_std);
+        }
+    }
+
+    /// Borrow check and lint a checked body (if type checking its function
+    /// found no errors, `typeck_ok`), then keep it.
+    fn finish_body(&mut self, b: Body, typeck_ok: bool, is_std: bool) {
+        let errs_before = self.p.diags.error_count();
+        if typeck_ok {
+            // A closure's body has the bounds of the function it is in.
+            let owner = match self.p.closures.get(b.def) {
+                Some(c) => c.parent,
+                None => b.def,
+            };
+            let env_list = self.env_of(owner);
+            let env = self.p.preds.list(env_list).to_grow();
+            borrowck::check(&mut self.p, b, env[..]);
+            // Lints on a function with borrow errors would only add
+            // noise (and may be wrong about code that will change).
+            if !is_std && self.p.diags.error_count() == errs_before {
+                let mut out = Diags::new();
+                borrowck::lint(&mut self.p, b, &mut out);
+                // As through `err` in Rust, which drops lints inside
+                // expansions.
+                for i in 0..out.list.len() {
+                    let d = out.list[i];
+                    if d.is_error() || !self.in_expansion(d.span) {
+                        self.p.diags.push_from(&out, d);
+                    }
+                }
+            }
+        }
+        self.p.bodies.insert(b.def, b);
+    }
+
+    /// The function's body; the bodies of the closures written in it go
+    /// to `closures_out`.
+    fn check_fn(&mut self, def: DefId, f: ast::FnDecl, body: Id::<ast::Block>, closures_out: &mut [Body; -..+]): Body {
+        let mut cx = self.lower_cx(def);
+        cx.allow_infer = true;
+        let fd = self.p.fn_data(def);
+        let mut env: [Pred; ..+] = [];
+        let base = self.p.preds.list(cx.env).to_grow();
+        self.p.elaborate(base[..], &mut env);
+        self.fcx = FnCtx::new(def, cx, fd.sig.ret, fd.is_unsafe);
+        self.fcx.env = env;
+        // Inside the body, each `impl Trait` it returns is the type it
+        // actually returns: a variable to infer.
+        let mut opener = OpenOpaques { def, next: self.fcx.vars.len() as u32, found: [] };
+        let ret = self.p.types.fold(fd.sig.ret, &mut opener);
+        self.fcx.ret_ty = ret;
+        for k in 0..opener.found.len() {
+            let i = opener.found[k];
+            let span = match self.p.opaques.get((def, i)) {
+                Some(o) => o.span,
+                None => f.sig_span,
+            };
+            let v = self.new_var(span);
+            self.fcx.opaque_vars.push(OpaqueVar { idx: i, var: v, span });
+        }
+        let mut params: [LocalId; ..+] = [];
+        for i in 0..fd.sig.params.len() {
+            let p = self.p.params.list(fd.sig.params)[i];
+            let grow = match self.p.types.kind(p.ty) {
+                TyKind::Grow(_) => true,
+                _ => false,
+            };
+            let owned = p.mode == ParamMode::Take;
+            let mutable = p.inout || (owned && p.mutable);
+            let id = self.new_local(p.name, p.ty, mutable, LocalKind::Param { index: i as u32, inout: p.inout, grow, owned }, p.span, 0);
+            if self.p.text(p.name) != "_" {
+                self.bind_name(p.name, p.ctx, id);
+            }
+            params.push(id);
+        }
+        let ret = self.fcx.ret_ty;
+        let bd = self.p.ast.blocks.get(body);
+        let block = self.check_block_expr(body, Some(ret), true);
+        let diverges_or_ok = self.coercible(block.ty, ret);
+        let block = if !diverges_or_ok && bd.tail.is_none() && !self.p.types.is_unit(ret) {
+            let r = self.ty_str(ret);
+            let mut m = String::new();
+            m.write("function `{self.p.text(f.name.name)}` must return `{r}` but its body can finish without returning");
+            self.error_at(codes::ty::RETURN_MISSING(), f.sig_span, m.as_str());
+            self.with_secondary(bd.span.shrink_to_hi(), "body ends here");
+            self.with_help("add a `return` statement or a tail expression");
+            self.emit();
+            block
+        } else {
+            let sp = match bd.tail {
+                Some(t) => self.p.ast.exprs.get(t).span,
+                None => bd.span,
+            };
+            self.coerce(block, ret, sp)
+        };
+        self.finish();
+        let b = match block.kind {
+            ExprKind::Block(b) => b,
+            _ => {
+                let t = self.node(block);
+                self.p.thir.blocks.add(Block { stmts: List::empty(), tail: Some(t), locals: List::empty(), span: bd.span })
+            }
+        };
+        self.zonk_block(b);
+        self.resolve_closures();
+        for i in 0..self.fcx.locals.len() {
+            let t = self.resolve(self.fcx.locals[i].ty);
+            self.fcx.locals[i].ty = default_ty(&mut self.p.types, t);
+        }
+        self.closure_bodies(closures_out);
+        let locals = self.p.thir.locals.add_list(self.fcx.locals[..]);
+        let params = self.p.thir.local_ids.add_list(params[..]);
+        return Body { def, locals, params, block: b, span: bd.span };
+    }
+
+    // ===================================================================== diagnostics
+
+    /// Start an error.
+    pub fn error_at(&mut self, kept code: Code, span: Span, msg: str) {
+        let m = self.p.sym(msg);
+        self.p.diags.error(code, span, m);
+    }
+
+    /// Start a warning.
+    pub fn warning_at(&mut self, kept code: Code, span: Span, msg: str) {
+        let m = self.p.sym(msg);
+        self.p.diags.warning(code, span, m);
+    }
+
+    /// The text under the primary span of the diagnostic being built.
+    pub fn with_label(&mut self, text: str) {
+        let m = self.p.sym(text);
+        self.p.diags.label(m);
+    }
+
+    pub fn with_secondary(&mut self, span: Span, text: str) {
+        let m = self.p.sym(text);
+        self.p.diags.secondary(span, m);
+    }
+
+    pub fn with_note(&mut self, text: str) {
+        let m = self.p.sym(text);
+        self.p.diags.note(m);
+    }
+
+    pub fn with_help(&mut self, text: str) {
+        let m = self.p.sym(text);
+        self.p.diags.help(m);
+    }
+
+    pub fn ty_str(&mut self, t: Ty): String {
+        let r = self.resolve(t);
+        return self.p.ty_str(r);
+    }
+
+    pub fn mismatch(&mut self, expected: Ty, found: Ty, span: Span) {
+        let re = self.resolve(expected);
+        let rf = self.resolve(found);
+        if self.p.types.has_error(re) || self.p.types.has_error(rf) {
+            return;
+        }
+        let e = self.p.ty_str(re);
+        let f = self.p.ty_str(rf);
+        let ke = self.p.types.kind(re);
+        let kf = self.p.types.kind(rf);
+        let closures = match (ke, kf) {
+            (TyKind::Closure(..), TyKind::Closure(..)) => true,
+            _ => false,
+        };
+        let mut opaque = false;
+        if closures {
+            for i in 0..self.fcx.opaque_vars.len() {
+                let v = self.fcx.opaque_vars[i].var;
+                if self.resolve(v) == re {
+                    opaque = true;
+                }
+            }
+        }
+        let code = if opaque { codes::ty::OPAQUE_MISMATCH() } else { codes::ty::MISMATCH() };
+        let mut m = String::new();
+        m.write("mismatched types: expected `{e}`, found `{f}`");
+        self.error_at(code, span, m.as_str());
+        let mut l = String::new();
+        l.write("expected `{e}`");
+        self.with_label(l.as_str());
+        match (ke, kf) {
+            (TyKind::Array(_, k), TyKind::Array(_, k2)) => {
+                if k.is_slice() && !k2.is_slice() {
+                    self.with_help("take a slice of the array with `[..]`");
+                } else if k.is_owner() && k2.is_owner() {
+                    self.with_note("array kinds only convert implicitly when passed to a parameter");
+                }
+            }
+            (TyKind::Str, TyKind::String) => self.with_help("use `.as_str()` to view a `String` as `str`"),
+            (TyKind::String, TyKind::Str) => self.with_help("use `String::from(...)` to build an owned `String`"),
+            (TyKind::Closure(..), TyKind::Closure(..)) => {
+                self.with_note("every closure has a type of its own, even when two are written alike");
+                if opaque {
+                    self.with_help("a function returning `impl Trait` returns one type: return a single closure and decide inside it");
+                }
+            }
+            _ => {}
+        }
+        self.emit();
+    }
+
+    // ===================================================================== locals & scopes
+
+    pub fn depth(&self): u32 {
+        return self.fcx.scopes.len() as u32 - 1;
+    }
+
+    pub fn new_local(&mut self, name: Symbol, ty: Ty, mutable: bool, kind: LocalKind, span: Span, depth: u32): LocalId {
+        let id = LocalId::new(self.fcx.locals.len());
+        self.fcx.locals.push(Local { name, ty, mutable, kind, span, depth });
+        if kind != LocalKind::Temp {
+            self.record_local(span, id);
+        }
+        return id;
+    }
+
+    /// Remember that `span` names local `l` (editor tooling).
+    pub fn record_local(&mut self, span: Span, l: LocalId) {
+        self.p.refs.push(Ref { span, target: RefTarget::Local { body: self.fcx.def, local: l } });
+    }
+
+    pub fn record_def(&mut self, span: Span, d: DefId) {
+        self.record(span, d);
+    }
+
+    /// Bind a local. Hygiene: a binding only answers to names with the same
+    /// syntax context, so a macro's `let t` and the caller's `t` never meet.
+    /// `self` is the exception: it is the receiver wherever it is written.
+    pub fn bind_name(&mut self, name: Symbol, ctx: SyntaxCtx, id: LocalId) {
+        let ctx = if self.p.text(name) == "self" { SyntaxCtx::root() } else { ctx };
+        self.fcx.names.push(ScopeName { name, ctx, id });
+    }
+
+    pub fn local_kind(&self, id: LocalId): LocalKind {
+        return self.fcx.locals[id.index()].kind;
+    }
+
+    pub fn lookup_local(&self, name: Symbol, ctx: SyntaxCtx): Option::<LocalId> {
+        let ctx = if self.p.text(name) == "self" { SyntaxCtx::root() } else { ctx };
+        let mut i = self.fcx.names.len();
+        while i > 0 {
+            i -= 1;
+            let n = self.fcx.names[i];
+            if n.name == name && n.ctx == ctx {
+                return Some(n.id);
+            }
+        }
+        return None;
+    }
+
+    pub fn push_scope(&mut self, module: Option::<DefId>) {
+        let start = self.fcx.names.len() as u32;
+        self.fcx.scopes.push(Scope { start, module });
+    }
+
+    pub fn pop_scope(&mut self) {
+        if let Some(s) = self.fcx.scopes.pop() {
+            self.fcx.names.truncate(s.start as usize);
+        }
+    }
+
+    /// The module used for item lookups at this point (innermost block scope).
+    pub fn module(&self): DefId {
+        let mut i = self.fcx.scopes.len();
+        while i > 0 {
+            i -= 1;
+            if let Some(m) = self.fcx.scopes[i].module {
+                return m;
+            }
+        }
+        return self.fcx.cx.module;
+    }
+
+    /// The lowering context at this point (`FnCtx::lower_cx` in Rust).
+    pub fn local_cx(&self): LowerCx {
+        let mut cx = self.fcx.cx;
+        cx.module = self.module();
+        return cx;
+    }
+
+    pub fn new_loop(&mut self, is_loop: bool): LoopId {
+        let id = LoopId { index: self.fcx.next_loop };
+        self.fcx.next_loop += 1;
+        self.fcx.loops.push(LoopCtx { id, break_ty: None, is_loop, saw_break: false });
+        return id;
+    }
+
+    // ===================================================================== inference
+
+    pub fn new_var(&mut self, span: Span): Ty {
+        return self.new_kind_var(VarKind::General, span);
+    }
+
+    fn new_kind_var(&mut self, kind: VarKind, span: Span): Ty {
+        self.fcx.vars.push(Var::Unbound(kind, span));
+        let v = self.fcx.vars.len() as u32 - 1;
+        return self.p.types.infer(v);
+    }
+
+    pub fn int_var(&mut self, span: Span): Ty {
+        return self.new_kind_var(VarKind::Int, span);
+    }
+
+    pub fn float_var(&mut self, span: Span): Ty {
+        return self.new_kind_var(VarKind::Float, span);
+    }
+
+    pub fn new_len(&mut self): u32 {
+        self.fcx.lens.push(LenVar::Unbound);
+        return self.fcx.lens.len() as u32 - 1;
+    }
+
+    fn len_root(&self, v: u32): u32 {
+        return len_root(self.fcx.lens[..], v);
+    }
+
+    /// Set variable `i` (remembering the old value for `rollback`).
+    fn set_var(&mut self, i: u32, v: Var) {
+        self.fcx.trail.push(Undo::Var(i, self.fcx.vars[i as usize]));
+        self.fcx.vars[i as usize] = v;
+    }
+
+    fn set_len(&mut self, i: u32, l: LenVar) {
+        self.fcx.trail.push(Undo::Len(i, self.fcx.lens[i as usize]));
+        self.fcx.lens[i as usize] = l;
+    }
+
+    /// The inference tables as they are now.
+    pub fn snapshot(&self): Snapshot {
+        return Snapshot { vars: self.fcx.vars.len(), lens: self.fcx.lens.len(), trail: self.fcx.trail.len() };
+    }
+
+    /// Undo every inference step since `s` was taken.
+    pub fn rollback(&mut self, s: Snapshot) {
+        while self.fcx.trail.len() > s.trail {
+            match self.fcx.trail.pop() {
+                Some(Undo::Var(i, v)) => self.fcx.vars[i as usize] = v,
+                Some(Undo::Len(i, l)) => self.fcx.lens[i as usize] = l,
+                None => {}
+            }
+        }
+        self.fcx.vars.truncate(s.vars);
+        self.fcx.lens.truncate(s.lens);
+    }
+
+    /// Replace placeholder inference markers produced by type lowering.
+    pub fn instantiate(&mut self, t: Ty, span: Span): Ty {
+        let base_var = self.fcx.vars.len() as u32;
+        let base_len = self.fcx.lens.len() as u32;
+        let mut f = Instantiate { next_var: base_var, next_len: base_len };
+        let r = self.p.types.fold(t, &mut f);
+        for _ in base_var..f.next_var {
+            self.fcx.vars.push(Var::Unbound(VarKind::General, span));
+        }
+        for _ in base_len..f.next_len {
+            self.fcx.lens.push(LenVar::Unbound);
+        }
+        return r;
+    }
+
+    /// Resolve the outermost inference variable.
+    pub fn shallow(&mut self, t: Ty): Ty {
+        let mut t = t;
+        loop {
+            match self.p.types.kind(t) {
+                TyKind::Infer(v) => match self.fcx.vars[v as usize] {
+                    Var::Bound(b) => t = b,
+                    Var::Unbound(..) => return t,
+                },
+                TyKind::Array(e, ArrKind::FixedVar(v)) => {
+                    let r = self.len_root(v);
+                    return match self.fcx.lens[r as usize] {
+                        LenVar::Bound(n) => self.p.types.array(e, ArrKind::Fixed(n)),
+                        _ => self.p.types.array(e, ArrKind::FixedVar(r)),
+                    };
+                }
+                _ => return t,
+            }
+        }
+    }
+
+    /// Fully resolve all inference variables that have been solved.
+    pub fn resolve(&mut self, t: Ty): Ty {
+        if !self.p.types.has_infer(t) {
+            return t;
+        }
+        let mut r = Resolver { vars: self.fcx.vars[..], lens: self.fcx.lens[..] };
+        return self.p.types.fold(t, &mut r);
+    }
+
+    /// The trait reference with its arguments resolved.
+    pub fn resolve_trait_ref(&mut self, tr: TraitRef): TraitRef {
+        return TraitRef { trait_id: tr.trait_id, args: self.resolve_list(tr.args) };
+    }
+
+    pub fn resolve_list(&mut self, l: TyList): TyList {
+        let mut out: [Ty; ..+] = [];
+        for i in 0..l.len() {
+            let t = self.p.types.at(l, i);
+            out.push(self.resolve(t));
+        }
+        return self.p.types.mk_list(out[..]);
+    }
+
+    fn var_kind(&mut self, t: Ty): Option::<VarKind> {
+        let s = self.shallow(t);
+        return match self.p.types.kind(s) {
+            TyKind::Infer(v) => match self.fcx.vars[v as usize] {
+                Var::Unbound(k, _) => Some(k),
+                _ => None,
+            },
+            _ => None,
+        };
+    }
+
+    pub fn is_int_var(&mut self, t: Ty): bool {
+        return match self.var_kind(t) {
+            Some(VarKind::Int) => true,
+            _ => false,
+        };
+    }
+
+    pub fn is_float_var(&mut self, t: Ty): bool {
+        return match self.var_kind(t) {
+            Some(VarKind::Float) => true,
+            _ => false,
+        };
+    }
+
+    pub fn is_unbound_var(&mut self, t: Ty): bool {
+        return self.var_kind(t).is_some();
+    }
+
+    fn occurs(&mut self, v: u32, t: Ty): bool {
+        let r = self.resolve(t);
+        return self.p.types.any(r, &|k| match k {
+            TyKind::Infer(y) => y == v,
+            _ => false,
+        });
+    }
+
+    /// Unify two types; returns false on mismatch (no error reported).
+    pub fn unify(&mut self, a: Ty, b: Ty): bool {
+        let a = self.shallow(a);
+        let b = self.shallow(b);
+        let ka = self.p.types.kind(a);
+        let kb = self.p.types.kind(b);
+        return match (ka, kb) {
+            (TyKind::Error, _) => true,
+            (_, TyKind::Error) => true,
+            (TyKind::Infer(x), TyKind::Infer(y)) => {
+                if x == y {
+                    return true;
+                }
+                let kx = self.var_kind(a).unwrap();
+                let ky = self.var_kind(b).unwrap();
+                let merged = if kx == VarKind::General {
+                    ky
+                } else if ky == VarKind::General {
+                    kx
+                } else if kx == ky {
+                    kx
+                } else {
+                    return false;
+                };
+                if let Var::Unbound(_, sp) = self.fcx.vars[y as usize] {
+                    self.set_var(y, Var::Unbound(merged, sp));
+                }
+                self.set_var(x, Var::Bound(b));
+                true
+            }
+            (TyKind::Infer(x), _) => self.bind_var(x, b),
+            (_, TyKind::Infer(x)) => self.bind_var(x, a),
+            (TyKind::Tuple(xs), TyKind::Tuple(ys)) => self.unify_lists(xs, ys),
+            (TyKind::Adt(d1, xs), TyKind::Adt(d2, ys)) => d1 == d2 && self.unify_lists(xs, ys),
+            (TyKind::Array(e1, k1), TyKind::Array(e2, k2)) => self.unify_len(k1, k2) && self.unify(e1, e2),
+            (TyKind::Ptr(x, m1), TyKind::Ptr(y, m2)) => m1 == m2 && self.unify(x, y),
+            (TyKind::Grow(x), TyKind::Grow(y)) => self.unify(x, y),
+            (TyKind::FnPtr(p1, m1, r1), TyKind::FnPtr(p2, m2, r2)) => {
+                if p1.len() != p2.len() {
+                    return false;
+                }
+                for i in 0..p1.len() {
+                    if m1.get(i) != m2.get(i) {
+                        return false;
+                    }
+                    let x = self.p.types.at(p1, i);
+                    let y = self.p.types.at(p2, i);
+                    if !self.unify(x, y) {
+                        return false;
+                    }
+                }
+                self.unify(r1, r2)
+            }
+            _ => a == b,
+        };
+    }
+
+    /// Bind unbound variable `x` to `t` (not a variable).
+    fn bind_var(&mut self, x: u32, t: Ty): bool {
+        let kind = match self.fcx.vars[x as usize] {
+            Var::Unbound(k, _) => k,
+            Var::Bound(_) => panic("binding a bound variable"),
+        };
+        let ok = match kind {
+            VarKind::General => true,
+            VarKind::Int => self.p.types.is_integral(t),
+            VarKind::Float => match self.p.types.kind(t) {
+                TyKind::Float(_) => true,
+                _ => false,
+            },
+        };
+        if !ok || self.occurs(x, t) {
+            return false;
+        }
+        self.set_var(x, Var::Bound(t));
+        return true;
+    }
+
+    fn unify_lists(&mut self, xs: TyList, ys: TyList): bool {
+        if xs.len() != ys.len() {
+            return false;
+        }
+        for i in 0..xs.len() {
+            let x = self.p.types.at(xs, i);
+            let y = self.p.types.at(ys, i);
+            if !self.unify(x, y) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn unify_len(&mut self, a: ArrKind, b: ArrKind): bool {
+        return match (a, b) {
+            (ArrKind::FixedVar(x), ArrKind::FixedVar(y)) => {
+                let rx = self.len_root(x);
+                let ry = self.len_root(y);
+                if rx != ry {
+                    match (self.fcx.lens[rx as usize], self.fcx.lens[ry as usize]) {
+                        (LenVar::Bound(n), LenVar::Bound(m)) => return n == m,
+                        (LenVar::Bound(_), _) => self.set_len(ry, LenVar::Link(rx)),
+                        _ => self.set_len(rx, LenVar::Link(ry)),
+                    }
+                }
+                true
+            }
+            (ArrKind::FixedVar(x), ArrKind::Fixed(n)) => self.bind_len(x, n),
+            (ArrKind::Fixed(n), ArrKind::FixedVar(x)) => self.bind_len(x, n),
+            _ => a == b,
+        };
+    }
+
+    fn bind_len(&mut self, x: u32, n: u64): bool {
+        let r = self.len_root(x);
+        return match self.fcx.lens[r as usize] {
+            LenVar::Bound(m) => m == n,
+            _ => {
+                self.set_len(r, LenVar::Bound(n));
+                true
+            }
+        };
+    }
+
+    /// Default integer/float variables (used before method lookups).
+    pub fn default_var(&mut self, t: Ty): Ty {
+        let s = self.shallow(t);
+        match self.var_kind(s) {
+            Some(VarKind::Int) => {
+                let i = self.p.types.int(IntTy::I32);
+                self.unify(s, i);
+            }
+            Some(VarKind::Float) => {
+                let f = self.p.types.mk(TyKind::Float(FloatTy::F64));
+                self.unify(s, f);
+            }
+            _ => {}
+        }
+        return self.shallow(t);
+    }
+
+    // ===================================================================== coercion
+
+    /// Whether `from` can be coerced to `to` (without committing inference).
+    pub fn coercible(&mut self, from: Ty, to: Ty): bool {
+        let f = self.shallow(from);
+        match self.p.types.kind(f) {
+            TyKind::Never | TyKind::Error => return true,
+            _ => {}
+        }
+        let snap = self.snapshot();
+        let ok = self.unify(from, to);
+        self.rollback(snap);
+        return ok;
+    }
+
+    /// Coerce `e` to type `to`, reporting a mismatch at `span` on failure.
+    pub fn coerce(&mut self, e: Expr, to: Ty, span: Span): Expr {
+        return match self.try_coerce(e, to) {
+            Ok(e) => e,
+            Err(e) => {
+                self.mismatch(to, e.ty, span);
+                Expr { kind: e.kind, ty: self.p.types.error(), span: e.span }
+            }
+        };
+    }
+
+    pub fn try_coerce(&mut self, e: Expr, to: Ty): Result::<Expr, Expr> {
+        let from = self.shallow(e.ty);
+        let target = self.shallow(to);
+        let span = e.span;
+        if self.p.types.is_never(from) {
+            if self.p.types.is_never(target) {
+                return Ok(e);
+            }
+            let x = self.node(e);
+            return Ok(Expr { kind: ExprKind::Coerce { kind: Coercion::NeverToAny, expr: x }, ty: to, span });
+        }
+        match (self.p.types.kind(from), self.p.types.kind(target)) {
+            (TyKind::Array(a, ArrKind::SliceMut), TyKind::Array(b, ArrKind::Slice)) => {
+                if self.unify(a, b) {
+                    let x = self.node(e);
+                    return Ok(Expr { kind: ExprKind::Coerce { kind: Coercion::Weaken, expr: x }, ty: to, span });
+                }
+            }
+            (TyKind::Ptr(a, true), TyKind::Ptr(b, false)) => {
+                if self.unify(a, b) {
+                    let x = self.node(e);
+                    return Ok(Expr { kind: ExprKind::Coerce { kind: Coercion::Weaken, expr: x }, ty: to, span });
+                }
+            }
+            _ => {}
+        }
+        if self.unify(e.ty, to) {
+            return Ok(e);
+        }
+        return Err(e);
+    }
+
+    /// Coercion at a parameter-passing site: additionally allows viewing an
+    /// array (place) as a slice and a `String` as `str`.
+    pub fn coerce_arg(&mut self, e: Expr, to: Ty, span: Span): Expr {
+        let from = self.shallow(e.ty);
+        let target = self.shallow(to);
+        match (self.p.types.kind(from), self.p.types.kind(target)) {
+            (TyKind::Array(a, k), TyKind::Array(b, tk)) => {
+                if (k.is_owner() || k.is_fixed()) && tk.is_slice() {
+                    let mutable = tk == ArrKind::SliceMut;
+                    if self.unify(a, b) {
+                        let place = self.expr_as_place(e);
+                        if mutable && !self.is_mutable_place(place) {
+                            self.immutable_err(place, span, "borrow this array as `[T; &mut]`");
+                        }
+                        let x = self.node(place);
+                        return Expr { kind: ExprKind::Coerce { kind: Coercion::ToSlice { mutable }, expr: x }, ty: to, span };
+                    }
+                }
+            }
+            (TyKind::String, TyKind::Str) => {
+                let place = self.expr_as_place(e);
+                let x = self.node(place);
+                return Expr { kind: ExprKind::Coerce { kind: Coercion::StringToStr, expr: x }, ty: self.p.types.str(), span };
+            }
+            _ => {}
+        }
+        return self.coerce(e, to, span);
+    }
+
+    /// Turn a value-producing expression that reads a place back into the
+    /// place (or materialize it into a temporary).
+    pub fn expr_as_place(&mut self, e: Expr): Expr {
+        if let ExprKind::Read { place, .. } = e.kind {
+            return self.p.thir.expr(place);
+        }
+        if is_place(e) {
+            return e;
+        }
+        let ty = e.ty;
+        let span = e.span;
+        let x = self.node(e);
+        return Expr { kind: ExprKind::Temp(x), ty, span };
+    }
+
+    /// Read a place as a value: copies for copyable types, otherwise `mode`.
+    pub fn read(&mut self, place: Expr, mode: ReadMode): Expr {
+        let ty = place.ty;
+        let span = place.span;
+        let resolved = self.resolve(ty);
+        let copy = if self.p.types.has_infer(resolved) {
+            !self.could_be_owner(resolved)
+        } else {
+            let s = self.p.types.strip_grow(resolved);
+            self.p.is_copy(s, self.fcx.env[..])
+        };
+        let mode = if copy { ReadMode::Copy } else { mode };
+        let ty = self.p.types.strip_grow(ty);
+        let p = self.node(place);
+        return Expr { kind: ExprKind::Read { place: p, mode }, ty, span };
+    }
+
+    /// Conservative: an unresolved variable might become an owner.
+    fn could_be_owner(&self, t: Ty): bool {
+        let vars = self.fcx.vars[..];
+        return self.p.types.any(t, &|x| match x {
+            TyKind::Infer(v) => match vars[v as usize] {
+                Var::Unbound(VarKind::General, _) => true,
+                _ => false,
+            },
+            TyKind::String | TyKind::Param(..) => true,
+            TyKind::Array(_, k) => k.is_owner(),
+            _ => false,
+        });
+    }
+
+    // ===================================================================== places
+
+    pub fn is_mutable_place(&mut self, e: Expr): bool {
+        return match e.kind {
+            ExprKind::Local(id) => self.fcx.locals[id.index()].mutable,
+            ExprKind::Static(d) => match self.p.def(d).data {
+                DefData::Static(s) => s.mutable,
+                _ => false,
+            },
+            ExprKind::Field { base, .. } => {
+                let b = self.p.thir.expr(base);
+                self.is_mutable_place(b)
+            }
+            ExprKind::Index { base, .. } => {
+                let b = self.p.thir.expr(base);
+                let bt = self.shallow(b.ty);
+                match self.p.types.kind(bt) {
+                    TyKind::Array(_, ArrKind::SliceMut) => true,
+                    TyKind::Array(_, ArrKind::Slice) => false,
+                    _ => self.is_mutable_place(b),
+                }
+            }
+            ExprKind::Deref(p) => {
+                let pt = self.p.thir.expr(p).ty;
+                let s = self.shallow(pt);
+                match self.p.types.kind(s) {
+                    TyKind::Ptr(_, true) => true,
+                    _ => false,
+                }
+            }
+            ExprKind::Temp(_) => true,
+            _ => false,
+        };
+    }
+
+    pub fn root_local(&self, e: Expr): Option::<LocalId> {
+        return root_local(&self.p, e);
+    }
+
+    pub fn immutable_err(&mut self, place: Expr, span: Span, what: str) {
+        let container = match place.kind {
+            ExprKind::Index { base, .. } => {
+                let bt = self.p.thir.expr(base).ty;
+                self.shallow(bt)
+            }
+            _ => self.p.types.error(),
+        };
+        let slice = match self.p.types.kind(container) {
+            TyKind::Array(_, ArrKind::Slice) => true,
+            _ => false,
+        };
+        let mut m = String::new();
+        m.write("cannot {what}: it is not mutable");
+        if slice {
+            self.error_at(codes::ty::IMMUTABLE(), span, m.as_str());
+            self.with_note("elements of a `[T; &]` slice are read-only; use a `[T; &mut]` slice");
+        } else if let Some(l) = self.root_local(place) {
+            let local = self.fcx.locals[l.index()];
+            let n = self.p.text(local.name).to_string();
+            let sp = local.span;
+            match local.kind {
+                LocalKind::Param { owned: true, .. } => {
+                    self.error_at(codes::ty::IMMUTABLE(), span, m.as_str());
+                    let mut h = String::new();
+                    h.write("declare it `mut {n}` to change this function's own copy, or `{n}: &mut ...` to change the caller's");
+                    self.with_help(h.as_str());
+                }
+                LocalKind::Param { .. } => {
+                    let inner = self.p.types.strip_grow(local.ty);
+                    let ty = self.ty_str(inner);
+                    self.error_at(codes::ty::IMMUTABLE(), span, m.as_str());
+                    let mut h = String::new();
+                    h.write("to change the caller's value in place: `{n}: &mut {ty}`");
+                    self.with_help(h.as_str());
+                    let mut h2 = String::new();
+                    h2.write("or take ownership and change your own: `mut {n}: {ty}`");
+                    self.with_help(h2.as_str());
+                }
+                _ => {
+                    self.error_at(codes::ty::IMMUTABLE(), span, m.as_str());
+                    let mut h = String::new();
+                    h.write("declare it with `let mut {n}`");
+                    self.with_help(h.as_str());
+                }
+            }
+            let mut s = String::new();
+            s.write("`{n}` declared here");
+            self.with_secondary(sp, s.as_str());
+        } else {
+            self.error_at(codes::ty::IMMUTABLE(), span, m.as_str());
+            if let ExprKind::Deref(_) = place.kind {
+                self.with_note("writing through a pointer requires a `*mut T`");
+            }
+        }
+        self.emit();
+    }
+
+    // ===================================================================== unsafe
+
+    pub fn require_unsafe(&mut self, span: Span, what: str) {
+        if self.fcx.unsafe_depth > 0 {
+            return;
+        }
+        if self.fcx.in_unsafe_fn {
+            let mut m = String::new();
+            m.write("{what} requires an `unsafe` block, even inside an `unsafe fn`");
+            self.error_at(codes::unsafe_::IN_UNSAFE_FN(), span, m.as_str());
+            self.with_note("`unsafe fn` only means the function is unsafe to call; its body gets no implicit unsafe context");
+            self.with_help("wrap the operation in `unsafe { ... }`");
+            self.emit();
+        } else {
+            let mut m = String::new();
+            m.write("{what} is unsafe and requires an `unsafe` block");
+            self.error_at(codes::unsafe_::OUTSIDE_UNSAFE(), span, m.as_str());
+            self.with_help("wrap the operation in `unsafe { ... }`");
+            self.emit();
+        }
+    }
+
+    // ===================================================================== obligations
+
+    /// The bounds known to hold here: the function's (with supertraits),
+    /// and for an `impl Trait` type, what it promises.
+    pub fn known_preds(&mut self, ty: Ty): [Pred; ..+] {
+        let mut out = self.fcx.env.clone();
+        if let TyKind::Opaque(d, i, args) = self.p.types.kind(ty) {
+            let mut promised: [Pred; ..+] = [];
+            self.p.opaque_preds(d, i, args, &mut promised);
+            self.p.elaborate(promised[..], &mut out);
+        }
+        return out;
+    }
+
+    pub fn oblige(&mut self, ty: Ty, tr: TraitRef, span: Span) {
+        self.fcx.obligations.push(Obligation { ty, tr, span });
+    }
+
+    /// Learn types from trait bounds: where a bound with unknown types can
+    /// only be met one way (by one impl, or one bound in scope), take that
+    /// way's types. `I: Iterator::<(K, V)>` with `I` known gives `K` and
+    /// `V`; a returned `Ids::<_>` promised as `impl Iterator::<Id::<T>>`
+    /// gives its parameter.
+    pub fn infer_from_bounds(&mut self) {
+        let mut goals: [(Ty, TraitRef); ..+] = [];
+        for i in 0..self.fcx.obligations.len() {
+            let o = self.fcx.obligations[i];
+            goals.push((o.ty, o.tr));
+        }
+        for i in 0..self.fcx.opaque_vars.len() {
+            let ov = self.fcx.opaque_vars[i];
+            if let Some(o) = self.p.opaques.get((self.fcx.def, ov.idx)) {
+                for b in self.p.trait_refs.list(o.bounds) {
+                    goals.push((ov.var, b));
+                }
+            }
+        }
+        for _ in 0..4 {
+            let mut progress = false;
+            for g in goals[..] {
+                let (ty, tr) = g;
+                let t = self.resolve(ty);
+                let tr = self.resolve_trait_ref(tr);
+                if !self.p.types.has_infer(t) && !self.any_infer(tr.args) {
+                    continue;
+                }
+                if self.meet_unique_way(t, tr) {
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+    }
+
+    /// Whether any type of `l` has inference variables.
+    pub fn any_infer(&self, l: TyList): bool {
+        for t in self.p.types.list(l) {
+            if self.p.types.has_infer(t) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// If exactly one bound in scope or impl can make `t: tr` hold, unify
+    /// with it; returns whether that taught anything.
+    fn meet_unique_way(&mut self, t: Ty, tr: TraitRef): bool {
+        // Each way: the self type and trait arguments it has.
+        let mut ways: [(Ty, TyList); ..+] = [];
+        let sm = self.shallow(t);
+        let sm_infer = match self.p.types.kind(sm) {
+            TyKind::Infer(_) => true,
+            _ => false,
+        };
+        if !sm_infer {
+            let preds = self.known_preds(sm);
+            for p in preds[..] {
+                if p.trait_ref.trait_id == tr.trait_id {
+                    ways.push((p.ty, p.trait_ref.args));
+                }
+            }
+        }
+        let snap = self.snapshot();
+        let mut fits: [(Ty, TyList); -..+] = [];
+        for w in ways[..] {
+            let (wty, wargs) = w;
+            let ok = self.unify(wty, t) && wargs.len() == tr.args.len() && self.unify_lists(wargs, tr.args);
+            self.rollback(snap);
+            if ok {
+                fits.push((wty, wargs));
+            }
+        }
+        let mut impl_fit: Option::<DefId> = None;
+        let mut impl_count: usize = 0;
+        for k in 0..self.p.impls.len() {
+            let imp = self.p.impls[k];
+            let d = match self.p.def(imp).data {
+                DefData::Impl(d) => d,
+                _ => continue,
+            };
+            let itr = match d.trait_ref {
+                Some(x) => x,
+                None => continue,
+            };
+            if itr.trait_id != tr.trait_id || d.negative {
+                continue;
+            }
+            let fresh = self.fresh_vars(d.generics.count());
+            let self_ty = self.p.types.subst(d.self_ty, fresh);
+            let ok = self.unify(self_ty, t) && itr.args.len() == tr.args.len() && self.unify_subst_lists(itr.args, fresh, tr.args);
+            self.rollback(snap);
+            if ok {
+                impl_count += 1;
+                impl_fit = Some(imp);
+            }
+        }
+        if fits.len() + impl_count != 1 {
+            return false;
+        }
+        let before_t = self.resolve(t);
+        let before_args = self.resolve_list(tr.args);
+        if let Some(w) = fits.pop() {
+            let (wty, wargs) = w;
+            self.unify(wty, t);
+            for i in 0..wargs.len() {
+                let a = self.p.types.at(wargs, i);
+                let b = self.p.types.at(tr.args, i);
+                self.unify(a, b);
+            }
+        } else if let Some(imp) = impl_fit {
+            let d = self.p.impl_data(imp);
+            let itr = d.trait_ref.unwrap();
+            let fresh = self.fresh_vars(d.generics.count());
+            let self_ty = self.p.types.subst(d.self_ty, fresh);
+            self.unify(self_ty, t);
+            for i in 0..itr.args.len() {
+                if i >= tr.args.len() {
+                    break;
+                }
+                let a0 = self.p.types.at(itr.args, i);
+                let a = self.p.types.subst(a0, fresh);
+                let b = self.p.types.at(tr.args, i);
+                self.unify(a, b);
+            }
+        }
+        let after_t = self.resolve(t);
+        let after_args = self.resolve_list(tr.args);
+        return before_t != after_t || before_args != after_args;
+    }
+
+    /// `n` fresh variables (at no particular place), as a list.
+    pub fn fresh_vars(&mut self, n: usize): TyList {
+        let mut fresh: [Ty; ..+] = [];
+        for _ in 0..n {
+            fresh.push(self.new_var(dummy_span()));
+        }
+        return self.p.types.mk_list(fresh[..]);
+    }
+
+    /// Unify each of `xs`, with `args` substituted, with the same item of
+    /// `ys` (of the same length).
+    fn unify_subst_lists(&mut self, xs: TyList, args: TyList, ys: TyList): bool {
+        for i in 0..xs.len() {
+            let a0 = self.p.types.at(xs, i);
+            let a = self.p.types.subst(a0, args);
+            let b = self.p.types.at(ys, i);
+            if !self.unify(a, b) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Resolve remaining inference, check deferred obligations and literals.
+    fn finish(&mut self) {
+        self.infer_from_bounds();
+        for i in 0..self.fcx.vars.len() {
+            if let Var::Unbound(k, _) = self.fcx.vars[i] {
+                match k {
+                    VarKind::Int => {
+                        let t = self.p.types.int(IntTy::I32);
+                        self.set_var(i as u32, Var::Bound(t));
+                    }
+                    VarKind::Float => {
+                        let t = self.p.types.mk(TyKind::Float(FloatTy::F64));
+                        self.set_var(i as u32, Var::Bound(t));
+                    }
+                    VarKind::General => {}
+                }
+            }
+        }
+        // Whether a closure implements an `Fn` trait depends on its
+        // signature, so record it before checking obligations.
+        self.resolve_closures();
+        for i in 0..self.fcx.obligations.len() {
+            let o = self.fcx.obligations[i];
+            let t = self.resolve(o.ty);
+            let tr = self.resolve_trait_ref(o.tr);
+            if self.p.types.has_infer(t) || self.any_infer(tr.args) {
+                self.annotations_needed(o.span);
+                continue;
+            }
+            if !self.p.implements(t, tr, self.fcx.env[..]) {
+                if self.fn_bound_diag(t, tr, o.span, codes::ty::UNSATISFIED_BOUND()) {
+                    self.emit();
+                    continue;
+                }
+                let ts = self.p.ty_str(t);
+                let tn = self.p.name(tr.trait_id).to_string();
+                let mut m = String::new();
+                m.write("the trait bound `{ts}: {tn}` is not satisfied");
+                self.error_at(codes::ty::UNSATISFIED_BOUND(), o.span, m.as_str());
+                let mut l = String::new();
+                l.write("`{ts}` does not implement `{tn}`");
+                self.with_label(l.as_str());
+                if let TyKind::Param(_, n) = self.p.types.kind(t) {
+                    let mut h = String::new();
+                    h.write("add {tn} to {self.p.text(n)}'s bounds: `{self.p.text(n)}: {tn}`");
+                    self.with_help(h.as_str());
+                } else if self.p.is_lang(tr.trait_id, "dull") {
+                    let mut h = String::new();
+                    h.write("`{ts}` is pointy: it is or contains a pointer, slice, string or array");
+                    self.with_note(h.as_str());
+                } else if self.p.is_lang(tr.trait_id, "light") {
+                    let mut h = String::new();
+                    h.write("`{ts}` owns an array or string");
+                    self.with_note(h.as_str());
+                }
+                self.emit();
+            }
+        }
+        self.fcx.obligations.clear();
+        self.finish_opaques();
+        for i in 0..self.fcx.dull_checks.len() {
+            let (ty, span) = self.fcx.dull_checks[i];
+            let t = self.resolve(ty);
+            if self.p.types.has_infer(t) || self.p.types.has_error(t) {
+                continue;
+            }
+            if !self.p.is_light(t, self.fcx.env[..]) {
+                let gs = self.fcx.cx.generics_span;
+                self.pointy_diag(t, span, gs);
+                self.emit();
+            }
+        }
+        self.fcx.dull_checks.clear();
+        for i in 0..self.fcx.lit_checks.len() {
+            let c = self.fcx.lit_checks[i];
+            let rt = self.resolve(c.ty);
+            if let TyKind::Int(it) = self.p.types.kind(rt) {
+                let ok = if c.high != 0 {
+                    false
+                } else if c.neg {
+                    c.mag <= it.min_magnitude()
+                } else {
+                    c.mag <= it.max()
+                };
+                if !ok {
+                    let mut lo = String::new();
+                    if it.signed() {
+                        lo.write("-{it.min_magnitude()}");
+                    } else {
+                        lo.push_str("0");
+                    }
+                    let mut v = String::new();
+                    if c.neg {
+                        v.push('-');
+                    }
+                    v.push_str(ast::u128_decimal(c.high, c.mag).as_str());
+                    let mut m = String::new();
+                    m.write("literal `{v}` does not fit in `{it.name()}`");
+                    self.error_at(codes::ty::LITERAL_RANGE(), c.span, m.as_str());
+                    let mut n = String::new();
+                    n.write("`{it.name()}` ranges from {lo} to {it.max()}");
+                    self.with_note(n.as_str());
+                    self.emit();
+                }
+            }
+        }
+        self.fcx.lit_checks.clear();
+        for i in 0..self.fcx.vars.len() {
+            if let Var::Unbound(VarKind::General, span) = self.fcx.vars[i] {
+                self.annotations_needed(span);
+                let e = self.p.types.error();
+                self.set_var(i as u32, Var::Bound(e));
+            }
+        }
+        for i in 0..self.fcx.lens.len() {
+            if let LenVar::Unbound = self.fcx.lens[i] {
+                self.set_len(i as u32, LenVar::Bound(0));
+            }
+        }
+    }
+
+    /// Record the type each `impl Trait` of this function stands for, and
+    /// check that it has the promised bounds.
+    fn finish_opaques(&mut self) {
+        for k in 0..self.fcx.opaque_vars.len() {
+            let ov = self.fcx.opaque_vars[k];
+            let (i, var, span) = (ov.idx, ov.var, ov.span);
+            let c = self.resolve(var);
+            if self.p.types.has_infer(c) {
+                // Only a body that never returns leaves it open.
+                let s = self.shallow(var);
+                if let TyKind::Infer(_) = self.p.types.kind(s) {
+                    let u = self.p.types.unit();
+                    self.unify(var, u);
+                } else {
+                    self.annotations_needed(span);
+                    continue;
+                }
+            }
+            let r = self.resolve(var);
+            let c = default_ty(&mut self.p.types, r);
+            let bounds = match self.p.opaques.get((self.fcx.def, i)) {
+                Some(o) => o.bounds,
+                None => List::empty(),
+            };
+            for j in 0..bounds.len() {
+                let b = self.p.trait_refs.list(bounds)[j];
+                if self.p.types.has_error(c) || self.p.implements(c, b, self.fcx.env[..]) {
+                    continue;
+                }
+                let cs = self.p.ty_str(c);
+                let bs = self.p.trait_ref_str(b);
+                // For a closure, say why at the closure.
+                let at = match self.p.types.kind(c) {
+                    TyKind::Closure(cd, _) => self.p.def(cd).span,
+                    _ => span,
+                };
+                if self.fn_bound_diag(c, b, at, codes::ty::OPAQUE_MISMATCH()) {
+                    let mut s = String::new();
+                    s.write("the function promises `{bs}`");
+                    self.with_secondary(span, s.as_str());
+                } else {
+                    let mut m = String::new();
+                    m.write("this function returns `{cs}`, which does not implement `{bs}`");
+                    self.error_at(codes::ty::OPAQUE_MISMATCH(), span, m.as_str());
+                    let mut l = String::new();
+                    l.write("promises `{bs}`");
+                    self.with_label(l.as_str());
+                }
+                self.emit();
+            }
+            if let Some(o) = self.p.opaques.get((self.fcx.def, i)) {
+                let mut o = o;
+                o.concrete = Some(c);
+                self.p.opaques.insert((self.fcx.def, i), o);
+            }
+        }
+        self.fcx.opaque_vars.clear();
+    }
+
+    pub fn annotations_needed(&mut self, span: Span) {
+        if self.fcx.reported_annotations {
+            return;
+        }
+        self.fcx.reported_annotations = true;
+        self.error_at(codes::ty::ANNOTATIONS_NEEDED(), span, "type annotations needed");
+        self.with_help("add a type annotation, e.g. `let x: i32 = ...`");
+        self.emit();
+    }
+
+    // ===================================================================== zonking
+
+    fn zonk(&mut self, t: Ty): Ty {
+        let r = self.resolve(t);
+        return default_ty(&mut self.p.types, r);
+    }
+
+    fn zonk_list(&mut self, l: TyList): TyList {
+        let mut out: [Ty; ..+] = [];
+        for i in 0..l.len() {
+            let t = self.p.types.at(l, i);
+            out.push(self.zonk(t));
+        }
+        return self.p.types.mk_list(out[..]);
+    }
+
+    fn zonk_trait_ref(&mut self, tr: TraitRef): TraitRef {
+        return TraitRef { trait_id: tr.trait_id, args: self.zonk_list(tr.args) };
+    }
+
+    pub fn zonk_block(&mut self, id: Id::<Block>) {
+        let b = self.p.thir.block(id);
+        for i in 0..b.stmts.len() {
+            match self.p.thir.stmts.list(b.stmts)[i] {
+                Stmt::Let { pat, init, .. } => {
+                    self.zonk_pat(pat);
+                    if let Some(e) = init {
+                        self.zonk_expr(e);
+                    }
+                }
+                Stmt::Expr(e) => self.zonk_expr(e),
+            }
+        }
+        if let Some(t) = b.tail {
+            self.zonk_expr(t);
+        }
+    }
+
+    pub fn zonk_pat(&mut self, id: Id::<Pat>) {
+        let mut p = self.p.thir.pat(id);
+        p.ty = self.zonk(p.ty);
+        self.p.thir.pats.set(id, p);
+        match p.kind {
+            PatKind::Binding { sub, .. } => {
+                if let Some(s) = sub {
+                    self.zonk_pat(s);
+                }
+            }
+            PatKind::Tuple(ps) => self.zonk_pats(ps),
+            PatKind::Or(ps) => self.zonk_pats(ps),
+            PatKind::Adt { fields, .. } => {
+                for i in 0..fields.len() {
+                    let f = self.p.thir.field_pats.list(fields)[i];
+                    self.zonk_pat(f.pat);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn zonk_pats(&mut self, ps: List::<Id::<Pat>>) {
+        for i in 0..ps.len() {
+            let p = self.p.thir.pat_ids.list(ps)[i];
+            self.zonk_pat(p);
+        }
+    }
+
+    fn zonk_exprs(&mut self, es: List::<Id::<Expr>>) {
+        for i in 0..es.len() {
+            let e = self.p.thir.expr_ids.list(es)[i];
+            self.zonk_expr(e);
+        }
+    }
+
+    fn zonk_args(&mut self, args: List::<Arg>) {
+        for i in 0..args.len() {
+            let a = self.p.thir.args.list(args)[i];
+            self.zonk_expr(a.expr());
+        }
+    }
+
+    pub fn zonk_expr(&mut self, id: Id::<Expr>) {
+        let mut e = self.p.thir.expr(id);
+        e.ty = self.zonk(e.ty);
+        match e.kind {
+            ExprKind::FnRef { def, args } => {
+                e.kind = ExprKind::FnRef { def, args: self.zonk_list(args) };
+            }
+            ExprKind::Call { callee, args } => {
+                let c = match callee {
+                    Callee::Fn { def, args: ga } => Callee::Fn { def, args: self.zonk_list(ga) },
+                    Callee::Intrinsic { def, name, args: ga } => Callee::Intrinsic { def, name, args: self.zonk_list(ga) },
+                    Callee::Trait { trait_ref, self_ty, method, method_args } => {
+                        let tr = self.zonk_trait_ref(trait_ref);
+                        let st = self.zonk(self_ty);
+                        let ma = self.zonk_list(method_args);
+                        Callee::Trait { trait_ref: tr, self_ty: st, method, method_args: ma }
+                    }
+                    other => other,
+                };
+                e.kind = ExprKind::Call { callee: c, args };
+            }
+            ExprKind::Adt { def, args, variant, fields } => {
+                e.kind = ExprKind::Adt { def, args: self.zonk_list(args), variant, fields };
+            }
+            _ => {}
+        }
+        self.p.thir.exprs.set(id, e);
+        match e.kind {
+            ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Lit(_) | ExprKind::Continue { .. } | ExprKind::Error | ExprKind::FnRef { .. } => {}
+            ExprKind::Field { base, .. } => self.zonk_expr(base),
+            ExprKind::Index { base, index } => {
+                self.zonk_expr(base);
+                self.zonk_expr(index);
+            }
+            ExprKind::Deref(x) => self.zonk_expr(x),
+            ExprKind::Temp(x) => self.zonk_expr(x),
+            ExprKind::Unary(_, x) => self.zonk_expr(x),
+            ExprKind::Cast(x) => self.zonk_expr(x),
+            ExprKind::Read { place, .. } => self.zonk_expr(place),
+            ExprKind::Call { callee, args } => {
+                match callee {
+                    Callee::Indirect(f) => self.zonk_expr(f),
+                    Callee::Value { callee: f, .. } => self.zonk_expr(f),
+                    _ => {}
+                }
+                self.zonk_args(args);
+            }
+            ExprKind::Binary(_, a, b) => {
+                self.zonk_expr(a);
+                self.zonk_expr(b);
+            }
+            ExprKind::Logical { lhs, rhs, .. } => {
+                self.zonk_expr(lhs);
+                self.zonk_expr(rhs);
+            }
+            ExprKind::Assign { place, value } => {
+                self.zonk_expr(place);
+                self.zonk_expr(value);
+            }
+            ExprKind::AssignOp { place, value, .. } => {
+                self.zonk_expr(place);
+                self.zonk_expr(value);
+            }
+            ExprKind::Tuple(es) => self.zonk_exprs(es),
+            ExprKind::Array(es) => self.zonk_exprs(es),
+            ExprKind::Adt { fields, .. } => {
+                for i in 0..fields.len() {
+                    let f = self.p.thir.field_exprs.list(fields)[i];
+                    self.zonk_expr(f.expr);
+                }
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                self.zonk_expr(value);
+                self.zonk_expr(count);
+            }
+            ExprKind::Slice { base, start, end, .. } => {
+                self.zonk_expr(base);
+                if let Some(x) = start {
+                    self.zonk_expr(x);
+                }
+                if let Some(x) = end {
+                    self.zonk_expr(x);
+                }
+            }
+            ExprKind::Block(b) => self.zonk_block(b),
+            ExprKind::Loop { body, .. } => self.zonk_block(body),
+            ExprKind::If { cond, then, else_ } => {
+                self.zonk_expr(cond);
+                self.zonk_expr(then);
+                if let Some(x) = else_ {
+                    self.zonk_expr(x);
+                }
+            }
+            ExprKind::Match { scrut, arms } => {
+                self.zonk_expr(scrut);
+                for i in 0..arms.len() {
+                    let a = self.p.thir.arms.list(arms)[i];
+                    self.zonk_pat(a.pat);
+                    if let Some(g) = a.guard {
+                        self.zonk_expr(g);
+                    }
+                    self.zonk_expr(a.body);
+                }
+            }
+            ExprKind::While { cond, body, .. } => {
+                self.zonk_expr(cond);
+                self.zonk_block(body);
+            }
+            ExprKind::ForRange { start, end, body, .. } => {
+                self.zonk_expr(start);
+                self.zonk_expr(end);
+                self.zonk_block(body);
+            }
+            ExprKind::ForArray { pat, array, body, .. } => {
+                self.zonk_pat(pat);
+                self.zonk_expr(array);
+                self.zonk_block(body);
+            }
+            ExprKind::Break { value, .. } => {
+                if let Some(x) = value {
+                    self.zonk_expr(x);
+                }
+            }
+            ExprKind::Return(value) => {
+                if let Some(x) = value {
+                    self.zonk_expr(x);
+                }
+            }
+            ExprKind::Coerce { expr, .. } => self.zonk_expr(expr),
+            ExprKind::FmtArgs(pieces) => {
+                for i in 0..pieces.len() {
+                    if let FmtPiece::Arg(x, _) = self.p.thir.fmt_pieces.list(pieces)[i] {
+                        self.zonk_expr(x);
+                    }
+                }
+            }
+            ExprKind::Closure { captures, .. } => self.zonk_args(captures),
+        }
+    }
+
+    // ===================================================================== building THIR
+
+    /// Add an expression to the typed tree.
+    pub fn node(&mut self, e: Expr): Id::<Expr> {
+        return self.p.thir.exprs.add(e);
+    }
+
+    /// Add a pattern to the typed tree.
+    pub fn pat_node(&mut self, p: Pat): Id::<Pat> {
+        return self.p.thir.pats.add(p);
+    }
+
+    /// Add expressions to the typed tree, as a list.
+    pub fn node_list(&mut self, es: [Expr; &]): List::<Id::<Expr>> {
+        let mut ids: [Id::<Expr>; ..+] = [];
+        for e in es {
+            ids.push(self.node(e));
+        }
+        return self.p.thir.expr_ids.add_list(ids[..]);
+    }
+
+    pub fn mk(&self, kind: ExprKind, ty: Ty, span: Span): Expr {
+        return Expr { kind, ty, span };
+    }
+}
+
+/// Whether the expression is a place.
+pub fn is_place(e: Expr): bool {
+    return match e.kind {
+        ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Deref(_) | ExprKind::Temp(_) => true,
+        _ => false,
+    };
+}
+
+/// The local a place expression is rooted at (not through a pointer).
+pub fn root_local(p: &Program, e: Expr): Option::<LocalId> {
+    return match e.kind {
+        ExprKind::Local(id) => Some(id),
+        ExprKind::Field { base, .. } => root_local(p, p.thir.expr(base)),
+        ExprKind::Index { base, .. } => root_local(p, p.thir.expr(base)),
+        _ => None,
+    };
+}
+
+/// Match `ty` against `pat`, binding `pat`'s generic parameters (by index)
+/// in `out` (`Program::match_ty` in Rust).
+pub fn match_ty(types: &Types, pat: Ty, ty: Ty, out: &mut [Option::<Ty>; -..+]): bool {
+    return match (types.kind(pat), types.kind(ty)) {
+        (TyKind::Param(i, _), _) => {
+            let i = i as usize;
+            while out.len() <= i {
+                out.push(None);
+            }
+            match out[i] {
+                Some(prev) => prev == ty,
+                None => {
+                    out[i] = Some(ty);
+                    true
+                }
+            }
+        }
+        (TyKind::Tuple(a), TyKind::Tuple(b)) => match_lists(types, a, b, out),
+        (TyKind::Adt(a, xs), TyKind::Adt(b, ys)) => a == b && match_lists(types, xs, ys, out),
+        (TyKind::Array(a, k1), TyKind::Array(b, k2)) => k1 == k2 && match_ty(types, a, b, out),
+        (TyKind::Ptr(a, m1), TyKind::Ptr(b, m2)) => m1 == m2 && match_ty(types, a, b, out),
+        (TyKind::Grow(a), TyKind::Grow(b)) => match_ty(types, a, b, out),
+        (TyKind::FnPtr(a, ma, r1), TyKind::FnPtr(b, mb, r2)) => {
+            if a.len() != b.len() {
+                return false;
+            }
+            for i in 0..a.len() {
+                if ma.get(i) != mb.get(i) || !match_ty(types, types.at(a, i), types.at(b, i), out) {
+                    return false;
+                }
+            }
+            match_ty(types, r1, r2, out)
+        }
+        _ => pat == ty,
+    };
+}
+
+fn match_lists(types: &Types, a: TyList, b: TyList, out: &mut [Option::<Ty>; -..+]): bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if !match_ty(types, types.at(a, i), types.at(b, i), out) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn len_root(lens: [LenVar; &], v: u32): u32 {
+    let mut v = v;
+    loop {
+        match lens[v as usize] {
+            LenVar::Link(n) => v = n,
+            _ => return v,
+        }
+    }
+}
+
+/// Replace any leftover inference variables with defaults (after errors).
+pub fn default_ty(types: &mut +Types, t: Ty): Ty {
+    let mut f = DefaultFolder {};
+    return types.fold(t, &mut f);
+}
+
+pub fn lang_trait_ref(p: &Program, name: str): Option::<TraitRef> {
+    return match p.lang_item(name) {
+        Some(id) => Some(TraitRef { trait_id: id, args: List::empty() }),
+        None => None,
+    };
+}
+
+struct DefaultFolder {}
+
+impl Folder for DefaultFolder {
+    fn fold_ty(&mut self, types: &mut +Types, t: Ty): Ty {
+        return match types.kind(t) {
+            TyKind::Infer(_) => types.error(),
+            TyKind::Array(e, ArrKind::FixedVar(_)) => types.array(e, ArrKind::Fixed(0)),
+            _ => t,
+        };
+    }
+}
+
+/// Resolves solved inference variables.
+struct Resolver {
+    vars: [Var; &],
+    lens: [LenVar; &],
+}
+
+impl Folder for Resolver {
+    fn fold_ty(&mut self, types: &mut +Types, t: Ty): Ty {
+        return match types.kind(t) {
+            TyKind::Infer(v) => match self.vars[v as usize] {
+                Var::Bound(b) => types.fold(b, self),
+                _ => t,
+            },
+            TyKind::Array(e, ArrKind::FixedVar(v)) => {
+                let r = len_root(self.lens, v);
+                match self.lens[r as usize] {
+                    LenVar::Bound(n) => types.array(e, ArrKind::Fixed(n)),
+                    _ => if r == v { t } else { types.array(e, ArrKind::FixedVar(r)) },
+                }
+            }
+            _ => t,
+        };
+    }
+}
+
+/// Numbers the placeholders of type lowering (`Infer(u32::MAX)`,
+/// `FixedVar(u32::MAX)`) as new variables from `next_var` / `next_len` on.
+struct Instantiate {
+    next_var: u32,
+    next_len: u32,
+}
+
+impl Folder for Instantiate {
+    fn fold_ty(&mut self, types: &mut +Types, t: Ty): Ty {
+        return match types.kind(t) {
+            TyKind::Infer(4294967295) => {
+                let v = self.next_var;
+                self.next_var += 1;
+                types.infer(v)
+            }
+            TyKind::Array(e, ArrKind::FixedVar(4294967295)) => {
+                let v = self.next_len;
+                self.next_len += 1;
+                types.array(e, ArrKind::FixedVar(v))
+            }
+            _ => t,
+        };
+    }
+}
+
+/// Replaces each `impl Trait` of function `def` by a new variable (numbered
+/// from `next` on), noting its index in `found`.
+struct OpenOpaques {
+    def: DefId,
+    next: u32,
+    found: [u32; ..+],
+}
+
+impl Folder for OpenOpaques {
+    fn fold_ty(&mut self, types: &mut +Types, t: Ty): Ty {
+        return match types.kind(t) {
+            TyKind::Opaque(d, i, _) => {
+                if d != self.def {
+                    return t;
+                }
+                let v = self.next;
+                self.next += 1;
+                self.found.push(i);
+                types.infer(v)
+            }
+            _ => t,
+        };
+    }
+}

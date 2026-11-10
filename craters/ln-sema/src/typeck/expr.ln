@@ -1,0 +1,2130 @@
+// Type checking of expressions, statements and blocks: a port of
+// crates/ln-sema/src/typeck/expr.rs.
+
+use core::arena::{Id, List};
+use core::intern::Symbol;
+use crater::codes;
+use crater::defs::*;
+use crater::lower::{DeferKind, TyPos};
+use crater::resolve::{ModRes, prim_type};
+use crater::sema::Sema;
+use crater::thir::{Arg, Arm, Block, Callee, Coercion, Expr, ExprKind, FieldExpr, FieldPat, FmtPiece, LocalId, LocalKind, Pat, PatKind, ReadMode, Stmt};
+use crater::ty::*;
+use crater::typeck::{is_place, lang_trait_ref, match_ty, LitCheck};
+use ln_ast as ast;
+use ln_ast::{BinOp, Ident, Span, UnOp};
+
+impl Sema {
+    pub fn error_expr(&mut self, span: Span): Expr {
+        return Expr { kind: ExprKind::Error, ty: self.p.types.error(), span };
+    }
+
+    /// `what` needs the lang item `name`, which the loaded `core` does not
+    /// define (only possible with a modified standard library).
+    pub fn missing_lang_item(&mut self, name: str, what: str, span: Span) {
+        let mut m = String::new();
+        m.write("{what} needs the lang item `{name}`, which the standard library does not define");
+        self.error_at(codes::build::MISSING_LANG_ITEM(), span, m.as_str());
+        let mut n = String::new();
+        n.write("`core` must mark an item `#[lang = \"{name}\"]`; if `LUNAR_STD_DIR` is set, check that it points at an unmodified standard library");
+        self.with_note(n.as_str());
+        self.emit();
+    }
+
+    pub fn unit_expr(&mut self, span: Span): Expr {
+        return Expr { kind: ExprKind::Tuple(List::empty()), ty: self.p.types.unit(), span };
+    }
+
+    /// Lower a type annotation inside a body.
+    pub fn lower_local_ty(&mut self, t: Id::<ast::Ty>): Ty {
+        let cx = self.local_cx();
+        let before = self.deferred.len();
+        let ty = self.lower_ty(cx, t, TyPos::Other);
+        for i in before..self.deferred.len() {
+            let d = self.deferred[i];
+            if let DeferKind::ArrayElem = d.kind {
+                self.fcx.dull_checks.push((d.ty, d.span));
+            }
+        }
+        self.deferred.truncate(before);
+        let span = self.p.ast.tys.get(t).span;
+        return self.instantiate(ty, span);
+    }
+
+    /// The span of an expression of the syntax tree.
+    pub fn ast_span(&self, e: Id::<ast::Expr>): Span {
+        return self.p.ast.exprs.get(e).span;
+    }
+
+    // ===================================================================== entry points
+
+    /// A value expression whose result is consumed (moved if it is an owner).
+    pub fn check_expr(&mut self, e: Id::<ast::Expr>, expect: Option::<Ty>): Expr {
+        return self.check_expr_mode(e, expect, ReadMode::Move);
+    }
+
+    /// A value expression passed to a callee: owners are borrowed, not moved.
+    pub fn check_expr_borrow(&mut self, e: Id::<ast::Expr>, expect: Option::<Ty>): Expr {
+        return self.check_expr_mode(e, expect, ReadMode::Borrow);
+    }
+
+    /// Check `e` and coerce it to `ty`.
+    pub fn check_expr_coerce(&mut self, e: Id::<ast::Expr>, ty: Ty): Expr {
+        let x = self.check_expr(e, Some(ty));
+        let span = self.ast_span(e);
+        return self.coerce(x, ty, span);
+    }
+
+    pub fn check_expr_mode(&mut self, e: Id::<ast::Expr>, expect: Option::<Ty>, mode: ReadMode): Expr {
+        if let Some(place) = self.check_place(e) {
+            if let ExprKind::Static(_) = place.kind {
+                let span = self.ast_span(e);
+                self.static_access(place, span);
+            }
+            return self.read(place, mode);
+        }
+        return self.check_value(e, expect, mode);
+    }
+
+    /// A place if `e` denotes one, otherwise its value materialized in a temporary.
+    pub fn check_place_or_temp(&mut self, e: Id::<ast::Expr>): Expr {
+        return match self.check_place(e) {
+            Some(p) => p,
+            None => {
+                let v = self.check_value(e, None, ReadMode::Move);
+                self.expr_as_place(v)
+            }
+        };
+    }
+
+    fn static_access(&mut self, place: Expr, span: Span) {
+        if let ExprKind::Static(d) = place.kind {
+            if let DefData::Static(s) = self.p.def(d).data {
+                if s.mutable {
+                    self.require_unsafe(span, "accessing a `static mut`");
+                }
+            }
+        }
+    }
+
+    // ===================================================================== places
+
+    pub fn check_place(&mut self, e: Id::<ast::Expr>): Option::<Expr> {
+        let ex = self.p.ast.exprs.get(e);
+        let span = ex.span;
+        return match ex.kind {
+            ast::ExprKind::Paren(x) => self.check_place(x),
+            ast::ExprKind::Path(p) => {
+                if self.p.ast.is_single(p) {
+                    let id = self.segment(p, 0).ident;
+                    let ctx = self.ident_ctx(id);
+                    if let Some(l) = self.lookup_local(id.name, ctx) {
+                        self.record_local(id.span, l);
+                        let ty = self.fcx.locals[l.index()].ty;
+                        return Some(self.mk(ExprKind::Local(l), ty, span));
+                    }
+                }
+                self.static_place(p, span)
+            }
+            ast::ExprKind::Field(base, field) => {
+                let b = self.check_place_or_temp(base);
+                Some(self.field_place(b, field))
+            }
+            ast::ExprKind::TupleField(base, idx, sp) => {
+                let b = self.check_place_or_temp(base);
+                let bt0 = self.shallow(b.ty);
+                let bt = self.p.types.strip_grow(bt0);
+                match self.p.types.kind(bt) {
+                    TyKind::Tuple(ts) => {
+                        if (idx as usize) < ts.len() {
+                            let t = self.p.types.at(ts, idx as usize);
+                            let bn = self.node(b);
+                            Some(self.mk(ExprKind::Field { base: bn, variant: 0, field: idx }, t, span))
+                        } else {
+                            let mut m = String::new();
+                            m.write("tuple has no field `{idx}`");
+                            self.error_at(codes::ty::NO_FIELD(), sp, m.as_str());
+                            self.emit();
+                            Some(self.error_expr(span))
+                        }
+                    }
+                    TyKind::Adt(d, args) if !self.p.is_enum(d) => {
+                        let n = self.p.struct_fields(d).len();
+                        let mut want = String::new();
+                        want.write("{idx}");
+                        let mut found: Option::<Ty> = None;
+                        if (idx as usize) < n {
+                            let f = self.p.struct_fields(d)[idx as usize];
+                            if self.p.text(f.name) == want.as_str() {
+                                found = Some(f.ty);
+                            }
+                        }
+                        match found {
+                            Some(fty) => {
+                                let t = self.p.types.subst(fty, args);
+                                let bn = self.node(b);
+                                Some(self.mk(ExprKind::Field { base: bn, variant: 0, field: idx }, t, span))
+                            }
+                            None => {
+                                let ts = self.ty_str(bt);
+                                let mut m = String::new();
+                                m.write("no field `{idx}` on type `{ts}`");
+                                self.error_at(codes::ty::NO_FIELD(), sp, m.as_str());
+                                self.emit();
+                                Some(self.error_expr(span))
+                            }
+                        }
+                    }
+                    TyKind::Error => Some(self.error_expr(span)),
+                    _ => {
+                        if self.is_unbound_var(bt) {
+                            let bs = self.ast_span(base);
+                            self.annotations_needed(bs);
+                        } else {
+                            let ts = self.ty_str(bt);
+                            let mut m = String::new();
+                            m.write("type `{ts}` has no tuple fields");
+                            self.error_at(codes::ty::NO_FIELD(), sp, m.as_str());
+                            self.emit();
+                        }
+                        Some(self.error_expr(span))
+                    }
+                }
+            }
+            ast::ExprKind::Index(base, idx) => {
+                if let ast::ExprKind::Range { .. } = self.p.ast.exprs.get(idx).kind {
+                    return None;
+                }
+                let b = self.check_place_or_temp(base);
+                let bt0 = self.shallow(b.ty);
+                let bt = self.p.types.strip_grow(bt0);
+                let elem = match self.p.types.kind(bt) {
+                    TyKind::Array(el, _) => el,
+                    TyKind::Error => self.p.types.error(),
+                    TyKind::Str | TyKind::String => {
+                        self.error_at(codes::ty::NOT_INDEXABLE(), span, "strings cannot be indexed by position");
+                        self.with_help("use `.as_bytes()[i]` for a byte, or slice with a range: `s[a..b]`");
+                        self.emit();
+                        self.p.types.error()
+                    }
+                    _ => {
+                        if self.is_unbound_var(bt) {
+                            let bs = self.ast_span(base);
+                            self.annotations_needed(bs);
+                        } else {
+                            let ts = self.ty_str(bt);
+                            let mut m = String::new();
+                            m.write("cannot index into a value of type `{ts}`");
+                            self.error_at(codes::ty::NOT_INDEXABLE(), span, m.as_str());
+                            self.emit();
+                        }
+                        self.p.types.error()
+                    }
+                };
+                let usize = self.p.types.usize();
+                let i = self.check_expr(idx, Some(usize));
+                let is = self.ast_span(idx);
+                let i = self.coerce(i, usize, is);
+                let bn = self.node(b);
+                let inode = self.node(i);
+                Some(self.mk(ExprKind::Index { base: bn, index: inode }, elem, span))
+            }
+            ast::ExprKind::Unary(UnOp::Deref, inner) => {
+                let p = self.check_expr(inner, None);
+                let pt = self.shallow(p.ty);
+                match self.p.types.kind(pt) {
+                    TyKind::Ptr(t, _) => {
+                        self.require_unsafe(span, "dereferencing a raw pointer");
+                        let pn = self.node(p);
+                        Some(self.mk(ExprKind::Deref(pn), t, span))
+                    }
+                    TyKind::Error => Some(self.error_expr(span)),
+                    _ => {
+                        let ts = self.ty_str(pt);
+                        let mut m = String::new();
+                        m.write("type `{ts}` cannot be dereferenced");
+                        self.error_at(codes::ty::BAD_OPERAND(), span, m.as_str());
+                        self.with_note("only raw pointers (`*T`, `*mut T`) can be dereferenced");
+                        self.emit();
+                        Some(self.error_expr(span))
+                    }
+                }
+            }
+            _ => None,
+        };
+    }
+
+    /// Segment `i` of a path.
+    pub fn segment(&self, p: ast::Path, i: usize): ast::PathSegment {
+        return self.p.ast.segments.list(p.segments)[i];
+    }
+
+
+    /// The path's names joined by `::` (`Path::to_string_lossy` in Rust).
+    pub fn path_str(&self, p: ast::Path): String {
+        let mut out = String::new();
+        let segs = self.p.ast.segments.list(p.segments);
+        for i in 0..segs.len() {
+            if i > 0 {
+                out.push_str("::");
+            }
+            out.push_str(self.p.text(segs[i].ident.name));
+        }
+        return out;
+    }
+
+    fn static_place(&mut self, p: ast::Path, span: Span): Option::<Expr> {
+        let idents = self.idents_of(p);
+        let module = self.module();
+        // Silent lookup: only statics become places.
+        let def = if idents.len() == 1 {
+            match self.lookup_ident(module, idents[0], Ns::Value) {
+                Some(ModRes::Def(d)) => d,
+                _ => return None,
+            }
+        } else {
+            let saved = self.p.diags.len();
+            let r = self.resolve_prefix_pair(module, idents[..], Ns::Value);
+            if self.p.diags.len() != saved {
+                // Not a static; the caller resolves the path again as a
+                // value and reports the problem once.
+                self.p.diags.truncate(saved);
+                return None;
+            }
+            match r {
+                Some((ModRes::Def(d), n)) => {
+                    if n != idents.len() {
+                        return None;
+                    }
+                    d
+                }
+                _ => return None,
+            }
+        };
+        return match self.p.def(def).data {
+            DefData::Static(s) => Some(self.mk(ExprKind::Static(def), s.ty, span)),
+            _ => None,
+        };
+    }
+
+    pub fn field_place(&mut self, b: Expr, field: Ident): Expr {
+        let span = b.span.to(field.span);
+        let bt0 = self.shallow(b.ty);
+        let bt = self.p.types.strip_grow(bt0);
+        return match self.p.types.kind(bt) {
+            TyKind::Adt(d, args) if !self.p.is_enum(d) => {
+                let n = self.p.struct_fields(d).len();
+                for i in 0..n {
+                    let f = self.p.struct_fields(d)[i];
+                    if f.name != field.name {
+                        continue;
+                    }
+                    let owner_mod = self.p.def(d).module;
+                    let here = self.module();
+                    if !f.is_pub && !self.is_ancestor_or_self(owner_mod, here) {
+                        let mut m = String::new();
+                        m.write("field `{self.p.text(field.name)}` of `{self.p.name(d)}` is private");
+                        self.error_at(codes::name::PRIVATE(), field.span, m.as_str());
+                        self.with_secondary(f.span, "declared here");
+                        self.emit();
+                    }
+                    let t = self.p.types.subst(f.ty, args);
+                    self.p.refs.push(crater::program::Ref { span: field.span, target: crater::program::RefTarget::Field { adt: d, variant: 0, field: i as u32 } });
+                    let bn = self.node(b);
+                    return self.mk(ExprKind::Field { base: bn, variant: 0, field: i as u32 }, t, span);
+                }
+                let mut names = String::new();
+                for i in 0..n {
+                    if i > 0 {
+                        names.push_str(", ");
+                    }
+                    names.push_str(self.p.text(self.p.struct_fields(d)[i].name));
+                }
+                let ts = self.ty_str(bt);
+                let mut m = String::new();
+                m.write("no field `{self.p.text(field.name)}` on type `{ts}`");
+                self.error_at(codes::ty::NO_FIELD(), field.span, m.as_str());
+                if n > 0 {
+                    let mut note = String::new();
+                    note.write("available fields: {names}");
+                    self.with_note(note.as_str());
+                }
+                self.emit();
+                self.error_expr(span)
+            }
+            TyKind::Error => self.error_expr(span),
+            k => {
+                if self.is_unbound_var(bt) {
+                    self.annotations_needed(b.span);
+                } else {
+                    let ts = self.ty_str(bt);
+                    let fname = self.p.text(field.name).to_string();
+                    let mut m = String::new();
+                    m.write("no field `{fname}` on type `{ts}`");
+                    self.error_at(codes::ty::NO_FIELD(), field.span, m.as_str());
+                    let seq = match k {
+                        TyKind::Array(..) | TyKind::Str | TyKind::String => true,
+                        _ => false,
+                    };
+                    if seq && fname.as_str() == "len" {
+                        self.with_help("call it as a method: `.len()`");
+                    }
+                    self.emit();
+                }
+                self.error_expr(span)
+            }
+        };
+    }
+
+    // ===================================================================== values
+
+    fn check_value(&mut self, e: Id::<ast::Expr>, expect: Option::<Ty>, mode: ReadMode): Expr {
+        let ex = self.p.ast.exprs.get(e);
+        let span = ex.span;
+        return match ex.kind {
+            ast::ExprKind::Error => self.error_expr(span),
+            ast::ExprKind::Lit(l) => self.check_lit(l, expect, span),
+            ast::ExprKind::Paren(x) => self.check_expr_mode(x, expect, mode),
+            ast::ExprKind::Path(p) => self.check_path_value(p, expect, span),
+            ast::ExprKind::Unary(op, x) => self.check_unary(op, x, expect, span),
+            ast::ExprKind::MacCall(m) => {
+                let module = self.module();
+                match self.expand_expr(module, m) {
+                    Some(x) => self.check_expr_mode(x, expect, mode),
+                    None => self.error_expr(span),
+                }
+            }
+            // Call arguments are handled by `check_args`; anywhere else a
+            // borrow has nothing to lend to.
+            ast::ExprKind::Borrow { expr, .. } => {
+                self.error_at(codes::borrow::NOT_AN_ARGUMENT(), span, "`&` and `&mut` lend a call argument; they make no value on their own");
+                self.with_note("Lunar has no references: borrowing is a parameter mode, written at the call");
+                self.with_help("remove the `&`, or pass this directly to a function that takes `&T` or `&mut T`");
+                self.emit();
+                self.check_expr_mode(expr, expect, mode)
+            }
+            ast::ExprKind::Binary(op, a, b) => self.check_binary(op, a, b, expect, span),
+            ast::ExprKind::Assign(lhs, rhs) => self.check_assign(lhs, rhs, span),
+            ast::ExprKind::AssignOp(op, lhs, rhs) => self.check_assign_op(op, lhs, rhs, span),
+            ast::ExprKind::Call(f, args) => self.check_call(f, args, expect, span),
+            ast::ExprKind::Closure(c) => self.check_closure(c, expect, span),
+            ast::ExprKind::MethodCall { recv, name, generics, args } => self.check_method_call(recv, name, generics, args, expect, span),
+            ast::ExprKind::Index(base, idx) => match self.p.ast.exprs.get(idx).kind {
+                ast::ExprKind::Range { start, end, inclusive } => self.check_slice(base, start, end, inclusive, expect, span),
+                _ => panic("non-range index handled as place"),
+            },
+            ast::ExprKind::Range { start, end, inclusive } => self.check_range_value(start, end, inclusive, expect, span),
+            ast::ExprKind::Array(elems) => self.check_array(elems, expect, span),
+            ast::ExprKind::ArrayRepeat(v, n) => self.check_array_repeat(v, n, expect, span),
+            ast::ExprKind::Tuple(es) => {
+                let mut exp: Option::<TyList> = None;
+                if let Some(t) = expect {
+                    let s = self.shallow(t);
+                    if let TyKind::Tuple(ts) = self.p.types.kind(s) {
+                        if ts.len() == es.len() {
+                            exp = Some(ts);
+                        }
+                    }
+                }
+                let mut out: [Expr; ..+] = [];
+                let mut tys: [Ty; ..+] = [];
+                for i in 0..es.len() {
+                    let x = self.p.ast.expr_ids.list(es)[i];
+                    let et = match exp {
+                        Some(l) => Some(self.p.types.at(l, i)),
+                        None => None,
+                    };
+                    let v = self.check_expr(x, et);
+                    let v = match et {
+                        Some(t) => {
+                            let xs = self.ast_span(x);
+                            self.coerce(v, t, xs)
+                        }
+                        None => v,
+                    };
+                    tys.push(v.ty);
+                    out.push(v);
+                }
+                let l = self.node_list(out[..]);
+                let ty = self.p.types.tuple(tys[..]);
+                self.mk(ExprKind::Tuple(l), ty, span)
+            }
+            ast::ExprKind::StructLit { path, fields } => self.check_struct_lit(path, fields, expect, span),
+            ast::ExprKind::Block(b) => self.check_block_expr(b, expect, false),
+            ast::ExprKind::Unsafe(b) => {
+                self.fcx.unsafe_depth += 1;
+                let r = self.check_block_expr(b, expect, false);
+                self.fcx.unsafe_depth -= 1;
+                r
+            }
+            ast::ExprKind::If { cond, then, else_ } => self.check_if(cond, then, else_, expect, span),
+            ast::ExprKind::IfLet { pat, scrut, then, else_ } => self.check_if_let(pat, scrut, then, else_, expect, span),
+            ast::ExprKind::Match { scrut, arms } => self.check_match(scrut, arms, expect, span),
+            ast::ExprKind::While { cond, body } => {
+                let b = self.p.types.bool();
+                let c = self.check_expr_coerce(cond, b);
+                let id = self.new_loop(false);
+                let u = self.p.types.unit();
+                let blk = self.check_block(body, Some(u));
+                self.fcx.loops.pop();
+                let cn = self.node(c);
+                self.mk(ExprKind::While { cond: cn, body: blk, id }, u, span)
+            }
+            ast::ExprKind::WhileLet { pat, scrut, body } => self.check_while_let(pat, scrut, body, span),
+            ast::ExprKind::Loop(body) => {
+                let id = self.new_loop(true);
+                let u = self.p.types.unit();
+                let b = self.check_block(body, Some(u));
+                let ctx = self.fcx.loops.pop().unwrap();
+                let ty = if ctx.saw_break {
+                    match ctx.break_ty {
+                        Some(t) => t,
+                        None => self.p.types.unit(),
+                    }
+                } else {
+                    self.p.types.never()
+                };
+                self.mk(ExprKind::Loop { body: b, id }, ty, span)
+            }
+            ast::ExprKind::For { pat, iter, body } => self.check_for(pat, iter, body, span),
+            ast::ExprKind::Break(v) => {
+                if self.fcx.loops.len() <= self.fcx.loop_base {
+                    self.error_at(codes::ty::BREAK_OUTSIDE_LOOP(), span, "`break` outside of a loop");
+                    self.emit();
+                    let never = self.p.types.never();
+                    return self.mk(ExprKind::Error, never, span);
+                }
+                let idx = self.fcx.loops.len() - 1;
+                let id = self.fcx.loops[idx].id;
+                self.fcx.loops[idx].saw_break = true;
+                let value = match v {
+                    Some(v) => {
+                        let vs = self.ast_span(v);
+                        if !self.fcx.loops[idx].is_loop {
+                            self.error_at(codes::ty::BREAK_OUTSIDE_LOOP(), vs, "`break` with a value is only allowed inside `loop`");
+                            self.emit();
+                        }
+                        let bt = self.fcx.loops[idx].break_ty;
+                        let x = self.check_expr(v, bt);
+                        let x = match bt {
+                            Some(t) => self.coerce(x, t, vs),
+                            None => {
+                                self.fcx.loops[idx].break_ty = Some(x.ty);
+                                x
+                            }
+                        };
+                        Some(self.node(x))
+                    }
+                    None => {
+                        if self.fcx.loops[idx].is_loop {
+                            let u = self.p.types.unit();
+                            match self.fcx.loops[idx].break_ty {
+                                Some(t) => {
+                                    if !self.unify(t, u) {
+                                        self.mismatch(t, u, span);
+                                    }
+                                }
+                                None => self.fcx.loops[idx].break_ty = Some(u),
+                            }
+                        }
+                        None
+                    }
+                };
+                let never = self.p.types.never();
+                self.mk(ExprKind::Break { id, value }, never, span)
+            }
+            ast::ExprKind::Continue => {
+                if self.fcx.loops.len() <= self.fcx.loop_base {
+                    self.error_at(codes::ty::BREAK_OUTSIDE_LOOP(), span, "`continue` outside of a loop");
+                    self.emit();
+                    let never = self.p.types.never();
+                    return self.mk(ExprKind::Error, never, span);
+                }
+                let id = self.fcx.loops[self.fcx.loops.len() - 1].id;
+                let never = self.p.types.never();
+                self.mk(ExprKind::Continue { id }, never, span)
+            }
+            ast::ExprKind::Return(v) => {
+                let ret = self.fcx.ret_ty;
+                let value = match v {
+                    Some(v) => {
+                        let x = self.check_expr_coerce(v, ret);
+                        Some(self.node(x))
+                    }
+                    None => {
+                        let u = self.p.types.unit();
+                        if !self.unify(ret, u) {
+                            let r = self.ty_str(ret);
+                            let mut m = String::new();
+                            m.write("`return` without a value in a function returning `{r}`");
+                            self.error_at(codes::ty::MISMATCH(), span, m.as_str());
+                            self.emit();
+                        }
+                        None
+                    }
+                };
+                let never = self.p.types.never();
+                self.mk(ExprKind::Return(value), never, span)
+            }
+            ast::ExprKind::Cast(x, t) => self.check_cast(x, t, span),
+            ast::ExprKind::Try(x) => self.check_try(x, span),
+            ast::ExprKind::Field(..) | ast::ExprKind::TupleField(..) => panic("handled as places"),
+        };
+    }
+
+    // ===================================================================== literals
+
+    pub fn check_lit(&mut self, l: ast::Lit, expect: Option::<Ty>, span: Span): Expr {
+        let exp = match expect {
+            Some(t) => Some(self.shallow(t)),
+            None => None,
+        };
+        return match l {
+            ast::Lit::Int { value, high, suffix } => {
+                let ty = match suffix {
+                    Some(s) => match prim_type(&mut self.p.types, self.p.text(s)) {
+                        Some(t) => t,
+                        None => self.p.types.error(),
+                    },
+                    None => match exp {
+                        Some(t) => match self.p.types.kind(t) {
+                            TyKind::Int(_) => t,
+                            TyKind::Float(f) => {
+                                // `let x: f64 = 1;` is accepted as `1.0`.
+                                let ft = self.p.types.mk(TyKind::Float(f));
+                                return self.mk(ExprKind::Lit(ConstVal::Float(int_as_f64(high, value))), ft, span);
+                            }
+                            _ => {
+                                if self.is_int_var(t) {
+                                    t
+                                } else {
+                                    self.int_var(span)
+                                }
+                            }
+                        },
+                        None => self.int_var(span),
+                    },
+                };
+                if let TyKind::Float(_) = self.p.types.kind(ty) {
+                    return self.mk(ExprKind::Lit(ConstVal::Float(int_as_f64(high, value))), ty, span);
+                }
+                if high >= 9223372036854775808 {
+                    // Too large for every integer type; checked here because
+                    // the range checks work on 128-bit values.
+                    self.error_at(codes::ty::LITERAL_RANGE(), span, "integer literal is too large");
+                    self.with_note("the largest integer type, `u64`, holds values up to 18446744073709551615");
+                    self.emit();
+                    return self.error_expr(span);
+                }
+                self.fcx.lit_checks.push(LitCheck { ty, neg: false, mag: value, high, span });
+                self.mk(ExprKind::Lit(ConstVal::Int(ConstInt { neg: false, mag: value })), ty, span)
+            }
+            ast::Lit::Float { suffix } => {
+                let ty = match suffix {
+                    Some(s) => match prim_type(&mut self.p.types, self.p.text(s)) {
+                        Some(t) => t,
+                        None => self.p.types.error(),
+                    },
+                    None => match exp {
+                        Some(t) => match self.p.types.kind(t) {
+                            TyKind::Float(_) => t,
+                            _ => {
+                                if self.is_float_var(t) {
+                                    t
+                                } else {
+                                    self.float_var(span)
+                                }
+                            }
+                        },
+                        None => self.float_var(span),
+                    },
+                };
+                let value = float_lit_value(self.p.sources.snippet(span));
+                self.mk(ExprKind::Lit(ConstVal::Float(value)), ty, span)
+            }
+            ast::Lit::Bool(b) => {
+                let t = self.p.types.bool();
+                self.mk(ExprKind::Lit(ConstVal::Bool(b)), t, span)
+            }
+            ast::Lit::Char(c) => {
+                let t = self.p.types.mk(TyKind::Char);
+                self.mk(ExprKind::Lit(ConstVal::Char(c)), t, span)
+            }
+            ast::Lit::Str { value, fmt } => {
+                if let Some(t) = exp {
+                    if let TyKind::FmtArgs = self.p.types.kind(t) {
+                        return self.check_fmt(fmt, span);
+                    }
+                }
+                let t = self.p.types.str();
+                self.mk(ExprKind::Lit(ConstVal::Str(value)), t, span)
+            }
+        };
+    }
+
+    /// A string literal converted to `FmtArgs`.
+    fn check_fmt(&mut self, fmt: ast::FmtString, span: Span): Expr {
+        let fmt_ty = self.p.types.mk(TyKind::FmtArgs);
+        let pieces = match fmt {
+            ast::FmtString::Pieces(p) => p,
+            ast::FmtString::Invalid(msg, sp) => {
+                self.p.diags.error(codes::syntax::BAD_FORMAT(), sp, msg);
+                self.with_note("this string is a format string because it is passed to a `FmtArgs` parameter");
+                self.emit();
+                return self.mk(ExprKind::Error, fmt_ty, span);
+            }
+        };
+        let display = lang_trait_ref(&self.p, "display");
+        let debug = lang_trait_ref(&self.p, "debug");
+        let mut out: [FmtPiece; ..+] = [];
+        for i in 0..pieces.len() {
+            match self.p.ast.fmt_pieces.list(pieces)[i] {
+                ast::FmtPiece::Text(t) => out.push(FmtPiece::Text(t)),
+                ast::FmtPiece::Hole(e, spec) => {
+                    let v = self.check_expr_borrow(e, None);
+                    let v = self.auto_read_bang(v);
+                    let tr = match spec {
+                        ast::FmtSpec::Show => display,
+                        ast::FmtSpec::Debugged => debug,
+                    };
+                    if let Some(t) = tr {
+                        let es = self.ast_span(e);
+                        self.oblige(v.ty, t, es);
+                    }
+                    let vn = self.node(v);
+                    out.push(FmtPiece::Arg(vn, spec));
+                }
+            }
+        }
+        let l = self.p.thir.fmt_pieces.add_list(out[..]);
+        return self.mk(ExprKind::FmtArgs(l), fmt_ty, span);
+    }
+
+    fn auto_read_bang(&mut self, v: Expr): Expr {
+        return v;
+    }
+
+    // ===================================================================== operators
+
+    fn check_unary(&mut self, op: UnOp, x: Id::<ast::Expr>, expect: Option::<Ty>, span: Span): Expr {
+        return match op {
+            UnOp::Deref => panic("deref is a place"),
+            UnOp::Neg => {
+                // Fold `-literal` so `-128i8` range-checks correctly.
+                let xe = self.p.ast.exprs.get(x);
+                if let ast::ExprKind::Lit(l) = xe.kind {
+                    if let ast::Lit::Int { .. } = l {
+                        let checks_before = self.fcx.lit_checks.len();
+                        let mut lit = self.check_lit(l, expect, xe.span);
+                        lit.span = span;
+                        match lit.kind {
+                            ExprKind::Lit(ConstVal::Int(v)) => {
+                                lit.kind = ExprKind::Lit(ConstVal::Int(neg_int(v)));
+                                let lt = self.shallow(lit.ty);
+                                let unsigned = match self.p.types.kind(lt) {
+                                    TyKind::Int(it) => if it.signed() { None } else { Some(it) },
+                                    _ => None,
+                                };
+                                if self.fcx.lit_checks.len() > checks_before {
+                                    if unsigned.is_some() {
+                                        // Reported below; the range check would only repeat it.
+                                        self.fcx.lit_checks.pop();
+                                    } else {
+                                        let k = self.fcx.lit_checks.len() - 1;
+                                        let mut c = self.fcx.lit_checks[k];
+                                        c.neg = !c.neg && (c.mag != 0 || c.high != 0);
+                                        c.span = span;
+                                        self.fcx.lit_checks[k] = c;
+                                    }
+                                }
+                                if let Some(it) = unsigned {
+                                    let n = it.name();
+                                    let mut m = String::new();
+                                    m.write("cannot negate unsigned integer `{n}`");
+                                    self.error_at(codes::ty::BAD_OPERAND(), span, m.as_str());
+                                    let mut note = String::new();
+                                    note.write("`{n}` cannot hold negative values");
+                                    self.with_note(note.as_str());
+                                    self.emit();
+                                }
+                            }
+                            ExprKind::Lit(ConstVal::Float(f)) => lit.kind = ExprKind::Lit(ConstVal::Float(-f)),
+                            // Already reported, e.g. a literal too large for any type.
+                            _ => {}
+                        }
+                        return lit;
+                    }
+                }
+                let v = self.check_expr(x, expect);
+                let t = self.shallow(v.ty);
+                let ok_prim = match self.p.types.kind(t) {
+                    TyKind::Int(i) => i.signed(),
+                    TyKind::Float(_) => true,
+                    _ => false,
+                } || self.is_int_var(t) || self.is_float_var(t);
+                if ok_prim {
+                    let ty = v.ty;
+                    let vn = self.node(v);
+                    return self.mk(ExprKind::Unary(UnOp::Neg, vn), ty, span);
+                }
+                self.op_trait_call("neg", "neg", v, None, span)
+            }
+            UnOp::Not => {
+                let v = self.check_expr(x, expect);
+                let t = self.shallow(v.ty);
+                let prim = match self.p.types.kind(t) {
+                    TyKind::Bool | TyKind::Int(_) => true,
+                    _ => false,
+                };
+                if prim || self.is_int_var(t) {
+                    let ty = v.ty;
+                    let vn = self.node(v);
+                    return self.mk(ExprKind::Unary(UnOp::Not, vn), ty, span);
+                }
+                self.op_trait_call("not", "not", v, None, span)
+            }
+        };
+    }
+
+    fn is_prim_operand(&mut self, t: Ty): bool {
+        let t = self.shallow(t);
+        if self.p.types.is_primitive_scalar(t) || self.is_int_var(t) || self.is_float_var(t) {
+            return true;
+        }
+        return match self.p.types.kind(t) {
+            TyKind::Error | TyKind::Never => true,
+            _ => false,
+        };
+    }
+
+    fn check_binary(&mut self, op: BinOp, a: Id::<ast::Expr>, b: Id::<ast::Expr>, expect: Option::<Ty>, span: Span): Expr {
+        if op == BinOp::And || op == BinOp::Or {
+            let bt = self.p.types.bool();
+            let l = self.check_expr_coerce(a, bt);
+            let r = self.check_expr_coerce(b, bt);
+            let ln = self.node(l);
+            let rn = self.node(r);
+            return self.mk(ExprKind::Logical { and: op == BinOp::And, lhs: ln, rhs: rn }, bt, span);
+        }
+        let lhs_expect = if op.is_comparison() { None } else { expect };
+        let l = self.check_expr_borrow(a, lhs_expect);
+        let lt = self.shallow(l.ty);
+        let is_str = match self.p.types.kind(lt) {
+            TyKind::Str => true,
+            _ => false,
+        };
+        let bs = self.ast_span(b);
+        if self.is_prim_operand(lt) && !is_str {
+            let r = self.check_expr_borrow(b, Some(lt));
+            let r = self.coerce(r, lt, bs);
+            let t = self.shallow(lt);
+            let numeric = self.p.types.is_numeric(t) || self.is_int_var(t) || self.is_float_var(t);
+            let integral = self.p.types.is_integral(t) || self.is_int_var(t);
+            let is_bool = match self.p.types.kind(t) {
+                TyKind::Bool => true,
+                _ => false,
+            };
+            let err_or_never = match self.p.types.kind(t) {
+                TyKind::Error | TyKind::Never => true,
+                _ => false,
+            };
+            let valid = match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => numeric,
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => integral || is_bool,
+                BinOp::Shl | BinOp::Shr => integral,
+                BinOp::Eq | BinOp::Ne => true,
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => !is_bool,
+                _ => false,
+            } || err_or_never;
+            if !valid {
+                let ts = self.ty_str(t);
+                let mut m = String::new();
+                m.write("operator `{op.as_str()}` cannot be applied to `{ts}`");
+                self.error_at(codes::ty::BAD_OPERAND(), span, m.as_str());
+                self.emit();
+            }
+            let ty = if op.is_comparison() { self.p.types.bool() } else { lt };
+            let ln = self.node(l);
+            let rn = self.node(r);
+            return self.mk(ExprKind::Binary(op, ln, rn), ty, span);
+        }
+        let (lang, method) = binop_trait(op);
+        if self.is_unbound_var(lt) {
+            let as_ = self.ast_span(a);
+            self.annotations_needed(as_);
+            return self.error_expr(span);
+        }
+        let r = self.check_expr_borrow(b, Some(lt));
+        let r = self.coerce_arg(r, lt, bs);
+        let call = self.op_trait_call(lang, method, l, Some(r), span);
+        if op == BinOp::Ne {
+            // `a != b` is `!(a == b)`.
+            let cn = self.node(call);
+            let bt = self.p.types.bool();
+            return self.mk(ExprKind::Unary(UnOp::Not, cn), bt, span);
+        }
+        return call;
+    }
+
+    /// Call an operator trait method on a non-primitive operand.
+    fn op_trait_call(&mut self, lang: str, method: str, lhs: Expr, rhs: Option::<Expr>, span: Span): Expr {
+        let tr = match lang_trait_ref(&self.p, lang) {
+            Some(t) => t,
+            None => {
+                let mut w = String::new();
+                w.write("the operator method `{method}`");
+                self.missing_lang_item(lang, w.as_str(), span);
+                return self.error_expr(span);
+            }
+        };
+        let self_ty = self.resolve(lhs.ty);
+        if self.p.types.is_error(self_ty) {
+            return self.error_expr(span);
+        }
+        if !self.p.types.has_infer(self_ty) && !self.p.implements(self_ty, tr, self.fcx.env[..]) {
+            let ts = self.p.ty_str(self_ty);
+            let tn = self.p.name(tr.trait_id).to_string();
+            let mut m = String::new();
+            m.write("cannot apply this operator to `{ts}`");
+            self.error_at(codes::ty::BAD_OPERAND(), span, m.as_str());
+            let mut n = String::new();
+            n.write("`{ts}` does not implement `{tn}`");
+            self.with_note(n.as_str());
+            let mut h = String::new();
+            if let TyKind::Param(..) = self.p.types.kind(self_ty) {
+                h.write("add `{tn}` to the parameter's bounds");
+            } else {
+                h.write("implement `{tn}` for `{ts}`");
+            }
+            self.with_help(h.as_str());
+            self.emit();
+            return self.error_expr(span);
+        }
+        self.oblige(self_ty, tr, span);
+        let ret = if lang == "eq" || lang == "ord" { self.p.types.bool() } else { self_ty };
+        let mut args: [Arg; ..+] = [];
+        let ln = self.node(lhs);
+        args.push(Arg::Value(ln));
+        if let Some(r) = rhs {
+            let rn = self.node(r);
+            args.push(Arg::Value(rn));
+        }
+        let m = self.p.sym(method);
+        let callee = Callee::Trait { trait_ref: tr, self_ty, method: m, method_args: List::empty() };
+        let al = self.p.thir.args.add_list(args[..]);
+        return self.mk(ExprKind::Call { callee, args: al }, ret, span);
+    }
+
+    fn check_assign(&mut self, lhs: Id::<ast::Expr>, rhs: Id::<ast::Expr>, span: Span): Expr {
+        let lspan = self.ast_span(lhs);
+        let place = match self.check_place(lhs) {
+            Some(p) => p,
+            None => {
+                self.check_expr(lhs, None);
+                self.error_at(codes::ty::NOT_A_PLACE(), lspan, "invalid left-hand side of assignment");
+                self.with_note("only variables, fields, indexes and `*ptr` can be assigned");
+                self.emit();
+                self.check_expr(rhs, None);
+                return self.unit_expr(span);
+            }
+        };
+        if let ExprKind::Static(_) = place.kind {
+            self.static_access(place, lspan);
+        }
+        if !self.is_mutable_place(place) && !self.p.types.is_error(place.ty) {
+            self.immutable_err(place, lspan, "assign to this place");
+        }
+        let pty = self.p.types.strip_grow(place.ty);
+        let v = self.check_expr(rhs, Some(pty));
+        let rs = self.ast_span(rhs);
+        let v = self.coerce(v, pty, rs);
+        let pn = self.node(place);
+        let vn = self.node(v);
+        let u = self.p.types.unit();
+        return self.mk(ExprKind::Assign { place: pn, value: vn }, u, span);
+    }
+
+    fn check_assign_op(&mut self, op: BinOp, lhs: Id::<ast::Expr>, rhs: Id::<ast::Expr>, span: Span): Expr {
+        let lspan = self.ast_span(lhs);
+        let place = match self.check_place(lhs) {
+            Some(p) => p,
+            None => {
+                self.error_at(codes::ty::NOT_A_PLACE(), lspan, "invalid left-hand side of compound assignment");
+                self.emit();
+                return self.unit_expr(span);
+            }
+        };
+        if let ExprKind::Static(_) = place.kind {
+            self.static_access(place, lspan);
+        }
+        if !self.is_mutable_place(place) && !self.p.types.is_error(place.ty) {
+            self.immutable_err(place, lspan, "assign to this place");
+        }
+        let pty = self.shallow(place.ty);
+        let rs = self.ast_span(rhs);
+        let u = self.p.types.unit();
+        if self.is_prim_operand(pty) {
+            let v = self.check_expr(rhs, Some(pty));
+            let v = self.coerce(v, pty, rs);
+            let pn = self.node(place);
+            let vn = self.node(v);
+            return self.mk(ExprKind::AssignOp { op, place: pn, value: vn }, u, span);
+        }
+        // `a op= b` on a non-primitive is `a = a.op(b)`.
+        let (lang, method) = binop_trait(op);
+        let cur = self.read(place, ReadMode::Borrow);
+        let r = self.check_expr_borrow(rhs, Some(pty));
+        let r = self.coerce_arg(r, pty, rs);
+        let v = self.op_trait_call(lang, method, cur, Some(r), span);
+        let pn = self.node(place);
+        let vn = self.node(v);
+        return self.mk(ExprKind::Assign { place: pn, value: vn }, u, span);
+    }
+
+    fn check_cast(&mut self, x: Id::<ast::Expr>, t: Id::<ast::Ty>, span: Span): Expr {
+        let target = self.lower_local_ty(t);
+        let v = self.check_expr(x, None);
+        let from = self.default_var(v.ty);
+        let to = self.shallow(target);
+        let kf = self.p.types.kind(from);
+        let kt = self.p.types.kind(to);
+        let pointer_int = |k: TyKind| match k {
+            TyKind::Int(IntTy::Usize) | TyKind::Int(IntTy::Isize) => true,
+            _ => false,
+        };
+        let is_ptr = |k: TyKind| match k {
+            TyKind::Ptr(..) => true,
+            _ => false,
+        };
+        let ok = match (kf, kt) {
+            (TyKind::Error, _) | (_, TyKind::Error) => true,
+            (TyKind::Bool, TyKind::Int(_)) => true,
+            (TyKind::Char, TyKind::Int(_)) => true,
+            (TyKind::Int(IntTy::U8), TyKind::Char) => true,
+            (TyKind::FnPtr(..), TyKind::Ptr(..)) => true,
+            _ => {
+                (self.p.types.is_numeric(from) && self.p.types.is_numeric(to))
+                    || (is_ptr(kf) && is_ptr(kt))
+                    || (is_ptr(kf) && pointer_int(kt))
+                    || (pointer_int(kf) && is_ptr(kt))
+                    || from == to
+            }
+        };
+        if !ok {
+            let f = self.ty_str(from);
+            let tt = self.ty_str(to);
+            let mut m = String::new();
+            m.write("cannot cast `{f}` as `{tt}`");
+            self.error_at(codes::ty::BAD_CAST(), span, m.as_str());
+            if let TyKind::Char = kt {
+                self.with_help("only `u8` can be cast to `char`; use `char::from_u32` for other integers");
+            }
+            self.emit();
+        }
+        let vn = self.node(v);
+        return self.mk(ExprKind::Cast(vn), to, span);
+    }
+
+    // ===================================================================== arrays & ranges
+
+    fn check_array(&mut self, elems: List::<Id::<ast::Expr>>, expect: Option::<Ty>, span: Span): Expr {
+        let exp = match expect {
+            Some(t) => Some(self.shallow(t)),
+            None => None,
+        };
+        let mut annotated = false;
+        let mut elem_ty = self.p.types.error();
+        let mut kind = ArrKind::Fixed(elems.len() as u64);
+        let mut have_exp = false;
+        if let Some(t) = exp {
+            if let TyKind::Array(e, k) = self.p.types.kind(t) {
+                // `[]` is also a valid (empty) slice.
+                if elems.len() == 0 && k.is_slice() {
+                    return self.mk(ExprKind::Array(List::empty()), t, span);
+                }
+                if !k.is_slice() {
+                    annotated = true;
+                    have_exp = true;
+                    elem_ty = e;
+                    kind = k;
+                }
+            }
+        }
+        if !have_exp {
+            elem_ty = self.new_var(span);
+        }
+        let mut out: [Expr; ..+] = [];
+        for i in 0..elems.len() {
+            let x = self.p.ast.expr_ids.list(elems)[i];
+            let v = self.check_expr(x, Some(elem_ty));
+            let xs = self.ast_span(x);
+            out.push(self.coerce(v, elem_ty, xs));
+        }
+        let n = elems.len() as u64;
+        let kind = match kind {
+            ArrKind::Fixed(want) => {
+                if want != n {
+                    let mut m = String::new();
+                    m.write("expected an array of {want} elements, found {n}");
+                    self.error_at(codes::ty::ARRAY_LEN(), span, m.as_str());
+                    self.emit();
+                }
+                ArrKind::Fixed(want)
+            }
+            ArrKind::FixedVar(v) => {
+                let fixed = ArrKind::Fixed(n);
+                let err = self.p.types.error();
+                let a = self.p.types.array(err, ArrKind::FixedVar(v));
+                let b = self.p.types.array(err, fixed);
+                if !self.unify(a, b) {
+                    self.error_at(codes::ty::ARRAY_LEN(), span, "array length does not match the annotation");
+                    self.emit();
+                }
+                fixed
+            }
+            k => k,
+        };
+        if !annotated {
+            self.fcx.dull_checks.push((elem_ty, span));
+        }
+        let l = self.node_list(out[..]);
+        let ty = self.p.types.array(elem_ty, kind);
+        return self.mk(ExprKind::Array(l), ty, span);
+    }
+
+    fn check_array_repeat(&mut self, v: Id::<ast::Expr>, n: Id::<ast::Expr>, expect: Option::<Ty>, span: Span): Expr {
+        let mut kind: Option::<ArrKind> = None;
+        let mut elem_ty = self.p.types.error();
+        if let Some(t) = expect {
+            let s = self.shallow(t);
+            if let TyKind::Array(e, k) = self.p.types.kind(s) {
+                if !k.is_slice() {
+                    elem_ty = e;
+                    kind = Some(k);
+                }
+            }
+        }
+        if kind.is_none() {
+            elem_ty = self.new_var(span);
+        }
+        let annotated = kind.is_some();
+        let value = self.check_expr(v, Some(elem_ty));
+        let vs = self.ast_span(v);
+        let value = self.coerce(value, elem_ty, vs);
+        let value = self.read_if_place(value);
+        let usize = self.p.types.usize();
+        let owner = match kind {
+            Some(k) => k.is_owner(),
+            None => false,
+        };
+        let kind = if owner {
+            kind.unwrap()
+        } else {
+            // Fixed arrays need a constant count.
+            let module = self.module();
+            let count: u64 = match self.eval_const(module, n, usize) {
+                Some(ConstVal::Int(c)) => if c.neg { 0 } else { c.mag },
+                _ => 0,
+            };
+            match kind {
+                Some(ArrKind::Fixed(want)) => {
+                    if want != count {
+                        let mut m = String::new();
+                        m.write("expected an array of {want} elements, found {count}");
+                        self.error_at(codes::ty::ARRAY_LEN(), span, m.as_str());
+                        self.emit();
+                    }
+                }
+                Some(ArrKind::FixedVar(var)) => {
+                    let err = self.p.types.error();
+                    let a = self.p.types.array(err, ArrKind::FixedVar(var));
+                    let b = self.p.types.array(err, ArrKind::Fixed(count));
+                    self.unify(a, b);
+                }
+                _ => {}
+            }
+            ArrKind::Fixed(count)
+        };
+        let count = self.check_expr_coerce(n, usize);
+        if !annotated {
+            self.fcx.dull_checks.push((elem_ty, span));
+        }
+        let vn = self.node(value);
+        let cn = self.node(count);
+        let ty = self.p.types.array(elem_ty, kind);
+        return self.mk(ExprKind::ArrayRepeat { value: vn, count: cn }, ty, span);
+    }
+
+    fn read_if_place(&mut self, e: Expr): Expr {
+        if is_place(e) {
+            return self.read(e, ReadMode::Copy);
+        }
+        return e;
+    }
+
+    /// `base[start..end]`
+    fn check_slice(&mut self, base: Id::<ast::Expr>, start: Option::<Id::<ast::Expr>>, end: Option::<Id::<ast::Expr>>, inclusive: bool, expect: Option::<Ty>, span: Span): Expr {
+        let b = self.check_place_or_temp(base);
+        let bt0 = self.shallow(b.ty);
+        let bt = self.p.types.strip_grow(bt0);
+        let want_mut = match expect {
+            Some(t) => {
+                let s = self.shallow(t);
+                match self.p.types.kind(s) {
+                    TyKind::Array(_, ArrKind::SliceMut) => true,
+                    _ => false,
+                }
+            }
+            None => false,
+        };
+        let bspan = self.ast_span(base);
+        let ty = match self.p.types.kind(bt) {
+            TyKind::Array(e, k) => {
+                if want_mut {
+                    let ok = match k {
+                        ArrKind::SliceMut => true,
+                        ArrKind::Slice => false,
+                        _ => self.is_mutable_place(b),
+                    };
+                    if !ok {
+                        self.immutable_err(b, bspan, "take a `[T; &mut]` slice of this array");
+                    }
+                    self.p.types.array(e, ArrKind::SliceMut)
+                } else {
+                    self.p.types.array(e, ArrKind::Slice)
+                }
+            }
+            TyKind::Str | TyKind::String => self.p.types.str(),
+            TyKind::Error => self.p.types.error(),
+            _ => {
+                if self.is_unbound_var(bt) {
+                    self.annotations_needed(bspan);
+                } else {
+                    let ts = self.ty_str(bt);
+                    let mut m = String::new();
+                    m.write("cannot slice a value of type `{ts}`");
+                    self.error_at(codes::ty::NOT_INDEXABLE(), span, m.as_str());
+                    self.emit();
+                }
+                self.p.types.error()
+            }
+        };
+        let usize = self.p.types.usize();
+        let s = match start {
+            Some(x) => {
+                let v = self.check_expr_coerce(x, usize);
+                Some(self.node(v))
+            }
+            None => None,
+        };
+        let e = match end {
+            Some(x) => {
+                let v = self.check_expr_coerce(x, usize);
+                Some(self.node(v))
+            }
+            None => None,
+        };
+        if inclusive && e.is_none() {
+            self.error_at(codes::ty::BAD_OPERAND(), span, "inclusive ranges need an end: `a..=b`");
+            self.emit();
+        }
+        let mutable = match self.p.types.kind(ty) {
+            TyKind::Array(_, ArrKind::SliceMut) => true,
+            _ => false,
+        };
+        let bn = self.node(b);
+        return self.mk(ExprKind::Slice { base: bn, start: s, end: e, inclusive, mutable }, ty, span);
+    }
+
+    /// A range used as a value: `core::ops::Range::<T> { start, end }`.
+    fn check_range_value(&mut self, start: Option::<Id::<ast::Expr>>, end: Option::<Id::<ast::Expr>>, inclusive: bool, expect: Option::<Ty>, span: Span): Expr {
+        let range = match self.p.lang_item("range") {
+            Some(r) => r,
+            None => {
+                self.missing_lang_item("range", "a range value", span);
+                return self.error_expr(span);
+            }
+        };
+        let (s, e) = match (start, end) {
+            (Some(s), Some(e)) => (s, e),
+            _ => {
+                self.error_at(codes::ty::BAD_OPERAND(), span, "open ranges are only allowed when slicing (`arr[a..]`)");
+                self.with_help("give both ends: `a..b`");
+                self.emit();
+                return self.error_expr(span);
+            }
+        };
+        if inclusive {
+            self.error_at(codes::ty::BAD_OPERAND(), span, "inclusive range values are not supported; use `a..b+1` or a `for` loop");
+            self.emit();
+        }
+        let mut elem: Option::<Ty> = None;
+        if let Some(t) = expect {
+            let st = self.shallow(t);
+            if let TyKind::Adt(d, args) = self.p.types.kind(st) {
+                if d == range {
+                    elem = Some(self.p.types.at(args, 0));
+                }
+            }
+        }
+        let elem = match elem {
+            Some(t) => t,
+            None => self.new_var(span),
+        };
+        let sv = self.check_expr(s, Some(elem));
+        let ss = self.ast_span(s);
+        let sv = self.coerce(sv, elem, ss);
+        let ev = self.check_expr(e, Some(elem));
+        let es = self.ast_span(e);
+        let ev = self.coerce(ev, elem, es);
+        let args = self.p.types.mk_list([elem][..]);
+        let ty = self.p.types.adt(range, args);
+        let sn = self.node(sv);
+        let en = self.node(ev);
+        let fields = self.p.thir.field_exprs.add_list([FieldExpr { field: 0, expr: sn }, FieldExpr { field: 1, expr: en }][..]);
+        return self.mk(ExprKind::Adt { def: range, args, variant: 0, fields }, ty, span);
+    }
+
+    // ===================================================================== blocks
+
+    /// Check a block and wrap it as an expression.
+    pub fn check_block_expr(&mut self, b: Id::<ast::Block>, expect: Option::<Ty>, fn_body: bool): Expr {
+        let (blk, ty) = self.check_block_typed(b, expect);
+        let span = self.p.ast.blocks.get(b).span;
+        return self.mk(ExprKind::Block(blk), ty, span);
+    }
+
+    /// Check a block whose value is discarded or unit.
+    pub fn check_block(&mut self, b: Id::<ast::Block>, expect: Option::<Ty>): Id::<Block> {
+        let (blk, ty) = self.check_block_typed(b, expect);
+        if let Some(t) = expect {
+            if self.p.types.is_unit(t) {
+                let s = self.shallow(ty);
+                let settled = match self.p.types.kind(s) {
+                    TyKind::Never | TyKind::Error => true,
+                    _ => false,
+                };
+                let u = self.p.types.unit();
+                if !settled && !self.unify(ty, u) {
+                    let ab = self.p.ast.blocks.get(b);
+                    let sp = match ab.tail {
+                        Some(t) => self.ast_span(t),
+                        None => ab.span,
+                    };
+                    self.mismatch(u, ty, sp);
+                }
+            }
+        }
+        return blk;
+    }
+
+    fn check_block_typed(&mut self, b: Id::<ast::Block>, expect: Option::<Ty>): (Id::<Block>, Ty) {
+        let module = self.block_scopes.get(b);
+        let ab = self.p.ast.blocks.get(b);
+        self.push_scope(module);
+        let r = self.check_stmts(ab.stmts, 0, ab.tail, expect, ab.span);
+        self.pop_scope();
+        return r;
+    }
+
+    /// Check statements (`stmts` from index `from` on) and a tail in the
+    /// current scope. A `let .. else` takes the statements after it into the
+    /// arm where its pattern matched, so the rest of the block becomes a
+    /// `match`, the block's tail.
+    fn check_stmts(&mut self, stmts: List::<ast::Stmt>, from: usize, b_tail: Option::<Id::<ast::Expr>>, expect: Option::<Ty>, span: Span): (Id::<Block>, Ty) {
+        let first_local = self.fcx.locals.len();
+        let mut out: [Stmt; ..+] = [];
+        let mut diverges = false;
+        let mut rest: Option::<Expr> = None;
+        for i in from..stmts.len() {
+            let s = self.p.ast.stmts.list(stmts)[i];
+            match s.kind {
+                ast::StmtKind::Item(_) => {}
+                ast::StmtKind::Let { pat, ty, init, else_ } => {
+                    if let Some(init) = init {
+                        if let Some(els) = else_ {
+                            rest = Some(self.check_let_else(pat, ty, init, els, stmts, i + 1, b_tail, expect, s.span, span));
+                            break;
+                        }
+                    }
+                    let st = self.check_let(pat, ty, init, s.span);
+                    if let Stmt::Let { init: Some(i), .. } = st {
+                        let it = self.p.thir.expr(i).ty;
+                        let s2 = self.shallow(it);
+                        if self.p.types.is_never(s2) {
+                            diverges = true;
+                        }
+                    }
+                    out.push(st);
+                }
+                ast::StmtKind::Expr(e) => {
+                    let v = self.check_expr(e, None);
+                    let s2 = self.shallow(v.ty);
+                    if self.p.types.is_never(s2) {
+                        diverges = true;
+                    }
+                    let vn = self.node(v);
+                    out.push(Stmt::Expr(vn));
+                }
+            }
+        }
+        let tail = match rest {
+            Some(m) => Some(m),
+            None => match b_tail {
+                Some(t) => Some(self.check_expr(t, expect)),
+                None => None,
+            },
+        };
+        let ty = match tail {
+            Some(t) => t.ty,
+            None => if diverges { self.p.types.never() } else { self.p.types.unit() },
+        };
+        let tail = match tail {
+            Some(t) => Some(self.node(t)),
+            None => None,
+        };
+        let depth = self.depth();
+        let mut locals: [LocalId; ..+] = [];
+        for i in first_local..self.fcx.locals.len() {
+            let l = self.fcx.locals[i];
+            if l.depth == depth && l.kind == LocalKind::Let {
+                locals.push(LocalId::new(i));
+            }
+        }
+        let sl = self.p.thir.stmts.add_list(out[..]);
+        let ll = self.p.thir.local_ids.add_list(locals[..]);
+        let b = self.p.thir.blocks.add(Block { stmts: sl, tail, locals: ll, span });
+        return (b, ty);
+    }
+
+    /// `let pat = init else { els }; rest..` as
+    /// `match init { pat => { rest.. }, _ => els }`. The `else` block cannot
+    /// see the pattern's bindings and must diverge.
+    fn check_let_else(
+        &mut self,
+        pat: Id::<ast::Pat>,
+        ty: Option::<Id::<ast::Ty>>,
+        init: Id::<ast::Expr>,
+        els: Id::<ast::Block>,
+        rest: List::<ast::Stmt>,
+        rest_from: usize,
+        tail: Option::<Id::<ast::Expr>>,
+        expect: Option::<Ty>,
+        let_span: Span,
+        block_span: Span,
+    ): Expr {
+        let s = match ty {
+            Some(t) => {
+                let declared = self.lower_local_ty(t);
+                let v = self.check_expr(init, Some(declared));
+                let is = self.ast_span(init);
+                let v = self.coerce(v, declared, is);
+                self.expr_as_place(v)
+            }
+            None => self.check_place_or_temp(init),
+        };
+        let st = s.ty;
+        let mut else_e = self.check_block_expr(els, None, false);
+        let pspan = self.p.ast.pats.get(pat).span;
+        let eb = self.p.ast.blocks.get(els);
+        let es = self.shallow(else_e.ty);
+        let settled = match self.p.types.kind(es) {
+            TyKind::Never | TyKind::Error => true,
+            _ => false,
+        };
+        if !settled {
+            let found = self.ty_str(else_e.ty);
+            let sp = match eb.tail {
+                Some(t) => self.ast_span(t),
+                None => eb.span,
+            };
+            self.error_at(codes::ty::LET_ELSE_FALLS_THROUGH(), sp, "the `else` block of a `let .. else` must not finish");
+            let mut l = String::new();
+            l.write("this block finishes with a value of type `{found}`");
+            self.with_label(l.as_str());
+            self.with_secondary(pspan, "the code after the `let` needs this pattern to match");
+            self.with_help("end the block with `return`, `break`, `continue` or a call that never returns");
+            self.emit();
+            // Reported: do not also report it as a mismatch with the rest.
+            else_e.ty = self.p.types.error();
+        }
+        self.push_scope(None);
+        let p = self.check_pat(pat, st, false);
+        if self.p.thir.is_irrefutable(p, &|d| self.p.is_enum(d)) && !self.in_expansion(pspan) {
+            self.warning_at(codes::lint::IRREFUTABLE_LET_ELSE(), pspan, "this pattern always matches, so the `else` block never runs");
+            self.with_help("remove the `else` block");
+            self.emit();
+        }
+        self.push_scope(None);
+        let (blk, rest_ty) = self.check_stmts(rest, rest_from, tail, expect, block_span);
+        self.pop_scope();
+        self.pop_scope();
+        let rest_e = self.mk(ExprKind::Block(blk), rest_ty, block_span);
+        let (rest_e, else_e, ty) = self.join_branches(rest_e, else_e, expect, eb.span);
+        let wild = self.pat_node(Pat { kind: PatKind::Wild, ty: st, span: pspan });
+        let rn = self.node(rest_e);
+        let en = self.node(else_e);
+        let arms = self.p.thir.arms.add_list([Arm { pat: p, guard: None, body: rn }, Arm { pat: wild, guard: None, body: en }][..]);
+        let sn = self.node(s);
+        return self.mk(ExprKind::Match { scrut: sn, arms }, ty, let_span);
+    }
+
+    fn check_let(&mut self, pat: Id::<ast::Pat>, ty: Option::<Id::<ast::Ty>>, init: Option::<Id::<ast::Expr>>, span: Span): Stmt {
+        let declared = match ty {
+            Some(t) => Some(self.lower_local_ty(t)),
+            None => None,
+        };
+        let init = match init {
+            Some(e) => {
+                let v = self.check_expr(e, declared);
+                Some(match declared {
+                    Some(t) => {
+                        let es = self.ast_span(e);
+                        self.coerce(v, t, es)
+                    }
+                    None => v,
+                })
+            }
+            None => {
+                self.error_at(codes::ty::ANNOTATIONS_NEEDED(), span, "`let` bindings must be initialized");
+                self.with_help("give it a value: `let x: T = ...;`");
+                self.emit();
+                None
+            }
+        };
+        let t = match declared {
+            Some(t) => t,
+            None => match init {
+                Some(i) => i.ty,
+                None => self.p.types.error(),
+            },
+        };
+        let p = self.check_pat(pat, t, true);
+        if !self.p.thir.is_irrefutable(p, &|d| self.p.is_enum(d)) {
+            let pspan = self.p.ast.pats.get(pat).span;
+            self.error_at(codes::ty::NON_EXHAUSTIVE(), pspan, "refutable pattern in `let`");
+            self.with_help("handle the other cases with `let .. else { .. }`, `if let` or `match`");
+            self.emit();
+        }
+        let init = match init {
+            Some(i) => Some(self.node(i)),
+            None => None,
+        };
+        return Stmt::Let { pat: p, init, span };
+    }
+
+    // ===================================================================== control flow
+
+    fn check_if(&mut self, cond: Id::<ast::Expr>, then: Id::<ast::Block>, else_: Option::<Id::<ast::Expr>>, expect: Option::<Ty>, span: Span): Expr {
+        let bt = self.p.types.bool();
+        let c = self.check_expr_coerce(cond, bt);
+        return match else_ {
+            None => {
+                let u = self.p.types.unit();
+                let t = self.check_block(then, Some(u));
+                let tspan = self.p.ast.blocks.get(then).span;
+                let te = self.mk(ExprKind::Block(t), u, tspan);
+                let cn = self.node(c);
+                let tn = self.node(te);
+                self.mk(ExprKind::If { cond: cn, then: tn, else_: None }, u, span)
+            }
+            Some(e) => {
+                let t = self.check_block_expr(then, expect, false);
+                let ee = match expect {
+                    Some(x) => Some(x),
+                    None => Some(t.ty),
+                };
+                let ev = self.check_expr(e, ee);
+                let es = self.ast_span(e);
+                let (t, ev, ty) = self.join_branches(t, ev, expect, es);
+                let cn = self.node(c);
+                let tn = self.node(t);
+                let en = self.node(ev);
+                self.mk(ExprKind::If { cond: cn, then: tn, else_: Some(en) }, ty, span)
+            }
+        };
+    }
+
+    /// Find the common type of two branches, coercing `!` branches.
+    pub fn join_branches(&mut self, a: Expr, b: Expr, expect: Option::<Ty>, b_span: Span): (Expr, Expr, Ty) {
+        let at = self.shallow(a.ty);
+        let bt = self.shallow(b.ty);
+        let a_never = self.p.types.is_never(at);
+        let b_never = self.p.types.is_never(bt);
+        if a_never && b_never {
+            return (a, b, self.p.types.never());
+        }
+        let target = if a_never {
+            bt
+        } else {
+            match expect {
+                Some(t) => t,
+                None => at,
+            }
+        };
+        let a = self.coerce(a, target, b_span);
+        let b = self.coerce(b, target, b_span);
+        return (a, b, target);
+    }
+
+    fn check_if_let(&mut self, pat: Id::<ast::Pat>, scrut: Id::<ast::Expr>, then: Id::<ast::Block>, else_: Option::<Id::<ast::Expr>>, expect: Option::<Ty>, span: Span): Expr {
+        let s = self.check_place_or_temp(scrut);
+        let st = s.ty;
+        self.push_scope(None);
+        let p = self.check_pat(pat, st, false);
+        let has_else = else_.is_some();
+        let u = self.p.types.unit();
+        let then_e = if has_else {
+            self.check_block_expr(then, expect, false)
+        } else {
+            let b = self.check_block(then, Some(u));
+            let tspan = self.p.ast.blocks.get(then).span;
+            self.mk(ExprKind::Block(b), u, tspan)
+        };
+        self.pop_scope();
+        let else_e = match else_ {
+            Some(e) => self.check_expr(e, Some(then_e.ty)),
+            None => self.unit_expr(span),
+        };
+        let (then_e, else_e, ty) = if has_else { self.join_branches(then_e, else_e, expect, span) } else { (then_e, else_e, u) };
+        let wild = self.pat_node(Pat { kind: PatKind::Wild, ty: st, span });
+        let tn = self.node(then_e);
+        let en = self.node(else_e);
+        let arms = self.p.thir.arms.add_list([Arm { pat: p, guard: None, body: tn }, Arm { pat: wild, guard: None, body: en }][..]);
+        let sn = self.node(s);
+        return self.mk(ExprKind::Match { scrut: sn, arms }, ty, span);
+    }
+
+    fn check_while_let(&mut self, pat: Id::<ast::Pat>, scrut: Id::<ast::Expr>, body: Id::<ast::Block>, span: Span): Expr {
+        let id = self.new_loop(false);
+        let s = self.check_place_or_temp(scrut);
+        let st = s.ty;
+        self.push_scope(None);
+        let p = self.check_pat(pat, st, false);
+        let u = self.p.types.unit();
+        let b = self.check_block(body, Some(u));
+        self.pop_scope();
+        self.fcx.loops.pop();
+        let bspan = self.p.ast.blocks.get(body).span;
+        let body_e = self.mk(ExprKind::Block(b), u, bspan);
+        let never = self.p.types.never();
+        let brk = self.mk(ExprKind::Break { id, value: None }, never, span);
+        let bn = self.node(brk);
+        let brk = self.mk(ExprKind::Coerce { kind: Coercion::NeverToAny, expr: bn }, u, span);
+        let wild = self.pat_node(Pat { kind: PatKind::Wild, ty: st, span });
+        let body_n = self.node(body_e);
+        let brk_n = self.node(brk);
+        let arms = self.p.thir.arms.add_list([Arm { pat: p, guard: None, body: body_n }, Arm { pat: wild, guard: None, body: brk_n }][..]);
+        let sn = self.node(s);
+        let m = self.mk(ExprKind::Match { scrut: sn, arms }, u, span);
+        let mn = self.node(m);
+        let stmts = self.p.thir.stmts.add_list([Stmt::Expr(mn)][..]);
+        let blk = self.p.thir.blocks.add(Block { stmts, tail: None, locals: List::empty(), span });
+        return self.mk(ExprKind::Loop { body: blk, id }, u, span);
+    }
+
+    fn check_match(&mut self, scrut: Id::<ast::Expr>, arms: List::<ast::Arm>, expect: Option::<Ty>, span: Span): Expr {
+        let s = self.check_place_or_temp(scrut);
+        let st = s.ty;
+        let mut pats: [Id::<Pat>; ..+] = [];
+        let mut guards: [Option::<Id::<Expr>>; ..+] = [];
+        let mut bodies: [Expr; ..+] = [];
+        let mut result_ty: Option::<Ty> = expect;
+        let mut all_never = true;
+        let bt = self.p.types.bool();
+        for i in 0..arms.len() {
+            let a = self.p.ast.arms.list(arms)[i];
+            self.push_scope(None);
+            let p = self.check_pat(a.pat, st, false);
+            let guard = match a.guard {
+                Some(g) => {
+                    let ge = self.check_expr_coerce(g, bt);
+                    Some(self.node(ge))
+                }
+                None => None,
+            };
+            let body = self.check_expr(a.body, result_ty);
+            self.pop_scope();
+            let bty = self.shallow(body.ty);
+            let body = if self.p.types.is_never(bty) {
+                body
+            } else {
+                all_never = false;
+                match result_ty {
+                    Some(t) => {
+                        let bs = self.ast_span(a.body);
+                        self.coerce(body, t, bs)
+                    }
+                    None => {
+                        result_ty = Some(body.ty);
+                        body
+                    }
+                }
+            };
+            pats.push(p);
+            guards.push(guard);
+            bodies.push(body);
+        }
+        let never = self.p.types.never();
+        let ty = if all_never && arms.len() > 0 {
+            never
+        } else {
+            match result_ty {
+                Some(t) => t,
+                None => never,
+            }
+        };
+        let ty = if arms.len() == 0 { never } else { ty };
+        // Coerce diverging arms to the result type.
+        let mut out: [Arm; ..+] = [];
+        for i in 0..bodies.len() {
+            let mut body = bodies[i];
+            let bty = self.shallow(body.ty);
+            if !self.p.types.is_never(ty) && self.p.types.is_never(bty) {
+                let sp = body.span;
+                body = self.coerce(body, ty, sp);
+            }
+            let bn = self.node(body);
+            out.push(Arm { pat: pats[i], guard: guards[i], body: bn });
+        }
+        let al = self.p.thir.arms.add_list(out[..]);
+        self.check_exhaustive(st, al, span);
+        let sn = self.node(s);
+        return self.mk(ExprKind::Match { scrut: sn, arms: al }, ty, span);
+    }
+
+    fn check_for(&mut self, pat: Id::<ast::Pat>, iter: Id::<ast::Expr>, body: Id::<ast::Block>, span: Span): Expr {
+        let ie = self.p.ast.exprs.get(iter);
+        let u = self.p.types.unit();
+        // Integer ranges.
+        if let ast::ExprKind::Range { start: Some(s), end: Some(e), inclusive } = ie.kind {
+            let sv = self.check_expr(s, None);
+            let st = sv.ty;
+            let ev = self.check_expr(e, Some(st));
+            let es = self.ast_span(e);
+            let ev = self.coerce(ev, st, es);
+            let t = self.shallow(st);
+            if !(self.p.types.is_integral(t) || self.is_int_var(t) || self.p.types.is_error(t)) {
+                // An unsuffixed float literal is still an inference variable
+                // here; settle it to its default so the message names a type.
+                if self.is_float_var(t) {
+                    let f = self.p.types.mk(TyKind::Float(FloatTy::F64));
+                    self.unify(t, f);
+                }
+                let ts = self.ty_str(t);
+                let mut m = String::new();
+                m.write("`for` ranges must be over integers, found `{ts}`");
+                self.error_at(codes::ty::NOT_ITERABLE(), ie.span, m.as_str());
+                self.emit();
+            }
+            let id = self.new_loop(false);
+            self.push_scope(None);
+            let depth = self.depth();
+            let pe = self.p.ast.pats.get(pat);
+            let var = match pe.kind {
+                ast::PatKind::Binding { is_mut, name } => {
+                    let l = self.new_local(name.name, st, is_mut, LocalKind::Let, name.span, depth);
+                    let ctx = self.ident_ctx(name);
+                    self.bind_name(name.name, ctx, l);
+                    l
+                }
+                ast::PatKind::Wild => {
+                    let n = self.p.sym("_");
+                    self.new_local(n, st, false, LocalKind::Let, pe.span, depth)
+                }
+                _ => {
+                    let n = self.p.sym("<i>");
+                    let l = self.new_local(n, st, false, LocalKind::Temp, pe.span, depth);
+                    self.check_pat(pat, st, true);
+                    l
+                }
+            };
+            let b = self.check_block(body, Some(u));
+            self.pop_scope();
+            self.fcx.loops.pop();
+            let sn = self.node(sv);
+            let en = self.node(ev);
+            return self.mk(ExprKind::ForRange { var, start: sn, end: en, inclusive, body: b, id }, u, span);
+        }
+        let it = self.check_place_or_temp(iter);
+        let itt0 = self.shallow(it.ty);
+        let itt = self.p.types.strip_grow(itt0);
+        return match self.p.types.kind(itt) {
+            TyKind::Array(elem, _) => {
+                let id = self.new_loop(false);
+                self.push_scope(None);
+                let depth = self.depth();
+                let n = self.p.sym("<idx>");
+                let usize = self.p.types.usize();
+                let index = self.new_local(n, usize, true, LocalKind::Temp, ie.span, depth);
+                let p = self.check_pat(pat, elem, true);
+                let b = self.check_block(body, Some(u));
+                self.pop_scope();
+                self.fcx.loops.pop();
+                let an = self.node(it);
+                self.mk(ExprKind::ForArray { pat: p, array: an, index, body: b, id }, u, span)
+            }
+            TyKind::Error => self.error_expr(span),
+            _ => self.check_for_iterator(pat, it, itt, body, ie.span, span),
+        };
+    }
+
+    /// `for x in it` over an `Iterator::<T>` value: `loop { match it.next() { Some(x) => body, _ => break } }`.
+    fn check_for_iterator(&mut self, pat: Id::<ast::Pat>, it: Expr, it_ty: Ty, body: Id::<ast::Block>, iter_span: Span, span: Span): Expr {
+        let iter_trait = self.p.lang_item("iterator");
+        let option = self.p.lang_item("option");
+        let (iter_trait, option) = match (iter_trait, option) {
+            (Some(i), Some(o)) => (i, o),
+            _ => {
+                let missing = if iter_trait.is_none() { "iterator" } else { "option" };
+                self.missing_lang_item(missing, "a `for` loop over an iterator", iter_span);
+                return self.error_expr(span);
+            }
+        };
+        // Find the item type from an impl or bound.
+        let item = match self.iterator_item(it_ty, iter_trait) {
+            Some(i) => i,
+            None => {
+                let t = self.ty_str(it_ty);
+                let mut m = String::new();
+                m.write("`{t}` is not iterable");
+                self.error_at(codes::ty::NOT_ITERABLE(), iter_span, m.as_str());
+                self.with_note("`for` loops work over integer ranges, arrays and slices, and types implementing `Iterator`");
+                let stringy = match self.p.types.kind(it_ty) {
+                    TyKind::Str | TyKind::String => true,
+                    _ => false,
+                };
+                self.with_help(if stringy { "iterate `s.chars()` or `s.bytes()`" } else { "implement `core::iter::Iterator` for it" });
+                self.emit();
+                return self.error_expr(span);
+            }
+        };
+        // Move the iterator into a mutable temporary.
+        let depth = self.depth();
+        let iter_name = self.p.sym("<iter>");
+        let tmp = self.new_local(iter_name, it_ty, true, LocalKind::Let, iter_span, depth + 1);
+        let id = self.new_loop(false);
+        self.push_scope(None);
+        let item_list = self.p.types.mk_list([item][..]);
+        let opt_ty = self.p.types.adt(option, item_list);
+        let some_idx = match self.p.variant_index(option, "Some") {
+            Some(i) => i as u32,
+            None => 1,
+        };
+        let bind = self.check_pat(pat, item, true);
+        let u = self.p.types.unit();
+        let b = self.check_block(body, Some(u));
+        self.pop_scope();
+        self.fcx.loops.pop();
+        let tr = TraitRef { trait_id: iter_trait, args: item_list };
+        let tmp_place = self.mk(ExprKind::Local(tmp), it_ty, iter_span);
+        let tp = self.node(tmp_place);
+        let next_sym = self.p.sym("next");
+        let args = self.p.thir.args.add_list([Arg::InOut(tp)][..]);
+        let next = self.mk(
+            ExprKind::Call { callee: Callee::Trait { trait_ref: tr, self_ty: it_ty, method: next_sym, method_args: List::empty() }, args },
+            opt_ty,
+            iter_span,
+        );
+        let next = self.expr_as_place(next);
+        let pspan = self.p.ast.pats.get(pat).span;
+        let fields = self.p.thir.field_pats.add_list([FieldPat { field: 0, pat: bind }][..]);
+        let some_pat = self.pat_node(Pat { kind: PatKind::Adt { def: option, variant: some_idx, fields }, ty: opt_ty, span: pspan });
+        let bspan = self.p.ast.blocks.get(body).span;
+        let body_e = self.mk(ExprKind::Block(b), u, bspan);
+        let never = self.p.types.never();
+        let brk = self.mk(ExprKind::Break { id, value: None }, never, span);
+        let bn = self.node(brk);
+        let brk = self.mk(ExprKind::Coerce { kind: Coercion::NeverToAny, expr: bn }, u, span);
+        let wild = self.pat_node(Pat { kind: PatKind::Wild, ty: opt_ty, span });
+        let body_n = self.node(body_e);
+        let brk_n = self.node(brk);
+        let arms = self.p.thir.arms.add_list([Arm { pat: some_pat, guard: None, body: body_n }, Arm { pat: wild, guard: None, body: brk_n }][..]);
+        let next_n = self.node(next);
+        let m = self.mk(ExprKind::Match { scrut: next_n, arms }, u, span);
+        let mn = self.node(m);
+        let loop_stmts = self.p.thir.stmts.add_list([Stmt::Expr(mn)][..]);
+        let loop_block = self.p.thir.blocks.add(Block { stmts: loop_stmts, tail: None, locals: List::empty(), span });
+        let lp = self.mk(ExprKind::Loop { body: loop_block, id }, u, span);
+        let init = self.read(it, ReadMode::Move);
+        let bind_tmp = self.pat_node(Pat { kind: PatKind::Binding { local: tmp, mode: ReadMode::Move, sub: None }, ty: it_ty, span: iter_span });
+        let init_n = self.node(init);
+        let lp_n = self.node(lp);
+        let outer_stmts = self.p.thir.stmts.add_list([Stmt::Let { pat: bind_tmp, init: Some(init_n), span: iter_span }, Stmt::Expr(lp_n)][..]);
+        let outer_locals = self.p.thir.local_ids.add_list([tmp][..]);
+        let outer = self.p.thir.blocks.add(Block { stmts: outer_stmts, tail: None, locals: outer_locals, span });
+        return self.mk(ExprKind::Block(outer), u, span);
+    }
+
+    fn iterator_item(&mut self, t: Ty, iter_trait: DefId): Option::<Ty> {
+        let t = self.resolve(t);
+        let preds = self.known_preds(t);
+        for p in preds[..] {
+            if p.ty == t && p.trait_ref.trait_id == iter_trait {
+                if p.trait_ref.args.len() == 0 {
+                    return None;
+                }
+                return Some(self.p.types.at(p.trait_ref.args, 0));
+            }
+        }
+        for k in 0..self.p.impls.len() {
+            let imp = self.p.impls[k];
+            let d = match self.p.def(imp).data {
+                DefData::Impl(d) => d,
+                _ => continue,
+            };
+            let tr = match d.trait_ref {
+                Some(tr) => tr,
+                None => continue,
+            };
+            if tr.trait_id != iter_trait {
+                continue;
+            }
+            let mut sub: [Option::<Ty>; -..+] = [];
+            for _ in 0..d.generics.count() {
+                sub.push(None);
+            }
+            if match_ty(&self.p.types, d.self_ty, t, &mut sub) {
+                let mut args: [Ty; ..+] = [];
+                for x in sub[..] {
+                    args.push(match x {
+                        Some(a) => a,
+                        None => self.p.types.error(),
+                    });
+                }
+                if tr.args.len() == 0 {
+                    return None;
+                }
+                let al = self.p.types.mk_list(args[..]);
+                let a0 = self.p.types.at(tr.args, 0);
+                return Some(self.p.types.subst(a0, al));
+            }
+        }
+        return None;
+    }
+
+    /// `expr?` on `Option` or `Result`.
+    fn check_try(&mut self, x: Id::<ast::Expr>, span: Span): Expr {
+        let v = self.check_place_or_temp(x);
+        let vt = self.shallow(v.ty);
+        let option = match self.p.lang_item("option") {
+            Some(o) => o,
+            None => {
+                self.missing_lang_item("option", "the `?` operator", span);
+                return self.error_expr(span);
+            }
+        };
+        let result = self.p.lang_item("result");
+        let rt = self.fcx.ret_ty;
+        let ret = self.shallow(rt);
+        let kv = self.p.types.kind(vt);
+        let kr = self.p.types.kind(ret);
+        if let TyKind::Adt(d, args) = kv {
+            if let TyKind::Adt(rd, rargs) = kr {
+                let is_result = match result {
+                    Some(r) => d == r,
+                    None => false,
+                };
+                if d == rd && (d == option || is_result) {
+                    return self.check_try_adt(v, vt, ret, d, args, rargs, d == option, span);
+                }
+            }
+        }
+        let either_error = match (kv, kr) {
+            (TyKind::Error, _) | (_, TyKind::Error) => true,
+            _ => false,
+        };
+        if either_error {
+            return self.error_expr(span);
+        }
+        let a = self.ty_str(vt);
+        let b = self.ty_str(ret);
+        let mut m = String::new();
+        m.write("`?` cannot be used on `{a}` in a function returning `{b}`");
+        self.error_at(codes::ty::MISMATCH(), span, m.as_str());
+        self.with_note("`?` works on `Option` in functions returning `Option`, and on `Result` in functions returning `Result` with the same error type");
+        self.emit();
+        return self.error_expr(span);
+    }
+
+    /// `v?` where `v: Option::<T>` or `Result::<T, E>` (`vt`, enum `d` with
+    /// `args`) in a function returning `ret` (`rargs`).
+    fn check_try_adt(&mut self, v: Expr, vt: Ty, ret: Ty, d: DefId, args: TyList, rargs: TyList, is_opt: bool, span: Span): Expr {
+        let ok_name = if is_opt { "Some" } else { "Ok" };
+        let ok_idx = match self.p.variant_index(d, ok_name) {
+            Some(i) => i as u32,
+            None => 0,
+        };
+        let depth = self.depth();
+        let val_ty = self.p.types.at(args, 0);
+        let ok_sym = self.p.sym("<ok>");
+        let val = self.new_local(ok_sym, val_ty, false, LocalKind::Let, span, depth + 1);
+        let val_bind = self.pat_node(Pat { kind: PatKind::Binding { local: val, mode: ReadMode::Move, sub: None }, ty: val_ty, span });
+        let ok_fields = self.p.thir.field_pats.add_list([FieldPat { field: 0, pat: val_bind }][..]);
+        let ok_pat = self.pat_node(Pat { kind: PatKind::Adt { def: d, variant: ok_idx, fields: ok_fields }, ty: vt, span });
+        let val_read = self.mk(ExprKind::Local(val), val_ty, span);
+        let val_read = self.read(val_read, ReadMode::Move);
+        // Failure arm: return None / Err(e).
+        let mut fail_pat = self.pat_node(Pat { kind: PatKind::Wild, ty: vt, span });
+        let fail_value = if is_opt {
+            let none_idx = match self.p.variant_index(d, "None") {
+                Some(i) => i as u32,
+                None => 0,
+            };
+            self.mk(ExprKind::Adt { def: d, args: rargs, variant: none_idx, fields: List::empty() }, ret, span)
+        } else {
+            let err_idx = match self.p.variant_index(d, "Err") {
+                Some(i) => i as u32,
+                None => 1,
+            };
+            let et = self.p.types.at(args, 1);
+            let ret_et = self.p.types.at(rargs, 1);
+            if !self.unify(et, ret_et) {
+                self.mismatch(ret_et, et, span);
+            }
+            let err_sym = self.p.sym("<err>");
+            let e_local = self.new_local(err_sym, et, false, LocalKind::Let, span, depth + 1);
+            let e_bind = self.pat_node(Pat { kind: PatKind::Binding { local: e_local, mode: ReadMode::Move, sub: None }, ty: et, span });
+            let e_fields = self.p.thir.field_pats.add_list([FieldPat { field: 0, pat: e_bind }][..]);
+            fail_pat = self.pat_node(Pat { kind: PatKind::Adt { def: d, variant: err_idx, fields: e_fields }, ty: vt, span });
+            let er = self.mk(ExprKind::Local(e_local), et, span);
+            let er = self.read(er, ReadMode::Move);
+            let ern = self.node(er);
+            let fields = self.p.thir.field_exprs.add_list([FieldExpr { field: 0, expr: ern }][..]);
+            self.mk(ExprKind::Adt { def: d, args: rargs, variant: err_idx, fields }, ret, span)
+        };
+        let fv = self.node(fail_value);
+        let never = self.p.types.never();
+        let r = self.mk(ExprKind::Return(Some(fv)), never, span);
+        let rn = self.node(r);
+        let r = self.mk(ExprKind::Coerce { kind: Coercion::NeverToAny, expr: rn }, val_ty, span);
+        let vr = self.node(val_read);
+        let rr = self.node(r);
+        let arms = self.p.thir.arms.add_list([Arm { pat: ok_pat, guard: None, body: vr }, Arm { pat: fail_pat, guard: None, body: rr }][..]);
+        let vn = self.node(v);
+        return self.mk(ExprKind::Match { scrut: vn, arms }, val_ty, span);
+    }
+}
+
+/// The trait (lang item) and method of a binary operator.
+pub fn binop_trait(op: BinOp): (str, str) {
+    return match op {
+        BinOp::Add => ("add", "add"),
+        BinOp::Sub => ("sub", "sub"),
+        BinOp::Mul => ("mul", "mul"),
+        BinOp::Div => ("div", "div"),
+        BinOp::Rem => ("rem", "rem"),
+        BinOp::BitAnd => ("bitand", "bitand"),
+        BinOp::BitOr => ("bitor", "bitor"),
+        BinOp::BitXor => ("bitxor", "bitxor"),
+        BinOp::Shl => ("shl", "shl"),
+        BinOp::Shr => ("shr", "shr"),
+        BinOp::Eq => ("eq", "eq"),
+        // `a != b` is `!(a == b)` (see `check_binary`).
+        BinOp::Ne => ("eq", "eq"),
+        BinOp::Lt => ("ord", "lt"),
+        BinOp::Le => ("ord", "le"),
+        BinOp::Gt => ("ord", "gt"),
+        BinOp::Ge => ("ord", "ge"),
+        BinOp::And | BinOp::Or => ("", ""),
+    };
+}
+
+/// `-v`.
+pub fn neg_int(v: ConstInt): ConstInt {
+    if v.mag == 0 {
+        return v;
+    }
+    return ConstInt { neg: !v.neg, mag: v.mag };
+}
+
+/// The integer literal `high * 2^64 + low` as a float.
+fn int_as_f64(high: u64, low: u64): f64 {
+    return (high as f64) * 18446744073709551616.0 + (low as f64);
+}
+
+/// The value of a float literal from its source text (`1.5`, `2e10`,
+/// `1_000.5f32`, or with a leading `-`); the suffix is ignored. Lunar keeps
+/// float literals as text (craters/README.md).
+pub fn float_lit_value(text: str): f64 {
+    let b = text.as_bytes();
+    let mut i: usize = 0;
+    while i < b.len() && (b[i] == b'-' || b[i] == b' ') {
+        i += 1;
+    }
+    // The significant digits (up to 19), and the power of ten to scale by.
+    let mut mant: u64 = 0;
+    let mut digits: u32 = 0;
+    let mut exp10: i64 = 0;
+    let mut seen_dot = false;
+    while i < b.len() {
+        let c = b[i];
+        if c >= b'0' && c <= b'9' {
+            if digits < 19 {
+                if mant != 0 || c != b'0' {
+                    digits += 1;
+                }
+                mant = mant * 10 + (c - b'0') as u64;
+                if seen_dot {
+                    exp10 -= 1;
+                }
+            } else if !seen_dot {
+                exp10 += 1;
+            }
+        } else if c == b'.' && !seen_dot {
+            seen_dot = true;
+        } else if c != b'_' {
+            break;
+        }
+        i += 1;
+    }
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        i += 1;
+        let mut neg = false;
+        if i < b.len() && (b[i] == b'-' || b[i] == b'+') {
+            neg = b[i] == b'-';
+            i += 1;
+        }
+        let mut e: i64 = 0;
+        while i < b.len() && ((b[i] >= b'0' && b[i] <= b'9') || b[i] == b'_') {
+            if b[i] != b'_' && e < 100000 {
+                e = e * 10 + (b[i] - b'0') as i64;
+            }
+            i += 1;
+        }
+        exp10 += if neg { -e } else { e };
+    }
+    let mut v = mant as f64;
+    if v == 0.0 {
+        return 0.0;
+    }
+    // Scale by an exact power of ten where possible (correctly rounded for
+    // up to 15 digits and exponents up to 22).
+    if exp10 >= 0 {
+        let mut k = exp10;
+        while k > 22 {
+            v = v * 10000000000000000000000.0;
+            k -= 22;
+        }
+        v = v * pow10(k);
+    } else {
+        let mut k = -exp10;
+        while k > 22 {
+            v = v / 10000000000000000000000.0;
+            k -= 22;
+        }
+        v = v / pow10(k);
+    }
+    return v;
+}
+
+/// `10^k` for `0 <= k <= 22` (exact).
+fn pow10(k: i64): f64 {
+    let mut r: f64 = 1.0;
+    let mut i: i64 = 0;
+    while i < k {
+        r = r * 10.0;
+        i += 1;
+    }
+    return r;
+}

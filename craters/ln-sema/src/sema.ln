@@ -20,7 +20,8 @@ use crater::defs::*;
 use crater::diag::{Code, dummy_span, is_dummy};
 use crater::expand::{Expander, Mark, Pending, Rule};
 use crater::loader::{Craters, CrateSource};
-use crater::lower::Deferred;
+use crater::lower::{Deferred, LowerCx};
+use crater::typeck::FnCtx;
 use crater::program::{CraterRoot, Program};
 use crater::ty::Ty;
 use ln_ast::{Block, ConstDecl, EnumDecl, FnDecl, ImplDecl, MacroDef, Span, StaticDecl, StructDecl, TraitDecl, TypeAlias, UseTree, VariantDecl};
@@ -153,13 +154,21 @@ pub struct Sema {
     /// The diagnostic being built is a lint inside an expansion: `emit`
     /// drops it.
     drop_current: bool,
+
+    /// The type checker's state for the function being checked (see
+    /// `typeck`); reset for each body.
+    pub fcx: FnCtx,
 }
 
 impl Sema {
     pub fn new(p: Program, craters: Craters, opts: Options): Sema {
         let mut marks: [Mark; ..+] = [];
         marks.push(Mark { def_module: DefId::new(0), def_ctx: SyntaxCtx::root(), depth: 0 });
+        let mut p = p;
+        let unit = p.types.unit();
+        let fcx = FnCtx::new(DefId::new(0), LowerCx::new(DefId::new(0)), unit, false);
         return Sema {
+            fcx,
             p,
             asts: [],
             opts,
@@ -326,7 +335,7 @@ pub fn analyze(p: Program, craters: Craters, opts: Options): Sema {
         }
     }
     if !s.p.diags.has_errors() || s.opts.keep_going {
-        crater::typeck::check_bodies(&mut s);
+        s.check_bodies();
     }
     return s;
 }

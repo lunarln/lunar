@@ -1,0 +1,819 @@
+// Closures (docs/design/closures.md): checking a closure expression,
+// inferring its captures and kind, and calls through `Fn` traits. A port of
+// crates/ln-sema/src/typeck/closure.rs.
+//
+// A closure is compiled to a function of its own whose leading parameters
+// are the captured variables, with the mode the body needs (read: `&`,
+// changed: `&mut`, consumed: owned), followed by the closure's parameters.
+// Borrow checking and code generation then treat it like any function;
+// only building the closure's value and calling it are special.
+
+use core::arena::{Id, List};
+use crater::codes;
+use crater::defs::*;
+use crater::diag::{Code, dummy_span};
+use crater::program::{Capture, ClosureInfo, Program};
+use crater::sema::{AstRef, Sema};
+use crater::thir::{Arg, Block, Body, Callee, ClosureKind, Expr, ExprKind, FmtPiece, Local, LocalId, LocalKind, ReadMode, Stmt};
+use crater::ty::*;
+use crater::typeck::{default_ty, root_local};
+use ln_ast as ast;
+use ln_ast::{ParamMode, Span};
+
+/// How a callable value is called: its parameters, result and kind.
+pub struct CallSig {
+    pub params: TyList,
+    pub modes: Modes,
+    pub ret: Ty,
+    pub kind: ClosureKind,
+}
+
+/// A signature a closure is expected to have.
+pub struct ExpectedSig {
+    pub params: TyList,
+    pub modes: Modes,
+    pub ret: Ty,
+}
+
+/// A closure checked in the current function, finished with it.
+pub struct PendingClosure {
+    pub def: DefId,
+    /// The locals made for the closure (its parameters and everything
+    /// declared in its body): `first..end`.
+    pub first: u32,
+    pub end: u32,
+    pub params: List::<LocalId>,
+    /// The captured variables, in capture order.
+    pub captured: List::<LocalId>,
+    pub body: Id::<Expr>,
+}
+
+/// How a closure body uses a variable from outside it.
+pub struct Use {
+    changed: bool,
+    moved: bool,
+}
+
+/// The signature of a function pointer type, if `sig` is one.
+fn sig_parts(types: &Types, sig: Ty): Option::<ExpectedSig> {
+    return match types.kind(sig) {
+        TyKind::FnPtr(ps, m, r) => Some(ExpectedSig { params: ps, modes: m, ret: r }),
+        _ => None,
+    };
+}
+
+/// Whether trait `id` is `Fn`, `FnMut` or `FnOnce`.
+fn is_fn_trait(p: &Program, id: DefId): bool {
+    return fn_trait_kind(p, id).is_some();
+}
+
+/// Which of `Fn`, `FnMut` and `FnOnce` trait `id` is, if any.
+fn fn_trait_kind(p: &Program, id: DefId): Option::<ClosureKind> {
+    return match p.lang_name(id) {
+        Some(n) => ClosureKind::from_lang(n),
+        None => None,
+    };
+}
+
+impl Sema {
+    /// The signature a closure is expected to have: from a function pointer
+    /// type, or from an `Fn(..)` bound on the inference variable or generic
+    /// parameter it is checked against.
+    fn expected_closure_sig(&mut self, t: Ty): Option::<ExpectedSig> {
+        let t = self.shallow(t);
+        return match self.p.types.kind(t) {
+            TyKind::FnPtr(ps, m, r) => Some(ExpectedSig { params: ps, modes: m, ret: r }),
+            // Where another closure is expected (both returned as one
+            // `impl Fn`), take its signature; the types will still differ.
+            TyKind::Closure(def, args) => {
+                if !self.p.closures.contains(def) {
+                    return None;
+                }
+                let sig = self.p.closure_sig(def, args);
+                let s = self.shallow(sig);
+                sig_parts(&self.p.types, s)
+            }
+            TyKind::Infer(_) => {
+                for i in 0..self.fcx.obligations.len() {
+                    let o = self.fcx.obligations[i];
+                    if !is_fn_trait(&self.p, o.tr.trait_id) {
+                        continue;
+                    }
+                    let st = self.shallow(o.ty);
+                    if st != t || o.tr.args.len() == 0 {
+                        continue;
+                    }
+                    let a0 = self.p.types.at(o.tr.args, 0);
+                    let s = self.shallow(a0);
+                    if let Some(sig) = sig_parts(&self.p.types, s) {
+                        return Some(sig);
+                    }
+                }
+                // A closure this function returns as `impl Fn(..)`.
+                let mut idx: Option::<u32> = None;
+                for i in 0..self.fcx.opaque_vars.len() {
+                    let ov = self.fcx.opaque_vars[i];
+                    if self.shallow(ov.var) == t {
+                        idx = Some(ov.idx);
+                        break;
+                    }
+                }
+                let i = idx?;
+                let o = self.p.opaques.get((self.fcx.def, i))?;
+                for k in 0..o.bounds.len() {
+                    let b = self.p.trait_refs.list(o.bounds)[k];
+                    if is_fn_trait(&self.p, b.trait_id) {
+                        if b.args.len() == 0 {
+                            return None;
+                        }
+                        let a0 = self.p.types.at(b.args, 0);
+                        let s = self.shallow(a0);
+                        return sig_parts(&self.p.types, s);
+                    }
+                }
+                None
+            }
+            TyKind::Opaque(..) | TyKind::Param(..) => {
+                let preds = self.known_preds(t);
+                for p in preds[..] {
+                    if is_fn_trait(&self.p, p.trait_ref.trait_id) && p.ty == t && p.trait_ref.args.len() > 0 {
+                        let a0 = self.p.types.at(p.trait_ref.args, 0);
+                        let s = self.shallow(a0);
+                        if let Some(sig) = sig_parts(&self.p.types, s) {
+                            return Some(sig);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+    }
+
+    /// The generic parameters of the function being checked, as types: a
+    /// closure has its enclosing function's generics.
+    fn identity_args(&mut self): TyList {
+        let names = self.fcx.cx.generic_names;
+        let mut out: [Ty; ..+] = [];
+        for i in 0..names.len() {
+            let n = self.p.symbols.list(names)[i];
+            out.push(self.p.types.mk(TyKind::Param(i as u32, n)));
+        }
+        return self.p.types.mk_list(out[..]);
+    }
+
+    pub fn check_closure(&mut self, c: ast::Closure, expect: Option::<Ty>, span: Span): Expr {
+        let expected = match expect {
+            Some(t) => match self.expected_closure_sig(t) {
+                Some(s) => if s.params.len() == c.params.len() { Some(s) } else { None },
+                None => None,
+            },
+            None => None,
+        };
+        let module = self.p.def(self.fcx.def).module;
+        let name = self.p.sym("<closure>");
+        let def = self.new_def(name, DefKind::Fn, Some(module), span, AstRef::None);
+
+        // The body is checked in a context of its own: `return` leaves the
+        // closure, and loops outside it cannot be broken from inside.
+        self.push_scope(None);
+        let first = self.fcx.locals.len() as u32;
+        let depth = self.depth();
+        let mut params: [LocalId; ..+] = [];
+        let mut sig_params: [(ParamMode, Ty); ..+] = [];
+        for i in 0..c.params.len() {
+            let p = self.p.ast.closure_params.list(c.params)[i];
+            let exp: Option::<(ParamMode, Ty)> = match expected {
+                Some(s) => Some((s.modes.get(i), self.p.types.at(s.params, i))),
+                None => None,
+            };
+            let ty = match p.ty {
+                Some(t) => {
+                    let t = self.lower_local_ty(t);
+                    if let Some(e) = exp {
+                        let (_, et) = e;
+                        if !self.unify(t, et) {
+                            self.mismatch(et, t, p.span);
+                        }
+                    }
+                    t
+                }
+                None => match exp {
+                    Some(e) => {
+                        let (_, et) = e;
+                        et
+                    }
+                    None => self.new_var(p.span),
+                },
+            };
+            let mode = match p.mode {
+                Some(m) => m,
+                None => match exp {
+                    Some(e) => {
+                        let (m, _) = e;
+                        m
+                    }
+                    None => ParamMode::Take,
+                },
+            };
+            let pname = match p.name {
+                Some(n) => n.name,
+                None => self.p.sym("_"),
+            };
+            let l = self.new_local(pname, ty, p.is_mut || mode == ParamMode::InOut, LocalKind::Let, p.span, depth);
+            if let Some(n) = p.name {
+                let ctx = self.ident_ctx(n);
+                self.bind_name(n.name, ctx, l);
+                self.record_local(n.span, l);
+            }
+            params.push(l);
+            sig_params.push((mode, ty));
+        }
+        let ret = match c.ret {
+            Some(t) => self.lower_local_ty(t),
+            None => match expected {
+                Some(s) => s.ret,
+                None => self.new_var(span),
+            },
+        };
+        let saved_ret = self.fcx.ret_ty;
+        self.fcx.ret_ty = ret;
+        let saved_loop_base = self.fcx.loop_base;
+        self.fcx.loop_base = self.fcx.loops.len();
+        let body = self.check_expr(c.body, Some(ret));
+        let bspan = self.ast_span(c.body);
+        let body = self.coerce(body, ret, bspan);
+        self.fcx.ret_ty = saved_ret;
+        self.fcx.loop_base = saved_loop_base;
+        self.pop_scope();
+        let end = self.fcx.locals.len() as u32;
+
+        // Captures: every variable from outside the closure that its body
+        // uses, and how.
+        let mut uses: [(LocalId, Use); -..+] = [];
+        collect_uses(&self.p, body, first, &mut uses);
+        let mut any_moved = false;
+        let mut any_changed = false;
+        for u in uses[..] {
+            let (_, x) = u;
+            any_moved = any_moved || x.moved;
+            any_changed = any_changed || x.changed;
+        }
+        let kind = if any_moved {
+            ClosureKind::FnOnce
+        } else if any_changed {
+            ClosureKind::FnMut
+        } else {
+            ClosureKind::Fn
+        };
+        let mut captures: [Capture; ..+] = [];
+        let mut capture_exprs: [Arg; ..+] = [];
+        let mut captured: [LocalId; ..+] = [];
+        for k in 0..uses.len() {
+            let (l, u) = uses[k];
+            let local = self.fcx.locals[l.index()];
+            let ty = local.ty;
+            let by_ref = !c.is_move && !u.moved;
+            // A closure that is called once owns what it holds by value.
+            let mode = if !by_ref && kind == ClosureKind::FnOnce {
+                ParamMode::Take
+            } else if u.changed {
+                ParamMode::InOut
+            } else {
+                ParamMode::Borrow
+            };
+            captures.push(Capture { name: local.name, ty, by_ref, mode });
+            let place = self.mk(ExprKind::Local(l), ty, span);
+            let arg = if by_ref && mode == ParamMode::InOut {
+                Arg::InOut(self.node(place))
+            } else if by_ref {
+                Arg::Value(self.node(place))
+            } else {
+                let r = self.read(place, ReadMode::Move);
+                Arg::Value(self.node(r))
+            };
+            capture_exprs.push(arg);
+            captured.push(l);
+        }
+        self.register_closure(def, captures[..], kind, sig_params[..], ret);
+        let body_id = self.node(body);
+        let pl = self.p.thir.local_ids.add_list(params[..]);
+        let cl = self.p.thir.local_ids.add_list(captured[..]);
+        self.fcx.closures.push(PendingClosure { def, first, end, params: pl, captured: cl, body: body_id });
+        let args = self.identity_args();
+        let ty = self.p.types.mk(TyKind::Closure(def, args));
+        let caps = self.p.thir.args.add_list(capture_exprs[..]);
+        return self.mk(ExprKind::Closure { def, captures: caps }, ty, span);
+    }
+
+    /// Record a closure's function and captures in the program, with types
+    /// as resolved so far (they are resolved again when the function is
+    /// finished).
+    fn register_closure(&mut self, def: DefId, captures: [Capture; &], kind: ClosureKind, params: [(ParamMode, Ty); &], ret: Ty) {
+        let mut all: [Param; ..+] = [];
+        for c in captures {
+            all.push(Param {
+                name: c.name,
+                ctx: SyntaxCtx::root(),
+                ty: c.ty,
+                mode: c.mode,
+                inout: c.mode == ParamMode::InOut,
+                mutable: c.mode == ParamMode::InOut,
+                is_self: false,
+                // A call of a closure assumes it may store any argument (or
+                // capture) into anything it borrowed in-out.
+                kept: true,
+                span: dummy_span(),
+            });
+        }
+        for i in 0..params.len() {
+            let (m, t) = params[i];
+            let mut n = String::new();
+            n.write("<arg{i}>");
+            let name = self.p.sym(n.as_str());
+            all.push(Param {
+                name,
+                ctx: SyntaxCtx::root(),
+                ty: t,
+                mode: m,
+                inout: m == ParamMode::InOut,
+                mutable: m == ParamMode::InOut,
+                is_self: false,
+                kept: true,
+                span: dummy_span(),
+            });
+        }
+        let parent_count = self.fcx.cx.generic_names.len() as u32;
+        let pl = self.p.params.add_list(all[..]);
+        let fd = FnData {
+            generics: Generics { parent_count, names: List::empty(), preds: List::empty(), span: dummy_span() },
+            sig: FnSig { params: pl, ret, ret_span: dummy_span() },
+            is_unsafe: false,
+            abi: Abi::Lunar,
+            variadic: false,
+            has_body: true,
+            owner: None,
+            has_self: false,
+        };
+        self.p.defs[def.index()].data = DefData::Fn(fd);
+        let cl = self.p.captures.add_list(captures);
+        self.p.closures.insert(def, ClosureInfo { parent: self.fcx.def, captures: cl, kind });
+    }
+
+    /// Re-record every closure of this function with its final types.
+    pub fn resolve_closures(&mut self) {
+        for k in 0..self.fcx.closures.len() {
+            let def = self.fcx.closures[k].def;
+            let mut fd = self.p.fn_data(def);
+            let mut ps: [Param; ..+] = [];
+            for i in 0..fd.sig.params.len() {
+                let mut p = self.p.params.list(fd.sig.params)[i];
+                let r = self.resolve(p.ty);
+                p.ty = default_ty(&mut self.p.types, r);
+                ps.push(p);
+            }
+            fd.sig.params = self.p.params.add_list(ps[..]);
+            let r = self.resolve(fd.sig.ret);
+            fd.sig.ret = default_ty(&mut self.p.types, r);
+            self.p.defs[def.index()].data = DefData::Fn(fd);
+            let mut info = self.p.closures.get(def).unwrap();
+            let mut caps: [Capture; ..+] = [];
+            for i in 0..info.captures.len() {
+                let mut c = self.p.captures.list(info.captures)[i];
+                let r = self.resolve(c.ty);
+                c.ty = default_ty(&mut self.p.types, r);
+                caps.push(c);
+            }
+            info.captures = self.p.captures.add_list(caps[..]);
+            self.p.closures.insert(def, info);
+        }
+    }
+
+    /// Each closure's own body, as a function (into `out`): the parent's
+    /// locals (with final types), where the captures and the closure's
+    /// parameters are the parameters, and everything outside the closure is
+    /// unused. The closure's variables become unused in the parent's
+    /// (`FnCtx::locals`). Inner closures come first, so an outer one leaves
+    /// theirs out too.
+    pub fn closure_bodies(&mut self, out: &mut [Body; -..+]) {
+        for k in 0..self.fcx.closures.len() {
+            let c = self.fcx.closures[k];
+            self.zonk_expr(c.body);
+            let info = self.p.closures.get(c.def).unwrap();
+            let fd = self.p.fn_data(c.def);
+            let mut locals = self.fcx.locals.clone();
+            for i in 0..locals.len() {
+                if !((i as u32) >= c.first && (i as u32) < c.end) {
+                    locals[i].kind = LocalKind::Temp;
+                }
+            }
+            for i in c.first..c.end {
+                self.fcx.locals[i as usize].kind = LocalKind::Temp;
+            }
+            let mut params: [LocalId; ..+] = [];
+            for j in 0..c.captured.len() {
+                let l = self.p.thir.local_ids.list(c.captured)[j];
+                let cap = self.p.captures.list(info.captures)[j];
+                let li = l.index();
+                locals[li].kind = LocalKind::Param { index: j as u32, inout: cap.mode == ParamMode::InOut, grow: false, owned: cap.mode == ParamMode::Take };
+                locals[li].mutable = cap.mode == ParamMode::InOut || locals[li].mutable;
+                locals[li].depth = 0;
+                params.push(l);
+            }
+            let n = c.captured.len();
+            for j in 0..c.params.len() {
+                let l = self.p.thir.local_ids.list(c.params)[j];
+                let p = self.p.params.list(fd.sig.params)[n + j];
+                let grow = match self.p.types.kind(p.ty) {
+                    TyKind::Grow(_) => true,
+                    _ => false,
+                };
+                let li = l.index();
+                locals[li].kind = LocalKind::Param { index: (n + j) as u32, inout: p.mode == ParamMode::InOut, grow, owned: p.mode == ParamMode::Take };
+                locals[li].depth = 0;
+                params.push(l);
+            }
+            let span = self.p.thir.expr(c.body).span;
+            let block = self.p.thir.blocks.add(Block { stmts: List::empty(), tail: Some(c.body), locals: List::empty(), span });
+            let ll = self.p.thir.locals.add_list(locals[..]);
+            let pl = self.p.thir.local_ids.add_list(params[..]);
+            out.push(Body { def: c.def, locals: ll, params: pl, block, span });
+        }
+        self.fcx.closures.clear();
+    }
+
+    /// Why a closure does not satisfy an `Fn`, `FnMut` or `FnOnce` bound:
+    /// what it does to its captures, or its signature. Starts the
+    /// diagnostic (with `code`; the caller finishes it) and returns true, or
+    /// returns false when there is nothing particular to say.
+    pub fn fn_bound_diag(&mut self, t: Ty, tr: TraitRef, span: Span, kept code: Code): bool {
+        let want = match fn_trait_kind(&self.p, tr.trait_id) {
+            Some(k) => k,
+            None => return false,
+        };
+        let tn = self.p.name(tr.trait_id).to_string();
+        let (def, args) = match self.p.types.kind(t) {
+            TyKind::Closure(d, a) => (d, a),
+            _ => return false,
+        };
+        let info = match self.p.closures.get(def) {
+            Some(i) => i,
+            None => return false,
+        };
+        if info.kind > want {
+            let once = info.kind == ClosureKind::FnOnce;
+            let does = if once { "gives away" } else { "changes" };
+            let mut list = String::new();
+            let mut first = true;
+            for c in self.p.captures.list(info.captures) {
+                let take = if once { c.mode == ParamMode::Take } else { c.mode == ParamMode::InOut };
+                if take {
+                    if !first {
+                        list.push_str(", ");
+                    }
+                    first = false;
+                    list.write("`{self.p.text(c.name)}`");
+                }
+            }
+            let kind = if once { "FnOnce" } else { "FnMut" };
+            let why = if once { "so it can be called only once" } else { "so calling it changes something" };
+            let mut m = String::new();
+            m.write("expected a closure that implements `{tn}`, but this one is only `{kind}`");
+            self.error_at(code, span, m.as_str());
+            let mut l = String::new();
+            l.write("the closure {does} {list}, {why}");
+            self.with_label(l.as_str());
+            let mut n = String::new();
+            n.write("a closure that {does} what it captured implements `{kind}`, not `{tn}`");
+            self.with_note(n.as_str());
+            return true;
+        }
+        let have = self.p.closure_sig(def, args);
+        if tr.args.len() == 0 {
+            return false;
+        }
+        let want_sig = self.p.types.at(tr.args, 0);
+        let h = self.p.ty_str(have);
+        let w = self.p.ty_str(want_sig);
+        let mut m = String::new();
+        m.write("this closure has the wrong signature for `{tn}`");
+        self.error_at(code, span, m.as_str());
+        let mut l = String::new();
+        l.write("expected `{w}`, found `{h}`");
+        self.with_label(l.as_str());
+        return true;
+    }
+
+    // ===================================================================== calls
+
+    /// The signature and kind for calling a value of type `t`, if it can
+    /// be called: a closure, a function pointer, or a generic parameter
+    /// bounded by an `Fn` trait.
+    pub fn callable_sig(&mut self, t: Ty): Option::<CallSig> {
+        let t = self.shallow(t);
+        return match self.p.types.kind(t) {
+            TyKind::Closure(def, args) => {
+                let kind = self.p.closures.get(def)?.kind;
+                let sig = self.p.closure_sig(def, args);
+                match self.p.types.kind(sig) {
+                    TyKind::FnPtr(ps, m, r) => Some(CallSig { params: ps, modes: m, ret: r, kind }),
+                    _ => None,
+                }
+            }
+            TyKind::FnPtr(ps, m, r) => Some(CallSig { params: ps, modes: m, ret: r, kind: ClosureKind::Fn }),
+            TyKind::Param(..) | TyKind::Opaque(..) => {
+                // The weakest bound that applies: `Fn` before `FnMut` before `FnOnce`.
+                let mut best: Option::<CallSig> = None;
+                let preds = self.known_preds(t);
+                for p in preds[..] {
+                    let kind = match fn_trait_kind(&self.p, p.trait_ref.trait_id) {
+                        Some(k) => k,
+                        None => continue,
+                    };
+                    if p.ty != t || p.trait_ref.args.len() == 0 {
+                        continue;
+                    }
+                    let first = self.p.types.at(p.trait_ref.args, 0);
+                    if let TyKind::FnPtr(ps, m, r) = self.p.types.kind(first) {
+                        let better = match best {
+                            Some(b) => kind < b.kind,
+                            None => true,
+                        };
+                        if better {
+                            best = Some(CallSig { params: ps, modes: m, ret: r, kind });
+                        }
+                    }
+                }
+                best
+            }
+            _ => None,
+        };
+    }
+
+    /// `f(args)` where `f` is a value implementing an `Fn` trait.
+    pub fn check_value_call(&mut self, f: Id::<ast::Expr>, args: List::<Id::<ast::Expr>>, span: Span): Expr {
+        let fspan = self.ast_span(f);
+        let place = self.check_place_or_temp(f);
+        let pt = self.shallow(place.ty);
+        if let TyKind::FnPtr(params, modes, ret) = self.p.types.kind(pt) {
+            let callee = self.read(place, ReadMode::Copy);
+            let mut sig: [(Ty, ParamMode); ..+] = [];
+            for i in 0..params.len() {
+                sig.push((self.p.types.at(params, i), modes.get(i)));
+            }
+            let a = self.check_args(sig[..], false, args, span);
+            let cn = self.node(callee);
+            return self.mk(ExprKind::Call { callee: Callee::Indirect(cn), args: a }, ret, span);
+        }
+        let cs = match self.callable_sig(place.ty) {
+            Some(s) => s,
+            None => {
+                let r = self.resolve(place.ty);
+                if !self.p.types.is_error(r) {
+                    let t = self.ty_str(place.ty);
+                    let mut m = String::new();
+                    m.write("expected a function or closure, found `{t}`");
+                    self.error_at(codes::ty::NOT_CALLABLE(), fspan, m.as_str());
+                    self.with_help("only functions, function pointers, closures and generic parameters bounded by `Fn`, `FnMut` or `FnOnce` can be called");
+                    self.emit();
+                }
+                for i in 0..args.len() {
+                    let a = self.p.ast.expr_ids.list(args)[i];
+                    self.check_expr(a, None);
+                }
+                return self.error_expr(span);
+            }
+        };
+        let callee = match cs.kind {
+            ClosureKind::Fn => place,
+            ClosureKind::FnMut => {
+                if !self.is_mutable_place(place) && !self.p.types.is_error(place.ty) {
+                    self.immutable_err(place, fspan, "call this `FnMut` closure (it changes what it captured)");
+                }
+                place
+            }
+            ClosureKind::FnOnce => self.read(place, ReadMode::Move),
+        };
+        let mut sig: [(Ty, ParamMode); ..+] = [];
+        for i in 0..cs.params.len() {
+            sig.push((self.p.types.at(cs.params, i), cs.modes.get(i)));
+        }
+        let a = self.check_args(sig[..], false, args, span);
+        let cn = self.node(callee);
+        return self.mk(ExprKind::Call { callee: Callee::Value { callee: cn, kind: cs.kind }, args: a }, cs.ret, span);
+    }
+}
+
+/// Note that `e`'s tree uses local `l` as `u` (when `l` is from outside the
+/// closure, a local before `first`).
+fn note_use(l: LocalId, u: Use, first: u32, out: &mut [(LocalId, Use); -..+]) {
+    if l.index >= first {
+        return;
+    }
+    for i in 0..out.len() {
+        let (x, prev) = out[i];
+        if x == l {
+            out[i] = (x, Use { changed: prev.changed || u.changed, moved: prev.moved || u.moved });
+            return;
+        }
+    }
+    out.push((l, u));
+}
+
+/// The variables from outside a closure (locals before `first`) that `e`
+/// uses, and how.
+fn collect_uses(p: &Program, e: Expr, first: u32, out: &mut [(LocalId, Use); -..+]) {
+    let changed = Use { changed: true, moved: false };
+    let moved = Use { changed: false, moved: true };
+    // How `e` itself uses a variable, before looking inside it.
+    match e.kind {
+        ExprKind::Local(l) => note_use(l, Use { changed: false, moved: false }, first, out),
+        ExprKind::Read { place, mode: ReadMode::Move } => {
+            if let Some(l) = root_local(p, p.thir.expr(place)) {
+                note_use(l, moved, first, out);
+            }
+        }
+        ExprKind::Assign { place, .. } => {
+            if let Some(l) = root_local(p, p.thir.expr(place)) {
+                note_use(l, changed, first, out);
+            }
+        }
+        ExprKind::AssignOp { place, .. } => {
+            if let Some(l) = root_local(p, p.thir.expr(place)) {
+                note_use(l, changed, first, out);
+            }
+        }
+        ExprKind::Slice { base, mutable: true, .. } => {
+            if let Some(l) = root_local(p, p.thir.expr(base)) {
+                note_use(l, changed, first, out);
+            }
+        }
+        ExprKind::Call { callee, args } => {
+            for a in p.thir.args.list(args) {
+                if let Arg::InOut(x) = a {
+                    if let Some(l) = root_local(p, p.thir.expr(x)) {
+                        note_use(l, changed, first, out);
+                    }
+                }
+            }
+            if let Callee::Value { callee: c, kind: ClosureKind::FnMut } = callee {
+                if let Some(l) = root_local(p, p.thir.expr(c)) {
+                    note_use(l, changed, first, out);
+                }
+            }
+        }
+        // A closure inside this one captures from it in turn; one that
+        // changes a variable changes it here too.
+        ExprKind::Closure { captures, .. } => {
+            for a in p.thir.args.list(captures) {
+                if let Arg::InOut(x) = a {
+                    if let Some(l) = root_local(p, p.thir.expr(x)) {
+                        note_use(l, changed, first, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut children: [Id::<Expr>; ..+] = [];
+    visit_children(p, e, &mut children);
+    for c in children[..] {
+        collect_uses(p, p.thir.expr(c), first, out);
+    }
+}
+
+/// The direct sub-expressions of `e`, in evaluation order
+/// (`borrowck::visit_children` in Rust).
+pub fn visit_children(p: &Program, e: Expr, out: &mut +[Id::<Expr>; ..+]) {
+    match e.kind {
+        ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Lit(_) | ExprKind::FnRef { .. } | ExprKind::Continue { .. } | ExprKind::Error => {}
+        ExprKind::Field { base, .. } => out.push(base),
+        ExprKind::Index { base, index } => {
+            out.push(base);
+            out.push(index);
+        }
+        ExprKind::Deref(x) => out.push(x),
+        ExprKind::Temp(x) => out.push(x),
+        ExprKind::Unary(_, x) => out.push(x),
+        ExprKind::Cast(x) => out.push(x),
+        ExprKind::Coerce { expr, .. } => out.push(expr),
+        ExprKind::Read { place, .. } => out.push(place),
+        ExprKind::Call { callee, args } => {
+            match callee {
+                Callee::Indirect(c) => out.push(c),
+                Callee::Value { callee: c, .. } => out.push(c),
+                _ => {}
+            }
+            for a in p.thir.args.list(args) {
+                out.push(a.expr());
+            }
+        }
+        ExprKind::Closure { captures, .. } => {
+            for a in p.thir.args.list(captures) {
+                out.push(a.expr());
+            }
+        }
+        ExprKind::Binary(_, a, b) => {
+            out.push(a);
+            out.push(b);
+        }
+        ExprKind::Logical { lhs, rhs, .. } => {
+            out.push(lhs);
+            out.push(rhs);
+        }
+        ExprKind::Assign { place, value } => {
+            out.push(place);
+            out.push(value);
+        }
+        ExprKind::AssignOp { place, value, .. } => {
+            out.push(place);
+            out.push(value);
+        }
+        ExprKind::Tuple(es) => out.extend(p.thir.expr_ids.list(es)),
+        ExprKind::Array(es) => out.extend(p.thir.expr_ids.list(es)),
+        ExprKind::Adt { fields, .. } => {
+            for f in p.thir.field_exprs.list(fields) {
+                out.push(f.expr);
+            }
+        }
+        ExprKind::ArrayRepeat { value, count } => {
+            out.push(value);
+            out.push(count);
+        }
+        ExprKind::Slice { base, start, end, .. } => {
+            out.push(base);
+            if let Some(x) = start {
+                out.push(x);
+            }
+            if let Some(x) = end {
+                out.push(x);
+            }
+        }
+        ExprKind::Block(b) => visit_block(p, b, out),
+        ExprKind::Loop { body, .. } => visit_block(p, body, out),
+        ExprKind::If { cond, then, else_ } => {
+            out.push(cond);
+            out.push(then);
+            if let Some(x) = else_ {
+                out.push(x);
+            }
+        }
+        ExprKind::Match { scrut, arms } => {
+            out.push(scrut);
+            for a in p.thir.arms.list(arms) {
+                if let Some(g) = a.guard {
+                    out.push(g);
+                }
+                out.push(a.body);
+            }
+        }
+        ExprKind::While { cond, body, .. } => {
+            out.push(cond);
+            visit_block(p, body, out);
+        }
+        ExprKind::ForRange { start, end, body, .. } => {
+            out.push(start);
+            out.push(end);
+            visit_block(p, body, out);
+        }
+        ExprKind::ForArray { array, body, .. } => {
+            out.push(array);
+            visit_block(p, body, out);
+        }
+        ExprKind::Break { value, .. } => {
+            if let Some(x) = value {
+                out.push(x);
+            }
+        }
+        ExprKind::Return(value) => {
+            if let Some(x) = value {
+                out.push(x);
+            }
+        }
+        ExprKind::FmtArgs(pieces) => {
+            for piece in p.thir.fmt_pieces.list(pieces) {
+                if let FmtPiece::Arg(x, _) = piece {
+                    out.push(x);
+                }
+            }
+        }
+    }
+}
+
+/// The expressions of a block's statements and tail.
+pub fn visit_block(p: &Program, b: Id::<Block>, out: &mut +[Id::<Expr>; ..+]) {
+    let blk = p.thir.block(b);
+    for s in p.thir.stmts.list(blk.stmts) {
+        match s {
+            Stmt::Let { init, .. } => {
+                if let Some(i) = init {
+                    out.push(i);
+                }
+            }
+            Stmt::Expr(e) => out.push(e),
+        }
+    }
+    if let Some(t) = blk.tail {
+        out.push(t);
+    }
+}

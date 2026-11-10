@@ -21,7 +21,7 @@ Rust `lunar`, rebuilds this workspace into an identical compiler.
 | front end | `loader.rs`, `expand.rs`, `collect.rs`, `resolve.rs`, `lower.rs`, parser expansion parsing | `ln-sema/src/{sema,loader,expand,collect,resolve,lower}.ln` | done; same diagnostics as Rust on tests/ui, tests/run, examples |
 | traits, layout | `traits.rs`, `layout.rs` | `ln-sema/src/{traits,layout}.ln` | done (unit checks in `tests.ln`) |
 | borrow checker | `borrowck.rs` | `ln-sema/src/borrowck.ln` | done (unit checks on hand-built THIR in `tests.ln`) |
-| type checker | `typeck/*.rs` | `ln-sema/src/typeck*.ln` | after the front end |
+| type checker | `typeck/*.rs` | `ln-sema/src/typeck/{mod,expr,call,pat,closure}.ln` | ported |
 | code generation | `crates/ln-codegen` | `ln-codegen/src/{lib,func,ops,init,llvm}.ln` | done; the state of the function being lowered (Rust's `FnCg`) lives in `Cg` |
 | driver | `crates/ln-driver` (build path only) | `ln-driver/src/main.ln` (`lunarc`) | after the passes |
 

@@ -1,7 +1,0 @@
-// Type checking of function bodies: a stub until the port of
-// crates/ln-sema/src/typeck (by another porter) replaces it.
-
-use crater::sema::Sema;
-
-/// Type check (and borrow check) every function body.
-pub fn check_bodies(s: &mut Sema) {}

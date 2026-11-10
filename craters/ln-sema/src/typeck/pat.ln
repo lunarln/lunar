@@ -1,0 +1,722 @@
+// Patterns and match exhaustiveness: a port of
+// crates/ln-sema/src/typeck/pat.rs.
+//
+// The exhaustiveness checker's simplified patterns (`Lite`) live in an
+// arena of their own (`Exh`); a row of the pattern matrix is a list of
+// them, and a witness is one interned text per column.
+
+use core::arena::{Arena, Id, List};
+use core::intern::Symbol;
+use crater::codes;
+use crater::defs::*;
+use crater::program::{Program, Ref, RefTarget};
+use crater::sema::Sema;
+use crater::thir::{Arm, ExprKind, FieldPat, LocalKind, Pat, PatKind, ReadMode};
+use crater::ty::*;
+use crater::typeck::call::ValueRes;
+use crater::typeck::expr::neg_int;
+use crater::resolve::ModRes;
+use ln_ast as ast;
+use ln_ast::{Ident, Span};
+
+impl Sema {
+    /// Struct fields are private to the struct's module (and its children)
+    /// unless `pub`; enum variant fields are always visible.
+    pub fn check_field_privacy(&mut self, adt: DefId, field: usize, span: Span) {
+        let data = self.p.adt(adt);
+        if data.is_enum {
+            return;
+        }
+        let f = self.p.fields_of(self.p.variants_of(data)[0])[field];
+        let owner_mod = self.p.def(adt).module;
+        let here = self.module();
+        if f.is_pub || self.is_ancestor_or_self(owner_mod, here) {
+            return;
+        }
+        let mut m = String::new();
+        m.write("field `{self.p.text(f.name)}` of `{self.p.name(adt)}` is private");
+        self.error_at(codes::name::PRIVATE(), span, m.as_str());
+        self.with_secondary(f.span, "declared here");
+        self.with_help("mark the field `pub`, or match the rest with `..`");
+        self.emit();
+    }
+
+    /// Check a pattern against `ty`, declaring its bindings in the current scope.
+    pub fn check_pat(&mut self, id: Id::<ast::Pat>, ty: Ty, is_let: bool): Id::<Pat> {
+        let pe = self.p.ast.pats.get(id);
+        let span = pe.span;
+        let s0 = self.shallow(ty);
+        let sty = self.p.types.strip_grow(s0);
+        let kind = match pe.kind {
+            ast::PatKind::MacCall(m) => {
+                let module = self.module();
+                return match self.expand_pat(module, m) {
+                    Some(x) => self.check_pat(x, ty, is_let),
+                    None => self.pat_node(Pat { kind: PatKind::Wild, ty, span }),
+                };
+            }
+            ast::PatKind::Wild | ast::PatKind::Rest => PatKind::Wild,
+            ast::PatKind::Binding { is_mut, name } => self.binding(name, is_mut, ty, span),
+            ast::PatKind::Lit(l, neg) => self.lit_pat(l, neg, ty, span),
+            ast::PatKind::Range { lo, lo_neg, hi, hi_neg, inclusive } => {
+                let lo_v = self.lit_pat(lo, lo_neg, ty, span);
+                let hi_v = self.lit_pat(hi, hi_neg, ty, span);
+                match (lo_v, hi_v) {
+                    (PatKind::Lit(a), PatKind::Lit(b)) => {
+                        let st = self.shallow(ty);
+                        let ok = match self.p.types.kind(st) {
+                            TyKind::Int(_) | TyKind::Char | TyKind::Error => true,
+                            _ => false,
+                        };
+                        if !ok && !self.is_int_var(ty) {
+                            self.error_at(codes::ty::BAD_PATTERN(), span, "range patterns only work on integers and `char`");
+                            self.emit();
+                        }
+                        PatKind::Range { lo: a, hi: b, inclusive }
+                    }
+                    _ => PatKind::Wild,
+                }
+            }
+            ast::PatKind::Tuple(ps) => {
+                let has_rest = self.rest_position(ps);
+                let elems = match self.p.types.kind(sty) {
+                    TyKind::Tuple(ts) => ts,
+                    TyKind::Error => {
+                        let mut errs: [Ty; ..+] = [];
+                        for _ in 0..ps.len() {
+                            errs.push(self.p.types.error());
+                        }
+                        self.p.types.mk_list(errs[..])
+                    }
+                    _ => {
+                        if self.is_unbound_var(sty) && has_rest.is_none() {
+                            let mut ts: [Ty; ..+] = [];
+                            for i in 0..ps.len() {
+                                let x = self.p.ast.pat_ids.list(ps)[i];
+                                let xs = self.p.ast.pats.get(x).span;
+                                ts.push(self.new_var(xs));
+                            }
+                            let tl = self.p.types.mk_list(ts[..]);
+                            let tt = self.p.types.mk(TyKind::Tuple(tl));
+                            self.unify(sty, tt);
+                            tl
+                        } else {
+                            let t = self.ty_str(sty);
+                            let mut m = String::new();
+                            m.write("expected `{t}`, found a tuple pattern");
+                            self.error_at(codes::ty::BAD_PATTERN(), span, m.as_str());
+                            self.emit();
+                            let e = self.p.types.error();
+                            return self.pat_node(Pat { kind: PatKind::Wild, ty: e, span });
+                        }
+                    }
+                };
+                let out = self.tuple_like(ps, elems, has_rest, span);
+                let mut ids: [Id::<Pat>; ..+] = [];
+                for f in out[..] {
+                    ids.push(f.pat);
+                }
+                PatKind::Tuple(self.p.thir.pat_ids.add_list(ids[..]))
+            }
+            ast::PatKind::TupleStruct { path, pats } => match self.resolve_value_path(path, path.span) {
+                Some(ValueRes::Ctor { adt, variant, args }) => {
+                    let adt_ty = self.p.types.adt(adt, args);
+                    if !self.unify(adt_ty, ty) {
+                        self.mismatch(ty, adt_ty, span);
+                    }
+                    let v = self.p.variants_of(self.p.adt(adt))[variant as usize];
+                    if v.ctor != CtorKind::Tuple {
+                        let mut m = String::new();
+                        m.write("`{self.p.text(v.name)}` is not a tuple variant or struct");
+                        self.error_at(codes::ty::BAD_PATTERN(), span, m.as_str());
+                        self.emit();
+                        return self.pat_node(Pat { kind: PatKind::Wild, ty, span });
+                    }
+                    let mut ftys: [Ty; ..+] = [];
+                    for i in 0..v.fields.len() {
+                        let f = self.p.fields.list(v.fields)[i];
+                        ftys.push(self.p.types.subst(f.ty, args));
+                    }
+                    let ftys = self.p.types.mk_list(ftys[..]);
+                    let has_rest = self.rest_position(pats);
+                    // Positions written out (not covered by `..`) must be visible.
+                    let after = match has_rest {
+                        Some(r) => pats.len() - r - 1,
+                        None => 0,
+                    };
+                    let before = match has_rest {
+                        Some(r) => r,
+                        None => pats.len(),
+                    };
+                    for i in 0..v.fields.len() {
+                        if i < before || i + after >= v.fields.len() {
+                            self.check_field_privacy(adt, i, span);
+                        }
+                    }
+                    let fields = self.tuple_like(pats, ftys, has_rest, span);
+                    PatKind::Adt { def: adt, variant, fields: self.p.thir.field_pats.add_list(fields[..]) }
+                }
+                Some(_) => {
+                    let mut m = String::new();
+                    m.write("`{self.path_str(path)}` is not a tuple variant or struct");
+                    self.error_at(codes::ty::BAD_PATTERN(), path.span, m.as_str());
+                    self.emit();
+                    PatKind::Wild
+                }
+                None => PatKind::Wild,
+            },
+            ast::PatKind::Struct { path, fields, rest } => {
+                let (adt, variant, args) = match self.resolve_struct_path(path, span) {
+                    Some(r) => r,
+                    None => return self.pat_node(Pat { kind: PatKind::Wild, ty, span }),
+                };
+                let adt_ty = self.p.types.adt(adt, args);
+                if !self.unify(adt_ty, ty) {
+                    self.mismatch(ty, adt_ty, span);
+                }
+                let v = self.p.variants_of(self.p.adt(adt))[variant as usize];
+                let mut out: [FieldPat; ..+] = [];
+                for k in 0..fields.len() {
+                    let f = self.p.ast.field_pats.list(fields)[k];
+                    let mut idx: Option::<usize> = None;
+                    for i in 0..v.fields.len() {
+                        if self.p.fields.list(v.fields)[i].name == f.name.name {
+                            idx = Some(i);
+                            break;
+                        }
+                    }
+                    let idx = match idx {
+                        Some(i) => i,
+                        None => {
+                            let mut m = String::new();
+                            m.write("`{self.p.text(v.name)}` has no field named `{self.p.text(f.name.name)}`");
+                            self.error_at(codes::ty::NO_FIELD(), f.name.span, m.as_str());
+                            self.emit();
+                            continue;
+                        }
+                    };
+                    self.check_field_privacy(adt, idx, f.name.span);
+                    self.p.refs.push(Ref { span: f.name.span, target: RefTarget::Field { adt, variant, field: idx as u32 } });
+                    let fty = self.p.fields.list(v.fields)[idx].ty;
+                    let ft = self.p.types.subst(fty, args);
+                    let sub = self.check_pat(f.pat, ft, false);
+                    out.push(FieldPat { field: idx as u32, pat: sub });
+                }
+                if !rest {
+                    let mut missing = String::new();
+                    let mut any = false;
+                    for i in 0..v.fields.len() {
+                        let mut given = false;
+                        for x in out[..] {
+                            if x.field as usize == i {
+                                given = true;
+                            }
+                        }
+                        if !given {
+                            if any {
+                                missing.push_str(", ");
+                            }
+                            any = true;
+                            missing.push_str(self.p.text(self.p.fields.list(v.fields)[i].name));
+                        }
+                    }
+                    if any {
+                        let mut m = String::new();
+                        m.write("pattern does not mention field(s) {missing}");
+                        self.error_at(codes::ty::BAD_PATTERN(), span, m.as_str());
+                        self.with_help("add the fields or ignore the rest with `..`");
+                        self.emit();
+                    }
+                }
+                PatKind::Adt { def: adt, variant, fields: self.p.thir.field_pats.add_list(out[..]) }
+            }
+            ast::PatKind::Path(path) => {
+                // Unit variants, unit structs and constants; unknown single names bind.
+                if self.p.ast.is_single(path) && self.silent_value_kind(path).is_none() {
+                    let name = self.segment(path, 0).ident;
+                    let k = self.binding(name, false, ty, span);
+                    return self.pat_node(Pat { kind: k, ty, span });
+                }
+                match self.resolve_value_path(path, path.span) {
+                    Some(ValueRes::Ctor { adt, variant, args }) => {
+                        let adt_ty = self.p.types.adt(adt, args);
+                        if !self.unify(adt_ty, ty) {
+                            self.mismatch(ty, adt_ty, span);
+                        }
+                        let v = self.p.variants_of(self.p.adt(adt))[variant as usize];
+                        if v.ctor != CtorKind::Unit {
+                            let n = self.p.text(v.name).to_string();
+                            let mut m = String::new();
+                            m.write("`{n}` has fields; match them with `{n}(..)` or `{n} {{ .. }}`");
+                            self.error_at(codes::ty::BAD_PATTERN(), span, m.as_str());
+                            self.emit();
+                        }
+                        PatKind::Adt { def: adt, variant, fields: List::empty() }
+                    }
+                    Some(ValueRes::Const(d)) => {
+                        let c = match self.p.def(d).data {
+                            DefData::Const(c) => c,
+                            _ => panic("constant without data"),
+                        };
+                        if !self.unify(c.ty, ty) {
+                            self.mismatch(ty, c.ty, span);
+                        }
+                        match c.value {
+                            Some(v) => PatKind::Lit(v),
+                            None => PatKind::Wild,
+                        }
+                    }
+                    Some(_) => {
+                        self.error_at(codes::ty::BAD_PATTERN(), path.span, "expected a unit variant, unit struct or constant");
+                        self.emit();
+                        PatKind::Wild
+                    }
+                    None => PatKind::Wild,
+                }
+            }
+            ast::PatKind::Or(alts) => {
+                let before = self.fcx.locals.len();
+                let mut ps: [Id::<Pat>; ..+] = [];
+                for i in 0..alts.len() {
+                    let a = self.p.ast.pat_ids.list(alts)[i];
+                    ps.push(self.check_pat(a, ty, false));
+                }
+                if self.fcx.locals.len() != before {
+                    self.error_at(codes::ty::BAD_PATTERN(), span, "bindings are not supported inside `|` patterns yet");
+                    self.with_help("use separate match arms");
+                    self.emit();
+                }
+                PatKind::Or(self.p.thir.pat_ids.add_list(ps[..]))
+            }
+        };
+        return self.pat_node(Pat { kind, ty, span });
+    }
+
+    /// The position of `..` among sub-patterns, if any.
+    fn rest_position(&self, ps: List::<Id::<ast::Pat>>): Option::<usize> {
+        let ids = self.p.ast.pat_ids.list(ps);
+        for i in 0..ids.len() {
+            if let ast::PatKind::Rest = self.p.ast.pats.get(ids[i]).kind {
+                return Some(i);
+            }
+        }
+        return None;
+    }
+
+    /// Whether a single-segment path names a constructor or constant (no errors).
+    fn silent_value_kind(&mut self, path: ast::Path): Option::<DefKind> {
+        let module = self.module();
+        let id = self.segment(path, 0).ident;
+        return match self.lookup_ident(module, id, Ns::Value) {
+            Some(ModRes::Def(d)) => {
+                let k = self.p.def(d).kind;
+                match k {
+                    DefKind::Variant | DefKind::Struct | DefKind::Const => Some(k),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+    }
+
+    fn binding(&mut self, name: Ident, is_mut: bool, ty: Ty, span: Span): PatKind {
+        let depth = self.depth();
+        let l = self.new_local(name.name, ty, is_mut, LocalKind::Let, span, depth);
+        let ctx = self.ident_ctx(name);
+        self.bind_name(name.name, ctx, l);
+        let r = self.resolve(ty);
+        let mode = if !self.p.types.has_infer(r) && self.p.is_copy(r, self.fcx.env[..]) { ReadMode::Copy } else { ReadMode::Move };
+        return PatKind::Binding { local: l, mode, sub: None };
+    }
+
+    fn lit_pat(&mut self, l: ast::Lit, neg: bool, ty: Ty, span: Span): PatKind {
+        let e = self.check_lit(l, Some(ty), span);
+        if !self.unify(e.ty, ty) {
+            self.mismatch(ty, e.ty, span);
+        }
+        return match e.kind {
+            ExprKind::Lit(ConstVal::Int(i)) => {
+                let v = if neg { neg_int(i) } else { i };
+                if neg && self.fcx.lit_checks.len() > 0 {
+                    let k = self.fcx.lit_checks.len() - 1;
+                    let mut c = self.fcx.lit_checks[k];
+                    c.neg = !c.neg && (c.mag != 0 || c.high != 0);
+                    self.fcx.lit_checks[k] = c;
+                }
+                PatKind::Lit(ConstVal::Int(v))
+            }
+            ExprKind::Lit(ConstVal::Float(f)) => PatKind::Lit(ConstVal::Float(if neg { -f } else { f })),
+            ExprKind::Lit(v) => PatKind::Lit(v),
+            _ => PatKind::Wild,
+        };
+    }
+
+    /// Positional sub-patterns with an optional `..`.
+    fn tuple_like(&mut self, ps: List::<Id::<ast::Pat>>, tys: TyList, rest: Option::<usize>, span: Span): [FieldPat; -..+] {
+        let mut out: [FieldPat; -..+] = [];
+        match rest {
+            None => {
+                if ps.len() != tys.len() {
+                    let mut m = String::new();
+                    m.write("expected {tys.len()} field(s) in pattern, found {ps.len()}");
+                    self.error_at(codes::ty::BAD_PATTERN(), span, m.as_str());
+                    self.emit();
+                }
+                let n = if ps.len() < tys.len() { ps.len() } else { tys.len() };
+                for i in 0..n {
+                    let p = self.p.ast.pat_ids.list(ps)[i];
+                    let t = self.p.types.at(tys, i);
+                    let sub = self.check_pat(p, t, false);
+                    out.push(FieldPat { field: i as u32, pat: sub });
+                }
+            }
+            Some(r) => {
+                let before = r;
+                let after = ps.len() - r - 1;
+                if before + after > tys.len() {
+                    self.error_at(codes::ty::BAD_PATTERN(), span, "too many fields in pattern");
+                    self.emit();
+                    return out;
+                }
+                for i in 0..before {
+                    let p = self.p.ast.pat_ids.list(ps)[i];
+                    let t = self.p.types.at(tys, i);
+                    let sub = self.check_pat(p, t, false);
+                    out.push(FieldPat { field: i as u32, pat: sub });
+                }
+                let start = tys.len() - after;
+                for k in 0..after {
+                    let p = self.p.ast.pat_ids.list(ps)[r + 1 + k];
+                    let t = self.p.types.at(tys, start + k);
+                    let sub = self.check_pat(p, t, false);
+                    out.push(FieldPat { field: (start + k) as u32, pat: sub });
+                }
+                // Fill the elided positions with wildcards (tuples need every slot).
+                for i in before..start {
+                    let t = self.p.types.at(tys, i);
+                    let w = self.pat_node(Pat { kind: PatKind::Wild, ty: t, span });
+                    out.push(FieldPat { field: i as u32, pat: w });
+                }
+                // Sort by position.
+                let mut i: usize = 1;
+                while i < out.len() {
+                    let mut j = i;
+                    while j > 0 && out[j - 1].field > out[j].field {
+                        let t = out[j];
+                        out[j] = out[j - 1];
+                        out[j - 1] = t;
+                        j -= 1;
+                    }
+                    i += 1;
+                }
+            }
+        }
+        return out;
+    }
+
+    // ===================================================================== exhaustiveness
+
+    pub fn check_exhaustive(&mut self, scrut_ty: Ty, arms: List::<Arm>, span: Span) {
+        let ty = self.resolve(scrut_ty);
+        if self.p.types.has_error(ty) {
+            return;
+        }
+        let mut ex = Exh::new();
+        let mut rows: [List::<Id::<Lite>>; ..+] = [];
+        for i in 0..arms.len() {
+            let a = self.p.thir.arms.list(arms)[i];
+            if a.guard.is_some() {
+                continue;
+            }
+            let l = lite(&self.p, &mut ex, a.pat);
+            let alts = expand(&mut ex, l);
+            for alt in alts[..] {
+                let row = ex.ids.add_list([alt][..]);
+                rows.push(row);
+            }
+        }
+        let mut w: [Symbol; -..+] = [];
+        if self.missing(&mut ex, rows[..], [ty][..], &mut w) {
+            let first = if w.len() > 0 { self.p.text(w[0]).to_string() } else { String::from("_") };
+            let mut m = String::new();
+            m.write("non-exhaustive patterns: `{first}` not covered");
+            self.error_at(codes::ty::NON_EXHAUSTIVE(), span, m.as_str());
+            let mut h = String::new();
+            h.write("add an arm for `{first}`, or a wildcard arm `_ => ...`");
+            self.with_help(h.as_str());
+            self.emit();
+        }
+    }
+
+    /// Whether some value is not matched by `rows`; if so, a witness (one
+    /// text per column) goes to `out`.
+    fn missing(&mut self, ex: &mut Exh, rows: [List::<Id::<Lite>>; &], tys: [Ty; &], out: &mut [Symbol; -..+]): bool {
+        out.clear();
+        if tys.len() == 0 {
+            return rows.len() == 0;
+        }
+        let head_ty = self.resolve(tys[0]);
+        let mut all: [CtorInfo; ..+] = [];
+        let finite = self.ctors_of(head_ty, &mut all);
+        let rest_tys = tys[1..];
+        if finite {
+            let mut used: [u32; ..+] = [];
+            let mut all_ctor_rows = true;
+            for r in rows {
+                match ex.lites.get(ex.ids.list(r)[0]) {
+                    Lite::Ctor(c, _) => used.push(c),
+                    _ => all_ctor_rows = false,
+                }
+            }
+            let mut complete = true;
+            for c in all[..] {
+                if !used[..].contains(c.id) {
+                    complete = false;
+                }
+            }
+            if complete || all_ctor_rows {
+                for c in all[..] {
+                    let nf = c.fields.len();
+                    let mut spec: [List::<Id::<Lite>>; ..+] = [];
+                    for r in rows {
+                        let row = ex.ids.list(r).to_grow();
+                        let mut new_row: [Id::<Lite>; ..+] = [];
+                        match ex.lites.get(row[0]) {
+                            // Fields the pattern does not mention (`{ .. }`,
+                            // trailing `..`) are wildcards.
+                            Lite::Ctor(rc, subs) => {
+                                if rc != c.id {
+                                    continue;
+                                }
+                                new_row.extend(ex.ids.list(subs));
+                                for _ in subs.len()..nf {
+                                    new_row.push(ex.wild);
+                                }
+                            }
+                            Lite::Wild => {
+                                for _ in 0..nf {
+                                    new_row.push(ex.wild);
+                                }
+                            }
+                            _ => continue,
+                        }
+                        new_row.extend(row[1..]);
+                        spec.push(ex.ids.add_list(new_row[..]));
+                    }
+                    let mut sub_tys: [Ty; ..+] = [];
+                    sub_tys.extend(self.p.types.list(c.fields));
+                    sub_tys.extend(rest_tys);
+                    let mut w: [Symbol; -..+] = [];
+                    if self.missing(ex, spec[..], sub_tys[..], &mut w) {
+                        let mut head = String::new();
+                        let name = self.p.text(c.name).to_string();
+                        if nf == 0 {
+                            head.push_str(name.as_str());
+                        } else {
+                            head.push_str(name.as_str());
+                            head.push('(');
+                            for i in 0..nf {
+                                if i > 0 {
+                                    head.push_str(", ");
+                                }
+                                head.push_str(self.p.text(w[i]));
+                            }
+                            head.push(')');
+                        }
+                        out.push(self.p.sym(head.as_str()));
+                        for i in nf..w.len() {
+                            out.push(w[i]);
+                        }
+                        return true;
+                    }
+                }
+                return false;
+            }
+            let mut default: [List::<Id::<Lite>>; ..+] = [];
+            for r in rows {
+                let row = ex.ids.list(r).to_grow();
+                if let Lite::Wild = ex.lites.get(row[0]) {
+                    default.push(ex.ids.add_list(row[1..]));
+                }
+            }
+            let mut w: [Symbol; -..+] = [];
+            if !self.missing(ex, default[..], rest_tys, &mut w) {
+                return false;
+            }
+            let mut missing_ctor = String::from("_");
+            for c in all[..] {
+                if !used[..].contains(c.id) {
+                    missing_ctor = String::new();
+                    missing_ctor.push_str(self.p.text(c.name));
+                    if c.fields.len() > 0 {
+                        missing_ctor.push_str("(..)");
+                    }
+                    break;
+                }
+            }
+            out.push(self.p.sym(missing_ctor.as_str()));
+            out.extend(w[..]);
+            return true;
+        }
+        // Infinite types: only wildcards cover.
+        let mut default: [List::<Id::<Lite>>; ..+] = [];
+        for r in rows {
+            let row = ex.ids.list(r).to_grow();
+            if let Lite::Wild = ex.lites.get(row[0]) {
+                default.push(ex.ids.add_list(row[1..]));
+            }
+        }
+        let mut w: [Symbol; -..+] = [];
+        if !self.missing(ex, default[..], rest_tys, &mut w) {
+            return false;
+        }
+        out.push(self.p.sym("_"));
+        out.extend(w[..]);
+        return true;
+    }
+
+    /// Constructors of a type (into `out`): id, display name, field types.
+    /// False for types with infinitely many values.
+    fn ctors_of(&mut self, t: Ty, out: &mut +[CtorInfo; ..+]): bool {
+        return match self.p.types.kind(t) {
+            TyKind::Bool => {
+                out.push(CtorInfo { id: 0, name: self.p.sym("false"), fields: List::empty() });
+                out.push(CtorInfo { id: 1, name: self.p.sym("true"), fields: List::empty() });
+                true
+            }
+            TyKind::Tuple(ts) => {
+                out.push(CtorInfo { id: 0, name: self.p.sym(""), fields: ts });
+                true
+            }
+            TyKind::Adt(d, args) => {
+                let adt = self.p.adt(d);
+                for i in 0..adt.variants.len() {
+                    let v = self.p.variants.list(adt.variants)[i];
+                    let mut fs: [Ty; ..+] = [];
+                    for j in 0..v.fields.len() {
+                        let f = self.p.fields.list(v.fields)[j];
+                        fs.push(self.p.types.subst(f.ty, args));
+                    }
+                    let fields = self.p.types.mk_list(fs[..]);
+                    out.push(CtorInfo { id: i as u32, name: v.name, fields });
+                }
+                true
+            }
+            _ => false,
+        };
+    }
+}
+
+/// A constructor of a type: its id, display name and field types.
+struct CtorInfo {
+    id: u32,
+    name: Symbol,
+    fields: TyList,
+}
+
+/// Simplified pattern for exhaustiveness checking.
+enum Lite {
+    Wild,
+    Ctor(u32, List::<Id::<Lite>>),
+    /// A literal or range: never covers a type fully.
+    Lit,
+    Or(List::<Id::<Lite>>),
+}
+
+/// The simplified patterns of one exhaustiveness check.
+struct Exh {
+    lites: Arena::<Lite>,
+    ids: Arena::<Id::<Lite>>,
+    wild: Id::<Lite>,
+}
+
+impl Exh {
+    fn new(): Exh {
+        let mut lites: Arena::<Lite> = Arena::new();
+        let wild = lites.add(Lite::Wild);
+        return Exh { lites, ids: Arena::new(), wild };
+    }
+}
+
+fn lite(p: &Program, ex: &mut Exh, id: Id::<Pat>): Id::<Lite> {
+    let pat = p.thir.pat(id);
+    return match pat.kind {
+        PatKind::Wild => ex.wild,
+        PatKind::Binding { sub, .. } => match sub {
+            Some(s) => lite(p, ex, s),
+            None => ex.wild,
+        },
+        PatKind::Lit(ConstVal::Bool(b)) => ex.lites.add(Lite::Ctor(if b { 1 } else { 0 }, List::empty())),
+        PatKind::Lit(_) | PatKind::Range { .. } => ex.lites.add(Lite::Lit),
+        PatKind::Tuple(ps) => {
+            let mut subs: [Id::<Lite>; ..+] = [];
+            for q in p.thir.pat_ids.list(ps) {
+                subs.push(lite(p, ex, q));
+            }
+            let l = ex.ids.add_list(subs[..]);
+            ex.lites.add(Lite::Ctor(0, l))
+        }
+        PatKind::Adt { variant, fields, .. } => {
+            // Fields not mentioned are wildcards; order by index.
+            let mut n: usize = 0;
+            for f in p.thir.field_pats.list(fields) {
+                if f.field as usize + 1 > n {
+                    n = f.field as usize + 1;
+                }
+            }
+            let mut subs: [Id::<Lite>; ..+] = [];
+            for _ in 0..n {
+                subs.push(ex.wild);
+            }
+            for f in p.thir.field_pats.list(fields) {
+                subs[f.field as usize] = lite(p, ex, f.pat);
+            }
+            let l = ex.ids.add_list(subs[..]);
+            ex.lites.add(Lite::Ctor(variant, l))
+        }
+        PatKind::Or(ps) => {
+            let mut subs: [Id::<Lite>; ..+] = [];
+            for q in p.thir.pat_ids.list(ps) {
+                subs.push(lite(p, ex, q));
+            }
+            let l = ex.ids.add_list(subs[..]);
+            ex.lites.add(Lite::Or(l))
+        }
+    };
+}
+
+/// Expand or-patterns at the top level into separate rows.
+fn expand(ex: &mut Exh, l: Id::<Lite>): [Id::<Lite>; ..+] {
+    let mut out: [Id::<Lite>; ..+] = [];
+    match ex.lites.get(l) {
+        Lite::Or(ps) => {
+            for i in 0..ps.len() {
+                let q = ex.ids.list(ps)[i];
+                let e = expand(ex, q);
+                out.extend(e[..]);
+            }
+        }
+        Lite::Ctor(c, subs) => {
+            // Expand nested or-patterns (cartesian product).
+            let mut acc: [List::<Id::<Lite>>; ..+] = [List::empty()];
+            for i in 0..subs.len() {
+                let s = ex.ids.list(subs)[i];
+                let alts = expand(ex, s);
+                let mut next: [List::<Id::<Lite>>; ..+] = [];
+                for prefix in acc[..] {
+                    for a in alts[..] {
+                        let mut v = ex.ids.list(prefix).to_grow();
+                        v.push(a);
+                        next.push(ex.ids.add_list(v[..]));
+                    }
+                }
+                acc = next;
+            }
+            for v in acc[..] {
+                out.push(ex.lites.add(Lite::Ctor(c, v)));
+            }
+        }
+        _ => out.push(l),
+    }
+    return out;
+}
