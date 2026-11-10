@@ -195,8 +195,9 @@ to 64 MiB in total.
 * **`&mut +T` promises to only grow.** A parameter declared `&mut +T` (or a
   receiver `&mut +self`) is never shrunk or replaced, so the caller's views
   survive the call. `push`, `extend`, `insert`, `String::push_str`,
-  `String::write`, `Arena::add`, `HashMap::insert` and `Interner::intern`
-  are `+`:
+  `String::write`, `Arena::add` and `Interner::intern` are `+`
+  (`HashMap::insert` is not: growing replaces its table, so a loop over a
+  map cannot insert into it):
 
   ```lunar
   let s = a[0..2];
