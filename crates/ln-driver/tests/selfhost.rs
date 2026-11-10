@@ -229,15 +229,20 @@ fn std_dir_of(root: &Path) -> String {
 /// stage 2 makes of it. Stages 1 and 2 are the same program built by
 /// different compilers, so stages 2 and 3 must be identical: the same LLVM
 /// IR and the same bytes.
+///
+/// Each stage is linked to a file of the same name (in its own directory):
+/// on macOS the linker signs the executable ad hoc, and the signature
+/// names the executable by its file name.
 #[test]
 fn compiler_builds_itself() {
     let root = root();
     let dir = std::env::temp_dir().join(format!("lunar-bootstrap-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
     let std_dir = std_dir_of(&root);
     let stage = |compiler: &Path, n: u32| -> (PathBuf, String) {
-        let exe = dir.join(format!("stage{n}{}", std::env::consts::EXE_SUFFIX));
+        let stage_dir = dir.join(format!("stage{n}"));
+        std::fs::create_dir_all(&stage_dir).unwrap();
+        let exe = stage_dir.join(format!("lunar{}", std::env::consts::EXE_SUFFIX));
         let ll = dir.join(format!("stage{n}.ll"));
         let out = Command::new(compiler)
             .args(["build", "-p", "lunar", "-o"])
@@ -258,6 +263,16 @@ fn compiler_builds_itself() {
         panic!("stages 2 and 3 differ at IR line {}:\n  {a}\n  {b}", i + 1);
     }
     assert_eq!(ir2.len(), ir3.len(), "stage 3's IR is a prefix of stage 2's, or the other way round");
-    assert!(std::fs::read(&stage2).unwrap() == std::fs::read(&stage3).unwrap(), "stages 2 and 3 have the same IR but link to different bytes");
+    let (bin2, bin3) = (std::fs::read(&stage2).unwrap(), std::fs::read(&stage3).unwrap());
+    if let Some(at) = bin2.iter().zip(&bin3).position(|(a, b)| a != b).or((bin2.len() != bin3.len()).then(|| bin2.len().min(bin3.len()))) {
+        let around = |bin: &[u8]| String::from_utf8_lossy(&bin[at.saturating_sub(32).min(bin.len())..(at + 32).min(bin.len())]).into_owned();
+        panic!(
+            "stages 2 and 3 have the same IR but link to different bytes ({} and {} bytes, first difference at byte {at}):\n  {:?}\n  {:?}",
+            bin2.len(),
+            bin3.len(),
+            around(&bin2),
+            around(&bin3)
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

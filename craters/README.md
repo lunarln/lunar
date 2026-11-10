@@ -16,10 +16,14 @@ time.
 cd craters
 export LUNAR_LIB_PATH="C:/Program Files/LLVM/lib"   # or `llvm-config --libdir`
 lunar build --release                                # stage 1, by the Rust compiler
-target/release/lunar build -p lunar -o stage2        # stage 2, by stage 1
-./stage2 build -p lunar -o stage3                    # stage 3, by stage 2
-cmp stage2 stage3                                    # identical
+mkdir stage2 stage3
+target/release/lunar build -p lunar -o stage2/lunar  # stage 2, by stage 1
+stage2/lunar build -p lunar -o stage3/lunar          # stage 3, by stage 2
+cmp stage2/lunar stage3/lunar                        # identical
 ```
+
+(Both stages get the same file name because on macOS the linker's ad hoc
+code signature records it.)
 
 The executable, `target/release/lunar`, is a drop-in replacement for the
 Rust `lunar`: the same commands (`new`, `init`, `check`, `build`, `run`,
@@ -164,7 +168,8 @@ every `.ln` file in the repository:
   (before its summary line): the same diagnostics, drawn the same;
 * `compiler_builds_itself`: the bootstrap above; stages 2 and 3 must have
   the same LLVM IR and the same bytes (on Windows the link is reproducible
-  through `/Brepro`).
+  through `/Brepro`; on macOS the linker's ad hoc code signature names the
+  executable, so both stages are linked to files of the same name).
 
 Programs compiled by the Lunar compiler pass every run test
 (`tests/run`, `examples`), and `--check` reports the Rust compiler's
