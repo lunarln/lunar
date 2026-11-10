@@ -321,12 +321,24 @@ pub fn read_dir(path: str, names: &mut +String, ends: &mut +[u32; ..+], dirs: &m
 
 /// The path of the running executable.
 pub fn current_exe(): Option::<String> {
-    let mut buf: [u16; 32768] = [0; 32768];
-    let n = unsafe { GetModuleFileNameW(core::ptr::null_mut(), buf.as_mut_ptr(), 32768) };
-    if n == 0 || n >= 32768 {
-        return None;
+    // A path may be up to 32767 units long; the buffer grows until it
+    // holds it.
+    let mut size: usize = 512;
+    while size <= 65536 {
+        let mut buf: [u16; -..+] = [];
+        for _ in 0..size {
+            buf.push(0);
+        }
+        let n = unsafe { GetModuleFileNameW(core::ptr::null_mut(), buf.as_mut_ptr(), size as u32) } as usize;
+        if n == 0 {
+            return None;
+        }
+        if n < size {
+            return Some(narrow(buf[..n]));
+        }
+        size *= 2;
     }
-    return Some(narrow(buf[..n as usize]));
+    return None;
 }
 
 /// UTF-16 as UTF-8 (an unpaired surrogate as U+FFFD).

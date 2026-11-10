@@ -1,0 +1,633 @@
+// Printing declarations back as Lunar source, for editor hovers: a port of
+// crates/ln-ast/src/pretty.rs. Names, generics, parameters and types,
+// without bodies, attributes or comments. Output is normalized (one space
+// after `,` and `:`, ` + ` between bounds), not a copy of how the source
+// was formatted.
+//
+// Token trees keep only their spans, so the functions that print them take
+// `src`, the text the spans are offsets into (`Program::sources.text`).
+
+use core::arena::{Id, List};
+use crater::*;
+
+/// `a::b::<T, U>::c`
+pub fn path(a: &Ast, src: str, p: Path): String {
+    let mut out = String::new();
+    let segs = a.segments.list(p.segments);
+    for i in 0..segs.len() {
+        if i > 0 {
+            out.push_str("::");
+        }
+        out.push_str(a.text(segs[i].ident.name));
+        if let Some(args) = segs[i].args {
+            out.push_str("::<");
+            ty_list(a, src, args, &mut out);
+            out.push('>');
+        }
+    }
+    return out;
+}
+
+/// The types of `l`, separated by `, `.
+fn ty_list(a: &Ast, src: str, l: List::<Id::<Ty>>, out: &mut String) {
+    let ids = a.ty_ids.list(l);
+    for i in 0..ids.len() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(ty(a, src, ids[i]).as_str());
+    }
+}
+
+pub fn ty(a: &Ast, src: str, id: Id::<Ty>): String {
+    let t = a.tys.get(id);
+    let mut out = String::new();
+    match t.kind {
+        TyKind::Path(p) => out.push_str(path(a, src, p).as_str()),
+        TyKind::Array(elem, size) => {
+            let size_text = match size {
+                ArraySize::Fixed(e) => expr(a, src, e),
+                ArraySize::Inferred => String::from("_"),
+                ArraySize::Grow => String::from("..+"),
+                ArraySize::GrowShrink => String::from("-..+"),
+                ArraySize::Slice => String::from("&"),
+                ArraySize::SliceMut => String::from("&mut"),
+            };
+            out.write("[{ty(a, src, elem)}; {size_text}]");
+        }
+        TyKind::DynArray(elem) => out.write("[{ty(a, src, elem)}]"),
+        TyKind::Grow(inner) => out.write("+{ty(a, src, inner)}"),
+        TyKind::Ptr { is_mut, inner } => {
+            out.push('*');
+            if is_mut {
+                out.push_str("mut ");
+            }
+            out.push_str(ty(a, src, inner).as_str());
+        }
+        TyKind::Tuple(items) => {
+            out.push('(');
+            ty_list(a, src, items, &mut out);
+            if items.len() == 1 {
+                out.push(',');
+            }
+            out.push(')');
+        }
+        TyKind::Fn { params, ret } => {
+            out.push_str("fn(");
+            let ps = a.fn_ty_params.list(params);
+            for i in 0..ps.len() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(mode_prefix(ps[i].mode));
+                out.push_str(ty(a, src, ps[i].ty).as_str());
+            }
+            out.push(')');
+            if let Some(r) = ret {
+                out.write(": {ty(a, src, r)}");
+            }
+        }
+        TyKind::Never => out.push('!'),
+        TyKind::Infer => out.push('_'),
+        TyKind::MacCall(m) => out.push_str(mac_call(a, src, m).as_str()),
+        TyKind::ImplTrait(bounds) => {
+            out.push_str("impl ");
+            bounds_text(a, src, bounds, &mut out);
+        }
+    }
+    return out;
+}
+
+/// Bounds separated by ` + `.
+fn bounds_text(a: &Ast, src: str, l: List::<Path>, out: &mut String) {
+    let ps = a.paths.list(l);
+    for i in 0..ps.len() {
+        if i > 0 {
+            out.push_str(" + ");
+        }
+        out.push_str(bound(a, src, ps[i]).as_str());
+    }
+}
+
+/// A trait in a bound, with the `Fn(A): R` sugar where it was written so.
+pub fn bound(a: &Ast, src: str, p: Path): String {
+    let segs = a.segments.list(p.segments);
+    if segs.len() > 0 {
+        let last = segs[segs.len() - 1];
+        if let Some(args) = last.args {
+            let ids = a.ty_ids.list(args);
+            if ids.len() == 1 {
+                if let TyKind::Fn { .. } = a.tys.get(ids[0]).kind {
+                    let mut out = String::new();
+                    for i in 0..segs.len() {
+                        if i > 0 {
+                            out.push_str("::");
+                        }
+                        out.push_str(a.text(segs[i].ident.name));
+                        if i + 1 < segs.len() {
+                            if let Some(xs) = segs[i].args {
+                                out.push_str("::<");
+                                ty_list(a, src, xs, &mut out);
+                                out.push('>');
+                            }
+                        }
+                    }
+                    let sig = ty(a, src, ids[0]);
+                    out.push_str(trim_fn(sig.as_str()));
+                    return out;
+                }
+            }
+        }
+    }
+    return path(a, src, p);
+}
+
+/// `s` without the leading `fn`s (Rust's `trim_start_matches("fn")`).
+fn trim_fn(s: str): str {
+    let mut t = s;
+    while t.starts_with("fn") {
+        t = t[2..];
+    }
+    return t;
+}
+
+/// `path!(tokens)`.
+pub fn mac_call(a: &Ast, src: str, m: MacCall): String {
+    let mut out = path(a, src, m.path);
+    out.push('!');
+    out.push_str(m.delim.open());
+    out.push_str(tokens(a, src, m.tokens).as_str());
+    out.push_str(m.delim.close());
+    return out;
+}
+
+/// Token trees as source text, one space between tokens except where that
+/// would look odd (`a::b`, `f(x)`, `x.y`, `$x`).
+pub fn tokens(a: &Ast, src: str, trees: List::<TokenTree>): String {
+    let mut out = String::new();
+    let mut prev_glues = true;
+    for t in a.tokens.list(trees) {
+        let mut text = String::new();
+        let mut glue_before = false;
+        let mut glue_after = false;
+        match t {
+            TokenTree::Token(tok) => {
+                let s = src[tok.span.lo as usize..tok.span.hi as usize];
+                text.push_str(s);
+                glue_before = s == "::" || s == "." || s == "," || s == ";" || s == ":" || s == "?" || s == "!";
+                glue_after = s == "::" || s == "." || s == "$" || s == "&" || s == "#";
+            }
+            TokenTree::Group { delim, trees: inner, .. } => {
+                text.push_str(delim.open());
+                text.push_str(tokens(a, src, inner).as_str());
+                text.push_str(delim.close());
+                glue_before = match delim {
+                    Delim::Brace => false,
+                    _ => true,
+                };
+            }
+        }
+        if out.len() > 0 && !prev_glues && !glue_before {
+            out.push(' ');
+        }
+        out.push_str(text.as_str());
+        prev_glues = glue_after;
+    }
+    return out;
+}
+
+fn mode_prefix(mode: ParamMode): str {
+    return match mode {
+        ParamMode::Take => "",
+        ParamMode::Borrow => "&",
+        ParamMode::InOut => "&mut ",
+    };
+}
+
+/// `T: Ord + Clone`, or just `T`.
+pub fn generic_param(a: &Ast, src: str, p: GenericParam): String {
+    let mut out = String::from(a.text(p.name.name));
+    if p.bounds.len() > 0 {
+        out.push_str(": ");
+        bounds_text(a, src, p.bounds, &mut out);
+    }
+    return out;
+}
+
+/// The parameters of `g`, separated by `, `.
+fn generic_params(a: &Ast, src: str, g: Generics, out: &mut String) {
+    let ps = a.generic_params.list(g.params);
+    for i in 0..ps.len() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(generic_param(a, src, ps[i]).as_str());
+    }
+}
+
+/// `::<T: Ord, U>`, or nothing without parameters.
+pub fn generics(a: &Ast, src: str, g: Generics): String {
+    let mut out = String::new();
+    if g.params.len() == 0 {
+        return out;
+    }
+    out.push_str("::<");
+    generic_params(a, src, g, &mut out);
+    out.push('>');
+    return out;
+}
+
+pub fn param(a: &Ast, src: str, p: Param): String {
+    let mut_kw = if p.kept && p.is_mut {
+        "kept mut "
+    } else if p.kept {
+        "kept "
+    } else if p.is_mut {
+        "mut "
+    } else {
+        ""
+    };
+    let mut out = String::new();
+    let ty_text = match p.ty {
+        Some(t) => ty(a, src, t),
+        None => String::new(),
+    };
+    match p.kind {
+        ParamKind::SelfParam => match p.mode {
+            ParamMode::Take => out.write("{mut_kw}self"),
+            ParamMode::Borrow => out.push_str("&self"),
+            ParamMode::InOut => out.push_str(if p.self_grow { "&mut +self" } else { "&mut self" }),
+        },
+        ParamKind::Named(name) => out.write("{mut_kw}{a.text(name.name)}: {mode_prefix(p.mode)}{ty_text}"),
+        ParamKind::Wild => out.write("{mut_kw}_: {mode_prefix(p.mode)}{ty_text}"),
+    }
+    return out;
+}
+
+/// `unsafe fn name::<T: Ord>(a: T, b: &T): T`, without `pub`.
+pub fn fn_sig(a: &Ast, src: str, f: FnDecl): String {
+    let mut out = String::new();
+    if f.is_unsafe {
+        out.push_str("unsafe ");
+    }
+    out.write("fn {a.text(f.name.name)}{generics(a, src, f.generics)}(");
+    let ps = a.params.list(f.params);
+    for i in 0..ps.len() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(param(a, src, ps[i]).as_str());
+    }
+    if f.variadic {
+        if ps.len() > 0 {
+            out.push_str(", ");
+        }
+        out.push_str("...");
+    }
+    out.push(')');
+    if let Some(r) = f.ret {
+        out.write(": {ty(a, src, r)}");
+    }
+    return out;
+}
+
+/// A variant as written in its enum: `Some(T)`, `Point { x: i32 }`, `None`.
+pub fn variant(a: &Ast, src: str, v: VariantDecl): String {
+    let mut out = String::from(a.text(v.name.name));
+    out.push_str(variant_data(a, src, v.data, false).as_str());
+    return out;
+}
+
+fn vis(is_pub: bool): str {
+    return if is_pub { "pub " } else { "" };
+}
+
+/// The fields after a struct or variant name. Named fields go one per line
+/// when `multiline` (structs), else on one line (`Rect { w: f64, h: f64 }`).
+fn variant_data(a: &Ast, src: str, data: VariantData, multiline: bool): String {
+    let mut out = String::new();
+    match data {
+        VariantData::Unit => {}
+        VariantData::Tuple(fields) => {
+            out.push('(');
+            let fs = a.tuple_fields.list(fields);
+            for i in 0..fs.len() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.write("{vis(fs[i].is_pub)}{ty(a, src, fs[i].ty)}");
+            }
+            out.push(')');
+        }
+        VariantData::Named(fields) => {
+            let fs = a.field_decls.list(fields);
+            if fs.len() == 0 {
+                out.push_str(" {}");
+            } else if !multiline {
+                out.push_str(" { ");
+                for i in 0..fs.len() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.write("{vis(fs[i].is_pub)}{a.text(fs[i].name.name)}: {ty(a, src, fs[i].ty)}");
+                }
+                out.push_str(" }");
+            } else {
+                out.push_str(" {\n");
+                for f in fs {
+                    out.write("    {vis(f.is_pub)}{a.text(f.name.name)}: {ty(a, src, f.ty)},\n");
+                }
+                out.push('}');
+            }
+        }
+    }
+    return out;
+}
+
+/// The declaration of `item`: the signature of a function, the header of a
+/// trait or impl, a struct with its fields, an enum with its variants.
+/// `extern_abi` is the ABI of the `extern` block the item is in, if any.
+/// Attributes are never included.
+pub fn item(a: &Ast, src: str, it: Item, extern_abi: Option::<str>): String {
+    let v = vis(it.is_pub);
+    let mut out = String::new();
+    match it.kind {
+        ItemKind::Fn(f) => {
+            out.push_str(v);
+            if let Some(abi) = extern_abi {
+                out.write("extern {abi:?} ");
+            }
+            out.push_str(fn_sig(a, src, f).as_str());
+        }
+        ItemKind::Struct(s) => {
+            out.write("{v}struct {a.text(s.name.name)}{generics(a, src, s.generics)}{variant_data(a, src, s.kind, true)}");
+        }
+        ItemKind::Enum(e) => {
+            out.write("{v}enum {a.text(e.name.name)}{generics(a, src, e.generics)}");
+            let vs = a.variants.list(e.variants);
+            if vs.len() == 0 {
+                out.push_str(" {}");
+            } else {
+                out.push_str(" {\n");
+                for x in vs {
+                    out.write("    {variant(a, src, x)},\n");
+                }
+                out.push('}');
+            }
+        }
+        ItemKind::Trait(t) => {
+            out.write("{v}trait {a.text(t.name.name)}{generics(a, src, t.generics)}");
+            let sts = a.paths.list(t.supertraits);
+            if sts.len() > 0 {
+                out.push_str(": ");
+                for i in 0..sts.len() {
+                    if i > 0 {
+                        out.push_str(" + ");
+                    }
+                    out.push_str(path(a, src, sts[i]).as_str());
+                }
+            }
+        }
+        ItemKind::Impl(i) => {
+            out.push_str("impl");
+            if i.generics.params.len() > 0 {
+                out.push_str("::<");
+                generic_params(a, src, i.generics, &mut out);
+                out.push('>');
+            }
+            out.push(' ');
+            if let Some(tr) = i.trait_ref {
+                if i.negative {
+                    out.push('!');
+                }
+                out.write("{path(a, src, tr)} for ");
+            }
+            out.push_str(ty(a, src, i.self_ty).as_str());
+        }
+        ItemKind::Mod(m) => out.write("{v}mod {a.text(m.name.name)}"),
+        ItemKind::Const(c) => out.write("{v}const {a.text(c.name.name)}: {ty(a, src, c.ty)} = {expr(a, src, c.value)}"),
+        ItemKind::Static(s) => {
+            let m = if s.is_mut { "mut " } else { "" };
+            out.write("{v}static {m}{a.text(s.name.name)}: {ty(a, src, s.ty)} = {expr(a, src, s.value)}");
+        }
+        ItemKind::TypeAlias(t) => out.write("{v}type {a.text(t.name.name)}{generics(a, src, t.generics)} = {ty(a, src, t.ty)}"),
+        ItemKind::Extern(b) => {
+            let abi = match b.abi {
+                Some(s) => a.text(s),
+                None => "C",
+            };
+            out.write("extern {abi:?}");
+        }
+        ItemKind::Macro(m) => out.write("{v}macro {a.text(m.name.name)}"),
+        ItemKind::MacCall(m) => out.push_str(mac_call(a, src, m).as_str()),
+        ItemKind::Use(_) => out.push_str("use ..."),
+    }
+    return out;
+}
+
+/// A constant expression (array sizes, `const` values). Anything more
+/// involved than literals, paths and operators prints as `...`.
+pub fn expr(a: &Ast, src: str, id: Id::<Expr>): String {
+    let e = a.exprs.get(id);
+    let mut out = String::new();
+    match e.kind {
+        ExprKind::Lit(l) => out.push_str(lit(a, src, l, e.span).as_str()),
+        ExprKind::Path(p) => out.push_str(path(a, src, p).as_str()),
+        ExprKind::Unary(op, x) => {
+            let o = match op {
+                UnOp::Neg => "-",
+                UnOp::Not => "!",
+                UnOp::Deref => "*",
+            };
+            out.write("{o}{expr(a, src, x)}");
+        }
+        ExprKind::Borrow { mutable, expr: x } => {
+            out.push('&');
+            if mutable {
+                out.push_str("mut ");
+            }
+            out.push_str(expr(a, src, x).as_str());
+        }
+        ExprKind::Binary(op, l, r) => out.write("{expr(a, src, l)} {op.as_str()} {expr(a, src, r)}"),
+        ExprKind::Paren(x) => out.write("({expr(a, src, x)})"),
+        ExprKind::Cast(x, t) => out.write("{expr(a, src, x)} as {ty(a, src, t)}"),
+        ExprKind::Tuple(xs) => {
+            out.push('(');
+            exprs(a, src, xs, &mut out);
+            out.push(')');
+        }
+        ExprKind::Array(xs) => {
+            if xs.len() <= 8 {
+                out.push('[');
+                exprs(a, src, xs, &mut out);
+                out.push(']');
+            } else {
+                out.push_str("...");
+            }
+        }
+        ExprKind::ArrayRepeat(x, n) => out.write("[{expr(a, src, x)}; {expr(a, src, n)}]"),
+        ExprKind::StructLit { path: p, fields } => {
+            if fields.len() == 0 {
+                out.write("{path(a, src, p)} {{}}");
+            } else {
+                out.push_str("...");
+            }
+        }
+        _ => out.push_str("..."),
+    }
+    return out;
+}
+
+fn exprs(a: &Ast, src: str, l: List::<Id::<Expr>>, out: &mut String) {
+    let ids = a.expr_ids.list(l);
+    for i in 0..ids.len() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(expr(a, src, ids[i]).as_str());
+    }
+}
+
+/// A literal (at `span`), as Rust's printer shows its value.
+fn lit(a: &Ast, src: str, l: Lit, span: Span): String {
+    let mut out = String::new();
+    match l {
+        Lit::Int { value, high, suffix } => {
+            out.push_str(u128_decimal(high, value).as_str());
+            if let Some(s) = suffix {
+                out.push_str(a.text(s));
+            }
+        }
+        Lit::Float { suffix } => {
+            // The literal's text without `_` and its suffix, as the `f64`
+            // Rust's parser makes of it, printed as Rust prints an `f64`.
+            let mut text = String::new();
+            for c in src[span.lo as usize..span.hi as usize].chars() {
+                if c != '_' {
+                    text.push(c);
+                }
+            }
+            let mut t = text.as_str();
+            if let Some(s) = suffix {
+                let n = a.text(s).len();
+                if t.len() >= n {
+                    t = t[..t.len() - n];
+                }
+            }
+            let mut s = match std::fmt::parse_f64(t) {
+                Some(x) => rust_f64(x),
+                None => String::from(t),
+            };
+            if !s.as_str().contains(".") && !s.as_str().contains("e") && !s.as_str().contains("E") && !s.as_str().contains("inf") && !s.as_str().contains("NaN") {
+                s.push_str(".0");
+            }
+            out.push_str(s.as_str());
+            if let Some(x) = suffix {
+                out.push_str(a.text(x));
+            }
+        }
+        Lit::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+        Lit::Char(c) => {
+            out.push('\'');
+            escape_char(&mut out, c, '\'');
+            out.push('\'');
+        }
+        Lit::Str { value, .. } => {
+            out.push('"');
+            for c in a.text(value).chars() {
+                escape_char(&mut out, c, '"');
+            }
+            out.push('"');
+        }
+    }
+    return out;
+}
+
+/// `x` as Rust's `Display` for `f64` writes it: the shortest digits that
+/// read back as `x`, never in exponent form (`1e21` is
+/// `1000000000000000000000`).
+fn rust_f64(x: f64): String {
+    let mut g = String::new();
+    g.write("{x}");
+    let s = g.as_str();
+    let e = match s.find("e") {
+        Some(i) => i,
+        None => return g,
+    };
+    let (neg, mant) = if s.starts_with("-") { (true, s[1..e]) } else { (false, s[..e]) };
+    let exp = match s[e + 1..].parse_i64() {
+        Some(n) => n,
+        None => return g,
+    };
+    let mut digits = String::new();
+    let mut point: i64 = mant.len() as i64;
+    let mb = mant.as_bytes();
+    for i in 0..mb.len() {
+        if mb[i] == b'.' {
+            point = i as i64;
+        } else {
+            digits.push(mb[i] as char);
+        }
+    }
+    let pos = point + exp;
+    let n = digits.len() as i64;
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    if pos <= 0 {
+        out.push_str("0.");
+        for _ in 0..(-pos) {
+            out.push('0');
+        }
+        out.push_str(digits.as_str());
+    } else if pos >= n {
+        out.push_str(digits.as_str());
+        for _ in 0..(pos - n) {
+            out.push('0');
+        }
+    } else {
+        out.push_str(digits.as_str()[..pos as usize]);
+        out.push('.');
+        out.push_str(digits.as_str()[pos as usize..]);
+    }
+    return out;
+}
+
+fn escape_char(out: &mut String, c: char, quote: char) {
+    if c == '\n' {
+        out.push_str("\\n");
+    } else if c == '\t' {
+        out.push_str("\\t");
+    } else if c == '\r' {
+        out.push_str("\\r");
+    } else if c == '\0' {
+        out.push_str("\\0");
+    } else if c == '\\' {
+        out.push_str("\\\\");
+    } else if c == quote {
+        out.push('\\');
+        out.push(c);
+    } else {
+        out.push(c);
+    }
+}
+
+/// The documentation in `attrs`: the texts of its `doc` attributes (doc
+/// comments), one per line.
+pub fn doc_text(a: &Ast, attrs: List::<Attr>): String {
+    let mut out = String::new();
+    let mut first = true;
+    for at_ in a.attrs.list(attrs) {
+        if let Meta::NameValue(name, text) = at_.meta {
+            if a.text(name.name) == "doc" {
+                if !first {
+                    out.push('\n');
+                }
+                first = false;
+                out.push_str(a.text(text));
+            }
+        }
+    }
+    return out;
+}
