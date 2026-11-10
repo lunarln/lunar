@@ -7,7 +7,7 @@ use crate::thir::{self, Arm, Callee, Coercion, Expr, ExprKind, FmtPiece, LocalKi
 use crate::ty::{ArrKind, IntTy, TraitRef, Ty};
 use ln_ast as ast;
 use ln_ast::{BinOp, UnOp};
-use ln_diag::{Diagnostic, Span, codes::build, codes::name, codes::syntax, codes::ty as tyc};
+use ln_diag::{Diagnostic, Span, codes::build, codes::lint, codes::name, codes::syntax, codes::ty as tyc};
 
 impl<'s, 'a> FnCtx<'s, 'a> {
     pub(crate) fn mk(&self, kind: ExprKind, ty: Ty, span: Span) -> Expr {
@@ -956,13 +956,27 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     fn check_block_typed(&mut self, b: &ast::Block, expect: Option<&Ty>) -> (thir::Block, Ty) {
         let module = self.s.block_scopes.get(&b.id).copied();
         self.push_scope(module);
+        let r = self.check_stmts(&b.stmts, b.tail.as_deref(), expect, b.span);
+        self.pop_scope();
+        r
+    }
+
+    /// Check statements and a tail in the current scope. A `let .. else`
+    /// takes the statements after it into the arm where its pattern matched,
+    /// so the rest of the block becomes a `match`, the block's tail.
+    fn check_stmts(&mut self, b_stmts: &[ast::Stmt], b_tail: Option<&ast::Expr>, expect: Option<&Ty>, span: Span) -> (thir::Block, Ty) {
         let first_local = self.locals.len();
         let mut stmts = Vec::new();
         let mut diverges = false;
-        for s in &b.stmts {
+        let mut rest: Option<Expr> = None;
+        for (i, s) in b_stmts.iter().enumerate() {
             match &s.kind {
                 ast::StmtKind::Item(_) => {}
-                ast::StmtKind::Let { pat, ty, init } => {
+                ast::StmtKind::Let { pat, ty, init: Some(init), else_: Some(els) } => {
+                    rest = Some(self.check_let_else(pat, ty.as_ref(), init, els, &b_stmts[i + 1..], b_tail, expect, s.span, span));
+                    break;
+                }
+                ast::StmtKind::Let { pat, ty, init, .. } => {
                     let st = self.check_let(pat, ty.as_ref(), init.as_ref(), s.span);
                     if let thir::Stmt::Let { init: Some(i), .. } = &st
                         && matches!(self.shallow(&i.ty), Ty::Never)
@@ -980,18 +994,12 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 }
             }
         }
-        let tail = b.tail.as_ref().map(|t| {
-            let v = self.check_expr(t, expect);
-            Box::new(v)
-        });
+        let tail = match rest {
+            Some(m) => Some(Box::new(m)),
+            None => b_tail.map(|t| Box::new(self.check_expr(t, expect))),
+        };
         let ty = match &tail {
-            Some(t) => {
-                if diverges && !matches!(self.shallow(&t.ty), Ty::Never) {
-                    t.ty.clone()
-                } else {
-                    t.ty.clone()
-                }
-            }
+            Some(t) => t.ty.clone(),
             None if diverges => Ty::Never,
             None => Ty::unit(),
         };
@@ -1000,8 +1008,65 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             .map(|i| thir::LocalId(i as u32))
             .filter(|l| self.locals[l.0 as usize].depth == depth && self.locals[l.0 as usize].kind == LocalKind::Let)
             .collect();
+        (thir::Block { stmts, tail, locals, span }, ty)
+    }
+
+    /// `let pat = init else { els }; rest..` as
+    /// `match init { pat => { rest.. }, _ => els }`. The `else` block cannot
+    /// see the pattern's bindings and must diverge.
+    #[allow(clippy::too_many_arguments)]
+    fn check_let_else(
+        &mut self,
+        pat: &ast::Pat,
+        ty: Option<&ast::Ty>,
+        init: &ast::Expr,
+        els: &ast::Block,
+        rest: &[ast::Stmt],
+        tail: Option<&ast::Expr>,
+        expect: Option<&Ty>,
+        let_span: Span,
+        block_span: Span,
+    ) -> Expr {
+        let s = match ty {
+            Some(t) => {
+                let declared = self.lower_local_ty(t);
+                let v = self.check_expr(init, Some(&declared));
+                let v = self.coerce(v, &declared, init.span);
+                self.expr_as_place(v)
+            }
+            None => self.check_place_or_temp(init),
+        };
+        let st = s.ty.clone();
+        let mut else_e = self.check_block_expr(els, None, false);
+        if !matches!(self.shallow(&else_e.ty), Ty::Never | Ty::Error) {
+            let found = self.ty_str(&else_e.ty);
+            let sp = els.tail.as_ref().map_or(els.span, |t| t.span);
+            self.err(
+                Diagnostic::error(tyc::LET_ELSE_FALLS_THROUGH, sp, "the `else` block of a `let .. else` must not finish")
+                    .with_label(format!("this block finishes with a value of type `{found}`"))
+                    .with_secondary(pat.span, "the code after the `let` needs this pattern to match")
+                    .with_help("end the block with `return`, `break`, `continue` or a call that never returns"),
+            );
+            // Reported: do not also report it as a mismatch with the rest.
+            else_e.ty = Ty::Error;
+        }
+        self.push_scope(None);
+        let p = self.check_pat(pat, &st, false);
+        if p.is_irrefutable(&|d| self.s.p.is_enum(d)) {
+            self.err(
+                Diagnostic::warning(lint::IRREFUTABLE_LET_ELSE, pat.span, "this pattern always matches, so the `else` block never runs")
+                    .with_help("remove the `else` block"),
+            );
+        }
+        self.push_scope(None);
+        let (blk, rest_ty) = self.check_stmts(rest, tail, expect, block_span);
         self.pop_scope();
-        (thir::Block { stmts, tail, locals, span: b.span }, ty)
+        self.pop_scope();
+        let rest_e = self.mk(ExprKind::Block(blk), rest_ty, block_span);
+        let (rest_e, else_e, ty) = self.join_branches(rest_e, else_e, expect, els.span);
+        let wild = thir::Pat { kind: PatKind::Wild, ty: st, span: pat.span };
+        let arms = vec![Arm { pat: p, guard: None, body: rest_e }, Arm { pat: wild, guard: None, body: else_e }];
+        self.mk(ExprKind::Match { scrut: Box::new(s), arms }, ty, let_span)
     }
 
     fn check_let(&mut self, pat: &ast::Pat, ty: Option<&ast::Ty>, init: Option<&ast::Expr>, span: Span) -> thir::Stmt {
@@ -1025,7 +1090,8 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let p = self.check_pat(pat, &t, true);
         if !p.is_irrefutable(&|d| self.s.p.is_enum(d)) {
             self.err(
-                Diagnostic::error(tyc::NON_EXHAUSTIVE, pat.span, "refutable pattern in `let`").with_help("use `if let` or `match` to handle the other cases"),
+                Diagnostic::error(tyc::NON_EXHAUSTIVE, pat.span, "refutable pattern in `let`")
+                    .with_help("handle the other cases with `let .. else { .. }`, `if let` or `match`"),
             );
         }
         thir::Stmt::Let { pat: p, init, span }

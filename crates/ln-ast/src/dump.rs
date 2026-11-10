@@ -334,13 +334,16 @@ impl Dump {
     fn stmt(&mut self, s: &Stmt) {
         let sp = at(s.span);
         match &s.kind {
-            StmtKind::Let { pat, ty, init } => self.node(format!("stmt let {sp}"), |d| {
+            StmtKind::Let { pat, ty, init, else_ } => self.node(format!("stmt let {sp}"), |d| {
                 d.pat(pat);
                 if let Some(t) = ty {
                     d.node("ty", |d| d.ty(t));
                 }
                 if let Some(e) = init {
                     d.node("init", |d| d.expr(e));
+                }
+                if let Some(b) = else_ {
+                    d.node("else", |d| d.block(b));
                 }
             }),
             StmtKind::Expr(e) => self.node(format!("stmt expr {sp}"), |d| d.expr(e)),

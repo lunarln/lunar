@@ -3,7 +3,7 @@
 use core::arena::{Id, List};
 use core::intern::Symbol;
 use ln_ast::*;
-use ln_lexer::{NumKind, Token as T};
+use ln_lexer::{NumKind, Token as T, hole_end};
 use crater::{Parser, PResult, Code, Diag};
 
 /// The type suffixes, integer ones first.
@@ -459,27 +459,12 @@ impl Parser {
                     pieces.push(FmtPiece::Text(t));
                     text = String::new();
                 }
-                // Find the matching close brace, honouring nesting and strings.
+                // The matching close brace, as the lexer found it.
                 let open = i;
-                let mut depth: usize = 1;
-                let mut j = i + 1;
-                let mut in_str = false;
-                while j < b.len() && depth > 0 {
-                    let x = b[j];
-                    if x == b'\\' && in_str {
-                        j += 1;
-                    } else if x == b'"' {
-                        in_str = !in_str;
-                    } else if x == b'{' && !in_str {
-                        depth += 1;
-                    } else if x == b'}' && !in_str {
-                        depth -= 1;
-                    }
-                    j += 1;
-                }
-                if depth != 0 {
-                    return self.fmt_error("unclosed `{` in format string (use `{{` for a literal brace)", offset + open as u32, offset + open as u32 + 1);
-                }
+                let j = match hole_end(b, i + 1) {
+                    Some(e) => e,
+                    None => return self.fmt_error("unclosed `{` in format string (use `{{` for a literal brace)", offset + open as u32, offset + open as u32 + 1),
+                };
                 let inner = raw[open + 1..j - 1];
                 if inner.trim().len() == 0 {
                     return self.fmt_error("empty `{}` in format string: put an expression inside, e.g. `{x}`", offset + open as u32, offset + j as u32);

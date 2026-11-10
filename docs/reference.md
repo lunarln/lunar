@@ -302,9 +302,15 @@ for x in array { }       // arrays and slices (by value, Dull items)
 for c in s.chars() { }   // anything implementing Iterator::<T>
 while let Some(x) = it.next() { }
 if let Some(v) = maybe { }
+let Some(v) = maybe else { return; };  // `v` is bound for the rest of the block
 let n = text.find("x")?; // `?` on Option and Result
 ```
 
+* `let pattern = value else { ... };` takes a pattern that may fail to
+  match. When it does not match, the `else` block runs and must leave
+  (`return`, `break`, `continue`, or a call returning `!`):
+  `err(type::let_else_falls_through)`. It cannot see the pattern's bindings.
+  A pattern that always matches gets `warn(lint::irrefutable_let_else)`.
 * Indexing `a[i]` is bounds checked; `a[i..j]`, `a[..]`, `a[i..=j]` slice.
 * Struct literals `Point { x: 1, y }`; tuples `(1, 2)`, `t.0`.
 * Array literals `[1, 2, 3]`, repeats `[0.; 8]` (the count may be a runtime
@@ -357,6 +363,15 @@ parameter, such as `println`, `print`, `panic`, `String::write` or
 `core::fmt::format`. `{expr}` formats `expr` with `Display`; `{{` and `}}`
 are literal braces. Everywhere else a string literal is a plain `str`.
 
+A hole may contain string literals: `println("{m.get("k")} {greet("moon")}")`.
+Because any string literal may turn out to be a format string, the lexer
+reads a `{` as opening a hole only when what follows looks like an
+expression: brackets balance up to a matching `}`, and each `"` inside
+comes where an operand can begin (after an operator, `(`, `[`, `{` or `,`,
+not first in the hole) and closes on the same line. Otherwise the `{` is
+text, so plain strings such as `"{"`, `"} else {"` and `"{\"k\": 1}"` mean
+what they always did.
+
 ## 6. Unsafe code
 
 Unsafe operations: calling an `unsafe fn` or an `extern` function,
@@ -396,7 +411,7 @@ Every diagnostic has a scoped code: `err(scope::name)`. Scopes:
   `unused_variable` (assigning to a variable does not count as using it),
   `unused_mut`, `mut_param_not_read`, `unreachable` (code after `return`,
   `break`, `continue`, a call returning `!` or a `loop` without `break`),
-  `needless_borrow` and `unknown_cfg`. The first four are reported only
+  `needless_borrow`, `unknown_cfg` and `irrefutable_let_else`. The first four are reported only
   for functions without errors, and never for the standard library.
 * `build` codes are reported after the program has been checked, and are
   not about a place in the source: `no_main` (by `build`, `run` and

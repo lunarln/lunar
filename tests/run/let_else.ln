@@ -1,0 +1,75 @@
+enum Shape {
+    Circle(i32),
+    Rect(i32, i32),
+}
+
+fn rect_area(s: Shape): i32 {
+    let Shape::Rect(w, h) = s else {
+        return -1;
+    };
+    w * h
+}
+
+fn parse_digit(c: char): Option::<u32> {
+    if c >= '0' && c <= '9' { Some(c as u32 - '0' as u32) } else { None }
+}
+
+// Several in a row, each seeing the bindings of the ones before.
+fn sum_two(a: char, b: char): u32 {
+    let Some(x) = parse_digit(a) else {
+        return 100;
+    };
+    let Some(y) = parse_digit(b) else {
+        return 200 + x;
+    };
+    x + y
+}
+
+// An owned value moved out of the pattern, and a type annotation.
+fn shout(name: Option::<String>): String {
+    let Some(mut s): Option::<String> = name else {
+        return String::from("nobody");
+    };
+    s.push_str("!");
+    s
+}
+
+fn main() {
+    println("{rect_area(Shape::Rect(3, 4))} {rect_area(Shape::Circle(2))}");
+    println("{sum_two('3', '4')} {sum_two('x', '4')} {sum_two('5', 'y')}");
+    let hi = String::from("hi");
+    println("{shout(Some(hi))} {shout(None)}");
+
+    // `continue` and `break` from the `else` block.
+    let mut total = 0;
+    let digits = "1a2b3;9";
+    for c in digits.chars() {
+        if c == ';' {
+            break;
+        }
+        let Some(d) = parse_digit(c) else {
+            continue;
+        };
+        total += d;
+    }
+    println("{total}");
+
+    let mut n = 0;
+    loop {
+        n += 1;
+        let Some(d) = parse_digit(if n < 3 { '7' } else { 'z' }) else {
+            break;
+        };
+        println("got {d}");
+    }
+
+    // The rest of the block is the value of the block.
+    let opt: Option::<i32> = Some(20);
+    let v = {
+        let Some(x) = opt else {
+            return;
+        };
+        x + 1
+    };
+    println("{v}");
+}

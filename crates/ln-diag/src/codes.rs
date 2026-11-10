@@ -58,6 +58,7 @@ codes! {
         VARIADIC_NOT_EXTERN = "variadic_not_extern",
         IMPL_TRAIT_POSITION = "impl_trait_position",
         OPAQUE_MISMATCH = "opaque_mismatch",
+        LET_ELSE_FALLS_THROUGH = "let_else_falls_through",
     }
     syntax ("syntax") => {
         UNEXPECTED_TOKEN = "unexpected_token",
@@ -127,6 +128,7 @@ codes! {
         UNREACHABLE = "unreachable",
         UNUSED_MUT = "unused_mut",
         UNKNOWN_CFG = "unknown_cfg",
+        IRREFUTABLE_LET_ELSE = "irrefutable_let_else",
     }
     build ("build") => {
         LINK = "link",

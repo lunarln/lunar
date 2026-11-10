@@ -453,8 +453,21 @@ fn lex_number(b: [u8; &], i: usize): (NumKind, usize) {
     return (kind, j);
 }
 
-/// The end of the string literal starting at `i`, or where it gave up.
-fn string_end(b: [u8; &], i: usize): Result::<usize, usize> {
+/// The end of the string literal whose opening quote is at `i`, or where it
+/// gave up.
+///
+/// A `{` that opens a well-formed format hole (see `hole_end`) is skipped
+/// to its matching `}`, so string literals inside the hole do not end the
+/// string. Any other `{` is text: whether a string is a format string is
+/// only known once it is type checked, and plain strings such as `"{"` or
+/// `"} else {"` must keep their meaning.
+pub fn string_end(b: [u8; &], i: usize): Result::<usize, usize> {
+    string_end_in(b, i, false)
+}
+
+/// `string_end`; a string nested in a format hole (`nested`) must end on
+/// its line.
+fn string_end_in(b: [u8; &], i: usize, nested: bool): Result::<usize, usize> {
     let mut j = i + 1;
     while j < b.len() {
         let c = b[j];
@@ -467,11 +480,69 @@ fn string_end(b: [u8; &], i: usize): Result::<usize, usize> {
                 return Err(j);
             }
             j += char_len(b[j]);
+        } else if c == b'\n' && nested {
+            return Err(j);
+        } else if c == b'{' && at(b, j + 1) == b'{' {
+            j += 2;
+        } else if c == b'{' {
+            j = match hole_end(b, j + 1) {
+                Some(e) => e,
+                None => j + 1,
+            };
         } else {
             j += char_len(c);
         }
     }
     return Err(b.len());
+}
+
+/// The end (after the closing `}`) of the format hole whose contents start
+/// at `i`, if they look like an expression: brackets balance, and every `"`
+/// starts a string literal where an operand can begin (after an operator,
+/// `(`, `[`, `{` or `,`; never first in the hole) that ends on its line.
+/// Anything else (a backslash, a `"` right after an operand, a bracket that
+/// closes nothing, the end of the input) means the `{` was text.
+pub fn hole_end(b: [u8; &], i: usize): Option::<usize> {
+    let mut depth: u32 = 0;
+    let mut operand_next = false;
+    let mut k = i;
+    while k < b.len() {
+        let c = b[k];
+        if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' {
+            k += 1;
+        } else if c == b'"' && operand_next {
+            k = match string_end_in(b, k, true) {
+                Ok(e) => e,
+                Err(_) => return None,
+            };
+            operand_next = false;
+        } else if c == b'\'' {
+            k = match quoted_char_end(b, k) {
+                Ok(e) => e,
+                Err(_) => return None,
+            };
+            operand_next = false;
+        } else if c == b'"' || c == b'\\' {
+            return None;
+        } else {
+            if c == b'(' || c == b'[' || c == b'{' {
+                depth += 1;
+                operand_next = true;
+            } else if c == b')' || c == b']' || c == b'}' {
+                if depth == 0 {
+                    return if c == b'}' { Some(k + 1) } else { None };
+                }
+                depth -= 1;
+                operand_next = false;
+            } else if c == b'.' || c == b'?' || is_ident_continue(c) || c >= 0x80 {
+                operand_next = false;
+            } else {
+                operand_next = true;
+            }
+            k += char_len(c);
+        }
+    }
+    None
 }
 
 /// The end of the quoted character at `q` (`'a'`, `'\n'`, `'\u{41}'`), or

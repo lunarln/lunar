@@ -1,0 +1,7 @@
+// warning: lint::irrefutable_let_else
+fn main() {
+    let (a, b) = (1, 2) else {
+        return;
+    };
+    println("{a + b}");
+}

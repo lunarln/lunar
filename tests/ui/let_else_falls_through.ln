@@ -1,0 +1,11 @@
+// error: type::let_else_falls_through
+fn get(o: Option::<i32>): i32 {
+    let Some(x) = o else {
+        println("none");
+    };
+    x
+}
+
+fn main() {
+    println("{get(Some(1))}");
+}

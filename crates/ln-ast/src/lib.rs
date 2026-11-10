@@ -468,10 +468,14 @@ pub struct Stmt {
 
 #[derive(Clone, Debug)]
 pub enum StmtKind {
+    /// `let pat: ty = init;`, or `let pat = init else { .. };` when `else_`
+    /// is present (the pattern may then be refutable and the block must
+    /// diverge).
     Let {
         pat: Pat,
         ty: Option<Ty>,
         init: Option<Expr>,
+        else_: Option<Box<Block>>,
     },
     /// Expression statement. Block-like expressions (`if`, `match`, loops,
     /// blocks) may omit the `;`.

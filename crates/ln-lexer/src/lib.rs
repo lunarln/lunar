@@ -197,7 +197,9 @@ pub enum Token {
     Ident,
     #[regex("[0-9]", lex_number)]
     Number(NumKind),
-    #[regex(r#""([^"\\]|\\(.|\n))*""#)]
+    /// A string literal. Its format holes may contain string literals of
+    /// their own (`"{f("x")}"`): see [`string_end`].
+    #[token("\"", lex_string)]
     Str,
     #[regex(r#"'([^'\\\n]|\\[^\n][^'\n]*)'"#)]
     Char,
@@ -276,6 +278,142 @@ fn lex_number(lex: &mut Lexer<Token>) -> NumKind {
     }
     lex.bump(i);
     kind
+}
+
+/// The rest of a string literal after its opening quote. An unterminated
+/// string is an error covering the rest of the input.
+fn lex_string(lex: &mut Lexer<Token>) -> bool {
+    let start = lex.span().start;
+    let (end, ok) = match string_end(lex.source().as_bytes(), start) {
+        Ok(e) => (e, true),
+        Err(e) => (e, false),
+    };
+    lex.bump(end - lex.span().end);
+    ok
+}
+
+/// The end of the string literal whose opening quote is at `i`, or where it
+/// gave up.
+///
+/// A `{` that opens a well-formed format hole (see [`hole_end`]) is skipped
+/// to its matching `}`, so string literals inside the hole do not end the
+/// string. Any other `{` is text: whether a string is a format string is
+/// only known once it is type checked, and plain strings such as `"{"` or
+/// `"} else {"` must keep their meaning.
+pub fn string_end(b: &[u8], i: usize) -> Result<usize, usize> {
+    string_end_in(b, i, false)
+}
+
+/// [`string_end`]; a string nested in a format hole (`nested`) must end on
+/// its line.
+fn string_end_in(b: &[u8], i: usize, nested: bool) -> Result<usize, usize> {
+    let mut j = i + 1;
+    while j < b.len() {
+        match b[j] {
+            b'"' => return Ok(j + 1),
+            b'\\' => {
+                j += 1;
+                if j >= b.len() {
+                    return Err(j);
+                }
+                j += char_len(b[j]);
+            }
+            b'\n' if nested => return Err(j),
+            b'{' if b.get(j + 1) == Some(&b'{') => j += 2,
+            b'{' => match hole_end(b, j + 1) {
+                Some(e) => j = e,
+                None => j += 1,
+            },
+            c => j += char_len(c),
+        }
+    }
+    Err(b.len())
+}
+
+/// The end (after the closing `}`) of the format hole whose contents start
+/// at `i`, if they look like an expression: brackets balance, and every `"`
+/// starts a string literal where an operand can begin (after an operator,
+/// `(`, `[`, `{` or `,`; never first in the hole) that ends on its line.
+/// Anything else (a backslash, a `"` right after an operand, a bracket that
+/// closes nothing, the end of the input) means the `{` was text.
+pub fn hole_end(b: &[u8], i: usize) -> Option<usize> {
+    let mut depth = 0u32;
+    let mut operand_next = false;
+    let mut k = i;
+    while k < b.len() {
+        let c = b[k];
+        match c {
+            b' ' | b'\t' | b'\r' | b'\n' => {
+                k += 1;
+                continue;
+            }
+            b'"' if operand_next => {
+                k = string_end_in(b, k, true).ok()?;
+                operand_next = false;
+                continue;
+            }
+            b'\'' => {
+                k = quoted_char_end(b, k).ok()?;
+                operand_next = false;
+                continue;
+            }
+            b'"' | b'\\' => return None,
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                operand_next = true;
+            }
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    return if c == b'}' { Some(k + 1) } else { None };
+                }
+                depth -= 1;
+                operand_next = false;
+            }
+            b'.' | b'?' | b'_' => operand_next = false,
+            c if c.is_ascii_alphanumeric() || c >= 0x80 => operand_next = false,
+            _ => operand_next = true,
+        }
+        k += char_len(c);
+    }
+    None
+}
+
+/// The end of the quoted character at `q` (`'a'`, `'\n'`, `'\u{41}'`), or
+/// where it gave up: one character, or a backslash and anything up to the
+/// closing quote on the same line (the `Char` token's pattern).
+fn quoted_char_end(b: &[u8], q: usize) -> Result<usize, usize> {
+    let n = b.len();
+    let mut j = q + 1;
+    if j >= n {
+        return Err(j);
+    }
+    let c = b[j];
+    if c == b'\\' {
+        j += 1;
+        if j >= n || b[j] == b'\n' {
+            return Err(j);
+        }
+        j += char_len(b[j]);
+        while j < n && b[j] != b'\'' && b[j] != b'\n' {
+            j += char_len(b[j]);
+        }
+    } else {
+        if c == b'\'' || c == b'\n' {
+            return Err(j);
+        }
+        j += char_len(c);
+    }
+    if j < n && b[j] == b'\'' { Ok(j + 1) } else { Err(j) }
+}
+
+/// The length of the UTF-8 character starting with byte `c`.
+fn char_len(c: u8) -> usize {
+    match c {
+        0..0x80 => 1,
+        0x80..0xE0 => 2,
+        0xE0..0xF0 => 3,
+        _ => 4,
+    }
 }
 
 /// Nested `/* ... */` comments. An unterminated comment is an error
@@ -547,6 +685,31 @@ mod tests {
         use Token::*;
         assert_eq!(kinds("/* a /* b */ c */ x // y\n\"s\\\"{x}\" 'a' '\\n'"), vec![Ident, Str, Char, Char]);
         assert_eq!(kinds("b'a' b'\\xff' b 'c' b2'd'"), vec![Byte, Byte, Ident, Char, Ident, Char]);
+    }
+
+    #[test]
+    fn strings_in_format_holes() {
+        use Token::*;
+        let one = |src: &str| {
+            let (t, e) = lex(src);
+            assert!(e.is_empty(), "{src}: {e:?}");
+            assert_eq!(t.len(), 1, "{src}: {t:?}");
+            assert_eq!(t[0].range, 0..src.len(), "{src}");
+        };
+        // A string literal inside a hole is part of the outer string.
+        one(r#""{f("x")}""#);
+        one(r#""a {m.get("k", "v")} b""#);
+        one(r#""{s == "x"} {t + "}"}""#);
+        one(r#""{f("{g("y")}")}""#);
+        one(r#""{c == '"'}""#);
+        one(r#""{f("a\"b")}:?""#);
+        // A `{` that does not open an expression is text, as before.
+        assert_eq!(kinds(r#"f("{", "}")"#), vec![Ident, LParen, Str, Comma, Str, RParen]);
+        assert_eq!(kinds(r#"f("{ ", " }")"#), vec![Ident, LParen, Str, Comma, Str, RParen]);
+        assert_eq!(kinds(r#"f("{a", "b}")"#), vec![Ident, LParen, Str, Comma, Str, RParen]);
+        assert_eq!(kinds(r#""{\"k\": 1}""#), vec![Str]);
+        assert_eq!(kinds("p(\"{(\");\np(\")}\");"), vec![Ident, LParen, Str, RParen, Semi, Ident, LParen, Str, RParen, Semi]);
+        assert_eq!(kinds(r#""{{" "}}""#), vec![Str, Str]);
     }
 
     #[test]

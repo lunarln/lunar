@@ -236,24 +236,11 @@ pub(crate) fn parse_format(raw: &str, offset: u32, file: FileId, ids: &mut IdGen
                 if !text.is_empty() {
                     pieces.push(FmtPiece::Text(std::mem::take(&mut text)));
                 }
-                // Find the matching close brace, honouring nesting and strings.
+                // The matching close brace, as the lexer found it.
                 let open = i;
-                let mut depth = 1;
-                let mut j = i + 1;
-                let mut in_str = false;
-                while j < bytes.len() && depth > 0 {
-                    match bytes[j] {
-                        b'\\' if in_str => j += 1,
-                        b'"' => in_str = !in_str,
-                        b'{' if !in_str => depth += 1,
-                        b'}' if !in_str => depth -= 1,
-                        _ => {}
-                    }
-                    j += 1;
-                }
-                if depth != 0 {
+                let Some(j) = ln_lexer::hole_end(bytes, i + 1) else {
                     return FmtString::Err("unclosed `{` in format string (use `{{` for a literal brace)".into(), span_at(open, open + 1));
-                }
+                };
                 let inner = &raw[open + 1..j - 1];
                 if inner.trim().is_empty() {
                     return FmtString::Err("empty `{}` in format string: put an expression inside, e.g. `{x}`".into(), span_at(open, j));

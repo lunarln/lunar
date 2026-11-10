@@ -497,7 +497,13 @@ impl<'a> BlockFinder<'a> {
         };
         for s in &b.stmts {
             match &s.kind {
-                ast::StmtKind::Let { init: Some(e), .. } | ast::StmtKind::Expr(e) => self.expr(e, mine),
+                ast::StmtKind::Let { init: Some(e), else_, .. } => {
+                    self.expr(e, mine);
+                    if let Some(b) = else_ {
+                        self.block_in(b, mine);
+                    }
+                }
+                ast::StmtKind::Expr(e) => self.expr(e, mine),
                 _ => {}
             }
         }

@@ -720,8 +720,9 @@ impl P<'_, '_, '_> {
             let pat = self.pat()?;
             let ty = if self.k.eat(T::Colon) { Some(self.ty()?) } else { None };
             let init = if self.k.eat(T::Eq) { Some(self.expr()?) } else { None };
+            let else_ = if init.is_some() && self.k.eat(T::Else) { Some(Box::new(self.block()?)) } else { None };
             self.expect_semi()?;
-            return Ok(StmtOrTail::Stmt(Stmt { kind: StmtKind::Let { pat, ty, init }, span: self.span_from(start) }));
+            return Ok(StmtOrTail::Stmt(Stmt { kind: StmtKind::Let { pat, ty, init, else_ }, span: self.span_from(start) }));
         }
         if self.at_item_start() {
             let item = self.item()?;

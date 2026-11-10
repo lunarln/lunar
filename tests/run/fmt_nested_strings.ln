@@ -1,0 +1,26 @@
+use core::fmt::format;
+
+fn greet(name: str): String {
+    let mut s = String::from("hello, ");
+    s.push_str(name);
+    s
+}
+
+fn main() {
+    // String literals inside format holes.
+    println("{greet("moon")}");
+    let word = "lunar";
+    println("{word == "lunar"} {word.find("n"):?} {word.find("z"):?}");
+    println("{word.starts_with("lu") && !word.ends_with("x")}");
+
+    // A nested format string, and braces and quotes inside the nested one.
+    let n = 7;
+    println("[{format("{n}!")}] [{format("{{{n}}}")}] [{greet("\"q\"")}]");
+    println("{'"' as u32} {greet("}")}");
+
+    // Plain strings with braces keep their meaning.
+    let open = "{";
+    let close = "}";
+    let pair = ("{a", "b}");
+    println("{open}{close} {pair.0} {pair.1}");
+}

@@ -310,7 +310,7 @@ pub struct Stmt {
 }
 
 pub enum StmtKind {
-    Let { pat: Id::<Pat>, ty: Option::<Id::<Ty>>, init: Option::<Id::<Expr>> },
+    Let { pat: Id::<Pat>, ty: Option::<Id::<Ty>>, init: Option::<Id::<Expr>>, else_: Option::<Id::<Block>> },
     Expr(Id::<Expr>),
     Item(Id::<Item>),
 }
@@ -1103,7 +1103,7 @@ fn stmt(a: &Ast, o: &mut String, d: usize, s: Stmt) {
     let sp = at(s.span);
     ind(o, d);
     match s.kind {
-        StmtKind::Let { pat: p, ty: t, init } => {
+        StmtKind::Let { pat: p, ty: t, init, else_ } => {
             o.write("stmt let {sp}\n");
             pat(a, o, d + 1, p);
             if let Some(t) = t {
@@ -1115,6 +1115,11 @@ fn stmt(a: &Ast, o: &mut String, d: usize, s: Stmt) {
                 ind(o, d + 1);
                 o.push_str("init\n");
                 expr(a, o, d + 2, e);
+            }
+            if let Some(b) = else_ {
+                ind(o, d + 1);
+                o.push_str("else\n");
+                block(a, o, d + 2, b);
             }
         }
         StmtKind::Expr(e) => {
