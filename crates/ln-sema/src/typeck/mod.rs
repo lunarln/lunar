@@ -119,11 +119,13 @@ impl<'a> Sema<'a> {
                 checked.push((b, ok, is_std));
             }
         }
-        // What each function's result may point into, from its body, for
-        // the borrow checking of its callers.
-        let envs: Vec<Vec<crate::defs::Pred>> = checked.iter().filter(|c| c.1).map(|(b, _, _)| self.body_env(b.def)).collect();
-        let bodies: Vec<(&thir::Body, &[crate::defs::Pred])> = checked.iter().filter(|c| c.1).map(|c| &c.0).zip(envs.iter().map(|e| e.as_slice())).collect();
-        crate::borrowck::infer_ret_points(&mut self.p, &bodies);
+        // What each closure's result may point into, from its body, for the
+        // borrow checking of its callers (a named function's comes from its
+        // signature).
+        let closures: Vec<&thir::Body> = checked.iter().filter(|c| c.1 && self.p.closures.contains_key(&c.0.def)).map(|c| &c.0).collect();
+        let envs: Vec<Vec<crate::defs::Pred>> = closures.iter().map(|b| self.body_env(b.def)).collect();
+        let bodies: Vec<(&thir::Body, &[crate::defs::Pred])> = closures.into_iter().zip(envs.iter().map(|e| e.as_slice())).collect();
+        crate::borrowck::infer_closure_ret_points(&mut self.p, &bodies);
         for (b, ok, is_std) in checked {
             self.finish_body(b, ok, is_std);
         }

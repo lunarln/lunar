@@ -174,9 +174,13 @@ pub struct Program {
     pub refs: [Ref; ..+],
     pub closures: HashMap::<DefId, ClosureInfo>,
     pub opaques: HashMap::<(DefId, u32), OpaqueInfo>,
-    /// For each function (and closure) with a checked body, which of its
-    /// parameters the value it returns may point into, inferred from the
-    /// body (see `borrowck::infer_ret_points`).
+    /// For each named function, which of its parameters the value it
+    /// returns may point into, from its signature: its `from` clause, or
+    /// what an absent one means.
+    pub ret_from: HashMap::<DefId, RetFrom>,
+    /// For each closure with a checked body, which of its parameters (its
+    /// captures, then its arguments) the value it returns may point into,
+    /// inferred from the body (see `borrowck::infer_closure_ret_points`).
     pub ret_points: HashMap::<DefId, RetPoints>,
     /// Native libraries to link (`#[link(name = "...")]`).
     pub link_libs: [Symbol; ..+],
@@ -215,6 +219,7 @@ impl Program {
             refs: [],
             closures: HashMap::new(),
             opaques: HashMap::new(),
+            ret_from: HashMap::new(),
             ret_points: HashMap::new(),
             link_libs: [],
             diags: Diags::new(),

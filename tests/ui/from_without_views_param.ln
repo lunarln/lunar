@@ -1,0 +1,12 @@
+// error: type::from_without_views
+// `n` is a copy the function owns, and `owned` is freed when it returns: a
+// result cannot point into either.
+fn pick(s: &String, n: usize, owned: String): str from s, n, owned {
+    let _ = owned;
+    return s.as_str()[n..];
+}
+
+fn main() {
+    let x = String::from("hello");
+    println("{pick(&x, 1, String::new())}");
+}

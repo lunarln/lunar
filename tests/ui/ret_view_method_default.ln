@@ -1,0 +1,18 @@
+// error: borrow::escapes_via_return
+// Without a `from` clause, a method's result points only into `self`, so
+// returning a view of another argument needs one.
+struct Span {
+    lo: usize,
+    hi: usize,
+}
+
+impl Span {
+    fn text(&self, src: str): str {
+        return src[self.lo..self.hi];
+    }
+}
+
+fn main() {
+    let s = Span { lo: 0, hi: 2 };
+    println("{s.text("hello")}");
+}

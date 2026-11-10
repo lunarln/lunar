@@ -95,7 +95,7 @@ fn load(update: bool): Option::<Project> {
 
 /// The member packages a command works on: `-p <name>`, else the package
 /// the command started in, else (at a workspace root) every member.
-fn select(proj: &Project, package: Option::<str>): Result::<[usize; ..+], ProjectError> {
+fn select(proj: &Project, package: Option::<str>): Result::<[usize; ..+], ProjectError> from static {
     let mut out: [usize; ..+] = [];
     if let Some(name) = package {
         return match proj.member(name) {

@@ -1,12 +1,13 @@
 // error: borrow::move_while_borrowed
 // once: borrow::move_while_borrowed
-// A struct result holding a view into the argument it was built from.
+// A struct result holding a view into the argument it was built from, as
+// its signature says: `limit` may move, `text` may not.
 struct Span {
     text: str,
     len: usize,
 }
 
-fn span_of(text: &String, limit: &String): Span {
+fn span_of(text: &String, limit: &String): Span from text {
     let n = if text.len() < limit.len() { text.len() } else { limit.len() };
     return Span { text: text.as_str()[0..n], len: n };
 }

@@ -1,0 +1,16 @@
+// error: borrow::escapes_via_return
+// once: borrow::escapes_via_return
+// The body returns a view of `b`, which the signature does not list.
+fn pick(a: &String, b: &String): str from a {
+    if a.len() > b.len() {
+        a.as_str()
+    } else {
+        b.as_str()
+    }
+}
+
+fn main() {
+    let x = String::from("hello");
+    let y = String::from("hi");
+    println("{pick(&x, &y)}");
+}

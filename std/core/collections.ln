@@ -76,7 +76,7 @@ impl::<K: Light + Hash + Eq, V: Light> HashMap::<K, V> {
     /// Set the value for `k`; returns the value it replaced. A plain
     /// `&mut self`: growing replaces the table, so a loop over the map
     /// cannot insert into it.
-    pub fn insert(&mut self, kept k: K, kept v: V): Option::<V> {
+    pub fn insert(&mut self, kept k: K, kept v: V): Option::<V> from self, k, v {
         if (self.len + 1) * 4 > self.slots.len() * 3 {
             self.grow();
         }
@@ -106,7 +106,7 @@ impl::<K: Light + Hash + Eq, V: Light> HashMap::<K, V> {
     }
 
     /// The value for `k`, or `default` if there is none.
-    pub fn get_or(&self, k: K, default: V): V {
+    pub fn get_or(&self, k: K, default: V): V from self, default {
         return match self.get(k) {
             Some(v) => v,
             None => default,
@@ -329,7 +329,7 @@ impl::<K: Light + Hash + Eq, V: Light> OrderedHashMap::<K, V> {
 
     /// Set the value for `k`; returns the value it replaced. A new key goes
     /// last; a replaced value keeps its key's place.
-    pub fn insert(&mut self, kept k: K, kept v: V): Option::<V> {
+    pub fn insert(&mut self, kept k: K, kept v: V): Option::<V> from self, k, v {
         if (self.entries.len() + 1) * 4 > self.table.len() * 3 {
             self.rebuild();
         }
@@ -360,7 +360,7 @@ impl::<K: Light + Hash + Eq, V: Light> OrderedHashMap::<K, V> {
     }
 
     /// The value for `k`, or `default` if there is none.
-    pub fn get_or(&self, k: K, default: V): V {
+    pub fn get_or(&self, k: K, default: V): V from self, default {
         return match self.get(k) {
             Some(v) => v,
             None => default,

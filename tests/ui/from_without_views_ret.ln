@@ -1,0 +1,10 @@
+// error: type::from_without_views
+// A `usize` holds no views, so it points into no parameter.
+fn count(s: &String): usize from s {
+    return s.len();
+}
+
+fn main() {
+    let x = String::from("hello");
+    println("{count(&x)}");
+}

@@ -129,6 +129,9 @@ impl Dump {
                     if let Some(r) = &f.ret {
                         d.node("ret", |d| d.ty(r));
                     }
+                    for i in &f.ret_from {
+                        d.line(format!("from {}", ident(i)));
+                    }
                     if let Some(b) = &f.body {
                         d.block(b);
                     }

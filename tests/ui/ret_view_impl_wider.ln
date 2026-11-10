@@ -1,0 +1,25 @@
+// error: trait::signature
+// An implementation may not return views from more than the trait says:
+// callers through the trait would not know.
+trait Named {
+    fn name(&self, scratch: &String): str;
+}
+
+struct Person {
+    name: String,
+}
+
+impl Named for Person {
+    fn name(&self, scratch: &String): str from self, scratch {
+        if scratch.len() > 0 {
+            return scratch.as_str();
+        }
+        return self.name.as_str();
+    }
+}
+
+fn main() {
+    let p = Person { name: String::from("ada") };
+    let s = String::new();
+    println("{p.name(&s)}");
+}

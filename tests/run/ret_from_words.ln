@@ -1,0 +1,33 @@
+// `from` is a word only right after a return type: traits, functions,
+// methods and parameters may still be called `from`.
+
+trait From::<T> {
+    fn from(value: T): Self;
+}
+
+struct Text {
+    s: str,
+}
+
+impl From::<str> for Text {
+    fn from(s: str): Text {
+        return Text { s };
+    }
+}
+
+fn from(from: &String, other: &String): str from from {
+    if other.len() > 0 {
+        return from.as_str()[1..];
+    }
+    return from.as_str();
+}
+
+fn main() {
+    let t = Text::from("text");
+    let u: Text = From::from("from");
+    let a = String::from("abc");
+    let mut b = String::from("x");
+    let v = from(&a, &b);
+    b.clear();
+    println("{t.s} {u.s} {v}");
+}

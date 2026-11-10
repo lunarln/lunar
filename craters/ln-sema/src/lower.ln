@@ -9,6 +9,7 @@
 
 use core::arena::{Id, List};
 use core::intern::Symbol;
+use crater::borrowck;
 use crater::codes;
 use crater::defs::*;
 use crater::diag::{dummy_span, is_dummy};
@@ -353,6 +354,13 @@ impl Sema {
         // 5. Deferred checks.
         self.run_deferred();
         self.check_infinite_size();
+        // What each function's result may point into (this needs to know
+        // which types are Dull).
+        for i in 0..n {
+            if let AstRef::Fn(f, _) = self.ast(DefId::new(i)) {
+                self.lower_ret_from(DefId::new(i), f);
+            }
+        }
         // 6. Impl validation.
         for i in 0..n {
             if let AstRef::Impl(im) = self.ast(DefId::new(i)) {
@@ -1516,6 +1524,7 @@ impl Sema {
             args.push(self.p.types.mk(TyKind::Param((impl_count + j) as u32, n)));
         }
         let al = self.p.types.mk_list(args[..]);
+        let mut same = true;
         let (tn, imn) = (tf.sig.params.len(), imf.sig.params.len());
         if tn != imn {
             let tsp = self.p.defs[trait_m.index()].span;
@@ -1529,6 +1538,7 @@ impl Sema {
             let ip = self.p.params.list(imf.sig.params)[i];
             let want = self.p.types.subst(tp.ty, al);
             if want != ip.ty || tp.mode != ip.mode {
+                same = false;
                 let (w, g) = (self.p.ty_str(want), self.p.ty_str(ip.ty));
                 let (wm, gm) = (mode_prefix(tp.mode), mode_prefix(ip.mode));
                 self.error(codes::trait_::SIGNATURE(), ip.span, "parameter type mismatch with trait: expected `{wm}{w}`, found `{gm}{g}`");
@@ -1548,7 +1558,144 @@ impl Sema {
             let (w, g) = (self.p.ty_str(want_ret), self.p.ty_str(imf.sig.ret));
             self.error(codes::trait_::SIGNATURE(), imf.sig.ret_span, "return type mismatch with trait: expected `{w}`, found `{g}`");
             self.emit();
+            same = false;
         }
+        // Callers through the trait would not know the result points there.
+        if same {
+            let rfs = (self.p.ret_from.get(trait_m), self.p.ret_from.get(impl_m));
+            if let (Some(tr), Some(ir)) = rfs {
+                let mut extra: Option::<usize> = None;
+                let count = if imn < 64 { imn } else { 64 };
+                for i in 0..count {
+                    let bit = 1u64 << i as u64;
+                    if extra.is_none() && ir.set & bit != 0 && tr.set & bit == 0 {
+                        extra = Some(i);
+                    }
+                }
+                if let Some(i) = extra {
+                    let n = self.str_of(self.p.params.list(imf.sig.params)[i].name);
+                    let at = if is_dummy(ir.span) { imf.sig.ret_span } else { ir.span };
+                    let tat = if is_dummy(tr.span) { tf.sig.ret_span } else { tr.span };
+                    let only = if is_dummy(tr.span) { "without a `from` clause, the trait's result points" } else { "the trait's result is declared to point" };
+                    let names = borrowck::from_names(&self.p, trait_m, tr.set);
+                    let mut label = String::new();
+                    if names.len() == 0 {
+                        label.write("{only} into no parameter");
+                    } else {
+                        label.write("{only} only into {borrowck::quoted_list(names[..])}");
+                    }
+                    self.error(codes::trait_::SIGNATURE(), at, "the result may point into `{n}`, but the trait's may not");
+                    self.secondary(tat, "{label}");
+                    self.help("add `{n}` to the trait method's `from` clause, or do not return views from it");
+                    self.emit();
+                }
+            }
+        }
+    }
+
+    /// What function `id`'s result may point into, into `p.ret_from`: the
+    /// parameters its `from` clause names (none for `from static`), or
+    /// without one, the receiver of a method that borrows it (`&self`,
+    /// `&mut self`), else every parameter it could point into (a borrowed
+    /// one, or one that holds views). Nothing if the return type holds no
+    /// views.
+    fn lower_ret_from(&mut self, id: DefId, f: ln_ast::FnDecl) {
+        let env_list = self.env_of(id);
+        let env = self.p.preds.list(env_list).to_grow();
+        let sig = self.p.fn_data(id).sig;
+        let fname = self.str_of(f.name.name);
+        let ps = self.p.params.list(sig.params).to_grow();
+        let holds = borrowck::ty_has_view(&mut self.p, env[..], sig.ret, 0);
+        let names = self.p.ast.idents.list(f.ret_from).to_grow();
+        let mut span = dummy_span();
+        if names.len() > 0 {
+            span = names[0].span.to(names[names.len() - 1].span);
+        }
+        let mut set: u64 = 0;
+        if names.len() == 0 {
+            if holds {
+                if ps.len() > 0 && ps[0].is_self && ps[0].mode != ParamMode::Take {
+                    set = 1;
+                } else {
+                    for i in 0..ps.len() {
+                        if i < 64 && self.pointy(env[..], ps[i]) {
+                            set = set | (1u64 << i as u64);
+                        }
+                    }
+                }
+            }
+        } else if !holds {
+            if !self.p.types.is_error(sig.ret) {
+                let r = self.p.ty_str(sig.ret);
+                self.error(codes::ty::FROM_WITHOUT_VIEWS(), span, "`{fname}` returns `{r}`, which holds no views, so it points into no parameter");
+                self.help("remove the `from` clause");
+                self.emit();
+            }
+        } else if self.p.text(names[0].name) != "static" {
+            // (`from static` names no parameter, and nothing else.)
+            let mut seen: [(usize, Span); ..+] = [];
+            for n in names[..] {
+                let nn = self.str_of(n.name);
+                let mut found: Option::<usize> = None;
+                for i in 0..ps.len() {
+                    if found.is_none() && ps[i].name == n.name && self.p.text(ps[i].name) != "_" {
+                        found = Some(i);
+                    }
+                }
+                let Some(i) = found else {
+                    self.error(codes::name::UNRESOLVED(), n.span, "`{nn}` is not a parameter of `{fname}`");
+                    self.emit();
+                    continue;
+                };
+                let mut first: Option::<Span> = None;
+                for s in seen[..] {
+                    if first.is_none() && s.0 == i {
+                        first = Some(s.1);
+                    }
+                }
+                if let Some(fs) = first {
+                    self.error(codes::name::DUPLICATE(), n.span, "`{nn}` is named twice in this `from` clause");
+                    self.secondary(fs, "first named here");
+                    self.emit();
+                    continue;
+                }
+                seen.push((i, n.span));
+                let prm = ps[i];
+                if !self.pointy(env[..], prm) {
+                    if !self.p.types.is_error(prm.ty) {
+                        let t = self.p.ty_str(prm.ty);
+                        // An owner could be borrowed and pointed into.
+                        let mut help = String::new();
+                        if self.p.has_owner(prm.ty) {
+                            let mut borrowed = String::new();
+                            if prm.is_self {
+                                borrowed.push_str("&self");
+                            } else {
+                                borrowed.write("{nn}: &{t}");
+                            }
+                            help.write("borrow it (`{borrowed}`), or leave it out of the `from` clause");
+                        } else {
+                            help.push_str("leave it out of the `from` clause");
+                        }
+                        self.error(codes::ty::FROM_WITHOUT_VIEWS(), n.span, "the result of `{fname}` cannot point into `{nn}`");
+                        self.secondary(prm.span, "`{nn}` takes a `{t}` by value, which holds no views");
+                        self.help("{help}");
+                        self.emit();
+                    }
+                    continue;
+                }
+                if i < 64 {
+                    set = set | (1u64 << i as u64);
+                }
+            }
+        }
+        self.p.ret_from.insert(id, RetFrom { set, span });
+    }
+
+    /// Whether a function's result could point into parameter `prm`: it is
+    /// borrowed, or it holds views.
+    fn pointy(&mut self, env: [Pred; &], prm: Param): bool {
+        return prm.mode != ParamMode::Take || borrowck::ty_has_view(&mut self.p, env, prm.ty, 0);
     }
 
     fn check_main(&mut self) {

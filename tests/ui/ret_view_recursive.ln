@@ -1,6 +1,7 @@
-// error: borrow::shrink_while_borrowed
-// Each call swaps the arguments, so the result may point into either.
-fn alternate(a: &String, b: &String, n: usize): str {
+// error: borrow::escapes_via_return
+// Each call swaps the arguments, so the result may point into either, not
+// only into `a` as declared.
+fn alternate(a: &String, b: &String, n: usize): str from a {
     if n == 0 {
         return a.as_str();
     }

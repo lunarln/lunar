@@ -283,9 +283,30 @@ impl P<'_, '_, '_> {
             }
         }
         let ret = if self.k.eat(T::Colon) { Some(self.ret_ty()?) } else { None };
+        // `: T from a, b`, or `: T from static` (into no parameter). `from`
+        // is a word only here, right after a return type and before a name,
+        // so `From::from` and `fn from` still work.
+        let mut ret_from = Vec::new();
+        let from_word = matches!(self.k.nth_tok(0), Some(t) if t.kind == T::Ident && self.tok_text(t) == "from")
+            && matches!(self.k.nth(1), Some(T::Ident | T::SelfValue | T::Static));
+        if ret.is_some() && from_word {
+            self.k.bump();
+            if self.k.at(T::Static) {
+                let t = self.k.expect(T::Static)?;
+                ret_from.push(self.tok_ident(t));
+            } else {
+                loop {
+                    let t = if self.k.at(T::SelfValue) { self.k.expect(T::SelfValue)? } else { self.k.expect(T::Ident)? };
+                    ret_from.push(self.tok_ident(t));
+                    if !self.k.eat(T::Comma) {
+                        break;
+                    }
+                }
+            }
+        }
         let sig_span = self.span_from(sig_start);
         let body = if self.k.eat(T::Semi) { None } else { Some(self.block()?) };
-        Ok(FnDecl { name, generics, params, ret, body, is_unsafe, variadic, sig_span })
+        Ok(FnDecl { name, generics, params, ret, ret_from, body, is_unsafe, variadic, sig_span })
     }
 
     fn param(&mut self) -> PResult<Param> {

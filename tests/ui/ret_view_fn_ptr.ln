@@ -1,7 +1,7 @@
 // error: borrow::shrink_while_borrowed
-// Called through a function pointer, the body is unknown: the result may
-// point into every argument.
-fn first(a: &String, b: &String): str {
+// Called through a function pointer, the signature is unknown: the result
+// may point into every argument, whatever `first` says.
+fn first(a: &String, b: &String): str from a {
     return a.as_str();
 }
 
