@@ -16,8 +16,8 @@ impl::<T: Dull> Stack::<T> {
         self.items.push(x);
     }
 
-    // `self` is marked `!` so the stack's array may shrink.
-    fn pop(&mut !self): Option::<T> {
+    // `&mut self` may shrink the stack's array.
+    fn pop(&mut self): Option::<T> {
         return self.items.pop();
     }
 
@@ -89,7 +89,7 @@ fn total(a: &[i64; -..+]): i64 {
     return t;
 }
 
-fn drain_total(a: &mut ![i64; -..+]): i64 {
+fn drain_total(a: &mut [i64; -..+]): i64 {
     let t = total(a);
     a.clear();
     return t;

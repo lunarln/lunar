@@ -136,8 +136,9 @@ pub enum Ty {
     /// Struct or enum instance.
     Adt(DefId, Vec<Ty>),
     Array(Box<Ty>, ArrKind),
-    /// `!T` parameter marker.
-    Bang(Box<Ty>),
+    /// `+T` parameter marker: the argument only grows (it is never shrunk or
+    /// replaced), so the caller's views into it survive the call.
+    Grow(Box<Ty>),
     Ptr(Box<Ty>, bool /* mutable */),
     /// `fn(A, &B, &mut C): R`: each parameter's mode is part of the type.
     FnPtr(Vec<(ParamMode, Ty)>, Box<Ty>),
@@ -186,9 +187,9 @@ impl Ty {
         matches!(self, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char)
     }
 
-    pub fn strip_bang(&self) -> &Ty {
+    pub fn strip_grow(&self) -> &Ty {
         match self {
-            Ty::Bang(t) => t,
+            Ty::Grow(t) => t,
             t => t,
         }
     }
@@ -206,7 +207,7 @@ impl Ty {
         f(self);
         match self {
             Ty::Tuple(ts) | Ty::Adt(_, ts) | Ty::Closure(_, ts) | Ty::Opaque(_, _, ts) => ts.iter().for_each(|t| t.walk(f)),
-            Ty::Array(t, _) | Ty::Bang(t) | Ty::Ptr(t, _) => t.walk(f),
+            Ty::Array(t, _) | Ty::Grow(t) | Ty::Ptr(t, _) => t.walk(f),
             Ty::FnPtr(ps, r) => {
                 ps.iter().for_each(|(_, t)| t.walk(f));
                 r.walk(f);
@@ -241,7 +242,7 @@ impl Ty {
             Ty::Closure(d, ts) => Ty::Closure(*d, ts.iter().map(|t| t.map(f)).collect()),
             Ty::Opaque(d, i, ts) => Ty::Opaque(*d, *i, ts.iter().map(|t| t.map(f)).collect()),
             Ty::Array(t, k) => Ty::Array(Box::new(t.map(f)), *k),
-            Ty::Bang(t) => Ty::Bang(Box::new(t.map(f))),
+            Ty::Grow(t) => Ty::Grow(Box::new(t.map(f))),
             Ty::Ptr(t, m) => Ty::Ptr(Box::new(t.map(f)), *m),
             Ty::FnPtr(ps, r) => Ty::FnPtr(ps.iter().map(|(m, t)| (*m, t.map(f))).collect(), Box::new(r.map(f))),
             t => t.clone(),
@@ -307,7 +308,7 @@ impl fmt::Display for TyDisplay<'_> {
                 ArrKind::Slice => write!(f, "[{}; &]", d(t)),
                 ArrKind::SliceMut => write!(f, "[{}; &mut]", d(t)),
             },
-            Ty::Bang(t) => write!(f, "!{}", d(t)),
+            Ty::Grow(t) => write!(f, "+{}", d(t)),
             Ty::Ptr(t, m) => write!(f, "*{}{}", if *m { "mut " } else { "" }, d(t)),
             Ty::FnPtr(ps, r) => {
                 let params: Vec<String> = ps

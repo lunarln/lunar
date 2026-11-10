@@ -1,0 +1,10 @@
+// error: borrow::grow_only
+// A `&mut +` parameter promises its caller it only grows.
+fn drain(a: &mut +[i64; -..+]) {
+    a.pop();
+}
+
+fn main() {
+    let mut v: [i64; -..+] = [1];
+    drain(&mut v);
+}

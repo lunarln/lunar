@@ -37,7 +37,7 @@ pub fn ty(t: &Ty) -> String {
             format!("[{}; {size}]", ty(elem))
         }
         TyKind::DynArray(elem) => format!("[{}]", ty(elem)),
-        TyKind::Bang(inner) => format!("!{}", ty(inner)),
+        TyKind::Grow(inner) => format!("+{}", ty(inner)),
         TyKind::Ptr { is_mut, inner } => format!("*{}{}", if *is_mut { "mut " } else { "" }, ty(inner)),
         TyKind::Tuple(items) if items.len() == 1 => format!("({},)", ty(&items[0])),
         TyKind::Tuple(items) => format!("({})", list(items.iter().map(ty))),
@@ -125,7 +125,7 @@ pub fn param(p: &Param) -> String {
         ParamKind::SelfParam => match p.mode {
             ParamMode::Take => format!("{mut_kw}self"),
             ParamMode::Borrow => "&self".into(),
-            ParamMode::InOut if p.self_bang => "&mut !self".into(),
+            ParamMode::InOut if p.self_grow => "&mut +self".into(),
             ParamMode::InOut => "&mut self".into(),
         },
         ParamKind::Named(name) => format!("{mut_kw}{}: {}{}", name.name, mode_prefix(p.mode), p.ty.as_ref().map(ty).unwrap_or_default()),

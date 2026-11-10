@@ -6,10 +6,13 @@
 //!   the locals whose storage they point into. Roots are computed
 //!   flow-insensitively, then checked when a view is stored into a longer
 //!   lived local, returned, or written through a parameter.
-//! * **Shrinking**: converting an array to `!` (passing it to a `!`
-//!   parameter), replacing an owner, or moving it *invalidates* its root. A
+//! * **Invalidation**: lending an owner in-out (to a `&mut` parameter, or
+//!   to a closure that changes what it captured), replacing it, or moving it
+//!   *invalidates* its root: the callee may shrink, clear or replace it. A
 //!   backward liveness analysis reports any view of that root that is still
-//!   used afterwards. Only the owner may perform the `!` conversion.
+//!   used afterwards. A `&mut +T` parameter promises to only grow its
+//!   argument, so lending to one invalidates nothing; inside the function,
+//!   such a parameter may itself only be grown.
 
 use crate::Program;
 use crate::thir::*;
@@ -221,8 +224,10 @@ fn unreachable_expr(e: &Expr, diags: &mut Diagnostics) {
     }
 }
 
-pub fn check(p: &Program, body: &Body, diags: &mut Diagnostics) {
-    let mut cx = Cx { p, body, diags, roots: HashMap::new(), reported: HashSet::new(), loop_exit: HashMap::new(), loop_head: HashMap::new(), held: Vec::new() };
+/// Check `body`, whose generic parameters have the bounds `env`.
+pub fn check(p: &Program, body: &Body, env: &[crate::defs::Pred], diags: &mut Diagnostics) {
+    let mut cx =
+        Cx { p, body, env, diags, roots: HashMap::new(), reported: HashSet::new(), loop_exit: HashMap::new(), loop_head: HashMap::new(), held: Vec::new() };
     cx.compute_roots();
     cx.check_views_block(&body.block);
     if let Some(t) = &body.block.tail {
@@ -239,6 +244,7 @@ pub fn check(p: &Program, body: &Body, diags: &mut Diagnostics) {
 struct Cx<'p, 'd> {
     p: &'p Program,
     body: &'p Body,
+    env: &'p [crate::defs::Pred],
     diags: &'d mut Diagnostics,
     roots: HashMap<LocalId, Roots>,
     reported: HashSet<(Span, u32)>,
@@ -274,13 +280,13 @@ impl<'p> Cx<'p, '_> {
                 let adt = self.p.adt(*d);
                 adt.variants.iter().any(|v| v.fields.iter().any(|f| self.has_view_rec(&f.ty.subst(args), depth + 1)))
             }
-            Ty::Bang(t) => self.has_view_rec(t, depth + 1),
+            Ty::Grow(t) => self.has_view_rec(t, depth + 1),
             Ty::Closure(d, args) => {
                 self.p.closures.get(d).is_some_and(|c| c.captures.iter().any(|cap| cap.by_ref || self.has_view_rec(&cap.ty.subst(args), depth + 1)))
             }
             // Generic values may be instantiated with views, and `impl Trait`
-            // may stand for one.
-            Ty::Param(..) | Ty::Opaque(..) => true,
+            // may stand for one, unless bounded by `Dull`.
+            Ty::Param(..) | Ty::Opaque(..) => !self.p.is_dull(t, self.env),
             _ => false,
         }
     }
@@ -297,7 +303,7 @@ impl<'p> Cx<'p, '_> {
     }
 
     fn is_view_container(&self, t: &Ty) -> bool {
-        matches!(t.strip_bang(), Ty::Array(_, k) if k.is_slice()) || matches!(t, Ty::Str)
+        matches!(t.strip_grow(), Ty::Array(_, k) if k.is_slice()) || matches!(t, Ty::Str)
     }
 
     /// Roots of a borrow of `place` (slicing it, passing an owner handle).
@@ -685,15 +691,19 @@ impl<'p> Cx<'p, '_> {
             }
             let vn = self.local(v).name.clone();
             let vs = self.local(v).span;
-            let (code, verb) = match what {
-                "shrink" => (borrow::SHRINK_WHILE_BORROWED, "may be shrunk"),
-                "move" => (borrow::MOVE_WHILE_BORROWED, "is moved"),
-                _ => (borrow::ASSIGN_WHILE_BORROWED, "is replaced"),
+            let (code, verb, help) = match what {
+                "shrink" => (
+                    borrow::SHRINK_WHILE_BORROWED,
+                    "may be shrunk or replaced",
+                    format!("finish using `{vn}` before this point, or take a new slice afterwards; if this call only grows `{rname}`, declare that parameter `&mut +`"),
+                ),
+                "move" => (borrow::MOVE_WHILE_BORROWED, "is moved", format!("finish using `{vn}` before this point, or take a new slice afterwards")),
+                _ => (borrow::ASSIGN_WHILE_BORROWED, "is replaced", format!("finish using `{vn}` before this point, or take a new slice afterwards")),
             };
             self.err(
                 Diagnostic::error(code, span, format!("`{rname}` {verb} here while `{vn}` still points into it"))
                     .with_secondary(vs, format!("`{vn}` borrows from `{rname}` and is used later"))
-                    .with_help(format!("finish using `{vn}` before this point, or take a new slice afterwards")),
+                    .with_help(help),
             );
         }
         let held_conflict = self.held.iter().any(|r| r.contains(&Root::Local(root)));
@@ -701,55 +711,41 @@ impl<'p> Cx<'p, '_> {
             self.err(Diagnostic::error(
                 borrow::SHRINK_WHILE_BORROWED,
                 span,
-                format!("`{rname}` may be shrunk here while another argument of this call points into it"),
+                format!("`{rname}` may be shrunk or replaced here while another argument of this call points into it"),
             ));
         }
     }
 
-    /// The `!` conversion: only the owner (a local, or a `!` parameter) may do it.
-    fn check_bang_owner(&mut self, place: &Expr, span: Span) -> Option<LocalId> {
-        let root = match self.place_root(place) {
-            Some(Root::Local(l)) => l,
-            Some(Root::Temp | Root::Slot(_)) => return None,
-            None => {
-                self.err(Diagnostic::error(
-                    borrow::SHRINK_NOT_OWNER,
-                    span,
-                    "only an array's owner can mark it as shrinkable (`!`), and this place has no owner here",
-                ));
-                return None;
-            }
-        };
+    /// `place` (an owner) is about to be lent where it may be shrunk or
+    /// replaced (`what`): its root local, to invalidate. A `&mut +`
+    /// parameter may only grow, so that is an error.
+    fn may_shrink(&mut self, place: &Expr, span: Span, what: &str) -> Option<LocalId> {
+        let Some(Root::Local(root)) = self.place_root(place) else { return None };
         if self.place_through_view(place) {
-            self.err(Diagnostic::error(borrow::SHRINK_NOT_OWNER, span, "cannot shrink an array reached through a slice"));
             return None;
         }
-        let l = self.local(root);
-        if let LocalKind::Param { bang: false, owned: false, inout, .. } = l.kind {
-            let n = l.name.clone();
-            let ty = self.p.ty_str(&l.ty);
-            let ls = l.span;
-            if self.reported.insert((span, 1 << 29)) {
-                let d = Diagnostic::error(borrow::SHRINK_NOT_OWNER, span, format!("only the owner of `{n}` can mark it as shrinkable (`!`)"));
-                // The fix depends on the mode: an in-out parameter already
-                // changes the caller's value and only has to admit it may
-                // shrink it; a borrowed one can either do that or take
-                // ownership and shrink its own value.
-                let d = if inout {
-                    d.with_secondary(ls, format!("`{n}` is in-out, but not declared as shrinkable"))
-                        .with_help(format!("let callers know it may shrink: `{n}: &mut !{ty}`"))
-                } else {
-                    d.with_secondary(ls, format!("`{n}` is a borrowed parameter, so its caller owns it"))
-                        .with_help(format!("to shrink the caller's value in place: `{n}: &mut !{ty}`"))
-                        .with_help(format!("or take ownership and shrink your own: `mut {n}: {ty}`"))
-                };
-                self.err(d);
-            }
-            return None;
-        }
+        self.check_grow_only(root, span, what);
         Some(root)
     }
 
+    /// Report shrinking or replacing (`what`) local `l` if it is a `&mut +`
+    /// parameter.
+    fn check_grow_only(&mut self, l: LocalId, span: Span, what: &str) {
+        let local = self.local(l);
+        if let LocalKind::Param { grow: true, .. } = local.kind
+            && self.reported.insert((span, 1 << 29))
+        {
+            let n = local.name.clone();
+            let ls = local.span;
+            self.err(
+                Diagnostic::error(borrow::GROW_ONLY, span, format!("`{n}` may only grow, but {what}"))
+                    .with_secondary(ls, format!("`{n}` is declared `&mut +`, so callers keep their views into it across the call"))
+                    .with_help(format!("only grow `{n}` (with `&mut +` methods such as `push`), or drop the `+` so it may be shrunk")),
+            );
+        }
+    }
+
+    /// The parameter types of what is called, when known.
     fn callee_params(&self, c: &Callee) -> Option<Vec<Ty>> {
         match c {
             Callee::Fn { def, .. } | Callee::Intrinsic { def, .. } => Some(self.p.fn_data(*def).sig.params.iter().map(|p| p.ty.clone()).collect()),
@@ -758,7 +754,36 @@ impl<'p> Cx<'p, '_> {
                 let m = t.methods.iter().find(|m| m.name == *method)?;
                 Some(self.p.fn_data(m.def).sig.params.iter().map(|p| p.ty.clone()).collect())
             }
-            Callee::Indirect(_) | Callee::Value { .. } => None,
+            Callee::Indirect(f) => match &f.ty {
+                Ty::FnPtr(ps, _) => Some(ps.iter().map(|(_, t)| t.clone()).collect()),
+                _ => None,
+            },
+            Callee::Value { .. } => None,
+        }
+    }
+
+    /// Whether a closure value of type `t` may change what it captured when
+    /// called (conservatively yes, unless it is known to be an `Fn` closure).
+    fn may_change_captures(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Closure(d, _) => self.p.closures.get(d).is_none_or(|c| c.kind != crate::ClosureKind::Fn),
+            _ => true,
+        }
+    }
+
+    /// Calling (or handing on) a closure whose roots are `roots` may shrink
+    /// or replace the owners it borrowed in-out.
+    fn invalidate_captures(&mut self, roots: &Roots, after: &LiveSet, span: Span) {
+        let slots: Vec<LocalId> = roots
+            .iter()
+            .filter_map(|r| match r {
+                Root::Slot(l) if self.p.has_owner(&self.local(*l).ty) => Some(*l),
+                _ => None,
+            })
+            .collect();
+        for l in slots {
+            self.check_grow_only(l, span, "a closure that may shrink or replace it is called here");
+            self.invalidate(l, after, span, "shrink");
         }
     }
 
@@ -787,14 +812,34 @@ impl<'p> Cx<'p, '_> {
                     })
                     .collect();
                 for (i, a) in args.iter().enumerate() {
-                    let is_bang = params.as_ref().and_then(|ps| ps.get(i)).is_some_and(|t| matches!(t, Ty::Bang(_)));
-                    if let (Arg::InOut(p), true) = (a, is_bang)
-                        && let Some(root) = self.check_bang_owner(p, p.span)
+                    // Lent in-out to a parameter that is not `+`: the callee
+                    // may shrink or replace it.
+                    let grows = params.as_ref().and_then(|ps| ps.get(i)).is_some_and(|t| matches!(t, Ty::Grow(_)));
+                    if let Arg::InOut(p) = a
+                        && !grows
+                        && self.p.has_owner(&p.ty)
+                        && let Some(root) = self.may_shrink(p, p.span, "this call may shrink or replace it")
                     {
                         self.held = arg_roots.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, r)| r.clone()).collect();
                         self.invalidate(root, &after, p.span, "shrink");
                         self.held.clear();
                     }
+                    // A closure that changes what it borrowed may be called
+                    // by the callee.
+                    let ty = match a {
+                        Arg::InOut(p) => &p.ty,
+                        Arg::Value(v) => &v.ty,
+                    };
+                    if self.may_change_captures(ty) {
+                        let roots = arg_roots[i].clone();
+                        self.invalidate_captures(&roots, &after, e.span);
+                    }
+                }
+                if let Callee::Value { callee: f, kind } = callee
+                    && *kind != crate::ClosureKind::Fn
+                {
+                    let roots = if f.is_place() { self.value_roots_of_place(f) } else { self.value_roots(f) };
+                    self.invalidate_captures(&roots, &after, e.span);
                 }
                 let mut live = after;
                 for a in args.iter().rev() {
@@ -823,6 +868,7 @@ impl<'p> Cx<'p, '_> {
                     && let Some(Root::Local(r)) = self.place_root(place)
                     && !self.place_through_view(place)
                 {
+                    self.check_grow_only(r, e.span, "this replaces part of it");
                     self.invalidate(r, &after, e.span, "assign");
                 }
                 if let K::Local(l) = place.kind {
@@ -1198,7 +1244,7 @@ impl Moves<'_, '_, '_> {
                     let take = if n == "self" {
                         format!("`self` rather than `{borrow}self`")
                     } else {
-                        let ty = self.cx.p.ty_str(local.ty.strip_bang());
+                        let ty = self.cx.p.ty_str(local.ty.strip_grow());
                         format!("`{n}: {ty}` rather than `{n}: {borrow}{ty}`")
                     };
                     if self.cx.reported.insert((span, 3 << 28)) {

@@ -109,7 +109,7 @@ impl::<T: Dull> Arena::<T> {
     }
 
     /// Add an item; returns its handle.
-    pub fn add(&mut self, value: T): Id::<T> {
+    pub fn add(&mut +self, value: T): Id::<T> {
         let i = self.items.len();
         self.items.push(value);
         return Id { index: i as u32 };
@@ -121,12 +121,12 @@ impl::<T: Dull> Arena::<T> {
     }
 
     /// Replace the item.
-    pub fn set(&mut self, id: Id::<T>, value: T) {
+    pub fn set(&mut +self, id: Id::<T>, value: T) {
         self.items[id.index as usize] = value;
     }
 
     /// Replace the item with what `f` makes of it.
-    pub fn update::<F: FnOnce(T): T>(&mut self, id: Id::<T>, f: F) {
+    pub fn update::<F: FnOnce(T): T>(&mut +self, id: Id::<T>, f: F) {
         let i = id.index as usize;
         self.items[i] = f(self.items[i]);
     }
@@ -138,13 +138,13 @@ impl::<T: Dull> Arena::<T> {
     }
 
     /// The item, as a one-item slice to change in place.
-    pub fn view_mut(&mut self, id: Id::<T>): [T; &mut] {
+    pub fn view_mut(&mut +self, id: Id::<T>): [T; &mut] {
         let i = id.index as usize;
         return self.items[i..i + 1];
     }
 
     /// Add `items` as one run; returns it as a list.
-    pub fn add_list(&mut self, items: [T; &]): List::<T> {
+    pub fn add_list(&mut +self, items: [T; &]): List::<T> {
         let start = self.items.len();
         self.items.extend(items);
         return List { start: start as u32, len: items.len() as u32 };

@@ -577,14 +577,14 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             match sig.get(i) {
                 Some((pt, ParamMode::InOut)) => out.push(self.check_inout_arg(a, pt)),
                 Some((pt, ParamMode::Borrow)) => {
-                    let expect = pt.strip_bang().clone();
+                    let expect = pt.strip_grow().clone();
                     let v = self.check_expr_borrow(a, Some(&expect));
                     let v = self.coerce_arg(v, &expect, a.span);
                     out.push(Arg::Value(v));
                 }
                 Some((pt, ParamMode::Take)) => {
                     // The value moves into the call (or is copied, if Dull).
-                    let expect = pt.strip_bang().clone();
+                    let expect = pt.strip_grow().clone();
                     let v = self.check_expr(a, Some(&expect));
                     let v = self.coerce_arg(v, &expect, a.span);
                     out.push(Arg::Value(v));
@@ -667,10 +667,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             self.require_unsafe(a.span, "accessing a `static mut`");
         }
         if !self.is_mutable_place(&place) && !place.ty.is_error() {
-            self.immutable_err_for(&place, a.span, "pass this as a `&mut` argument", matches!(pt, Ty::Bang(_)));
+            self.immutable_err(&place, a.span, "pass this as a `&mut` argument");
         }
-        let want = self.shallow(pt.strip_bang());
-        let have = self.shallow(place.ty.strip_bang());
+        let want = self.shallow(pt.strip_grow());
+        let have = self.shallow(place.ty.strip_grow());
         // Owner kinds subsume: a `[T; -..+]` may be passed where `[T; ..+]` or `[T]` is expected.
         if let (Ty::Array(we, wk), Ty::Array(he, hk)) = (&want, &have)
             && wk.is_owner()
@@ -751,7 +751,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             self.infer_from_bounds();
         }
         let rt = self.default_var(&r.ty);
-        let rt = self.resolve(rt.strip_bang());
+        let rt = self.resolve(rt.strip_grow());
         if rt.is_error() {
             for a in args {
                 let _ = self.check_expr(a, None);
@@ -819,10 +819,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
 
     #[allow(clippy::too_many_arguments)]
     fn adjust_receiver(&mut self, r: Expr, rt: &Ty, step: &Ty, step_idx: usize, self_ty: &Ty, mode: ParamMode, span: Span) -> Arg {
-        let want = self.shallow(self_ty.strip_bang());
+        let want = self.shallow(self_ty.strip_grow());
         if mode == ParamMode::InOut {
             if !self.is_mutable_place(&r) && !r.ty.is_error() {
-                self.immutable_err_for(&r, span, "call a method taking `&mut self` on this value", matches!(self_ty, Ty::Bang(_)));
+                self.immutable_err(&r, span, "call a method taking `&mut self` on this value");
             }
             if step_idx > 0 && matches!(step, Ty::Array(_, k) if k.is_slice()) {
                 self.err(Diagnostic::error(tyc::MISMATCH, span, "cannot pass a slice view as `&mut self`"));

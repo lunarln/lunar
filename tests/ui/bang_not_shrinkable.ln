@@ -1,8 +1,0 @@
-// error: type::bang_not_shrinkable
-struct Log {
-    lines: [i32; ..+],
-}
-
-fn f(l: &mut !Log) {}
-
-fn main() {}

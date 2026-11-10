@@ -53,20 +53,9 @@ impl Parser {
         return Ok(self.ast.ty_ids.add_list(out[..]));
     }
 
-    /// A return type: `!` alone means "never returns".
+    /// A return type: `!` means "never returns".
     pub fn ret_ty(&mut self): PResult::<Id::<Ty>> {
-        if self.at(T::Bang) && !self.ty_can_start(1) {
-            let t = self.bump();
-            return Ok(self.add_ty(TyKind::Never, self.tok_span(t)));
-        }
         return self.ty();
-    }
-
-    fn ty_can_start(&mut self, n: usize): bool {
-        return match self.nth(n) {
-            Some(T::Ident | T::SelfType | T::Crater | T::Super | T::SelfValue | T::LBracket | T::LParen | T::Star | T::Bang | T::Fn | T::Placeholder | T::Impl) => true,
-            _ => false,
-        };
     }
 
     pub fn ty(&mut self): PResult::<Id::<Ty>> {
@@ -82,7 +71,12 @@ impl Parser {
             }
             Some(T::Bang) => {
                 self.bump();
-                if self.ty_can_start(0) { TyKind::Bang(self.ty()?) } else { TyKind::Never }
+                TyKind::Never
+            }
+            // `+T`: a parameter that only grows (checked when lowering).
+            Some(T::Plus) => {
+                self.bump();
+                TyKind::Grow(self.ty()?)
             }
             Some(T::Star) => {
                 self.bump();

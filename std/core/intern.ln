@@ -74,8 +74,9 @@ impl Interner {
         return None;
     }
 
-    /// The symbol for `s`, interning it if it is new.
-    pub fn intern(&mut self, s: str): Symbol {
+    /// The symbol for `s`, interning it if it is new. Only grows the
+    /// interner, so texts from `resolve` stay valid.
+    pub fn intern(&mut +self, s: str): Symbol {
         if let Some(sym) = self.get(s) {
             return sym;
         }

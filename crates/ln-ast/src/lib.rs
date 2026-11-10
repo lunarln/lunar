@@ -221,8 +221,9 @@ pub struct Param {
     pub kind: ParamKind,
     /// `None` only for a bare `self` (in any mode).
     pub ty: Option<Ty>,
-    /// `&mut !self`: the receiver may be shrunk.
-    pub self_bang: bool,
+    /// `&mut +self`: the receiver only grows (it is never shrunk or
+    /// replaced).
+    pub self_grow: bool,
     pub span: Span,
 }
 
@@ -409,8 +410,9 @@ pub enum TyKind {
     Array(Box<Ty>, ArraySize),
     /// `[T]`: dynamically sized at construction, then frozen.
     DynArray(Box<Ty>),
-    /// `!T`: parameter-only marker that the argument may have been shrunk.
-    Bang(Box<Ty>),
+    /// `+T`: parameter-only marker that the argument only grows: it is never
+    /// shrunk or replaced, so the caller's views into it stay valid.
+    Grow(Box<Ty>),
     /// `*T` / `*mut T`
     Ptr {
         is_mut: bool,

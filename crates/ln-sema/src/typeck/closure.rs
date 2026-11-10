@@ -269,7 +269,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             let mut params = Vec::new();
             for (i, (l, cap)) in c.captured.iter().zip(&info.captures).enumerate() {
                 let local = &mut locals[l.0 as usize];
-                local.kind = LocalKind::Param { index: i, inout: cap.mode == ParamMode::InOut, bang: false, owned: cap.mode == ParamMode::Take };
+                local.kind = LocalKind::Param { index: i, inout: cap.mode == ParamMode::InOut, grow: false, owned: cap.mode == ParamMode::Take };
                 local.mutable = cap.mode == ParamMode::InOut || local.mutable;
                 local.depth = 0;
                 params.push(*l);
@@ -278,7 +278,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             for (j, l) in c.params.iter().enumerate() {
                 let p = &fd.sig.params[n + j];
                 let local = &mut locals[l.0 as usize];
-                local.kind = LocalKind::Param { index: n + j, inout: p.mode == ParamMode::InOut, bang: false, owned: p.mode == ParamMode::Take };
+                local.kind = LocalKind::Param { index: n + j, inout: p.mode == ParamMode::InOut, grow: matches!(p.ty, crate::ty::Ty::Grow(_)), owned: p.mode == ParamMode::Take };
                 local.depth = 0;
                 params.push(*l);
             }
@@ -445,7 +445,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             ClosureKind::Fn => place,
             ClosureKind::FnMut => {
                 if !self.is_mutable_place(&place) && !place.ty.is_error() {
-                    self.immutable_err_for(&place, f.span, "call this `FnMut` closure (it changes what it captured)", false);
+                    self.immutable_err(&place, f.span, "call this `FnMut` closure (it changes what it captured)");
                 }
                 place
             }

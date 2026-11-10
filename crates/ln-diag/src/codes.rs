@@ -25,9 +25,9 @@ codes! {
     ty ("type") => {
         MISMATCH = "mismatch",
         ARRAY_POINTY_ITEMS = "array_pointy_items",
-        BANG_OUTSIDE_PARAM = "bang_outside_param",
-        BANG_NOT_SHRINKABLE = "bang_not_shrinkable",
-        BANG_WITHOUT_MUT = "bang_without_mut",
+        GROW_OUTSIDE_PARAM = "grow_outside_param",
+        GROW_NO_OWNER = "grow_no_owner",
+        GROW_WITHOUT_MUT = "grow_without_mut",
         FMTARGS_OUTSIDE_PARAM = "fmtargs_outside_param",
         ANNOTATIONS_NEEDED = "annotations_needed",
         NOT_CALLABLE = "not_callable",
@@ -96,7 +96,7 @@ codes! {
     borrow ("borrow") => {
         USE_AFTER_MOVE = "use_after_move",
         MOVE_OUT_OF_BORROW = "move_out_of_borrow",
-        SHRINK_NOT_OWNER = "shrink_not_owner",
+        GROW_ONLY = "grow_only",
         SHRINK_WHILE_BORROWED = "shrink_while_borrowed",
         MOVE_WHILE_BORROWED = "move_while_borrowed",
         ASSIGN_WHILE_BORROWED = "assign_while_borrowed",

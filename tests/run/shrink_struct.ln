@@ -1,0 +1,34 @@
+// Shrinking through `&mut`, and views kept across `&mut +` calls.
+
+struct Stack {
+    items: [i32; -..+],
+    name: str,
+}
+
+impl Stack {
+    // Only grows: callers keep their views into the stack.
+    fn push_twice(&mut +self, v: i32) {
+        self.items.push(v);
+        self.items.push(v);
+    }
+}
+
+// May shrink: any `&mut` parameter can.
+fn drain(s: &mut Stack): i32 {
+    let mut total = 0;
+    loop {
+        match s.items.pop() {
+            Some(v) => total += v,
+            None => break,
+        }
+    }
+    return total;
+}
+
+fn main() {
+    let mut s = Stack { items: [1, 2, 3], name: "nums" };
+    let peek = s.items[..];
+    s.push_twice(4);
+    println("{peek.len()} {peek[2]} {s.items.len()} {s.name}");
+    println("{drain(&mut s)} left={s.items.len()}");
+}

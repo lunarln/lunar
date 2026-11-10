@@ -290,31 +290,31 @@ impl P<'_, '_, '_> {
 
     fn param(&mut self) -> PResult<Param> {
         let start = self.start();
-        // Receivers: `&self`, `&mut self`, `&mut !self`.
+        // Receivers: `&self`, `&mut self`, `&mut +self`.
         let ref_self = self.k.at(T::Amp)
             && match self.k.nth(1) {
                 Some(T::SelfValue) => true,
-                Some(T::Mut) => matches!(self.k.nth(2), Some(T::SelfValue)) || (self.k.nth(2) == Some(T::Bang) && self.k.nth(3) == Some(T::SelfValue)),
+                Some(T::Mut) => matches!(self.k.nth(2), Some(T::SelfValue)) || (self.k.nth(2) == Some(T::Plus) && self.k.nth(3) == Some(T::SelfValue)),
                 _ => false,
             };
         if ref_self {
             self.k.bump();
             let mode = if self.k.eat(T::Mut) { ParamMode::InOut } else { ParamMode::Borrow };
-            let self_bang = self.k.eat(T::Bang);
+            let self_grow = self.k.eat(T::Plus);
             self.k.expect(T::SelfValue)?;
-            return Ok(Param { is_mut: false, mode, kind: ParamKind::SelfParam, ty: None, self_bang, span: self.span_from(start) });
+            return Ok(Param { is_mut: false, mode, kind: ParamKind::SelfParam, ty: None, self_grow, span: self.span_from(start) });
         }
         let is_mut = self.k.eat(T::Mut);
         if self.k.eat(T::SelfValue) {
             let ty = if self.k.eat(T::Colon) { Some(self.ty()?) } else { None };
-            return Ok(Param { is_mut, mode: ParamMode::Take, kind: ParamKind::SelfParam, ty, self_bang: false, span: self.span_from(start) });
+            return Ok(Param { is_mut, mode: ParamMode::Take, kind: ParamKind::SelfParam, ty, self_grow: false, span: self.span_from(start) });
         }
         let kind = if self.k.eat(T::Placeholder) { ParamKind::Wild } else { ParamKind::Named(self.ident()?) };
         self.k.expect(T::Colon)?;
         // `x: &T` borrows, `x: &mut T` is in-out, `x: T` takes ownership.
         let mode = if self.k.eat(T::Amp) { if self.k.eat(T::Mut) { ParamMode::InOut } else { ParamMode::Borrow } } else { ParamMode::Take };
         let ty = self.ty()?;
-        Ok(Param { is_mut, mode, kind, ty: Some(ty), self_bang: false, span: self.span_from(start) })
+        Ok(Param { is_mut, mode, kind, ty: Some(ty), self_grow: false, span: self.span_from(start) })
     }
 
     fn struct_decl(&mut self) -> PResult<StructDecl> {

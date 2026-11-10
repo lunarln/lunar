@@ -181,7 +181,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 ArrKind::Slice | ArrKind::SliceMut => self.slice_ty().into(),
                 ArrKind::Dyn | ArrKind::Grow | ArrKind::Shrink => self.handle_ty().into(),
             },
-            Ty::Bang(t) => self.llty(t),
+            Ty::Grow(t) => self.llty(t),
             Ty::Ptr(..) | Ty::FnPtr(..) => self.ptr_ty().into(),
             // The captures: a pointer to each borrowed one, each taken value.
             Ty::Closure(def, args) => {

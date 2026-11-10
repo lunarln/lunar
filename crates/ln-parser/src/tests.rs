@@ -38,7 +38,7 @@ fn generics_and_traits() {
         trait Show: Display + Dull { fn show(self): str; fn dflt(self) { } }
         impl::<T: Dull> Show for Pair::<T> { fn show(self): str { return "pair"; } }
         impl !Dull for Foo {}
-        fn f::<T: Dull + Eq, U>(x: Pair::<Pair::<T>>, mut s: ![T; -..+], p: *mut u8): ! { loop {} }
+        fn f::<T: Dull + Eq, U>(x: Pair::<Pair::<T>>, s: &mut +[T; -..+], p: *mut u8): ! { loop {} }
         extern "C" { fn write(fd: i32, buf: *u8, n: usize): isize; fn printf(f: *u8, ...): i32; }
         #[cfg(windows)] use std::io::{print, println as pl};
         const N: usize = 4;

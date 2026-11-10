@@ -33,7 +33,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     pub(crate) fn check_pat(&mut self, p: &ast::Pat, ty: &Ty, _is_let: bool) -> Pat {
         let span = p.span;
         let sty = self.shallow(ty);
-        let sty = sty.strip_bang().clone();
+        let sty = sty.strip_grow().clone();
         let kind = match &p.kind {
             ast::PatKind::MacCall(m) => {
                 let module = self.module();

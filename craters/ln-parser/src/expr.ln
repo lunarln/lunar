@@ -3,7 +3,7 @@
 use core::arena::{Id, List};
 use ln_ast::*;
 use ln_lexer::{NumKind, Token as T};
-use crater::{Parser, PResult, Named, Expected, Code, Tok};
+use crater::{Parser, PResult, Named, Expected, Code, Tok, tok_text};
 use crater::pat::is_uppercase;
 
 /// A binary operator at the cursor: the operator, its precedence and how
@@ -347,7 +347,7 @@ impl Parser {
 
     /// `e.0`, and `e.0.1`, which lexes `0.1` as one float token.
     fn tuple_fields_of(&mut self, e: Id::<Expr>, t: Tok, kind: NumKind, start: u32): Id::<Expr> {
-        let text = self.tok_text(t);
+        let text = tok_text(self.src, t);
         let mut e = e;
         let mut off = t.start;
         let mut part_start: usize = 0;

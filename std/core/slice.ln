@@ -188,16 +188,16 @@ fn sift_down::<T: Dull + Ord>(s: [T; &mut], start: usize, end: usize) {
 
 impl::<T: Dull> [T; ..+] {
     /// Append an element. Growth never moves existing elements, so slices
-    /// into the array stay valid.
-    pub fn push(&mut self, value: T) {
+    /// into the array stay valid (`&mut +self`).
+    pub fn push(&mut +self, value: T) {
         intrinsics::arr_push(self, value);
     }
 
-    pub fn extend(&mut self, items: [T; &]) {
+    pub fn extend(&mut +self, items: [T; &]) {
         intrinsics::arr_extend(self, items);
     }
 
-    pub fn reserve(&mut self, extra: usize) {
+    pub fn reserve(&mut +self, extra: usize) {
         intrinsics::arr_reserve(self, extra);
     }
 
@@ -217,9 +217,9 @@ impl::<T: Dull> [T; -..+] {
         return self;
     }
 
-    /// Remove and return the last element. Takes `!Self`: the caller's
-    /// slices into this array must be dead.
-    pub fn pop(&mut !self): Option::<T> {
+    /// Remove and return the last element. The caller's slices into this
+    /// array must be dead (as for any `&mut self` method that is not `+`).
+    pub fn pop(&mut self): Option::<T> {
         let n = self.len();
         if n == 0 {
             return None;
@@ -229,16 +229,16 @@ impl::<T: Dull> [T; -..+] {
         return Some(v);
     }
 
-    pub fn truncate(&mut !self, len: usize) {
+    pub fn truncate(&mut self, len: usize) {
         intrinsics::arr_truncate(self, len);
     }
 
-    pub fn clear(&mut !self) {
+    pub fn clear(&mut self) {
         intrinsics::arr_truncate(self, 0);
     }
 
     /// Remove the element at `i`, shifting later elements down.
-    pub fn remove(&mut !self, i: usize): T {
+    pub fn remove(&mut self, i: usize): T {
         let n = self.len();
         if i >= n {
             panic("remove index {i} out of bounds for length {n}");
@@ -254,7 +254,7 @@ impl::<T: Dull> [T; -..+] {
     }
 
     /// Insert `value` at `i`, shifting later elements up.
-    pub fn insert(&mut self, i: usize, value: T) {
+    pub fn insert(&mut +self, i: usize, value: T) {
         let n = self.len();
         if i > n {
             panic("insert index {i} out of bounds for length {n}");

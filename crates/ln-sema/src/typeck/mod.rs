@@ -109,7 +109,10 @@ impl<'a> Sema<'a> {
     /// found no errors), then keep it.
     fn finish_body(&mut self, b: thir::Body, errs_before: usize, is_std: bool) {
         if self.diags.error_count() == errs_before {
-            crate::borrowck::check(&self.p, &b, &mut self.diags);
+            // A closure's body has the bounds of the function it is in.
+            let owner = self.p.closures.get(&b.def).map_or(b.def, |c| c.parent);
+            let env = self.env_of(owner);
+            crate::borrowck::check(&self.p, &b, &env, &mut self.diags);
             // Lints on a function with borrow errors would only add
             // noise (and may be wrong about code that will change).
             if !is_std && self.diags.error_count() == errs_before {
@@ -168,10 +171,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         fcx.opaque_vars = opened;
         let mut params = Vec::new();
         for (i, p) in fd.sig.params.iter().enumerate() {
-            let bang = matches!(p.ty, Ty::Bang(_));
+            let grow = matches!(p.ty, Ty::Grow(_));
             let owned = p.mode == crate::defs::ParamMode::Take;
             let mutable = p.inout || (owned && p.mutable);
-            let id = fcx.new_local(&p.name, p.ty.clone(), mutable, LocalKind::Param { index: i, inout: p.inout, bang, owned }, p.span, 0);
+            let id = fcx.new_local(&p.name, p.ty.clone(), mutable, LocalKind::Param { index: i, inout: p.inout, grow, owned }, p.span, 0);
             if p.name != "_" {
                 fcx.bind_name(&p.name, p.ctx, id);
             }
@@ -469,7 +472,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             (Ty::Adt(d1, xs), Ty::Adt(d2, ys)) => d1 == d2 && xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| self.unify(x, y)),
             (Ty::Array(e1, k1), Ty::Array(e2, k2)) => self.unify_len(*k1, *k2) && self.unify(e1, e2),
             (Ty::Ptr(x, m1), Ty::Ptr(y, m2)) => m1 == m2 && self.unify(x, y),
-            (Ty::Bang(x), Ty::Bang(y)) => self.unify(x, y),
+            (Ty::Grow(x), Ty::Grow(y)) => self.unify(x, y),
             (Ty::FnPtr(p1, r1), Ty::FnPtr(p2, r2)) => {
                 p1.len() == p2.len() && p1.iter().zip(p2).all(|((m1, x), (m2, y))| m1 == m2 && self.unify(x, y)) && self.unify(r1, r2)
             }
@@ -617,10 +620,10 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         let ty = place.ty.clone();
         let span = place.span;
         let resolved = self.resolve(&ty);
-        let copy = if resolved.has_infer() { !self.could_be_owner(&resolved) } else { self.s.p.is_copy(resolved.strip_bang(), &self.env) };
+        let copy = if resolved.has_infer() { !self.could_be_owner(&resolved) } else { self.s.p.is_copy(resolved.strip_grow(), &self.env) };
         let mode = if copy { ReadMode::Copy } else { mode };
         let ty = match ty {
-            Ty::Bang(t) => *t,
+            Ty::Grow(t) => *t,
             t => t,
         };
         Expr { kind: ExprKind::Read { place: Box::new(place), mode }, ty, span }
@@ -664,12 +667,6 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     }
 
     pub(crate) fn immutable_err(&mut self, place: &Expr, span: Span, what: &str) {
-        self.immutable_err_for(place, span, what, false);
-    }
-
-    /// `shrink`: the place is about to be shrunk, so the in-place fix for a
-    /// parameter is `&mut !T` rather than `&mut T`.
-    pub(crate) fn immutable_err_for(&mut self, place: &Expr, span: Span, what: &str, shrink: bool) {
         let mut d = Diagnostic::error(tyc::IMMUTABLE, span, format!("cannot {what}: it is not mutable"));
         let container = match &place.kind {
             ExprKind::Index { base, .. } => self.shallow(&base.ty),
@@ -686,9 +683,8 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                     d.with_help(format!("declare it `mut {n}` to change this function's own copy, or `{n}: &mut ...` to change the caller's"))
                 }
                 LocalKind::Param { .. } => {
-                    let ty = self.ty_str(local.ty.strip_bang());
-                    let bang = if shrink { "!" } else { "" };
-                    d.with_help(format!("to change the caller's value in place: `{n}: &mut {bang}{ty}`"))
+                    let ty = self.ty_str(local.ty.strip_grow());
+                    d.with_help(format!("to change the caller's value in place: `{n}: &mut {ty}`"))
                         .with_help(format!("or take ownership and change your own: `mut {n}: {ty}`"))
                 }
                 _ => d.with_help(format!("declare it with `let mut {n}`")),

@@ -955,7 +955,7 @@ fn glue<'ctx>(cg: &mut Cg<'ctx, '_>, t: &Ty) -> Result<FunctionValue<'ctx>, Stri
             let free = cg.lang_fn("ds_free")?;
             cg.b.build_call(free, &[data.into()], "").unwrap();
         }
-        Ty::Bang(inner) => {
+        Ty::Grow(inner) => {
             let g = glue(cg, inner)?;
             cg.b.position_at_end(entry);
             cg.b.build_call(g, &[p.into()], "").unwrap();

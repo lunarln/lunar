@@ -20,7 +20,8 @@ pub enum LocalKind {
     /// Function parameter number `index`.
     /// `owned`: the function took ownership (`x: T`), so the parameter is
     /// a local it owns, not a borrow of the caller's value.
-    Param { index: usize, inout: bool, bang: bool, owned: bool },
+    /// `grow`: declared `&mut +T`, so it may only grow.
+    Param { index: usize, inout: bool, grow: bool, owned: bool },
     /// `let` binding or pattern binding.
     Let,
     /// Compiler temporary.

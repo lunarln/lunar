@@ -1,0 +1,9 @@
+// error: type::grow_no_owner
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn f(p: &mut +Point) {}
+
+fn main() {}

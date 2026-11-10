@@ -1,5 +1,5 @@
 // error: type::immutable
-// The help offers both fixes: `&mut !` in place, or taking ownership.
+// The help offers both fixes: `&mut` in place, or taking ownership.
 fn last(log: &[u8; -..+]): Option::<u8> {
     return log.pop();
 }

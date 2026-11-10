@@ -2,7 +2,7 @@
 
 A `self` parameter makes a function a method: it receives the value the
 method is called on, in any parameter mode (`self`, `mut self`, `&self`,
-`&mut self` or `&mut !self`). It is only allowed as the first parameter of a
+`&mut self` or `&mut +self`). It is only allowed as the first parameter of a
 function inside an `impl` or `trait` block. This code is reported when
 `self` appears in a later position, or in a free function that is not inside
 an `impl` or `trait`.

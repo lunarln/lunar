@@ -45,21 +45,9 @@ impl P<'_, '_, '_> {
         }
     }
 
-    /// A return type: `!` alone means "never returns".
+    /// A return type: `!` means "never returns".
     pub(crate) fn ret_ty(&mut self) -> PResult<Ty> {
-        if self.k.at(T::Bang) && !self.ty_can_start(1) {
-            let t = self.k.bump();
-            let id = self.id();
-            return Ok(Ty { kind: TyKind::Never, span: self.tok_span(t), id });
-        }
         self.ty()
-    }
-
-    fn ty_can_start(&mut self, n: usize) -> bool {
-        matches!(
-            self.k.nth(n),
-            Some(T::Ident | T::SelfType | T::Crater | T::Super | T::SelfValue | T::LBracket | T::LParen | T::Star | T::Bang | T::Fn | T::Placeholder | T::Impl)
-        )
     }
 
     pub(crate) fn ty(&mut self) -> PResult<Ty> {
@@ -75,7 +63,12 @@ impl P<'_, '_, '_> {
             }
             Some(T::Bang) => {
                 self.k.bump();
-                if self.ty_can_start(0) { TyKind::Bang(Box::new(self.ty()?)) } else { TyKind::Never }
+                TyKind::Never
+            }
+            // `+T`: a parameter that only grows (checked when lowering).
+            Some(T::Plus) => {
+                self.k.bump();
+                TyKind::Grow(Box::new(self.ty()?))
             }
             Some(T::Star) => {
                 self.k.bump();

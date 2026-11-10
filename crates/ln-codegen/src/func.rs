@@ -82,7 +82,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 // A parameter that took ownership is this function's to free
                 // (moving out of it zeroes the slot, making the drop a no-op).
                 if let LocalKind::Param { owned: true, .. } = local.kind {
-                    fc.register_cleanup(slot, ty.strip_bang());
+                    fc.register_cleanup(slot, ty.strip_grow());
                 }
             }
         }
@@ -334,13 +334,13 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             },
             ExprKind::Field { base, variant, field } => {
                 let bp = tri!(self.place(base));
-                let bt = self.t(&base.ty).strip_bang().clone();
+                let bt = self.t(&base.ty).strip_grow().clone();
                 Some(self.field_ptr(bp, &bt, *variant, *field))
             }
             ExprKind::Index { base, index } => {
                 let bp = tri!(self.place(base));
                 let i = tri!(self.value(index)).into_int_value();
-                let bt = self.t(&base.ty).strip_bang().clone();
+                let bt = self.t(&base.ty).strip_grow().clone();
                 let (data, len, elem) = self.array_parts(bp, &bt);
                 self.check_bounds(i, len, e.span);
                 let et = self.cg.llty(&elem);
@@ -428,13 +428,13 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         match &e.kind {
             K::Local(_) | K::Static(_) | K::Field { .. } | K::Index { .. } | K::Deref(_) => {
                 let p = tri!(self.place(e));
-                let t = ty.strip_bang().clone();
+                let t = ty.strip_grow().clone();
                 Some(self.load(p, &t))
             }
             K::Temp(v) => self.value(v),
             K::Read { place, mode } => {
                 let p = tri!(self.place(place));
-                let pt = self.t(&place.ty).strip_bang().clone();
+                let pt = self.t(&place.ty).strip_grow().clone();
                 let v = self.load(p, &pt);
                 if *mode == ReadMode::Move && self.cg.p.has_owner(&pt) {
                     let lt = self.cg.llty(&pt);
@@ -498,7 +498,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             K::Assign { place, value } => {
                 let v = tri!(self.value(value));
                 let p = tri!(self.place(place));
-                let pt = self.t(&place.ty).strip_bang().clone();
+                let pt = self.t(&place.ty).strip_grow().clone();
                 self.drop_in_place(p, &pt);
                 self.cg.b.build_store(p, v).unwrap();
                 Some(self.unit())
@@ -506,7 +506,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             K::AssignOp { op, place, value } => {
                 let v = tri!(self.value(value));
                 let p = tri!(self.place(place));
-                let pt = self.t(&place.ty).strip_bang().clone();
+                let pt = self.t(&place.ty).strip_grow().clone();
                 let cur = self.load(p, &pt);
                 let new = self.binop(*op, cur, v, &pt, e.span);
                 self.cg.b.build_store(p, new).unwrap();
@@ -558,7 +558,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             }
             K::Slice { base, start, end, inclusive, .. } => {
                 let bp = tri!(self.place(base));
-                let bt = self.t(&base.ty).strip_bang().clone();
+                let bt = self.t(&base.ty).strip_grow().clone();
                 let s = match start {
                     Some(x) => Some(tri!(self.value(x)).into_int_value()),
                     None => None,
@@ -664,7 +664,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 Coercion::Weaken | Coercion::FnToPtr => self.value(expr),
                 Coercion::ToSlice { .. } | Coercion::StringToStr => {
                     let p = tri!(self.place(expr));
-                    let at = self.t(&expr.ty).strip_bang().clone();
+                    let at = self.t(&expr.ty).strip_grow().clone();
                     let (data, len, _) = self.array_parts(p, &at);
                     Some(self.make_slice(data, len))
                 }
@@ -879,7 +879,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
 
     fn match_expr(&mut self, scrut: &Expr, arms: &[Arm], ty: &Ty) -> Option<BV<'ctx>> {
         let sp = tri!(self.place(scrut));
-        let st = self.t(&scrut.ty).strip_bang().clone();
+        let st = self.t(&scrut.ty).strip_grow().clone();
         let merge = self.block_named("match_end");
         let slot = if Cg::is_void(ty) { None } else { Some(self.alloca_for(ty, "matchv")) };
         let mut reached = false;
@@ -985,7 +985,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
 
     fn for_array(&mut self, pat: &Pat, array: &Expr, index: LocalId, body: &Block, id: LoopId) -> Option<BV<'ctx>> {
         let ap = tri!(self.place(array));
-        let at = self.t(&array.ty).strip_bang().clone();
+        let at = self.t(&array.ty).strip_grow().clone();
         let idx = self.locals[index.0 as usize].unwrap();
         self.cg.b.build_store(idx, self.usize(0)).unwrap();
         let head = self.block_named("each");

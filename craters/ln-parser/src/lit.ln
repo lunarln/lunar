@@ -4,7 +4,7 @@ use core::arena::{Id, List};
 use core::intern::Symbol;
 use ln_ast::*;
 use ln_lexer::{NumKind, Token as T, hole_end};
-use crater::{Parser, PResult, Code, Diag};
+use crater::{Parser, PResult, Code, Diag, tok_text};
 
 /// The type suffixes, integer ones first.
 fn suffix_at(i: usize): str {
@@ -567,7 +567,7 @@ impl Parser {
     /// A literal token (the current token).
     pub fn literal(&mut self): PResult::<Lit> {
         let t = self.bump();
-        let text = self.tok_text(t);
+        let text = tok_text(self.src, t);
         let sp = self.tok_span(t);
         let u8_suffix = self.intern("u8");
         let lit = match t.kind {

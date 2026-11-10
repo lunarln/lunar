@@ -127,7 +127,7 @@ let m = max!(3, square!(2), 1);
 | `[T; ..+]` | owning array that can grow but never shrinks |
 | `[T; -..+]` | owning array that can grow and shrink |
 | `[T; &]`, `[T; &mut]` | read-only / mutable slices (views) |
-| `!T` | `&mut` parameters and receivers only, where `T` contains something shrinkable (`[U; -..+]`, `String`, or a type containing one): the argument may be shrunk (see §4) |
+| `+T` | `&mut` parameters and receivers only, where `T` owns an array or string (or contains one): the argument only grows, so the caller's views into it stay valid (see §4) |
 | `str` | UTF-8 view (like Rust's `&str`) |
 | `String` | owned UTF-8 text (a `[u8; -..+]` with a UTF-8 invariant) |
 | `FmtArgs` | parameter only: an interpolated string literal |
@@ -185,39 +185,44 @@ to 64 MiB in total.
 
 * **Growing never moves elements.** Slices taken from a `[T; ..+]` stay
   valid after any number of `push`es.
-* **Shrinking can invalidate slices.** A function that may shrink its
-  argument takes it as `!T`, where `T` is `[U; -..+]`, `String`, or any
-  struct, enum or tuple containing one at any depth:
+* **Shrinking and replacing invalidate slices.** A `&mut` parameter (or
+  `&mut self`) may do anything to its argument: grow it, shrink it
+  (`pop`, `truncate`, `clear`), or replace an owner inside it
+  (`self.items = [];` frees the old array). So lending a value in-out ends
+  every view into it: using one after the call is
+  `err(borrow::shrink_while_borrowed)`. The same holds for calling a
+  closure that changes what it borrowed.
+* **`&mut +T` promises to only grow.** A parameter declared `&mut +T` (or a
+  receiver `&mut +self`) is never shrunk or replaced, so the caller's views
+  survive the call. `push`, `extend`, `insert`, `String::push_str`,
+  `String::write`, `Arena::add`, `HashMap::insert` and `Interner::intern`
+  are `+`:
 
   ```lunar
-  fn clear_all(a: &mut ![i32; -..+]) { ... }
-  fn drain(s: &mut !Stack): i32 { ... }      // struct Stack { items: [i32; -..+] }
+  let s = a[0..2];
+  a.push(9);          // push is `&mut +self`: `s` stays valid
+  a.pop();            // pop is `&mut self`: `s` ends here
+  use(s);             // err(borrow::shrink_while_borrowed)
 
   impl Stack {
-      fn pop(&mut !self): Option::<i32> { ... }   // a shrinking method
+      fn push_twice(&mut +self, v: i32) { self.items.push(v); self.items.push(v); }
   }
   ```
 
-  Methods that may shrink their receiver declare it `&mut !self`, as
-  `pop`, `truncate` and `clear` on `[T; -..+]` and `String` do. Calling
-  such a method follows the same rules as passing the receiver to a `!`
-  parameter.
-* `!` always comes with `&mut`: shrinking happens in place, so a `!`
-  parameter that is not in-out is `err(type::bang_without_mut)`. A `!` on a
-  type with nothing shrinkable in it is `err(type::bang_not_shrinkable)`.
-* Passing a value to a `!` parameter (or calling a `&mut !self` method on
-  it) is only allowed:
-  * for the value's **owner** (a local variable, a parameter that took
-    ownership, or a parameter that is itself declared `!`):
-    `err(borrow::shrink_not_owner)` otherwise;
-  * when **no live view** points into the value: the compiler's liveness
-    analysis reports `err(borrow::shrink_while_borrowed)` if a view is used
-    after the shrink.
-* A `!T` can be passed anywhere a plain `T` is expected.
+  The compiler holds the function to it: inside, a `+` parameter may only
+  be read, changed in its Dull parts, and passed on to other `+`
+  parameters. Shrinking it, replacing an owner in it, or lending it to a
+  plain `&mut` parameter is `err(borrow::grow_only)`.
+* `+` always comes with `&mut` (`err(type::grow_without_mut)`), appears
+  only on parameters (`err(type::grow_outside_param)`), and needs a type
+  that owns an array or string (`err(type::grow_no_owner)`). A `+T`
+  parameter accepts any `T` argument.
 * Views are tracked per variable, not per field: a view into any part of a
-  value blocks shrinking the whole value, even a disjoint field (a slice of
-  `stack.name` blocks `drain(stack)`). This is conservative but sound;
-  tracking disjoint fields separately is planned.
+  value is ended by lending the whole value in-out, even if the callee only
+  touches a disjoint field. This is conservative but sound; tracking
+  disjoint fields separately is planned. A view taken from a `str` or slice
+  *field* points where that field points, not into the struct, so it
+  survives changes to the struct.
 * Owners are freed when they go out of scope (also on `return`, `break`,
   `continue`). Moving out of a variable makes it unusable
   (`err(borrow::use_after_move)`).
@@ -238,7 +243,7 @@ How a function receives each argument is part of its signature:
 | `mut x: T`, `mut self` | the same, and the function may change its own value |
 | `x: &T`, `&self` | **borrows**: the caller keeps ownership; the function can read it but not keep or move it |
 | `x: &mut T`, `&mut self` | **in-out**: the caller passes a mutable place and sees the changes |
-| `x: &mut !T`, `&mut !self` | in-out and may be shrunk (see above) |
+| `x: &mut +T`, `&mut +self` | in-out, and only grows it (see above) |
 
 Call sites say what happens to each argument. A plain argument is moved
 (or copied), `&x` lends `x` to a borrowing parameter, and `&mut x` lends it

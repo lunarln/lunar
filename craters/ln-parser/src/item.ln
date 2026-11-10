@@ -3,7 +3,7 @@
 use core::arena::{Id, List};
 use ln_ast::*;
 use ln_lexer::{NumKind, Token as T};
-use crater::{Parser, PResult, Named, Expected, Code};
+use crater::{Parser, PResult, Named, Expected, Code, tok_text, text_of};
 use crater::lit::unescape;
 
 /// Tokens that can begin an item (for recovery and statement dispatch).
@@ -90,7 +90,7 @@ impl Parser {
         let mut k: u32 = 0;
         while k < run.count {
             let span = self.doc_spans[(run.first + k) as usize];
-            let raw = self.text_of(span.lo, span.hi);
+            let raw = text_of(self.src, span.lo, span.hi);
             let mut text = if raw.starts_with("///") { raw[3..] } else { raw };
             while text.ends_with("\r") {
                 text = text[..text.len() - 1];
@@ -110,7 +110,7 @@ impl Parser {
             Some(t) => t,
             None => return Err(self.error_expected_named(Named::AttributeName)),
         };
-        if t.kind != T::Ident && !word_like(self.tok_text(t)) {
+        if t.kind != T::Ident && !word_like(tok_text(self.src, t)) {
             return Err(self.error_expected_named(Named::AttributeName));
         }
         self.bump();
@@ -173,7 +173,7 @@ impl Parser {
                 self.bump();
                 let abi = if self.at(T::Str) {
                     let t = self.bump();
-                    let raw = self.tok_text(t);
+                    let raw = tok_text(self.src, t);
                     Some(self.intern(raw[1..raw.len() - 1]))
                 } else {
                     None
@@ -304,30 +304,30 @@ impl Parser {
 
     fn param(&mut self): PResult::<Param> {
         let start = self.start();
-        // Receivers: `&self`, `&mut self`, `&mut !self`.
+        // Receivers: `&self`, `&mut self`, `&mut +self`.
         let ref_self = self.at(T::Amp) && match self.nth(1) {
             Some(T::SelfValue) => true,
-            Some(T::Mut) => self.nth(2) == Some(T::SelfValue) || (self.nth(2) == Some(T::Bang) && self.nth(3) == Some(T::SelfValue)),
+            Some(T::Mut) => self.nth(2) == Some(T::SelfValue) || (self.nth(2) == Some(T::Plus) && self.nth(3) == Some(T::SelfValue)),
             _ => false,
         };
         if ref_self {
             self.bump();
             let mode = if self.eat(T::Mut) { ParamMode::InOut } else { ParamMode::Borrow };
-            let self_bang = self.eat(T::Bang);
+            let self_grow = self.eat(T::Plus);
             self.expect(T::SelfValue)?;
-            return Ok(Param { is_mut: false, mode, kind: ParamKind::SelfParam, ty: None, self_bang, span: self.span_from(start) });
+            return Ok(Param { is_mut: false, mode, kind: ParamKind::SelfParam, ty: None, self_grow, span: self.span_from(start) });
         }
         let is_mut = self.eat(T::Mut);
         if self.eat(T::SelfValue) {
             let ty = if self.eat(T::Colon) { Some(self.ty()?) } else { None };
-            return Ok(Param { is_mut, mode: ParamMode::Take, kind: ParamKind::SelfParam, ty, self_bang: false, span: self.span_from(start) });
+            return Ok(Param { is_mut, mode: ParamMode::Take, kind: ParamKind::SelfParam, ty, self_grow: false, span: self.span_from(start) });
         }
         let kind = if self.eat(T::Placeholder) { ParamKind::Wild } else { ParamKind::Named(self.ident()?) };
         self.expect(T::Colon)?;
         // `x: &T` borrows, `x: &mut T` is in-out, `x: T` takes ownership.
         let mode = if self.eat(T::Amp) { if self.eat(T::Mut) { ParamMode::InOut } else { ParamMode::Borrow } } else { ParamMode::Take };
         let ty = self.ty()?;
-        return Ok(Param { is_mut, mode, kind, ty: Some(ty), self_bang: false, span: self.span_from(start) });
+        return Ok(Param { is_mut, mode, kind, ty: Some(ty), self_grow: false, span: self.span_from(start) });
     }
 
     fn struct_decl(&mut self): PResult::<StructDecl> {
@@ -526,7 +526,7 @@ impl Parser {
                 Some(T::Str | T::Number(NumKind::Int) | T::Ident) => self.bump(),
                 _ => return Err(self.error_expected_named(Named::AttributeValue)),
             };
-            let raw = self.tok_text(t);
+            let raw = tok_text(self.src, t);
             let v = if t.kind == T::Str {
                 match unescape(raw[1..raw.len() - 1]) {
                     Ok(s) => self.intern(s.as_str()),

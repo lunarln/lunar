@@ -23,7 +23,7 @@ pub(crate) struct Deferred {
 
 pub(crate) enum DeferKind {
     ArrayElem,
-    Bang,
+    Grow,
     /// `x: &T` where `T` might be Dull (a pointless borrow).
     NeedlessBorrow,
 }
@@ -497,19 +497,19 @@ impl<'a> Sema<'a> {
                 Some(t) => self.lower_ty(&cx, t, TyPos::Param),
                 None => {
                     let t = cx.self_ty.clone().unwrap_or(Ty::Error);
-                    if p.self_bang { Ty::Bang(Box::new(t)) } else { t }
+                    if p.self_grow { Ty::Grow(Box::new(t)) } else { t }
                 }
             };
             if is_extern {
                 self.check_ffi_ty(&ty, p.span);
             }
-            if matches!(ty, Ty::Bang(_)) && p.mode != ast::ParamMode::InOut {
-                let fix = if is_self { "&mut !self".to_string() } else { format!("{pname}: &mut {}", self.p.ty_str(&ty)) };
+            if matches!(ty, Ty::Grow(_)) && p.mode != ast::ParamMode::InOut {
+                let fix = if is_self { "&mut +self".to_string() } else { format!("{pname}: &mut {}", self.p.ty_str(&ty)) };
                 self.err(
-                    Diagnostic::error(tyc::BANG_WITHOUT_MUT, p.span, format!("`!` parameter `{}` is not `&mut`", if is_self { "self" } else { &pname }))
-                        .with_label("this function could never shrink it")
-                        .with_note("`!` marks an argument the function may shrink in place, so it must be passed in-out")
-                        .with_help(format!("declare it `{fix}`")),
+                    Diagnostic::error(tyc::GROW_WITHOUT_MUT, p.span, format!("`+` parameter `{}` is not `&mut`", if is_self { "self" } else { &pname }))
+                        .with_label("a parameter that is not in-out cannot change the caller's value at all")
+                        .with_note("`+` promises that an in-out argument only grows")
+                        .with_help(format!("declare it `{fix}`, or drop the `+`")),
                 );
             }
             // `needless_borrow` deliberately skips:
@@ -648,23 +648,23 @@ impl<'a> Sema<'a> {
                 let r = ret.as_ref().map_or(Ty::unit(), |r| self.lower_ty(cx, r, TyPos::Other));
                 Ty::FnPtr(ps, Box::new(r))
             }
-            ast::TyKind::Bang(inner) => {
+            ast::TyKind::Grow(inner) => {
                 let inner_ty = self.lower_ty(cx, inner, TyPos::Other);
                 if pos != TyPos::Param {
                     self.err(
-                        Diagnostic::error(tyc::BANG_OUTSIDE_PARAM, t.span, "`!` types are only valid as function parameter types")
-                            .with_note("`!T` marks a parameter whose argument may have been shrunk; it has no meaning elsewhere"),
+                        Diagnostic::error(tyc::GROW_OUTSIDE_PARAM, t.span, "`+` types are only valid as function parameter types")
+                            .with_note("`&mut +T` marks a parameter that only grows; it has no meaning elsewhere"),
                     );
                     return inner_ty;
                 }
                 self.deferred.push(Deferred {
-                    kind: DeferKind::Bang,
+                    kind: DeferKind::Grow,
                     ty: inner_ty.clone(),
                     env: cx.env.clone(),
                     span: t.span,
                     generics_span: cx.generics_span,
                 });
-                Ty::Bang(Box::new(inner_ty))
+                Ty::Grow(Box::new(inner_ty))
             }
             ast::TyKind::DynArray(elem) => {
                 let e = self.lower_ty(cx, elem, TyPos::Other);
@@ -863,19 +863,19 @@ impl<'a> Sema<'a> {
                         self.err(diag);
                     }
                 }
-                DeferKind::Bang => {
-                    if !self.p.has_shrinkable(&d.ty, &d.env) {
+                DeferKind::Grow => {
+                    if !self.p.could_own(&d.ty, &d.env) {
                         let s = self.p.ty_str(&d.ty);
                         self.err(
-                            Diagnostic::error(tyc::BANG_NOT_SHRINKABLE, d.span, format!("`!{s}` is meaningless: `{s}` cannot shrink"))
-                                .with_note("`!` only applies to `[T; -..+]`, `String`, or types containing them"),
+                            Diagnostic::error(tyc::GROW_NO_OWNER, d.span, format!("`+{s}` is meaningless: `{s}` owns no array or string"))
+                                .with_note("`+` promises an argument is never shrunk or replaced; only owners (`[T]`, `[T; ..+]`, `[T; -..+]`, `String`, or types containing them) can be"),
                         );
                     }
                 }
                 DeferKind::NeedlessBorrow => {
                     // Borrowing passes an address, which pays off for large
                     // values; for a small Dull value a copy is just as cheap.
-                    let inner = d.ty.strip_bang();
+                    let inner = d.ty.strip_grow();
                     let small = self.p.layout_of(inner).is_some_and(|l| l.size <= NEEDLESS_BORROW_MAX);
                     if small && self.p.is_dull(inner, &d.env) {
                         let s = self.p.ty_str(inner);
@@ -955,7 +955,7 @@ impl<'a> Sema<'a> {
             }
             Ty::Tuple(ts) => ts.iter().any(|t| self.contains_by_value(root, t, seen, false)),
             Ty::Array(e, k) if !(k.is_owner() || k.is_slice()) => self.contains_by_value(root, e, seen, false),
-            Ty::Bang(t) => self.contains_by_value(root, t, seen, false),
+            Ty::Grow(t) => self.contains_by_value(root, t, seen, false),
             _ => false,
         }
     }

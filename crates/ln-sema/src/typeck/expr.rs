@@ -116,7 +116,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             ast::ExprKind::TupleField(base, idx, sp) => {
                 let b = self.check_place_or_temp(base);
                 let bt = self.shallow(&b.ty);
-                let bt = bt.strip_bang().clone();
+                let bt = bt.strip_grow().clone();
                 match bt {
                     Ty::Tuple(ts) => match ts.get(*idx as usize) {
                         Some(t) => Some(self.mk(ExprKind::Field { base: Box::new(b), variant: 0, field: *idx as usize }, t.clone(), e.span)),
@@ -152,7 +152,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             ast::ExprKind::Index(base, idx) if !matches!(idx.kind, ast::ExprKind::Range { .. }) => {
                 let b = self.check_place_or_temp(base);
                 let bt = self.shallow(&b.ty);
-                let bt = bt.strip_bang().clone();
+                let bt = bt.strip_grow().clone();
                 let elem = match &bt {
                     Ty::Array(el, _) => (**el).clone(),
                     Ty::Error => Ty::Error,
@@ -233,7 +233,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     pub(crate) fn field_place(&mut self, b: Expr, field: &ast::Ident) -> Expr {
         let span = b.span.to(field.span);
         let bt = self.shallow(&b.ty);
-        let bt = bt.strip_bang().clone();
+        let bt = bt.strip_grow().clone();
         match &bt {
             Ty::Adt(d, args) if !self.s.p.is_enum(*d) => {
                 let adt = self.s.p.adt(*d);
@@ -708,7 +708,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             self.immutable_err(&place, lhs.span, "assign to this place");
         }
         let pty = place.ty.clone();
-        let pty = pty.strip_bang().clone();
+        let pty = pty.strip_grow().clone();
         let v = self.check_expr(rhs, Some(&pty));
         let v = self.coerce(v, &pty, rhs.span);
         self.mk(ExprKind::Assign { place: Box::new(place), value: Box::new(v) }, Ty::unit(), span)
@@ -856,7 +856,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     fn check_slice(&mut self, base: &ast::Expr, start: Option<&ast::Expr>, end: Option<&ast::Expr>, inclusive: bool, expect: Option<&Ty>, span: Span) -> Expr {
         let b = self.check_place_or_temp(base);
         let bt = self.shallow(&b.ty);
-        let bt = bt.strip_bang().clone();
+        let bt = bt.strip_grow().clone();
         let want_mut = matches!(expect.map(|t| self.shallow(t)), Some(Ty::Array(_, ArrKind::SliceMut)));
         let ty = match &bt {
             Ty::Array(e, k) => {
@@ -1259,7 +1259,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         }
         let it = self.check_place_or_temp(iter);
         let itt = self.shallow(&it.ty);
-        let itt = itt.strip_bang().clone();
+        let itt = itt.strip_grow().clone();
         match &itt {
             Ty::Array(elem, _) => {
                 let elem = (**elem).clone();

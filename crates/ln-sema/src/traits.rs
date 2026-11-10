@@ -6,7 +6,7 @@
 
 use crate::Program;
 use crate::defs::*;
-use crate::ty::{ArrKind, TraitRef, Ty};
+use crate::ty::{TraitRef, Ty};
 use std::collections::HashMap;
 
 /// How a trait method call is implemented for a concrete self type.
@@ -79,7 +79,7 @@ impl Program {
                 let Some(dull) = self.lang_item("dull") else { return false };
                 self.elaborate(&self.opaque_preds(*def, *i, args)).iter().any(|p| p.trait_ref.trait_id == dull)
             }
-            Ty::Str | Ty::String | Ty::FmtArgs | Ty::Array(..) | Ty::Bang(_) | Ty::Ptr(..) | Ty::FnPtr(..) | Ty::Infer(_) => false,
+            Ty::Str | Ty::String | Ty::FmtArgs | Ty::Array(..) | Ty::Grow(_) | Ty::Ptr(..) | Ty::FnPtr(..) | Ty::Infer(_) => false,
         }
     }
 
@@ -100,31 +100,34 @@ impl Program {
                 let adt = self.adt(*id);
                 adt.variants.iter().any(|v| v.fields.iter().any(|f| self.has_owner_rec(&f.ty.subst(args), depth + 1)))
             }
-            Ty::Bang(t) => self.has_owner_rec(t, depth + 1),
+            Ty::Grow(t) => self.has_owner_rec(t, depth + 1),
             Ty::Closure(def, args) => self.closure_fields(*def, args).iter().any(|t| self.has_owner_rec(t, depth + 1)),
             _ => false,
         }
     }
 
-    /// Whether `ty` contains a shrinkable array (`[T; -..+]` or `String`),
-    /// making it a valid target for `!`.
-    pub fn has_shrinkable(&self, ty: &Ty, env: &[Pred]) -> bool {
-        self.has_shrinkable_rec(ty, env, 0)
+    /// Whether a value of `ty` may own a data stack (an array or `String`,
+    /// directly or in a field), so that changing it in place could shrink
+    /// or free one: a valid target for `+`.
+    pub fn could_own(&self, ty: &Ty, env: &[Pred]) -> bool {
+        self.could_own_rec(ty, env, 0)
     }
 
-    fn has_shrinkable_rec(&self, ty: &Ty, env: &[Pred], depth: u32) -> bool {
+    fn could_own_rec(&self, ty: &Ty, env: &[Pred], depth: u32) -> bool {
         if depth > 64 {
             return false;
         }
         match ty {
-            Ty::String | Ty::Array(_, ArrKind::Shrink) => true,
-            // A generic parameter might be instantiated with a shrinkable type.
+            Ty::String => true,
+            Ty::Array(_, k) => k.is_owner(),
+            // A generic parameter might be instantiated with an owner.
             Ty::Param(..) | Ty::Opaque(..) => !self.is_dull(ty, env),
-            Ty::Tuple(ts) => ts.iter().any(|t| self.has_shrinkable_rec(t, env, depth + 1)),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.could_own_rec(t, env, depth + 1)),
             Ty::Adt(id, args) => {
                 let adt = self.adt(*id);
-                adt.variants.iter().any(|v| v.fields.iter().any(|f| self.has_shrinkable_rec(&f.ty.subst(args), env, depth + 1)))
+                adt.variants.iter().any(|v| v.fields.iter().any(|f| self.could_own_rec(&f.ty.subst(args), env, depth + 1)))
             }
+            Ty::Closure(def, args) => self.closure_fields(*def, args).iter().any(|t| self.could_own_rec(t, env, depth + 1)),
             _ => false,
         }
     }
@@ -148,7 +151,7 @@ impl Program {
                 let adt = self.adt(*id);
                 adt.variants.iter().all(|v| v.fields.iter().all(|f| self.is_copy_rec(&f.ty.subst(args), env, depth + 1)))
             }
-            Ty::Bang(t) => self.is_copy_rec(t, env, depth + 1),
+            Ty::Grow(t) => self.is_copy_rec(t, env, depth + 1),
             // A closure that changes a variable it borrows is not copied: two
             // copies would both change it.
             Ty::Closure(def, args) => {
@@ -202,7 +205,7 @@ impl Program {
             (Ty::Adt(a, xs), Ty::Adt(b, ys)) => a == b && xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| Self::match_ty(x, y, out)),
             (Ty::Array(a, k1), Ty::Array(b, k2)) => k1 == k2 && Self::match_ty(a, b, out),
             (Ty::Ptr(a, m1), Ty::Ptr(b, m2)) => m1 == m2 && Self::match_ty(a, b, out),
-            (Ty::Bang(a), Ty::Bang(b)) => Self::match_ty(a, b, out),
+            (Ty::Grow(a), Ty::Grow(b)) => Self::match_ty(a, b, out),
             (Ty::FnPtr(a, r1), Ty::FnPtr(b, r2)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|((m1, x), (m2, y))| m1 == m2 && Self::match_ty(x, y, out)) && Self::match_ty(r1, r2, out)
             }
@@ -254,7 +257,7 @@ impl Program {
         if ty.is_error() || tr.args.iter().any(Ty::is_error) {
             return true;
         }
-        if let Ty::Bang(inner) = ty {
+        if let Ty::Grow(inner) = ty {
             return self.implements_depth(inner, tr, env, depth);
         }
         if matches!(ty, Ty::Param(..)) || ty.has_params() {
@@ -388,7 +391,7 @@ impl Program {
         }
         match ty {
             Ty::Str | Ty::String | Ty::FmtArgs | Ty::Ptr(..) | Ty::FnPtr(..) | Ty::Array(..) => true,
-            Ty::Bang(t) => self.robustly_pointy(t, crater, depth + 1),
+            Ty::Grow(t) => self.robustly_pointy(t, crater, depth + 1),
             Ty::Tuple(ts) => ts.iter().any(|t| self.robustly_pointy(t, crater, depth + 1)),
             Ty::Adt(d, args) if self.crater_of(*d) == crater => {
                 let DefData::Adt(adt) = &self.def(*d).data else { return false };
@@ -417,7 +420,7 @@ fn resolve(t: &Ty, s: &HashMap<u32, Ty>) -> Ty {
         Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(r).collect()),
         Ty::Adt(d, args) => Ty::Adt(*d, args.iter().map(r).collect()),
         Ty::Array(e, k) => Ty::Array(Box::new(r(e)), *k),
-        Ty::Bang(e) => Ty::Bang(Box::new(r(e))),
+        Ty::Grow(e) => Ty::Grow(Box::new(r(e))),
         Ty::Ptr(e, m) => Ty::Ptr(Box::new(r(e)), *m),
         Ty::FnPtr(ps, ret) => Ty::FnPtr(ps.iter().map(|(m, t)| (*m, r(t))).collect(), Box::new(r(ret))),
         _ => t,
@@ -451,7 +454,7 @@ fn unify(a: &Ty, b: &Ty, s: &mut HashMap<u32, Ty>) -> bool {
         (Ty::Tuple(x), Ty::Tuple(y)) => x.len() == y.len() && x.iter().zip(y).all(|(x, y)| unify(x, y, s)),
         (Ty::Adt(d1, x), Ty::Adt(d2, y)) => d1 == d2 && x.len() == y.len() && x.iter().zip(y).all(|(x, y)| unify(x, y, s)),
         (Ty::Array(x, k1), Ty::Array(y, k2)) => k1 == k2 && unify(x, y, s),
-        (Ty::Bang(x), Ty::Bang(y)) => unify(x, y, s),
+        (Ty::Grow(x), Ty::Grow(y)) => unify(x, y, s),
         (Ty::Ptr(x, m1), Ty::Ptr(y, m2)) => m1 == m2 && unify(x, y, s),
         (Ty::FnPtr(p1, r1), Ty::FnPtr(p2, r2)) => {
             p1.len() == p2.len() && p1.iter().zip(p2).all(|((m1, x), (m2, y))| m1 == m2 && unify(x, y, s)) && unify(r1, r2, s)

@@ -1,0 +1,14 @@
+// error: borrow::grow_only
+// Replacing an owner frees the old one, so it is not growing.
+struct Log {
+    lines: [i32; ..+],
+}
+
+fn reset(l: &mut +Log) {
+    l.lines = [];
+}
+
+fn main() {
+    let mut l = Log { lines: [1] };
+    reset(&mut l);
+}

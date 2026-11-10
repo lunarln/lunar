@@ -206,7 +206,7 @@ impl Dump {
             ParamKind::Named(i) => ident(i),
             ParamKind::Wild => "_".to_string(),
         };
-        let head = format!("param {}{}{} {kind} {}", mode(p.mode), if p.is_mut { " mut" } else { "" }, if p.self_bang { " bang" } else { "" }, at(p.span));
+        let head = format!("param {}{}{} {kind} {}", mode(p.mode), if p.is_mut { " mut" } else { "" }, if p.self_grow { " grow" } else { "" }, at(p.span));
         self.node(head, |d| {
             if let Some(t) = &p.ty {
                 d.ty(t);
@@ -300,7 +300,7 @@ impl Dump {
                 });
             }
             TyKind::DynArray(e) => self.node(format!("ty dyn_array {sp}"), |d| d.ty(e)),
-            TyKind::Bang(e) => self.node(format!("ty bang {sp}"), |d| d.ty(e)),
+            TyKind::Grow(e) => self.node(format!("ty grow {sp}"), |d| d.ty(e)),
             TyKind::Ptr { is_mut, inner } => self.node(format!("ty ptr{} {sp}", if *is_mut { " mut" } else { "" }), |d| d.ty(inner)),
             TyKind::Tuple(ts) => self.node(format!("ty tuple {sp}"), |d| ts.iter().for_each(|t| d.ty(t))),
             TyKind::Fn { params, ret } => self.node(format!("ty fn {sp}"), |d| {

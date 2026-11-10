@@ -1,0 +1,11 @@
+// error: borrow::shrink_while_borrowed
+// Calling a closure that changes what it borrowed may shrink it.
+fn main() {
+    let mut v: [i32; -..+] = [1, 2, 3];
+    let mut drop_last = || {
+        v.pop();
+    };
+    let s = v[..];
+    drop_last();
+    println("{s[2]}");
+}

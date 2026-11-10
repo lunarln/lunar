@@ -34,8 +34,8 @@ fn tokenize(src: str, out: &mut [Token; ..+]): bool {
     return true;
 }
 
-/// Evaluate; `stack` may shrink, so it is taken as `!`.
-fn eval(tokens: [Token; &], stack: &mut ![f64; -..+]): Option::<f64> {
+/// Evaluate, pushing onto and popping off `stack`.
+fn eval(tokens: [Token; &], stack: &mut [f64; -..+]): Option::<f64> {
     for t in tokens {
         match t {
             Token::Num(v) => stack.push(v),

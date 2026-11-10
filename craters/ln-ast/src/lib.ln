@@ -151,7 +151,7 @@ pub struct Param {
     pub mode: ParamMode,
     pub kind: ParamKind,
     pub ty: Option::<Id::<Ty>>,
-    pub self_bang: bool,
+    pub self_grow: bool,
     pub span: Span,
 }
 
@@ -272,7 +272,7 @@ pub enum TyKind {
     Path(Path),
     Array(Id::<Ty>, ArraySize),
     DynArray(Id::<Ty>),
-    Bang(Id::<Ty>),
+    Grow(Id::<Ty>),
     Ptr { is_mut: bool, inner: Id::<Ty> },
     Tuple(List::<Id::<Ty>>),
     Fn { params: List::<FnTyParam>, ret: Option::<Id::<Ty>> },
@@ -913,7 +913,7 @@ fn param(a: &Ast, o: &mut String, d: usize, p: Param) {
         ParamKind::Named(i) => kind.push_str(ident(a, i).as_str()),
         ParamKind::Wild => kind.push_str("_"),
     }
-    let (m, b) = (flag(p.is_mut, " mut"), flag(p.self_bang, " bang"));
+    let (m, b) = (flag(p.is_mut, " mut"), flag(p.self_grow, " grow"));
     ind(o, d);
     o.write("param {mode(p.mode)}{m}{b} {kind} {at(p.span)}\n");
     if let Some(t) = p.ty {
@@ -1041,8 +1041,8 @@ fn ty(a: &Ast, o: &mut String, d: usize, id: Id::<Ty>) {
             o.write("ty dyn_array {sp}\n");
             ty(a, o, d + 1, e);
         }
-        TyKind::Bang(e) => {
-            o.write("ty bang {sp}\n");
+        TyKind::Grow(e) => {
+            o.write("ty grow {sp}\n");
             ty(a, o, d + 1, e);
         }
         TyKind::Ptr { is_mut, inner } => {

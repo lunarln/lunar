@@ -204,7 +204,7 @@ pub fn hover(a: &Analysis, file: FileId, offset: u32) -> Option<(Span, String)> 
                     thir::LocalKind::Param { .. } => (mut_kw.to_string(), ""),
                     _ => (format!("let {mut_kw}"), ""),
                 };
-                let layout = layout_comment(p.layout_of(l.ty.strip_bang()), None);
+                let layout = layout_comment(p.layout_of(l.ty.strip_grow()), None);
                 format!("```lunar\n{layout}{before}{}: {mode}{}\n```", l.name, p.ty_str(&l.ty))
             }
         };

@@ -98,7 +98,7 @@ fn f(x: Pair![i32, str]) {}             // type
 ```
 
 `name!` is unambiguous: a `!` directly after a path and before a delimiter
-cannot be the prefix `!` (not, never, shrinkable) or `!=`.
+cannot be the prefix `!` (not, never) or `!=`.
 
 ## 3. Names
 

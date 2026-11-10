@@ -4,10 +4,11 @@
 // syntax errors, which crates/ln-driver/tests/selfhost.rs checks over every
 // program.
 //
-// The cursor's arrays only grow (shrinking a field needs `&mut !self`
-// throughout): a format string's holes are lexed into tokens appended after
-// the file's, parsed with the cursor's `limit` moved over them, and the
-// errors of such a sub-parse are marked dead instead of removed.
+// The cursor's arrays only grow (written when shrinking a field needed a
+// marker on every method up the call chain): a format string's holes are
+// lexed into tokens appended after the file's, parsed with the cursor's
+// `limit` moved over them, and the errors of such a sub-parse are marked
+// dead instead of removed.
 
 mod expr;
 mod item;
@@ -563,7 +564,7 @@ impl Parser {
         let mut span = Span::new(self.eof, self.eof);
         match self.current() {
             Some(t) => {
-                let text = self.tok_text(t);
+                let text = tok_text(self.src, t);
                 if t.kind == T::Ident {
                     msg.write("expected {exp}, found `{text}`");
                 } else {
@@ -618,14 +619,6 @@ impl Parser {
 
     // ===================================================================== helpers
 
-    fn text_of(&self, start: u32, end: u32): str {
-        return self.src[start as usize..end as usize];
-    }
-
-    fn tok_text(&self, t: Tok): str {
-        return self.src[t.start as usize..t.end as usize];
-    }
-
     fn tok_span(&self, t: Tok): Span {
         return Span::new(t.start, t.end);
     }
@@ -675,6 +668,18 @@ impl Parser {
     fn add_pat(&mut self, kind: PatKind, span: Span): Id::<Pat> {
         return self.ast.pats.add(Pat { kind, span });
     }
+}
+
+/// The source text from `start` to `end`. These take the source rather
+/// than the parser, so the text points into the source, not the parser,
+/// and stays usable across calls that change the parser.
+fn text_of(src: str, start: u32, end: u32): str {
+    return src[start as usize..end as usize];
+}
+
+/// The text of token `t`.
+fn tok_text(src: str, t: Tok): str {
+    return src[t.start as usize..t.end as usize];
 }
 
 /// The text of a parse's errors, as the selfhost test prints them:

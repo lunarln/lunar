@@ -71,7 +71,7 @@ impl Program {
             Ty::Str | Ty::FmtArgs => Layout::new(16, 8),
             Ty::String => Layout::new(24, 8),
             Ty::Ptr(..) | Ty::FnPtr(..) => Layout::new(8, 8),
-            Ty::Bang(inner) => return rec(inner),
+            Ty::Grow(inner) => return rec(inner),
             Ty::Never => Layout::new(0, 1),
             Ty::Tuple(ts) => {
                 let fs: Option<Vec<Layout>> = ts.iter().map(rec).collect();

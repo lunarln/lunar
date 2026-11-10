@@ -1,0 +1,19 @@
+// error: borrow::shrink_while_borrowed
+// A `&mut self` method may replace a field, freeing the array `s` points
+// into, so `s` cannot be used after the call.
+struct Holder {
+    items: [i32; ..+],
+}
+
+impl Holder {
+    fn replace(&mut self) {
+        self.items = [7, 7, 7];
+    }
+}
+
+fn main() {
+    let mut h = Holder { items: [1, 2, 3, 4] };
+    let s = h.items[..];
+    h.replace();
+    println("{s[3]}");
+}

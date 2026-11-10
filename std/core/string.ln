@@ -38,12 +38,12 @@ impl String {
         return self.len() == 0;
     }
 
-    pub fn push_str(&mut self, s: str) {
+    pub fn push_str(&mut +self, s: str) {
         intrinsics::string_push_str(self, s);
     }
 
     /// Append a character, UTF-8 encoded.
-    pub fn push(&mut self, c: char) {
+    pub fn push(&mut +self, c: char) {
         let cp = c as u32;
         let mut buf: [u8; 4] = [0; 4];
         let n: usize = if cp < 128 {
@@ -69,16 +69,16 @@ impl String {
     }
 
     /// Append formatted text: `s.write("x = {x}")`.
-    pub fn write(&mut self, args: FmtArgs) {
+    pub fn write(&mut +self, args: FmtArgs) {
         intrinsics::fmt_write(args, self);
     }
 
-    pub fn clear(&mut !self) {
+    pub fn clear(&mut self) {
         intrinsics::string_truncate(self, 0);
     }
 
     /// Shorten to `len` bytes, which must be on a character boundary.
-    pub fn truncate(&mut !self, len: usize) {
+    pub fn truncate(&mut self, len: usize) {
         if len < self.len() {
             let b = self.as_bytes()[len];
             if b >= 128 && b < 192 {
@@ -89,7 +89,7 @@ impl String {
     }
 
     /// Remove and return the last character.
-    pub fn pop(&mut !self): Option::<char> {
+    pub fn pop(&mut self): Option::<char> {
         let n = self.len();
         if n == 0 {
             return None;

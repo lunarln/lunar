@@ -7,7 +7,7 @@ the trait's generic arguments:
 * the number of the method's own generic parameters;
 * the number of parameters (including `self`);
 * each parameter's type and mode: taking ownership (`x: T`), borrowing
-  (`x: &T`) or in-out (`x: &mut T`), including `!`;
+  (`x: &T`) or in-out (`x: &mut T`), including `+`;
 * the return type.
 
 Callers that go through the trait rely on the trait's signature: what they
