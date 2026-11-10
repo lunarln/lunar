@@ -5,12 +5,18 @@
 //! statement temporaries that own data stacks are dropped when their scope
 //! ends, including on `return`, `break` and `continue`. Moving out of a place
 //! zeroes it, and dropping a zeroed handle is a no-op.
+//!
+//! The value of an expression whose type lives in memory
+//! ([`Cg::in_memory`]) is a pointer to memory holding it that nothing else
+//! uses, which its user may read, keep or hand on. `value_into` builds such
+//! a value straight where it is going (a variable, the return slot, a field
+//! of a bigger value), saving a copy and a temporary.
 
 use crate::Cg;
 use inkwell::IntPredicate;
 use inkwell::basic_block::BasicBlock;
 use inkwell::types::BasicTypeEnum;
-use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PointerValue};
+use inkwell::values::{AsValueRef, BasicValueEnum, FunctionValue, IntValue, PointerValue};
 use ln_diag::Span;
 use ln_sema::defs::ConstVal;
 use ln_sema::thir::*;
@@ -47,6 +53,8 @@ pub(crate) struct FnCg<'a, 'ctx, 'p> {
     pub marks: Vec<usize>,
     pub loops: HashMap<LoopId, LoopInfo<'ctx>>,
     pub error: Option<String>,
+    /// Where the function writes its result, if it lives in memory.
+    pub sret: Option<PointerValue<'ctx>>,
 }
 
 impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
@@ -63,10 +71,16 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             marks: Vec::new(),
             loops: HashMap::new(),
             error: None,
+            sret: None,
         };
+        let ret = fc.t(&fc.cg.p.fn_data(body.def).sig.ret);
+        if fc.cg.in_memory(&ret) {
+            fc.sret = Some(f.get_nth_param(0).unwrap().into_pointer_value());
+        }
+        let first = fc.sret.is_some() as u32;
         // Parameters.
         for (i, &l) in body.params.iter().enumerate() {
-            let param = f.get_nth_param(i as u32).unwrap();
+            let param = f.get_nth_param(i as u32 + first).unwrap();
             let local = body.local(l);
             // In-out and borrowed parameters arrive as pointers to the
             // caller's place.
@@ -75,9 +89,15 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 fc.locals[l.0 as usize] = Some(param.into_pointer_value());
             } else {
                 let ty = fc.t(&local.ty);
-                let lt = fc.cg.llty(&ty);
-                let slot = fc.alloca(lt, &local.name);
-                fc.cg.b.build_store(slot, param).unwrap();
+                let slot = if fc.cg.in_memory(&ty) {
+                    // A pointer to a copy that is this function's.
+                    param.into_pointer_value()
+                } else {
+                    let lt = fc.cg.llty(&ty);
+                    let slot = fc.alloca(lt, &local.name);
+                    fc.cg.b.build_store(slot, param).unwrap();
+                    slot
+                };
                 fc.locals[l.0 as usize] = Some(slot);
                 // A parameter that took ownership is this function's to free
                 // (moving out of it zeroes the slot, making the drop a no-op).
@@ -95,17 +115,18 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             let slot = fc.alloca_for(&ty, &local.name);
             fc.locals[i] = Some(slot);
         }
-        let v = fc.block(&body.block);
+        let v = fc.block_into(&body.block, fc.sret);
         if let Some(v) = v
             && !fc.terminated()
         {
-            let ret = fc.t(&fc.cg.p.fn_data(body.def).sig.ret);
             if Cg::is_void(&ret) {
                 if matches!(ret, ln_sema::ty::Ty::Never) {
                     fc.cg.b.build_unreachable().unwrap();
                 } else {
                     fc.cg.b.build_return(None).unwrap();
                 }
+            } else if fc.sret.is_some() {
+                fc.cg.b.build_return(None).unwrap();
             } else {
                 fc.cg.b.build_return(Some(&v)).unwrap();
             }
@@ -134,13 +155,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
 
     /// An alloca in the entry block.
     pub fn alloca(&mut self, ty: BasicTypeEnum<'ctx>, name: &str) -> PointerValue<'ctx> {
-        let entry = self.f.get_first_basic_block().unwrap();
-        let b = self.cg.ctx.create_builder();
-        match entry.get_first_instruction() {
-            Some(i) => b.position_before(&i),
-            None => b.position_at_end(entry),
-        }
-        b.build_alloca(ty, name).unwrap()
+        self.cg.entry_alloca(self.f, ty, name)
     }
 
     /// An alloca for a value of type `t`, zero-initialized if it owns data.
@@ -155,7 +170,13 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 Some(next) => b.position_before(&next),
                 None => b.position_at_end(entry),
             }
-            b.build_store(slot, lt.const_zero()).unwrap();
+            if self.cg.in_memory(t) {
+                let size = self.cg.usize_ty().const_int(self.cg.size_of(t), false);
+                let align = self.cg.align_of(t);
+                b.build_memset(slot, align, self.cg.ctx.i8_type().const_zero(), size).unwrap();
+            } else {
+                b.build_store(slot, lt.const_zero()).unwrap();
+            }
         }
         slot
     }
@@ -176,9 +197,48 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         self.cg.usize_ty().const_int(v, false)
     }
 
+    /// The value of type `t` at `ptr`: a copy, for one that lives in memory.
     pub fn load(&mut self, ptr: PointerValue<'ctx>, t: &Ty) -> BV<'ctx> {
         let lt = self.cg.llty(t);
+        if self.cg.in_memory(t) {
+            let tmp = self.alloca(lt, "copy");
+            self.cg.copy_mem(tmp, ptr, t);
+            return tmp.into();
+        }
         self.cg.b.build_load(lt, ptr, "").unwrap()
+    }
+
+    /// Store value `v` of type `t` at `ptr` (copying it from where it is,
+    /// if it lives in memory).
+    pub fn store(&mut self, ptr: PointerValue<'ctx>, v: BV<'ctx>, t: &Ty) {
+        if v.is_pointer_value() && self.cg.in_memory(t) {
+            self.cg.copy_mem(ptr, v.into_pointer_value(), t);
+        } else {
+            self.cg.b.build_store(ptr, v).unwrap();
+        }
+    }
+
+    /// Zero the value of type `t` at `ptr`.
+    pub fn store_zero(&mut self, ptr: PointerValue<'ctx>, t: &Ty) {
+        if self.cg.in_memory(t) {
+            let size = self.cg.usize_ty().const_int(self.cg.size_of(t), false);
+            let align = self.cg.align_of(t);
+            self.cg.b.build_memset(ptr, align, self.cg.ctx.i8_type().const_zero(), size).unwrap();
+        } else {
+            let lt = self.cg.llty(t);
+            self.cg.b.build_store(ptr, lt.const_zero()).unwrap();
+        }
+    }
+
+    /// The address of value `v` of type `t`: where it is, if it lives in
+    /// memory, or else a new slot holding it.
+    pub fn spill(&mut self, v: BV<'ctx>, t: &Ty, name: &str) -> PointerValue<'ctx> {
+        if v.is_pointer_value() && self.cg.in_memory(t) {
+            return v.into_pointer_value();
+        }
+        let tmp = self.alloca_for(t, name);
+        self.cg.b.build_store(tmp, v).unwrap();
+        tmp
     }
 
     pub fn struct_field(&mut self, sty: BasicTypeEnum<'ctx>, ptr: PointerValue<'ctx>, idx: u32) -> PointerValue<'ctx> {
@@ -205,8 +265,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         let entries: Vec<(PointerValue<'ctx>, Ty)> = self.cleanups[mark..].iter().rev().cloned().collect();
         for (p, t) in entries {
             self.drop_in_place(p, &t);
-            let lt = self.cg.llty(&t);
-            self.cg.b.build_store(p, lt.const_zero()).unwrap();
+            self.store_zero(p, &t);
         }
     }
 
@@ -219,6 +278,12 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
     // ===================================================================== blocks & statements
 
     pub fn block(&mut self, b: &Block) -> Option<BV<'ctx>> {
+        self.block_into(b, None)
+    }
+
+    /// A block whose value, if `dest` is given, is built at `dest` (see
+    /// `value_into`).
+    pub fn block_into(&mut self, b: &Block, dest: Option<PointerValue<'ctx>>) -> Option<BV<'ctx>> {
         self.push_mark();
         for s in &b.stmts {
             if self.stmt(s).is_none() {
@@ -226,9 +291,10 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 return None;
             }
         }
-        let v = match &b.tail {
-            Some(t) => self.value(t),
-            None => Some(self.unit()),
+        let v = match (&b.tail, dest) {
+            (Some(t), Some(d)) => self.value_into(t, d).map(|()| d.into()),
+            (Some(t), None) => self.value(t),
+            (None, _) => Some(self.unit()),
         };
         match v {
             Some(v) => {
@@ -247,6 +313,10 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         match s {
             Stmt::Let { pat, init, .. } => {
                 let Some(init) = init else { return Some(()) };
+                let ty = self.t(&pat.ty);
+                if self.cg.in_memory(&ty) {
+                    return self.let_in_memory(pat, init, &ty);
+                }
                 self.push_mark();
                 let v = match self.value(init) {
                     Some(v) => v,
@@ -257,7 +327,6 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                     }
                 };
                 self.pop_mark();
-                let ty = self.t(&pat.ty);
                 match &pat.kind {
                     PatKind::Binding { local, sub: None, .. } => {
                         let slot = self.locals[local.0 as usize].unwrap();
@@ -285,11 +354,9 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                         let ty = self.t(&e.ty);
                         if self.cg.p.has_owner(&ty) {
                             // A discarded owned value is dropped right away.
-                            let tmp = self.alloca_for(&ty, "discard");
-                            self.cg.b.build_store(tmp, v).unwrap();
+                            let tmp = self.spill(v, &ty, "discard");
                             self.drop_in_place(tmp, &ty);
-                            let lt = self.cg.llty(&ty);
-                            self.cg.b.build_store(tmp, lt.const_zero()).unwrap();
+                            self.store_zero(tmp, &ty);
                         }
                         self.pop_mark();
                         Some(())
@@ -302,6 +369,31 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 }
             }
         }
+    }
+
+    /// `let pat = init;` for a value that lives in memory: built in the
+    /// variable, or in a temporary the pattern binds from.
+    fn let_in_memory(&mut self, pat: &Pat, init: &Expr, ty: &Ty) -> Option<()> {
+        let dest = match &pat.kind {
+            PatKind::Binding { local, sub: None, .. } => self.locals[local.0 as usize].unwrap(),
+            _ => self.alloca_for(ty, "let_tmp"),
+        };
+        self.push_mark();
+        if self.value_into(init, dest).is_none() {
+            let m = self.marks.pop().unwrap();
+            self.cleanups.truncate(m);
+            return None;
+        }
+        self.pop_mark();
+        match &pat.kind {
+            PatKind::Binding { sub: None, .. } => self.register_cleanup(dest, ty),
+            PatKind::Wild => self.drop_in_place(dest, ty),
+            _ => {
+                self.bind_pat(pat, dest, ty, true);
+                self.register_cleanup(dest, ty);
+            }
+        }
+        Some(())
     }
 
     /// Evaluate `e` inside its own temporary scope (conditions, guards).
@@ -350,8 +442,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             ExprKind::Temp(v) => {
                 let val = tri!(self.value(v));
                 let ty = self.t(&v.ty);
-                let tmp = self.alloca_for(&ty, "tmp");
-                self.cg.b.build_store(tmp, val).unwrap();
+                let tmp = self.spill(val, &ty, "tmp");
                 self.register_cleanup(tmp, &ty);
                 Some(tmp)
             }
@@ -359,8 +450,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 // A value used where a place is needed.
                 let val = tri!(self.value(e));
                 let ty = self.t(&e.ty);
-                let tmp = self.alloca_for(&ty, "tmp");
-                self.cg.b.build_store(tmp, val).unwrap();
+                let tmp = self.spill(val, &ty, "tmp");
                 self.register_cleanup(tmp, &ty);
                 Some(tmp)
             }
@@ -425,6 +515,26 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
     pub fn value(&mut self, e: &Expr) -> Option<BV<'ctx>> {
         use ExprKind as K;
         let ty = self.t(&e.ty);
+        let built = matches!(
+            e.kind,
+            K::Read { .. }
+                | K::Lit(_)
+                | K::Call { .. }
+                | K::Tuple(_)
+                | K::Adt { .. }
+                | K::Array(_)
+                | K::ArrayRepeat { .. }
+                | K::If { .. }
+                | K::Match { .. }
+                | K::Loop { .. }
+                | K::Closure { .. }
+        );
+        if built && self.cg.in_memory(&ty) {
+            let lt = self.cg.llty(&ty);
+            let tmp = self.alloca(lt, "val");
+            tri!(self.value_into(e, tmp));
+            return Some(tmp.into());
+        }
         match &e.kind {
             K::Local(_) | K::Static(_) | K::Field { .. } | K::Index { .. } | K::Deref(_) => {
                 let p = tri!(self.place(e));
@@ -437,8 +547,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 let pt = self.t(&place.ty).strip_grow().clone();
                 let v = self.load(p, &pt);
                 if *mode == ReadMode::Move && self.cg.p.has_owner(&pt) {
-                    let lt = self.cg.llty(&pt);
-                    self.cg.b.build_store(p, lt.const_zero()).unwrap();
+                    self.store_zero(p, &pt);
                 }
                 Some(v)
             }
@@ -454,7 +563,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 let f = self.cg.instance(*def, &args);
                 Some(f.as_global_value().as_pointer_value().into())
             }
-            K::Call { callee, args } => self.call(callee, args, &ty, e.span),
+            K::Call { callee, args } => self.call(callee, args, &ty, e.span, None),
             K::Unary(op, x) => {
                 let v = tri!(self.value(x));
                 Some(self.unary(*op, v, &ty, e.span))
@@ -500,7 +609,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 let p = tri!(self.place(place));
                 let pt = self.t(&place.ty).strip_grow().clone();
                 self.drop_in_place(p, &pt);
-                self.cg.b.build_store(p, v).unwrap();
+                self.store(p, v, &pt);
                 Some(self.unit())
             }
             K::AssignOp { op, place, value } => {
@@ -570,29 +679,9 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 Some(self.slice(bp, &bt, s, en, *inclusive, e.span))
             }
             K::Block(b) => self.block(b),
-            K::If { cond, then, else_ } => self.if_expr(cond, then, else_.as_deref(), &ty),
-            K::Match { scrut, arms } => self.match_expr(scrut, arms, &ty),
-            K::Loop { body, id } => {
-                let head = self.block_named("loop");
-                let exit = self.block_named("loop_end");
-                let slot = if Cg::is_void(&ty) { None } else { Some(self.alloca_for(&ty, "brk")) };
-                let mark = self.cleanups.len();
-                self.loops.insert(*id, LoopInfo { brk: exit, cont: head, slot, mark });
-                self.cg.b.build_unconditional_branch(head).unwrap();
-                self.cg.b.position_at_end(head);
-                if self.block(body).is_some() && !self.terminated() {
-                    self.cg.b.build_unconditional_branch(head).unwrap();
-                }
-                self.cg.b.position_at_end(exit);
-                if exit.get_first_use().is_none() {
-                    self.cg.b.build_unreachable().unwrap();
-                    return None;
-                }
-                match slot {
-                    Some(s) => Some(self.load(s, &ty)),
-                    None => Some(self.unit()),
-                }
-            }
+            K::If { cond, then, else_ } => self.if_expr(cond, then, else_.as_deref(), &ty, None),
+            K::Match { scrut, arms } => self.match_expr(scrut, arms, &ty, None),
+            K::Loop { body, id } => self.loop_expr(body, *id, &ty, None),
             K::While { cond, body, id } => {
                 let head = self.block_named("while");
                 let body_bb = self.block_named("while_body");
@@ -615,16 +704,16 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             K::ForRange { var, start, end, inclusive, body, id } => self.for_range(*var, start, end, *inclusive, body, *id),
             K::ForArray { pat, array, index, body, id } => self.for_array(pat, array, *index, body, *id),
             K::Break { id, value } => {
-                let v = match value {
-                    Some(x) => Some(tri!(self.value(x))),
-                    None => None,
-                };
                 let (brk, slot, mark) = {
                     let l = &self.loops[id];
                     (l.brk, l.slot, l.mark)
                 };
-                if let (Some(v), Some(s)) = (v, slot) {
-                    self.cg.b.build_store(s, v).unwrap();
+                match (value, slot) {
+                    (Some(x), Some(s)) => tri!(self.value_into(x, s)),
+                    (Some(x), None) => {
+                        tri!(self.value(x));
+                    }
+                    (None, _) => {}
                 }
                 self.emit_cleanups(mark);
                 self.cg.b.build_unconditional_branch(brk).unwrap();
@@ -640,13 +729,17 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 None
             }
             K::Return(v) => {
-                let val = match v {
-                    Some(x) => tri!(self.value(x)),
-                    None => self.unit(),
+                let val = match (v, self.sret) {
+                    (Some(x), Some(s)) => {
+                        tri!(self.value_into(x, s));
+                        self.unit()
+                    }
+                    (Some(x), None) => tri!(self.value(x)),
+                    (None, _) => self.unit(),
                 };
                 self.emit_cleanups(0);
                 let ret = self.t(&self.cg.p.fn_data(self.body.def).sig.ret);
-                if Cg::is_void(&ret) {
+                if Cg::is_void(&ret) || self.sret.is_some() {
                     self.cg.b.build_return(None).unwrap();
                 } else {
                     self.cg.b.build_return(Some(&val)).unwrap();
@@ -690,6 +783,155 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 None
             }
         }
+    }
+
+    /// Evaluate `e` into `dest`. A value that lives in memory is built
+    /// there, so `dest` must be memory nothing reads while `e` is evaluated:
+    /// a new temporary, a variable being declared, a result slot.
+    pub fn value_into(&mut self, e: &Expr, dest: PointerValue<'ctx>) -> Option<()> {
+        use ExprKind as K;
+        let ty = self.t(&e.ty);
+        if !self.cg.in_memory(&ty) {
+            let v = tri!(self.value(e));
+            self.store(dest, v, &ty);
+            return Some(());
+        }
+        match &e.kind {
+            K::Local(_) | K::Static(_) | K::Field { .. } | K::Index { .. } | K::Deref(_) => {
+                let p = tri!(self.place(e));
+                self.cg.copy_mem(dest, p, &ty);
+            }
+            K::Temp(v) => return self.value_into(v, dest),
+            K::Read { place, mode } => {
+                let p = tri!(self.place(place));
+                let pt = self.t(&place.ty).strip_grow().clone();
+                self.cg.copy_mem(dest, p, &pt);
+                if *mode == ReadMode::Move && self.cg.p.has_owner(&pt) {
+                    self.store_zero(p, &pt);
+                }
+            }
+            K::Lit(v) => match self.cg.const_global(v, &ty) {
+                Ok(g) => self.cg.copy_mem(dest, g, &ty),
+                Err(err) => self.ice(err),
+            },
+            K::Call { callee, args } => {
+                let v = tri!(self.call(callee, args, &ty, e.span, Some(dest)));
+                if v != BV::from(dest) {
+                    self.store(dest, v, &ty);
+                }
+            }
+            K::Tuple(es) => {
+                let lt = self.cg.llty(&ty);
+                for (i, x) in es.iter().enumerate() {
+                    let fp = self.struct_field(lt, dest, i as u32);
+                    tri!(self.value_into(x, fp));
+                }
+            }
+            K::Adt { variant, fields, .. } => {
+                if let Ty::Adt(d, _) = &ty
+                    && self.cg.p.is_enum(*d)
+                {
+                    // Zeroed first, as `build_adt` does.
+                    self.store_zero(dest, &ty);
+                    let lt = self.cg.llty(&ty);
+                    let tag = self.struct_field(lt, dest, 0);
+                    self.cg.b.build_store(tag, self.cg.ctx.i32_type().const_int(*variant as u64, false)).unwrap();
+                }
+                for (i, x) in fields {
+                    let fp = self.field_ptr(dest, &ty, *variant, *i);
+                    tri!(self.value_into(x, fp));
+                }
+            }
+            K::Array(es) => {
+                let Ty::Array(elem, _) = &ty else {
+                    self.ice("array literal of non-array type");
+                    return None;
+                };
+                let et = self.cg.llty(elem);
+                for (i, x) in es.iter().enumerate() {
+                    let p = unsafe { self.cg.b.build_gep(et, dest, &[self.usize(i as u64)], "").unwrap() };
+                    tri!(self.value_into(x, p));
+                }
+            }
+            K::ArrayRepeat { value, count } => {
+                let v = tri!(self.value(value));
+                tri!(self.value(count));
+                let Ty::Array(elem, ArrKind::Fixed(n)) = &ty else {
+                    self.ice("repeat of a non-array type");
+                    return None;
+                };
+                self.fill(dest, elem, *n, v);
+            }
+            K::Block(b) => {
+                tri!(self.block_into(b, Some(dest)));
+            }
+            K::If { cond, then, else_ } => {
+                tri!(self.if_expr(cond, then, else_.as_deref(), &ty, Some(dest)));
+            }
+            K::Match { scrut, arms } => {
+                tri!(self.match_expr(scrut, arms, &ty, Some(dest)));
+            }
+            K::Loop { body, id } => {
+                tri!(self.loop_expr(body, *id, &ty, Some(dest)));
+            }
+            // The captures: the address of each borrowed variable, the value
+            // of each taken one.
+            K::Closure { captures, .. } => {
+                let lt = self.cg.llty(&ty);
+                for (i, a) in captures.iter().enumerate() {
+                    let fp = self.struct_field(lt, dest, i as u32);
+                    match a {
+                        Arg::InOut(p) => {
+                            let pp = tri!(self.place(p));
+                            self.cg.b.build_store(fp, pp).unwrap();
+                        }
+                        Arg::Value(p) if p.is_place() => {
+                            let pp = tri!(self.place(p));
+                            self.cg.b.build_store(fp, pp).unwrap();
+                        }
+                        Arg::Value(v) => tri!(self.value_into(v, fp)),
+                    }
+                }
+            }
+            _ => {
+                let v = tri!(self.value(e));
+                self.store(dest, v, &ty);
+            }
+        }
+        Some(())
+    }
+
+    /// Fill the `n` elements of type `elem` at `dest` with `v`: a `memset`
+    /// for bytes and zeros, else a loop.
+    fn fill(&mut self, dest: PointerValue<'ctx>, elem: &Ty, n: u64, v: BV<'ctx>) {
+        let et = self.cg.llty(elem);
+        let byte = matches!(et, BasicTypeEnum::IntType(t) if t.get_bit_width() == 8);
+        let zero = unsafe { llvm_sys_201::core::LLVMIsNull(v.as_value_ref()) } != 0;
+        if byte || zero {
+            let b = if byte { v.into_int_value() } else { self.cg.ctx.i8_type().const_zero() };
+            let bytes = n * self.cg.size_of(elem);
+            let align = self.cg.align_of(elem);
+            self.cg.b.build_memset(dest, align, b, self.usize(bytes)).unwrap();
+            return;
+        }
+        // for i in 0..n: dest[i] = v
+        let idx = self.alloca(self.cg.usize_ty().into(), "i");
+        self.cg.b.build_store(idx, self.usize(0)).unwrap();
+        let head = self.block_named("fill_head");
+        let body = self.block_named("fill_body");
+        let exit = self.block_named("fill_end");
+        self.cg.b.build_unconditional_branch(head).unwrap();
+        self.cg.b.position_at_end(head);
+        let i = self.cg.b.build_load(self.cg.usize_ty(), idx, "").unwrap().into_int_value();
+        let c = self.cg.b.build_int_compare(IntPredicate::ULT, i, self.usize(n), "").unwrap();
+        self.cg.b.build_conditional_branch(c, body, exit).unwrap();
+        self.cg.b.position_at_end(body);
+        let p = unsafe { self.cg.b.build_gep(et, dest, &[i], "").unwrap() };
+        self.store(p, v, elem);
+        let next = self.cg.b.build_int_add(i, self.usize(1), "").unwrap();
+        self.cg.b.build_store(idx, next).unwrap();
+        self.cg.b.build_unconditional_branch(head).unwrap();
+        self.cg.b.position_at_end(exit);
     }
 
     pub fn make_slice(&mut self, data: PointerValue<'ctx>, len: IntValue<'ctx>) -> BV<'ctx> {
@@ -796,7 +1038,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         self.cg.b.build_conditional_branch(c, body, exit).unwrap();
         self.cg.b.position_at_end(body);
         let p = unsafe { self.cg.b.build_gep(et, data, &[i], "").unwrap() };
-        self.cg.b.build_store(p, v).unwrap();
+        self.store(p, v, elem);
         let next = self.cg.b.build_int_add(i, self.usize(1), "").unwrap();
         self.cg.b.build_store(idx, next).unwrap();
         self.cg.b.build_unconditional_branch(head).unwrap();
@@ -828,7 +1070,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             let et = self.cg.llty(elem);
             for (i, v) in vals.into_iter().enumerate() {
                 let p = unsafe { self.cg.b.build_gep(et, data, &[self.usize(i as u64)], "").unwrap() };
-                self.cg.b.build_store(p, v).unwrap();
+                self.store(p, v, elem);
             }
             let lp = self.struct_field(ht.into(), slot, 1);
             self.cg.b.build_store(lp, n).unwrap();
@@ -838,31 +1080,55 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
 
     // ===================================================================== control flow
 
-    fn if_expr(&mut self, cond: &Expr, then: &Expr, else_: Option<&Expr>, ty: &Ty) -> Option<BV<'ctx>> {
+    /// The slot where the branches of an `if`, `match` or `loop` of type
+    /// `ty` leave its value: `dest` if given, else a new one (none for `()`).
+    fn result_slot(&mut self, ty: &Ty, dest: Option<PointerValue<'ctx>>, name: &str) -> Option<PointerValue<'ctx>> {
+        if Cg::is_void(ty) {
+            return None;
+        }
+        Some(match dest {
+            Some(d) => d,
+            None => self.alloca_for(ty, name),
+        })
+    }
+
+    /// Evaluate the branch `e` into the result slot, if there is one.
+    fn value_to(&mut self, e: &Expr, slot: Option<PointerValue<'ctx>>) -> Option<()> {
+        match slot {
+            Some(s) => self.value_into(e, s),
+            None => self.value(e).map(|_| ()),
+        }
+    }
+
+    /// The value left in a result slot: the slot itself for a value that
+    /// lives in memory.
+    fn slot_value(&mut self, slot: Option<PointerValue<'ctx>>, ty: &Ty) -> BV<'ctx> {
+        match slot {
+            Some(s) if self.cg.in_memory(ty) => s.into(),
+            Some(s) => self.load(s, ty),
+            None => self.unit(),
+        }
+    }
+
+    fn if_expr(&mut self, cond: &Expr, then: &Expr, else_: Option<&Expr>, ty: &Ty, dest: Option<PointerValue<'ctx>>) -> Option<BV<'ctx>> {
         let c = tri!(self.scoped_value(cond)).into_int_value();
         let then_bb = self.block_named("then");
         let else_bb = self.block_named("else");
         let merge = self.block_named("endif");
         self.cg.b.build_conditional_branch(c, then_bb, else_bb).unwrap();
-        let slot = if Cg::is_void(ty) { None } else { Some(self.alloca_for(ty, "ifv")) };
+        let slot = self.result_slot(ty, dest, "ifv");
         let mut reached = false;
         self.cg.b.position_at_end(then_bb);
-        if let Some(v) = self.value(then) {
-            if let Some(s) = slot {
-                self.cg.b.build_store(s, v).unwrap();
-            }
+        if self.value_to(then, slot).is_some() {
             self.cg.b.build_unconditional_branch(merge).unwrap();
             reached = true;
         }
         self.cg.b.position_at_end(else_bb);
         let ev = match else_ {
-            Some(e) => self.value(e),
-            None => Some(self.unit()),
+            Some(e) => self.value_to(e, slot),
+            None => Some(()),
         };
-        if let Some(v) = ev {
-            if let Some(s) = slot {
-                self.cg.b.build_store(s, v).unwrap();
-            }
+        if ev.is_some() {
             self.cg.b.build_unconditional_branch(merge).unwrap();
             reached = true;
         }
@@ -871,17 +1137,33 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             self.cg.b.build_unreachable().unwrap();
             return None;
         }
-        match slot {
-            Some(s) => Some(self.load(s, ty)),
-            None => Some(self.unit()),
-        }
+        Some(self.slot_value(slot, ty))
     }
 
-    fn match_expr(&mut self, scrut: &Expr, arms: &[Arm], ty: &Ty) -> Option<BV<'ctx>> {
+    fn loop_expr(&mut self, body: &Block, id: LoopId, ty: &Ty, dest: Option<PointerValue<'ctx>>) -> Option<BV<'ctx>> {
+        let head = self.block_named("loop");
+        let exit = self.block_named("loop_end");
+        let slot = self.result_slot(ty, dest, "brk");
+        let mark = self.cleanups.len();
+        self.loops.insert(id, LoopInfo { brk: exit, cont: head, slot, mark });
+        self.cg.b.build_unconditional_branch(head).unwrap();
+        self.cg.b.position_at_end(head);
+        if self.block(body).is_some() && !self.terminated() {
+            self.cg.b.build_unconditional_branch(head).unwrap();
+        }
+        self.cg.b.position_at_end(exit);
+        if exit.get_first_use().is_none() {
+            self.cg.b.build_unreachable().unwrap();
+            return None;
+        }
+        Some(self.slot_value(slot, ty))
+    }
+
+    fn match_expr(&mut self, scrut: &Expr, arms: &[Arm], ty: &Ty, dest: Option<PointerValue<'ctx>>) -> Option<BV<'ctx>> {
         let sp = tri!(self.place(scrut));
         let st = self.t(&scrut.ty).strip_grow().clone();
         let merge = self.block_named("match_end");
-        let slot = if Cg::is_void(ty) { None } else { Some(self.alloca_for(ty, "matchv")) };
+        let slot = self.result_slot(ty, dest, "matchv");
         let mut reached = false;
         for arm in arms {
             let next = self.block_named("arm_next");
@@ -907,11 +1189,8 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             } else {
                 self.bind_pat(&arm.pat, sp, &st, true);
             }
-            match self.value(&arm.body) {
-                Some(v) => {
-                    if let Some(s) = slot {
-                        self.cg.b.build_store(s, v).unwrap();
-                    }
+            match self.value_to(&arm.body, slot) {
+                Some(()) => {
                     self.pop_mark();
                     self.cg.b.build_unconditional_branch(merge).unwrap();
                     reached = true;
@@ -930,10 +1209,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             self.cg.b.build_unreachable().unwrap();
             return None;
         }
-        match slot {
-            Some(s) => Some(self.load(s, ty)),
-            None => Some(self.unit()),
-        }
+        Some(self.slot_value(slot, ty))
     }
 
     fn for_range(&mut self, var: LocalId, start: &Expr, end: &Expr, inclusive: bool, body: &Block, id: LoopId) -> Option<BV<'ctx>> {
@@ -1130,14 +1406,17 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 self.cleanups.extend(first.unwrap_or_default());
             }
             PatKind::Binding { local, mode, sub } => {
-                let v = self.load(ptr, ty);
                 let slot = self.locals[local.0 as usize].unwrap();
-                self.cg.b.build_store(slot, v).unwrap();
+                if self.cg.in_memory(ty) {
+                    self.cg.copy_mem(slot, ptr, ty);
+                } else {
+                    let v = self.load(ptr, ty);
+                    self.cg.b.build_store(slot, v).unwrap();
+                }
                 if *mode == ReadMode::Move {
                     self.register_cleanup(slot, ty);
                     if null_moves && self.cg.p.has_owner(ty) {
-                        let lt = self.cg.llty(ty);
-                        self.cg.b.build_store(ptr, lt.const_zero()).unwrap();
+                        self.store_zero(ptr, ty);
                     }
                 }
                 if let Some(s) = sub {
@@ -1168,10 +1447,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
     /// Zero the sources of moved bindings (after a guard succeeded).
     fn null_moves(&mut self, pat: &Pat, ptr: PointerValue<'ctx>, ty: &Ty) {
         match &pat.kind {
-            PatKind::Binding { mode: ReadMode::Move, .. } if self.cg.p.has_owner(ty) => {
-                let lt = self.cg.llty(ty);
-                self.cg.b.build_store(ptr, lt.const_zero()).unwrap();
-            }
+            PatKind::Binding { mode: ReadMode::Move, .. } if self.cg.p.has_owner(ty) => self.store_zero(ptr, ty),
             PatKind::Tuple(ps) => {
                 let Ty::Tuple(ts) = ty else { return };
                 let lt = self.cg.llty(ty);

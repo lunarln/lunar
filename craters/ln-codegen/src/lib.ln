@@ -12,6 +12,9 @@
 // * slices, `str`: `{ ptr, len }`; `FmtArgs`: `{ env, thunk }`.
 // * enums: `{ i32 tag, [N x i64] payload }`.
 //
+// Aggregates of more than `MEM_BYTES` bytes live in memory (see
+// `Cg::in_memory`); everything else is an LLVM value.
+//
 // Rust's `FnCg` (the state of the function being lowered, which borrows the
 // `Cg`) is folded into `Cg` here: structs cannot hold references, and only
 // one function body is lowered at a time. The program is passed to every
@@ -160,6 +163,7 @@ fn generate(p: &mut +Program, opts: Options): Result::<Generated, String> {
         glue: HashMap::new(),
         externs: HashMap::new(),
         counter: 0,
+        mem: HashMap::new(),
         f: null(),
         body: Body { def: DefId::new(0), locals: List::empty(), params: List::empty(), block: core::arena::Id::from_index(0), span: Span::new(0, 0) },
         args: List::empty(),
@@ -169,6 +173,7 @@ fn generate(p: &mut +Program, opts: Options): Result::<Generated, String> {
         loops: HashMap::new(),
         error: String::new(),
         failed: false,
+        sret: null(),
     };
     let r = cg.run(p, tm);
     unsafe {
@@ -207,6 +212,10 @@ pub struct LoopInfo {
     pub mark: usize,
 }
 
+/// Structs, enums, tuples, fixed arrays and closures bigger than this many
+/// bytes live in memory.
+const MEM_BYTES: u64 = 64;
+
 /// The code generator: the module being built, and the state of the
 /// function body being lowered.
 pub struct Cg {
@@ -234,6 +243,8 @@ pub struct Cg {
     /// libc helpers (memcmp, atoi), by name.
     externs: HashMap::<Symbol, ValueRef>,
     counter: u32,
+    /// Whether each type seen lives in memory (`in_memory`).
+    mem: HashMap::<Ty, bool>,
 
     // ----- the function being lowered (`FnCg` in Rust) -----
     f: ValueRef,
@@ -248,6 +259,9 @@ pub struct Cg {
     /// The first internal error in the function (when `failed`).
     error: String,
     failed: bool,
+    /// Where the function writes its result, if it lives in memory (else
+    /// null).
+    sret: ValueRef,
 }
 
 impl Cg {
@@ -484,19 +498,53 @@ impl Cg {
         return p.types.is_unit(t) || p.types.is_never(t);
     }
 
+    /// Whether values of type `t` live in memory instead of being LLVM
+    /// values: structs, enums, tuples, fixed arrays and closures of more
+    /// than `MEM_BYTES` bytes. LLVM loads and stores a first-class
+    /// aggregate one element at a time (and its instruction selection
+    /// crashes on big ones), so such a value is always handled through its
+    /// address: the value of an expression is a pointer to memory holding
+    /// it, which its user may take over; copies are `llvm.memcpy`; a Lunar
+    /// function takes one as a pointer to a copy it owns and returns one
+    /// through a pointer to the caller's memory (the first parameter).
+    /// (`extern` functions only take and return scalars.)
+    pub fn in_memory(&mut self, p: &mut +Program, t: Ty): bool {
+        if let Some(m) = self.mem.get(t) {
+            return m;
+        }
+        let l = self.llty(p, t);
+        let k = unsafe { LLVMGetTypeKind(l) };
+        let m = (k == STRUCT_TYPE_KIND || k == ARRAY_TYPE_KIND) && unsafe { LLVMABISizeOfType(self.td, l) } > MEM_BYTES;
+        self.mem.insert(t, m);
+        return m;
+    }
+
+    /// Copy the value of type `t` at `src` to `dst`.
+    pub fn copy_mem(&mut self, p: &mut +Program, dst: ValueRef, src: ValueRef, t: Ty) {
+        let size = self.size_of(p, t);
+        let align = self.align_of(p, t);
+        unsafe { LLVMBuildMemCpy(self.b, dst, align, src, align, self.const_int(self.usize_ty(), size)) };
+    }
+
     /// LLVM function type for a Lunar signature: `(type, passed by
-    /// pointer)` per parameter.
+    /// pointer)` per parameter. Values that live in memory are passed by
+    /// pointer too, and one returned is written through a pointer passed
+    /// first.
     pub fn fn_ty(&mut self, p: &mut +Program, params: [(Ty, bool); &], ret: Ty, variadic: bool): TypeRef {
+        let sret = self.in_memory(p, ret);
         let mut ps: [TypeRef; ..+] = [];
+        if sret {
+            ps.push(self.ptr_ty());
+        }
         for x in params {
             let (t, by_ref) = x;
-            if by_ref {
+            if by_ref || self.in_memory(p, t) {
                 ps.push(self.ptr_ty());
             } else {
                 ps.push(self.llty(p, t));
             }
         }
-        let r = if Cg::is_void(p, ret) { self.void_ty() } else { self.llty(p, ret) };
+        let r = if Cg::is_void(p, ret) || sret { self.void_ty() } else { self.llty(p, ret) };
         return unsafe { LLVMFunctionType(r, ps[..].as_ptr(), ps.len() as u32, variadic as i32) };
     }
 
@@ -716,6 +764,20 @@ impl Cg {
         let mut e = String::new();
         e.write("internal compiler error: unsupported constant {vs} of type {ts}");
         return Err(e);
+    }
+
+    /// A private global holding constant `v` of type `t`, for a value that
+    /// lives in memory.
+    pub fn const_global(&mut self, p: &mut +Program, v: ConstVal, t: Ty): Result::<ValueRef, String> {
+        let init = self.const_val(p, v, t)?;
+        let g = unsafe { LLVMAddGlobal(self.module, LLVMTypeOf(init), z(".const\0")) };
+        unsafe {
+            LLVMSetInitializer(g, init);
+            LLVMSetGlobalConstant(g, 1);
+            LLVMSetLinkage(g, PRIVATE_LINKAGE);
+            LLVMSetUnnamedAddress(g, GLOBAL_UNNAMED_ADDR);
+        }
+        return Ok(g);
     }
 
     /// The global of static `def`.

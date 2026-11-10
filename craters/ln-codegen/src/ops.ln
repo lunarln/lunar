@@ -132,7 +132,7 @@ impl Cg {
     /// Call a closure: its function takes the captures first, each from the
     /// closure's value at `env` (through the pointer for a borrowed one, in
     /// place for a held one), then the arguments.
-    fn call_closure(&mut self, p: &mut +Program, def: DefId, targs: TyList, env: ValueRef, vals: [ValueRef; &]): Option::<ValueRef> {
+    fn call_closure(&mut self, p: &mut +Program, def: DefId, targs: TyList, env: ValueRef, vals: [ValueRef; &], sret: ValueRef): Option::<ValueRef> {
         let info = p.closures.get(def).unwrap();
         let cty = p.types.mk(TyKind::Closure(def, targs));
         let lt = self.llty(p, cty);
@@ -149,19 +149,45 @@ impl Cg {
                 let v = self.load(p, at, t);
                 if cap.mode == ParamMode::Take && p.has_owner(t) {
                     // Taken by the call: the closure no longer owns it.
-                    let ft = self.llty(p, p.types.at(fields, i));
-                    self.store(self.const_null(ft), at);
+                    self.store_zero(p, at, p.types.at(fields, i));
                 }
                 all.push(v);
             }
         }
         all.extend(vals);
         let f = self.instance(p, def, targs);
-        return self.call_value(f, all[..]);
+        return self.emit_call(unsafe { LLVMGlobalGetValueType(f) }, f, all[..], sret);
     }
 
-    /// A call expression with result type `ret`.
-    pub fn call_expr(&mut self, p: &mut +Program, callee: Callee, args: List::<Arg>, ret: Ty, span: Span): Option::<ValueRef> {
+    /// Where a call returning `ret` writes its result, if it lives in
+    /// memory: `dest` if not null, or a new temporary (else null).
+    fn ret_slot(&mut self, p: &mut +Program, ret: Ty, dest: ValueRef): ValueRef {
+        if !self.in_memory(p, ret) {
+            return null();
+        }
+        if !is_null(dest) {
+            return dest;
+        }
+        let lt = self.llty(p, ret);
+        return self.alloca(lt, z("ret\0"));
+    }
+
+    /// Call `callee` of function type `fty` with `vals`, after `sret` (where
+    /// a result that lives in memory goes) if it is not null; the result.
+    fn emit_call(&mut self, fty: TypeRef, callee: ValueRef, vals: [ValueRef; &], sret: ValueRef): Option::<ValueRef> {
+        if is_null(sret) {
+            return self.call_typed(fty, callee, vals);
+        }
+        let mut all: [ValueRef; ..+] = [];
+        all.push(sret);
+        all.extend(vals);
+        self.call_typed(fty, callee, all[..]);
+        return Some(sret);
+    }
+
+    /// A call expression with result type `ret`. A result that lives in
+    /// memory is written at `dest` if it is not null (see `value_into`).
+    pub fn call_expr(&mut self, p: &mut +Program, callee: Callee, args: List::<Arg>, ret: Ty, span: Span, dest: ValueRef): Option::<ValueRef> {
         let mut indirect = null();
         if let Callee::Indirect(f) = callee {
             indirect = self.value(p, f)?;
@@ -198,8 +224,7 @@ impl Cg {
                 // A consumed closure: what it still holds after the call is
                 // dropped with the statement's temporaries.
                 let v = self.value(p, f)?;
-                let tmp = self.alloca_for(p, t, z("closure\0"));
-                self.store(v, tmp);
+                let tmp = self.spill(p, v, t, z("closure\0"));
                 self.register_cleanup(p, tmp, t);
                 value_callee = tmp;
             }
@@ -246,21 +271,21 @@ impl Cg {
                         }
                         let v = self.value(p, e)?;
                         let ty = self.ety(p, e);
-                        let tmp = self.alloca_for(p, ty, z("argtmp\0"));
-                        self.store(v, tmp);
+                        let tmp = self.spill(p, v, ty, z("argtmp\0"));
                         self.register_cleanup(p, tmp, ty);
                         vals.push(tmp);
                         continue;
                     }
                     by_ref_tys.push(None);
+                    // (A value that lives in memory is passed as a pointer
+                    // to this copy, which the callee owns.)
                     let v = self.value(p, e)?;
                     let ty = self.ety(p, e);
                     if p.has_owner(ty) && !is_borrowed(p, e) && !taken_at[i] {
                         // An owned temporary lent to a borrowing parameter:
                         // dropped after the statement. (A parameter that
                         // takes ownership frees it itself.)
-                        let tmp = self.alloca_for(p, ty, z("argtmp\0"));
-                        self.store(v, tmp);
+                        let tmp = self.spill(p, v, ty, z("argtmp\0"));
                         self.register_cleanup(p, tmp, ty);
                     }
                     vals.push(v);
@@ -276,7 +301,8 @@ impl Cg {
             Callee::Fn { def, args: targs } => {
                 let targs = self.t_list(p, targs);
                 let f = self.instance(p, def, targs);
-                result = self.call_value(f, vals[..]);
+                let sret = self.ret_slot(p, ret, dest);
+                result = self.emit_call(unsafe { LLVMGlobalGetValueType(f) }, f, vals[..], sret);
             }
             Callee::Trait { trait_ref, self_ty, method, method_args } => {
                 let tr = TraitRef { trait_id: trait_ref.trait_id, args: self.t_list(p, trait_ref.args) };
@@ -285,17 +311,15 @@ impl Cg {
                 match p.resolve_method(tr, st, method, margs) {
                     Some(MethodImpl::Fn { def, args }) => {
                         let f = self.instance(p, def, args);
-                        result = self.call_value(f, vals[..]);
+                        let sret = self.ret_slot(p, ret, dest);
+                        result = self.emit_call(unsafe { LLVMGlobalGetValueType(f) }, f, vals[..], sret);
                     }
                     Some(MethodImpl::Builtin { lang, method }) => {
                         // Built-in implementations work on values.
                         let mut vs: [ValueRef; ..+] = [];
                         for i in 0..vals.len() {
                             match by_ref_tys[i] {
-                                Some(t) => {
-                                    let lt = self.llty(p, t);
-                                    vs.push(self.load_ty(lt, vals[i], noname()));
-                                }
+                                Some(t) => vs.push(self.load(p, vals[i], t)),
                                 None => vs.push(vals[i]),
                             }
                         }
@@ -323,17 +347,20 @@ impl Cg {
                     return None;
                 };
                 let fty = self.ptr_fn_ty(p, params, modes, r);
-                result = self.call_typed(fty, indirect, vals[..]);
+                let sret = self.ret_slot(p, ret, dest);
+                result = self.emit_call(fty, indirect, vals[..], sret);
             }
             Callee::Value { callee: f, .. } => {
                 let ft = self.ety(p, f);
                 match p.types.kind(ft) {
                     TyKind::Closure(def, targs) => {
-                        result = self.call_closure(p, def, targs, value_callee, vals[..]);
+                        let sret = self.ret_slot(p, ret, dest);
+                        result = self.call_closure(p, def, targs, value_callee, vals[..], sret);
                     }
                     TyKind::FnPtr(params, modes, r) => {
                         let fty = self.ptr_fn_ty(p, params, modes, r);
-                        result = self.call_typed(fty, value_callee, vals[..]);
+                        let sret = self.ret_slot(p, ret, dest);
+                        result = self.emit_call(fty, value_callee, vals[..], sret);
                     }
                     _ => {
                         let s = p.ty_str(ft);
@@ -423,10 +450,9 @@ impl Cg {
             self.call_typed(fty, thunk, call_args[..]);
             v = self.unit();
         } else if name == "ptr_read" {
-            let lt = self.llty(p, p.types.at(targs, 0));
-            v = self.load_ty(lt, vals[0], noname());
+            v = self.load(p, vals[0], p.types.at(targs, 0));
         } else if name == "ptr_write" {
-            self.store(vals[1], vals[0]);
+            self.store_val(p, vals[0], vals[1], p.types.at(targs, 0));
             v = self.unit();
         } else if name == "ptr_offset" || name == "ptr_offset_mut" {
             let lt = self.llty(p, p.types.at(targs, 0));
@@ -517,7 +543,7 @@ impl Cg {
         let len = self.load_ty(self.usize_ty(), lp, noname());
         let et = self.llty(p, elem);
         let slot = self.gep(et, data, len, noname());
-        self.store(v, slot);
+        self.store_val(p, slot, v, elem);
         let n = self.add(len, self.usize(1), noname());
         self.store(n, lp);
     }
@@ -891,7 +917,7 @@ impl Cg {
         let env = self.alloca(env_ty, z("fmt_env\0"));
         for i in 0..arg_vals.len() {
             let fp = self.struct_field(env_ty, env, i as u32);
-            self.store(arg_vals[i], fp);
+            self.store_val(p, fp, arg_vals[i], arg_tys[i]);
             // An owned value made for the hole (`{name()}`) is a temporary
             // of the statement; a borrowed place is not ours to free.
             if !is_borrowed(p, arg_exprs[i]) {
@@ -947,15 +973,24 @@ impl Cg {
                     };
                     let t = arg_tys[ai];
                     let fp = self.struct_gep(env_ty, env, ai as u32, noname());
-                    let lt = self.llty(p, t);
-                    let v = self.load_ty(lt, fp, noname());
                     let tr = TraitRef { trait_id, args: List::empty() };
                     let msym = p.sym(method);
                     match p.resolve_method(tr, t, msym, List::empty()) {
                         Some(MethodImpl::Fn { def, args }) => {
                             let callee = self.instance(p, def, args);
-                            // `fmt(&self, ..)` takes the value's address.
-                            let recv = if p.param_by_ref(def, 0) { fp } else { v };
+                            // `fmt(&self, ..)` takes the value's address; a
+                            // value that lives in memory is passed as a
+                            // pointer to a copy.
+                            let mut recv = fp;
+                            if !p.param_by_ref(def, 0) {
+                                let lt = self.llty(p, t);
+                                if self.in_memory(p, t) {
+                                    recv = self.entry_alloca(f, lt, z("copy\0"));
+                                    self.copy_mem(p, recv, fp, t);
+                                } else {
+                                    recv = self.load_ty(lt, fp, noname());
+                                }
+                            }
                             let call_args = [recv, out];
                             self.call(callee, call_args[..]);
                         }

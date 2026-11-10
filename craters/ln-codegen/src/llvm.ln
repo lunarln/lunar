@@ -26,6 +26,10 @@ pub const PRIVATE_LINKAGE: u32 = 9;
 
 // ----- LLVMTypeKind -----
 pub const VOID_TYPE_KIND: u32 = 0;
+pub const INTEGER_TYPE_KIND: u32 = 8;
+pub const STRUCT_TYPE_KIND: u32 = 10;
+pub const ARRAY_TYPE_KIND: u32 = 11;
+pub const POINTER_TYPE_KIND: u32 = 12;
 
 // ----- LLVMIntPredicate -----
 pub const INT_EQ: u32 = 32;
@@ -153,6 +157,7 @@ extern "C" {
     pub fn LLVMConstArray2(elem: TypeRef, vals: *ValueRef, n: u64): ValueRef;
     pub fn LLVMConstIntToPtr(v: ValueRef, t: TypeRef): ValueRef;
     pub fn LLVMIsAConstantInt(v: ValueRef): ValueRef;
+    pub fn LLVMIsNull(v: ValueRef): i32;
     pub fn LLVMConstIntGetZExtValue(v: ValueRef): u64;
 
     // ----- globals and functions -----
@@ -228,6 +233,7 @@ extern "C" {
     pub fn LLVMBuildStructGEP2(b: BuilderRef, t: TypeRef, p: ValueRef, idx: u32, name: *u8): ValueRef;
     pub fn LLVMBuildMemCpy(b: BuilderRef, dst: ValueRef, dst_align: u32, src: ValueRef, src_align: u32, size: ValueRef): ValueRef;
     pub fn LLVMBuildMemMove(b: BuilderRef, dst: ValueRef, dst_align: u32, src: ValueRef, src_align: u32, size: ValueRef): ValueRef;
+    pub fn LLVMBuildMemSet(b: BuilderRef, p: ValueRef, v: ValueRef, size: ValueRef, align: u32): ValueRef;
 
     // ----- casts -----
     pub fn LLVMBuildPtrToInt(b: BuilderRef, v: ValueRef, t: TypeRef, name: *u8): ValueRef;
@@ -261,6 +267,11 @@ pub fn noname(): *u8 {
 
 pub fn is_null(p: *mut u8): bool {
     return (p as usize) == 0;
+}
+
+/// Whether value `v` is a pointer.
+pub fn is_pointer(v: ValueRef): bool {
+    return unsafe { LLVMGetTypeKind(LLVMTypeOf(v)) } == POINTER_TYPE_KIND;
 }
 
 pub fn null(): *mut u8 {

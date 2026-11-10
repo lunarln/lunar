@@ -8,6 +8,12 @@
 //
 // A lowering function returns `None` when control cannot continue after
 // the expression (it diverged), like the Rust `tri!` macro (`?` here).
+//
+// The value of an expression whose type lives in memory (`Cg::in_memory`)
+// is a pointer to memory holding it that nothing else uses, which its user
+// may read, keep or hand on. `value_into` builds such a value straight
+// where it is going (a variable, the return slot, a field of a bigger
+// value), saving a copy and a temporary.
 
 use core::arena::{Id, List};
 use core::collections::HashMap;
@@ -36,10 +42,16 @@ impl Cg {
         self.loops = HashMap::new();
         self.error.clear();
         self.failed = false;
+        self.sret = null();
+        let ret = self.t(p, p.fn_data(body.def).sig.ret);
+        if self.in_memory(p, ret) {
+            self.sret = unsafe { LLVMGetParam(f, 0) };
+        }
+        let first: u32 = if is_null(self.sret) { 0 } else { 1 };
         // Parameters.
         for i in 0..body.params.len() {
             let l = p.thir.local_ids.list(body.params)[i];
-            let param = unsafe { LLVMGetParam(f, i as u32) };
+            let param = unsafe { LLVMGetParam(f, i as u32 + first) };
             let local = p.thir.local(body, l);
             // In-out and borrowed parameters arrive as pointers to the
             // caller's place.
@@ -51,10 +63,14 @@ impl Cg {
                 self.locals[l.index()] = param;
             } else {
                 let ty = self.t(p, local.ty);
-                let lt = self.llty(p, ty);
-                let name = c_string(p.text(local.name));
-                let slot = self.alloca(lt, name.as_ptr());
-                self.store(param, slot);
+                let mut slot = param;
+                // Else a pointer to a copy that is this function's.
+                if !self.in_memory(p, ty) {
+                    let lt = self.llty(p, ty);
+                    let name = c_string(p.text(local.name));
+                    slot = self.alloca(lt, name.as_ptr());
+                    self.store(param, slot);
+                }
                 self.locals[l.index()] = slot;
                 // A parameter that took ownership is this function's to
                 // free (moving out of it zeroes the slot, making the drop a
@@ -76,15 +92,16 @@ impl Cg {
             let slot = self.alloca_for(p, ty, name.as_ptr());
             self.locals[i] = slot;
         }
-        let v = self.block(p, body.block);
+        let v = self.block_into(p, body.block, self.sret);
         if v.is_some() && !self.terminated() {
-            let ret = self.t(p, p.fn_data(body.def).sig.ret);
             if Cg::is_void(p, ret) {
                 if p.types.is_never(ret) {
                     self.unreachable();
                 } else {
                     self.ret_void();
                 }
+            } else if !is_null(self.sret) {
+                self.ret_void();
             } else {
                 self.ret(v.unwrap());
             }
@@ -139,7 +156,12 @@ impl Cg {
 
     /// An alloca in the entry block.
     pub fn alloca(&mut self, ty: TypeRef, name: *u8): ValueRef {
-        let entry = unsafe { LLVMGetFirstBasicBlock(self.f) };
+        return self.entry_alloca(self.f, ty, name);
+    }
+
+    /// An alloca in the entry block of `f`.
+    pub fn entry_alloca(&mut self, f: ValueRef, ty: TypeRef, name: *u8): ValueRef {
+        let entry = unsafe { LLVMGetFirstBasicBlock(f) };
         let first = unsafe { LLVMGetFirstInstruction(entry) };
         if is_null(first) {
             unsafe { LLVMPositionBuilderAtEnd(self.ab, entry) };
@@ -162,7 +184,13 @@ impl Cg {
             } else {
                 unsafe { LLVMPositionBuilderBefore(self.ab, next) };
             }
-            unsafe { LLVMBuildStore(self.ab, LLVMConstNull(lt), slot) };
+            if self.in_memory(p, t) {
+                let size = self.const_int(self.usize_ty(), self.size_of(p, t));
+                let align = self.align_of(p, t);
+                unsafe { LLVMBuildMemSet(self.ab, slot, self.const_null(self.i8_ty()), size, align) };
+            } else {
+                unsafe { LLVMBuildStore(self.ab, LLVMConstNull(lt), slot) };
+            }
         }
         return slot;
     }
@@ -181,9 +209,49 @@ impl Cg {
         return self.const_int(self.usize_ty(), v);
     }
 
+    /// The value of type `t` at `ptr`: a copy, for one that lives in
+    /// memory.
     pub fn load(&mut self, p: &mut +Program, ptr: ValueRef, t: Ty): ValueRef {
         let lt = self.llty(p, t);
+        if self.in_memory(p, t) {
+            let tmp = self.alloca(lt, z("copy\0"));
+            self.copy_mem(p, tmp, ptr, t);
+            return tmp;
+        }
         return self.load_ty(lt, ptr, noname());
+    }
+
+    /// Store value `v` of type `t` at `ptr` (copying it from where it is,
+    /// if it lives in memory).
+    pub fn store_val(&mut self, p: &mut +Program, ptr: ValueRef, v: ValueRef, t: Ty) {
+        if is_pointer(v) && self.in_memory(p, t) {
+            self.copy_mem(p, ptr, v, t);
+        } else {
+            self.store(v, ptr);
+        }
+    }
+
+    /// Zero the value of type `t` at `ptr`.
+    pub fn store_zero(&mut self, p: &mut +Program, ptr: ValueRef, t: Ty) {
+        if self.in_memory(p, t) {
+            let size = self.const_int(self.usize_ty(), self.size_of(p, t));
+            let align = self.align_of(p, t);
+            unsafe { LLVMBuildMemSet(self.b, ptr, self.const_null(self.i8_ty()), size, align) };
+        } else {
+            let lt = self.llty(p, t);
+            self.store(self.const_null(lt), ptr);
+        }
+    }
+
+    /// The address of value `v` of type `t`: where it is, if it lives in
+    /// memory, or else a new slot holding it.
+    pub fn spill(&mut self, p: &mut +Program, v: ValueRef, t: Ty, name: *u8): ValueRef {
+        if is_pointer(v) && self.in_memory(p, t) {
+            return v;
+        }
+        let tmp = self.alloca_for(p, t, name);
+        self.store(v, tmp);
+        return tmp;
     }
 
     pub fn struct_field(&self, sty: TypeRef, ptr: ValueRef, idx: u32): ValueRef {
@@ -218,8 +286,7 @@ impl Cg {
             i -= 1;
             let c = self.cleanups[i];
             self.drop_in_place(p, c.ptr, c.ty);
-            let lt = self.llty(p, c.ty);
-            self.store(self.const_null(lt), c.ptr);
+            self.store_zero(p, c.ptr, c.ty);
         }
     }
 
@@ -232,6 +299,12 @@ impl Cg {
     // ===================================================================== blocks & statements
 
     pub fn block(&mut self, p: &mut +Program, b: Id::<Block>): Option::<ValueRef> {
+        return self.block_into(p, b, null());
+    }
+
+    /// A block whose value, if `dest` is not null, is built at `dest` (see
+    /// `value_into`).
+    pub fn block_into(&mut self, p: &mut +Program, b: Id::<Block>, dest: ValueRef): Option::<ValueRef> {
         let blk = p.thir.block(b);
         self.push_mark();
         for i in 0..blk.stmts.len() {
@@ -242,7 +315,16 @@ impl Cg {
             }
         }
         let v = match blk.tail {
-            Some(t) => self.value(p, t),
+            Some(t) => {
+                if is_null(dest) {
+                    self.value(p, t)
+                } else {
+                    match self.value_into(p, t, dest) {
+                        Some(()) => Some(dest),
+                        None => None,
+                    }
+                }
+            }
             None => Some(self.unit()),
         };
         match v {
@@ -263,6 +345,11 @@ impl Cg {
                 let Some(init) = init else {
                     return Some(());
                 };
+                let pt = p.thir.pat(pat);
+                let ty = self.t(p, pt.ty);
+                if self.in_memory(p, ty) {
+                    return self.let_in_memory(p, pat, init, ty);
+                }
                 self.push_mark();
                 let v = match self.value(p, init) {
                     Some(v) => v,
@@ -272,8 +359,6 @@ impl Cg {
                     }
                 };
                 self.pop_mark(p);
-                let pt = p.thir.pat(pat);
-                let ty = self.t(p, pt.ty);
                 match pt.kind {
                     PatKind::Binding { local, sub: None, .. } => {
                         let slot = self.locals[local.index()];
@@ -301,11 +386,9 @@ impl Cg {
                         let ty = self.ety(p, e);
                         if p.has_owner(ty) {
                             // A discarded owned value is dropped right away.
-                            let tmp = self.alloca_for(p, ty, z("discard\0"));
-                            self.store(v, tmp);
+                            let tmp = self.spill(p, v, ty, z("discard\0"));
                             self.drop_in_place(p, tmp, ty);
-                            let lt = self.llty(p, ty);
-                            self.store(self.const_null(lt), tmp);
+                            self.store_zero(p, tmp, ty);
                         }
                         self.pop_mark(p);
                         return Some(());
@@ -317,6 +400,31 @@ impl Cg {
                 }
             }
         }
+    }
+
+    /// `let pat = init;` for a value that lives in memory: built in the
+    /// variable, or in a temporary the pattern binds from.
+    fn let_in_memory(&mut self, p: &mut +Program, pat: Id::<Pat>, init: Id::<Expr>, ty: Ty): Option::<()> {
+        let pt = p.thir.pat(pat);
+        let dest = match pt.kind {
+            PatKind::Binding { local, sub: None, .. } => self.locals[local.index()],
+            _ => self.alloca_for(p, ty, z("let_tmp\0")),
+        };
+        self.push_mark();
+        if self.value_into(p, init, dest).is_none() {
+            self.drop_mark();
+            return None;
+        }
+        self.pop_mark(p);
+        match pt.kind {
+            PatKind::Binding { sub: None, .. } => self.register_cleanup(p, dest, ty),
+            PatKind::Wild => self.drop_in_place(p, dest, ty),
+            _ => {
+                self.bind_pat(p, pat, dest, ty, true);
+                self.register_cleanup(p, dest, ty);
+            }
+        }
+        return Some(());
     }
 
     /// Evaluate `e` inside its own temporary scope (conditions, guards).
@@ -365,8 +473,7 @@ impl Cg {
             ExprKind::Temp(v) => {
                 let val = self.value(p, v)?;
                 let ty = self.ety(p, v);
-                let tmp = self.alloca_for(p, ty, z("tmp\0"));
-                self.store(val, tmp);
+                let tmp = self.spill(p, val, ty, z("tmp\0"));
                 self.register_cleanup(p, tmp, ty);
                 return Some(tmp);
             }
@@ -374,8 +481,7 @@ impl Cg {
                 // A value used where a place is needed.
                 let val = self.value(p, e)?;
                 let ty = self.t(p, ex.ty);
-                let tmp = self.alloca_for(p, ty, z("tmp\0"));
-                self.store(val, tmp);
+                let tmp = self.spill(p, val, ty, z("tmp\0"));
                 self.register_cleanup(p, tmp, ty);
                 return Some(tmp);
             }
@@ -443,6 +549,17 @@ impl Cg {
     pub fn value(&mut self, p: &mut +Program, e: Id::<Expr>): Option::<ValueRef> {
         let ex = p.thir.expr(e);
         let ty = self.t(p, ex.ty);
+        let built = match ex.kind {
+            ExprKind::Read { .. } | ExprKind::Lit(_) | ExprKind::Call { .. } | ExprKind::Tuple(_) | ExprKind::Adt { .. } | ExprKind::Array(_) => true,
+            ExprKind::ArrayRepeat { .. } | ExprKind::If { .. } | ExprKind::Match { .. } | ExprKind::Loop { .. } | ExprKind::Closure { .. } => true,
+            _ => false,
+        };
+        if built && self.in_memory(p, ty) {
+            let lt = self.llty(p, ty);
+            let tmp = self.alloca(lt, z("val\0"));
+            self.value_into(p, e, tmp)?;
+            return Some(tmp);
+        }
         match ex.kind {
             ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Deref(_) => {
                 let ptr = self.place(p, e)?;
@@ -455,8 +572,7 @@ impl Cg {
                 let pt = self.place_ty(p, place);
                 let v = self.load(p, ptr, pt);
                 if mode == ReadMode::Move && p.has_owner(pt) {
-                    let lt = self.llty(p, pt);
-                    self.store(self.const_null(lt), ptr);
+                    self.store_zero(p, ptr, pt);
                 }
                 return Some(v);
             }
@@ -471,7 +587,7 @@ impl Cg {
                 let targs = self.t_list(p, args);
                 return Some(self.instance(p, def, targs));
             }
-            ExprKind::Call { callee, args } => return self.call_expr(p, callee, args, ty, ex.span),
+            ExprKind::Call { callee, args } => return self.call_expr(p, callee, args, ty, ex.span, null()),
             ExprKind::Unary(op, x) => {
                 let v = self.value(p, x)?;
                 return Some(self.unary(p, op, v, ty, ex.span));
@@ -520,7 +636,7 @@ impl Cg {
                 let ptr = self.place(p, place)?;
                 let pt = self.place_ty(p, place);
                 self.drop_in_place(p, ptr, pt);
-                self.store(v, ptr);
+                self.store_val(p, ptr, v, pt);
                 return Some(self.unit());
             }
             ExprKind::AssignOp { op, place, value } => {
@@ -596,29 +712,9 @@ impl Cg {
                 return Some(self.slice(p, bp, bt, s, en, inclusive, ex.span));
             }
             ExprKind::Block(b) => return self.block(p, b),
-            ExprKind::If { cond, then, else_ } => return self.if_expr(p, cond, then, else_, ty),
-            ExprKind::Match { scrut, arms } => return self.match_expr(p, scrut, arms, ty),
-            ExprKind::Loop { body, id } => {
-                let head = self.block_named(z("loop\0"));
-                let exit = self.block_named(z("loop_end\0"));
-                let slot = if Cg::is_void(p, ty) { null() } else { self.alloca_for(p, ty, z("brk\0")) };
-                let mark = self.cleanups.len();
-                self.loops.insert(id, LoopInfo { brk: exit, cont: head, slot, mark });
-                self.br(head);
-                self.position(head);
-                if self.block(p, body).is_some() && !self.terminated() {
-                    self.br(head);
-                }
-                self.position(exit);
-                if is_null(unsafe { LLVMGetFirstUse(LLVMBasicBlockAsValue(exit)) }) {
-                    self.unreachable();
-                    return None;
-                }
-                if is_null(slot) {
-                    return Some(self.unit());
-                }
-                return Some(self.load(p, slot, ty));
-            }
+            ExprKind::If { cond, then, else_ } => return self.if_expr(p, cond, then, else_, ty, null()),
+            ExprKind::Match { scrut, arms } => return self.match_expr(p, scrut, arms, ty, null()),
+            ExprKind::Loop { body, id } => return self.loop_expr(p, body, id, ty, null()),
             ExprKind::While { cond, body, id } => {
                 let head = self.block_named(z("while\0"));
                 let body_bb = self.block_named(z("while_body\0"));
@@ -640,14 +736,12 @@ impl Cg {
             ExprKind::ForRange { var, start, end, inclusive, body, id } => return self.for_range(p, var, start, end, inclusive, body, id),
             ExprKind::ForArray { pat, array, index, body, id } => return self.for_array(p, pat, array, index, body, id),
             ExprKind::Break { id, value } => {
-                let v = match value {
-                    Some(x) => Some(self.value(p, x)?),
-                    None => None,
-                };
                 let l = self.loops.get(id).unwrap();
-                if let Some(v) = v {
-                    if !is_null(l.slot) {
-                        self.store(v, l.slot);
+                if let Some(x) = value {
+                    if is_null(l.slot) {
+                        self.value(p, x)?;
+                    } else {
+                        self.value_into(p, x, l.slot)?;
                     }
                 }
                 self.emit_cleanups(p, l.mark);
@@ -661,13 +755,17 @@ impl Cg {
                 return None;
             }
             ExprKind::Return(v) => {
-                let val = match v {
-                    Some(x) => self.value(p, x)?,
-                    None => self.unit(),
-                };
+                let mut val = self.unit();
+                if let Some(x) = v {
+                    if is_null(self.sret) {
+                        val = self.value(p, x)?;
+                    } else {
+                        self.value_into(p, x, self.sret)?;
+                    }
+                }
                 self.emit_cleanups(p, 0);
                 let ret = self.t(p, p.fn_data(self.body.def).sig.ret);
-                if Cg::is_void(p, ret) {
+                if Cg::is_void(p, ret) || !is_null(self.sret) {
                     self.ret_void();
                 } else {
                     self.ret(val);
@@ -717,6 +815,163 @@ impl Cg {
                 return None;
             }
         }
+    }
+
+    /// Evaluate `e` into `dest`. A value that lives in memory is built
+    /// there, so `dest` must be memory nothing reads while `e` is
+    /// evaluated: a new temporary, a variable being declared, a result
+    /// slot.
+    pub fn value_into(&mut self, p: &mut +Program, e: Id::<Expr>, dest: ValueRef): Option::<()> {
+        let ex = p.thir.expr(e);
+        let ty = self.t(p, ex.ty);
+        if !self.in_memory(p, ty) {
+            let v = self.value(p, e)?;
+            self.store_val(p, dest, v, ty);
+            return Some(());
+        }
+        match ex.kind {
+            ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Deref(_) => {
+                let ptr = self.place(p, e)?;
+                self.copy_mem(p, dest, ptr, ty);
+            }
+            ExprKind::Temp(v) => return self.value_into(p, v, dest),
+            ExprKind::Read { place, mode } => {
+                let ptr = self.place(p, place)?;
+                let pt = self.place_ty(p, place);
+                self.copy_mem(p, dest, ptr, pt);
+                if mode == ReadMode::Move && p.has_owner(pt) {
+                    self.store_zero(p, ptr, pt);
+                }
+            }
+            ExprKind::Lit(v) => match self.const_global(p, v, ty) {
+                Ok(g) => self.copy_mem(p, dest, g, ty),
+                Err(err) => self.ice(p, err.as_str()),
+            },
+            ExprKind::Call { callee, args } => {
+                let v = self.call_expr(p, callee, args, ty, ex.span, dest)?;
+                if (v as usize) != (dest as usize) {
+                    self.store_val(p, dest, v, ty);
+                }
+            }
+            ExprKind::Tuple(es) => {
+                let lt = self.llty(p, ty);
+                for i in 0..es.len() {
+                    let x = p.thir.expr_ids.list(es)[i];
+                    let fp = self.struct_field(lt, dest, i as u32);
+                    self.value_into(p, x, fp)?;
+                }
+            }
+            ExprKind::Adt { variant, fields, .. } => {
+                if let TyKind::Adt(d, _) = p.types.kind(ty) {
+                    if p.is_enum(d) {
+                        // Zeroed first, as `build_adt` does.
+                        self.store_zero(p, dest, ty);
+                        let lt = self.llty(p, ty);
+                        let tag = self.struct_field(lt, dest, 0);
+                        self.store(self.const_int(self.i32_ty(), variant as u64), tag);
+                    }
+                }
+                for i in 0..fields.len() {
+                    let fe = p.thir.field_exprs.list(fields)[i];
+                    let fp = self.field_ptr(p, dest, ty, variant as usize, fe.field as usize);
+                    self.value_into(p, fe.expr, fp)?;
+                }
+            }
+            ExprKind::Array(es) => {
+                let TyKind::Array(elem, _) = p.types.kind(ty) else {
+                    self.ice(p, "array literal of non-array type");
+                    return None;
+                };
+                let et = self.llty(p, elem);
+                for i in 0..es.len() {
+                    let x = p.thir.expr_ids.list(es)[i];
+                    let ptr = self.gep(et, dest, self.usize(i as u64), noname());
+                    self.value_into(p, x, ptr)?;
+                }
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                let v = self.value(p, value)?;
+                self.value(p, count)?;
+                let TyKind::Array(elem, ArrKind::Fixed(n)) = p.types.kind(ty) else {
+                    self.ice(p, "repeat of a non-array type");
+                    return None;
+                };
+                self.fill(p, dest, elem, n, v);
+            }
+            ExprKind::Block(b) => {
+                self.block_into(p, b, dest)?;
+            }
+            ExprKind::If { cond, then, else_ } => {
+                self.if_expr(p, cond, then, else_, ty, dest)?;
+            }
+            ExprKind::Match { scrut, arms } => {
+                self.match_expr(p, scrut, arms, ty, dest)?;
+            }
+            ExprKind::Loop { body, id } => {
+                self.loop_expr(p, body, id, ty, dest)?;
+            }
+            // The captures: the address of each borrowed variable, the
+            // value of each taken one.
+            ExprKind::Closure { captures, .. } => {
+                let lt = self.llty(p, ty);
+                for i in 0..captures.len() {
+                    let a = p.thir.args.list(captures)[i];
+                    let fp = self.struct_field(lt, dest, i as u32);
+                    match a {
+                        Arg::InOut(x) => {
+                            let ptr = self.place(p, x)?;
+                            self.store(ptr, fp);
+                        }
+                        Arg::Value(x) => {
+                            if p.thir.is_place(x) {
+                                let ptr = self.place(p, x)?;
+                                self.store(ptr, fp);
+                            } else {
+                                self.value_into(p, x, fp)?;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                let v = self.value(p, e)?;
+                self.store_val(p, dest, v, ty);
+            }
+        }
+        return Some(());
+    }
+
+    /// Fill the `n` elements of type `elem` at `dest` with `v`: a `memset`
+    /// for bytes and zeros, else a loop.
+    fn fill(&mut self, p: &mut +Program, dest: ValueRef, elem: Ty, n: u64, v: ValueRef) {
+        let et = self.llty(p, elem);
+        let byte = unsafe { LLVMGetTypeKind(et) } == INTEGER_TYPE_KIND && unsafe { LLVMGetIntTypeWidth(et) } == 8;
+        let zero = unsafe { LLVMIsNull(v) } != 0;
+        if byte || zero {
+            let b = if byte { v } else { self.const_null(self.i8_ty()) };
+            let bytes = n * self.size_of(p, elem);
+            let align = self.align_of(p, elem);
+            unsafe { LLVMBuildMemSet(self.b, dest, b, self.usize(bytes), align) };
+            return;
+        }
+        // for i in 0..n: dest[i] = v
+        let idx = self.alloca(self.usize_ty(), z("i\0"));
+        self.store(self.usize(0), idx);
+        let head = self.block_named(z("fill_head\0"));
+        let body = self.block_named(z("fill_body\0"));
+        let exit = self.block_named(z("fill_end\0"));
+        self.br(head);
+        self.position(head);
+        let i = self.load_ty(self.usize_ty(), idx, noname());
+        let c = self.icmp(INT_ULT, i, self.usize(n), noname());
+        self.cond_br(c, body, exit);
+        self.position(body);
+        let ptr = self.gep(et, dest, i, noname());
+        self.store_val(p, ptr, v, elem);
+        let next = self.add(i, self.usize(1), noname());
+        self.store(next, idx);
+        self.br(head);
+        self.position(exit);
     }
 
     pub fn make_slice(&self, data: ValueRef, len: ValueRef): ValueRef {
@@ -842,7 +1097,7 @@ impl Cg {
         self.cond_br(c, body, exit);
         self.position(body);
         let ptr = self.gep(et, data, i, noname());
-        self.store(v, ptr);
+        self.store_val(p, ptr, v, elem);
         let next = self.add(i, self.usize(1), noname());
         self.store(next, idx);
         self.br(head);
@@ -874,7 +1129,7 @@ impl Cg {
             let et = self.llty(p, elem);
             for i in 0..vals.len() {
                 let ptr = self.gep(et, data, self.usize(i as u64), noname());
-                self.store(vals[i], ptr);
+                self.store_val(p, ptr, vals[i], elem);
             }
             let lp = self.struct_field(ht, slot, 1);
             self.store(n, lp);
@@ -884,31 +1139,59 @@ impl Cg {
 
     // ===================================================================== control flow
 
-    fn if_expr(&mut self, p: &mut +Program, cond: Id::<Expr>, then: Id::<Expr>, else_: Option::<Id::<Expr>>, ty: Ty): Option::<ValueRef> {
+    /// The slot where the branches of an `if`, `match` or `loop` of type
+    /// `ty` leave its value: `dest` if not null, else a new one (null for
+    /// `()`).
+    fn result_slot(&mut self, p: &mut +Program, ty: Ty, dest: ValueRef, name: *u8): ValueRef {
+        if Cg::is_void(p, ty) {
+            return null();
+        }
+        if !is_null(dest) {
+            return dest;
+        }
+        return self.alloca_for(p, ty, name);
+    }
+
+    /// Evaluate the branch `e` into the result slot, if there is one.
+    fn value_to(&mut self, p: &mut +Program, e: Id::<Expr>, slot: ValueRef): Option::<()> {
+        if is_null(slot) {
+            self.value(p, e)?;
+            return Some(());
+        }
+        return self.value_into(p, e, slot);
+    }
+
+    /// The value left in a result slot: the slot itself for a value that
+    /// lives in memory.
+    fn slot_value(&mut self, p: &mut +Program, slot: ValueRef, ty: Ty): ValueRef {
+        if is_null(slot) {
+            return self.unit();
+        }
+        if self.in_memory(p, ty) {
+            return slot;
+        }
+        return self.load(p, slot, ty);
+    }
+
+    fn if_expr(&mut self, p: &mut +Program, cond: Id::<Expr>, then: Id::<Expr>, else_: Option::<Id::<Expr>>, ty: Ty, dest: ValueRef): Option::<ValueRef> {
         let c = self.scoped_value(p, cond)?;
         let then_bb = self.block_named(z("then\0"));
         let else_bb = self.block_named(z("else\0"));
         let merge = self.block_named(z("endif\0"));
         self.cond_br(c, then_bb, else_bb);
-        let slot = if Cg::is_void(p, ty) { null() } else { self.alloca_for(p, ty, z("ifv\0")) };
+        let slot = self.result_slot(p, ty, dest, z("ifv\0"));
         let mut reached = false;
         self.position(then_bb);
-        if let Some(v) = self.value(p, then) {
-            if !is_null(slot) {
-                self.store(v, slot);
-            }
+        if self.value_to(p, then, slot).is_some() {
             self.br(merge);
             reached = true;
         }
         self.position(else_bb);
         let ev = match else_ {
-            Some(x) => self.value(p, x),
-            None => Some(self.unit()),
+            Some(x) => self.value_to(p, x, slot),
+            None => Some(()),
         };
-        if let Some(v) = ev {
-            if !is_null(slot) {
-                self.store(v, slot);
-            }
+        if ev.is_some() {
             self.br(merge);
             reached = true;
         }
@@ -917,17 +1200,33 @@ impl Cg {
             self.unreachable();
             return None;
         }
-        if is_null(slot) {
-            return Some(self.unit());
-        }
-        return Some(self.load(p, slot, ty));
+        return Some(self.slot_value(p, slot, ty));
     }
 
-    fn match_expr(&mut self, p: &mut +Program, scrut: Id::<Expr>, arms: List::<Arm>, ty: Ty): Option::<ValueRef> {
+    fn loop_expr(&mut self, p: &mut +Program, body: Id::<Block>, id: LoopId, ty: Ty, dest: ValueRef): Option::<ValueRef> {
+        let head = self.block_named(z("loop\0"));
+        let exit = self.block_named(z("loop_end\0"));
+        let slot = self.result_slot(p, ty, dest, z("brk\0"));
+        let mark = self.cleanups.len();
+        self.loops.insert(id, LoopInfo { brk: exit, cont: head, slot, mark });
+        self.br(head);
+        self.position(head);
+        if self.block(p, body).is_some() && !self.terminated() {
+            self.br(head);
+        }
+        self.position(exit);
+        if is_null(unsafe { LLVMGetFirstUse(LLVMBasicBlockAsValue(exit)) }) {
+            self.unreachable();
+            return None;
+        }
+        return Some(self.slot_value(p, slot, ty));
+    }
+
+    fn match_expr(&mut self, p: &mut +Program, scrut: Id::<Expr>, arms: List::<Arm>, ty: Ty, dest: ValueRef): Option::<ValueRef> {
         let sp = self.place(p, scrut)?;
         let st = self.place_ty(p, scrut);
         let merge = self.block_named(z("match_end\0"));
-        let slot = if Cg::is_void(p, ty) { null() } else { self.alloca_for(p, ty, z("matchv\0")) };
+        let slot = self.result_slot(p, ty, dest, z("matchv\0"));
         let mut reached = false;
         for ai in 0..arms.len() {
             let arm = p.thir.arms.list(arms)[ai];
@@ -956,11 +1255,8 @@ impl Cg {
             } else {
                 self.bind_pat(p, arm.pat, sp, st, true);
             }
-            match self.value(p, arm.body) {
-                Some(v) => {
-                    if !is_null(slot) {
-                        self.store(v, slot);
-                    }
+            match self.value_to(p, arm.body, slot) {
+                Some(()) => {
                     self.pop_mark(p);
                     self.br(merge);
                     reached = true;
@@ -976,10 +1272,7 @@ impl Cg {
             self.unreachable();
             return None;
         }
-        if is_null(slot) {
-            return Some(self.unit());
-        }
-        return Some(self.load(p, slot, ty));
+        return Some(self.slot_value(p, slot, ty));
     }
 
     fn for_range(&mut self, p: &mut +Program, var: LocalId, start: Id::<Expr>, end: Id::<Expr>, inclusive: bool, body: Id::<Block>, id: LoopId): Option::<ValueRef> {
@@ -1229,14 +1522,17 @@ impl Cg {
                 self.position(done);
             }
             PatKind::Binding { local, mode, sub } => {
-                let v = self.load(p, ptr, ty);
                 let slot = self.locals[local.index()];
-                self.store(v, slot);
+                if self.in_memory(p, ty) {
+                    self.copy_mem(p, slot, ptr, ty);
+                } else {
+                    let v = self.load(p, ptr, ty);
+                    self.store(v, slot);
+                }
                 if mode == ReadMode::Move {
                     self.register_cleanup(p, slot, ty);
                     if null_moves && p.has_owner(ty) {
-                        let lt = self.llty(p, ty);
-                        self.store(self.const_null(lt), ptr);
+                        self.store_zero(p, ptr, ty);
                     }
                 }
                 if let Some(s) = sub {
@@ -1276,8 +1572,7 @@ impl Cg {
         match pt.kind {
             PatKind::Binding { mode, .. } => {
                 if mode == ReadMode::Move && p.has_owner(ty) {
-                    let lt = self.llty(p, ty);
-                    self.store(self.const_null(lt), ptr);
+                    self.store_zero(p, ptr, ty);
                 }
             }
             PatKind::Tuple(ps) => {

@@ -4,7 +4,7 @@
 use crate::Cg;
 use crate::func::{BV, FnCg, tri};
 use inkwell::intrinsics::Intrinsic;
-use inkwell::types::BasicMetadataTypeEnum;
+use inkwell::types::{BasicMetadataTypeEnum, FunctionType};
 use inkwell::values::{BasicMetadataValueEnum, FunctionValue, IntValue, PointerValue};
 use inkwell::{FloatPredicate, IntPredicate};
 use ln_ast::{BinOp, FmtSpec, UnOp};
@@ -62,7 +62,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
     /// Call a closure: its function takes the captures first, each from the
     /// closure's value at `env` (through the pointer for a borrowed one,
     /// in place for a held one), then the arguments.
-    fn call_closure(&mut self, def: DefId, targs: &[Ty], env: PointerValue<'ctx>, vals: &[BV<'ctx>]) -> Option<BV<'ctx>> {
+    fn call_closure(&mut self, def: DefId, targs: &[Ty], env: PointerValue<'ctx>, vals: &[BV<'ctx>], sret: Option<PointerValue<'ctx>>) -> Option<BV<'ctx>> {
         let info = self.cg.p.closures[&def].clone();
         let cty = Ty::Closure(def, targs.to_vec());
         let lt = self.cg.llty(&cty);
@@ -78,18 +78,34 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 let v = self.load(at, &t);
                 if cap.mode == ParamMode::Take && self.cg.p.has_owner(&t) {
                     // Taken by the call: the closure no longer owns it.
-                    let ft = self.cg.llty(&fields[i]);
-                    self.cg.b.build_store(at, ft.const_zero()).unwrap();
+                    self.store_zero(at, &fields[i]);
                 }
                 all.push(v);
             }
         }
         all.extend_from_slice(vals);
         let f = self.cg.instance(def, targs);
-        self.emit_call(f, &all)
+        self.emit_call(f, &all, sret)
     }
 
-    pub fn call(&mut self, callee: &Callee, args: &[Arg], ret: &Ty, span: Span) -> Option<BV<'ctx>> {
+    /// Where a call returning `ret` writes its result, if it lives in
+    /// memory: `dest`, or a new temporary.
+    fn ret_slot(&mut self, ret: &Ty, dest: Option<PointerValue<'ctx>>) -> Option<PointerValue<'ctx>> {
+        if !self.cg.in_memory(ret) {
+            return None;
+        }
+        Some(match dest {
+            Some(d) => d,
+            None => {
+                let lt = self.cg.llty(ret);
+                self.alloca(lt, "ret")
+            }
+        })
+    }
+
+    /// A call. A result that lives in memory is written at `dest` if given
+    /// (see `value_into`).
+    pub fn call(&mut self, callee: &Callee, args: &[Arg], ret: &Ty, span: Span, dest: Option<PointerValue<'ctx>>) -> Option<BV<'ctx>> {
         let indirect = match callee {
             Callee::Indirect(f) => Some(tri!(self.value(f)).into_pointer_value()),
             _ => None,
@@ -116,8 +132,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                         // A consumed closure: what it still holds after the
                         // call is dropped with the statement's temporaries.
                         let v = tri!(self.value(f));
-                        let tmp = self.alloca_for(&t, "closure");
-                        self.cg.b.build_store(tmp, v).unwrap();
+                        let tmp = self.spill(v, &t, "closure");
                         self.register_cleanup(tmp, &t);
                         tmp
                     }
@@ -157,13 +172,14 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                         }
                         let v = tri!(self.value(e));
                         let ty = self.t(&e.ty);
-                        let tmp = self.alloca_for(&ty, "argtmp");
-                        self.cg.b.build_store(tmp, v).unwrap();
+                        let tmp = self.spill(v, &ty, "argtmp");
                         self.register_cleanup(tmp, &ty);
                         vals.push(tmp.into());
                         continue;
                     }
                     by_ref_tys.push(None);
+                    // (A value that lives in memory is passed as a pointer to
+                    // this copy, which the callee owns.)
                     let v = tri!(self.value(e));
                     let ty = self.t(&e.ty);
                     let taken = taken_at[i];
@@ -171,8 +187,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                         // An owned temporary lent to a borrowing parameter:
                         // dropped after the statement. (A parameter that takes
                         // ownership frees it itself.)
-                        let tmp = self.alloca_for(&ty, "argtmp");
-                        self.cg.b.build_store(tmp, v).unwrap();
+                        let tmp = self.spill(v, &ty, "argtmp");
                         self.register_cleanup(tmp, &ty);
                     }
                     vals.push(v);
@@ -187,7 +202,8 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             Callee::Fn { def, args: targs } => {
                 let targs: Vec<Ty> = targs.iter().map(|t| self.t(t)).collect();
                 let f = self.cg.instance(*def, &targs);
-                self.emit_call(f, &vals)
+                let sret = self.ret_slot(ret, dest);
+                self.emit_call(f, &vals, sret)
             }
             Callee::Trait { trait_ref, self_ty, method, method_args } => {
                 let tr = TraitRef { trait_id: trait_ref.trait_id, args: trait_ref.args.iter().map(|t| self.t(t)).collect() };
@@ -196,15 +212,15 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 match self.cg.p.resolve_method(&tr, &st, method, &margs) {
                     Some(MethodImpl::Fn { def, args }) => {
                         let f = self.cg.instance(def, &args);
-                        self.emit_call(f, &vals)
+                        let sret = self.ret_slot(ret, dest);
+                        self.emit_call(f, &vals, sret)
                     }
                     Some(MethodImpl::Builtin { lang, method }) => {
                         // Built-in implementations work on values.
                         let mut vs = vals.clone();
                         for (v, t) in vs.iter_mut().zip(&by_ref_tys) {
                             if let Some(t) = t {
-                                let lt = self.cg.llty(t);
-                                *v = self.cg.b.build_load(lt, v.into_pointer_value(), "").unwrap();
+                                *v = self.load(v.into_pointer_value(), t);
                             }
                         }
                         Some(self.builtin(&lang, &method, &vs, &st, ret, span))
@@ -227,19 +243,21 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 };
                 let ps: Vec<(Ty, bool)> = params.iter().map(|(m, t)| (t.clone(), *m != ParamMode::Take)).collect();
                 let fty = self.cg.fn_ty(&ps, &r, false);
-                let args: Vec<BasicMetadataValueEnum> = vals.iter().map(|v| (*v).into()).collect();
-                let cs = self.cg.b.build_indirect_call(fty, indirect.unwrap(), &args, "").unwrap();
-                cs.try_as_basic_value().basic()
+                let sret = self.ret_slot(ret, dest);
+                self.emit_indirect(fty, indirect.unwrap(), &vals, sret)
             }
             Callee::Value { callee: f, .. } => {
                 let at = value_callee.unwrap();
                 match self.t(&f.ty) {
-                    Ty::Closure(def, targs) => self.call_closure(def, &targs, at, &vals),
+                    Ty::Closure(def, targs) => {
+                        let sret = self.ret_slot(ret, dest);
+                        self.call_closure(def, &targs, at, &vals, sret)
+                    }
                     Ty::FnPtr(params, r) => {
                         let ps: Vec<(Ty, bool)> = params.iter().map(|(m, t)| (t.clone(), *m != ParamMode::Take)).collect();
                         let fty = self.cg.fn_ty(&ps, &r, false);
-                        let args: Vec<BasicMetadataValueEnum> = vals.iter().map(|v| (*v).into()).collect();
-                        self.cg.b.build_indirect_call(fty, at, &args, "").unwrap().try_as_basic_value().basic()
+                        let sret = self.ret_slot(ret, dest);
+                        self.emit_indirect(fty, at, &vals, sret)
                     }
                     other => {
                         let s = self.cg.p.ty_str(&other);
@@ -258,10 +276,26 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         Some(result.unwrap_or_else(|| self.unit()))
     }
 
-    fn emit_call(&mut self, f: FunctionValue<'ctx>, vals: &[BV<'ctx>]) -> Option<BV<'ctx>> {
-        let args: Vec<BasicMetadataValueEnum> = vals.iter().map(|v| (*v).into()).collect();
-        let cs = self.cg.b.build_call(f, &args, "").unwrap();
-        cs.try_as_basic_value().basic()
+    /// The arguments of a call: `sret` (where a result that lives in memory
+    /// goes) first, then `vals`.
+    fn call_args(vals: &[BV<'ctx>], sret: Option<PointerValue<'ctx>>) -> Vec<BasicMetadataValueEnum<'ctx>> {
+        sret.map(|s| s.into()).into_iter().chain(vals.iter().map(|v| (*v).into())).collect()
+    }
+
+    fn emit_call(&mut self, f: FunctionValue<'ctx>, vals: &[BV<'ctx>], sret: Option<PointerValue<'ctx>>) -> Option<BV<'ctx>> {
+        let cs = self.cg.b.build_call(f, &Self::call_args(vals, sret), "").unwrap();
+        match sret {
+            Some(s) => Some(s.into()),
+            None => cs.try_as_basic_value().basic(),
+        }
+    }
+
+    fn emit_indirect(&mut self, fty: FunctionType<'ctx>, f: PointerValue<'ctx>, vals: &[BV<'ctx>], sret: Option<PointerValue<'ctx>>) -> Option<BV<'ctx>> {
+        let cs = self.cg.b.build_indirect_call(fty, f, &Self::call_args(vals, sret), "").unwrap();
+        match sret {
+            Some(s) => Some(s.into()),
+            None => cs.try_as_basic_value().basic(),
+        }
     }
 
     // ===================================================================== intrinsics
@@ -339,12 +373,9 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                 self.cg.b.build_indirect_call(fty, thunk, &[env.into(), vals[1].into()], "").unwrap();
                 self.unit()
             }
-            "ptr_read" => {
-                let lt = self.cg.llty(&targs[0]);
-                self.cg.b.build_load(lt, ptr(vals[0]), "").unwrap()
-            }
+            "ptr_read" => self.load(ptr(vals[0]), &targs[0]),
             "ptr_write" => {
-                self.cg.b.build_store(ptr(vals[0]), vals[1]).unwrap();
+                self.store(ptr(vals[0]), vals[1], &targs[0]);
                 self.unit()
             }
             "ptr_offset" | "ptr_offset_mut" => {
@@ -428,7 +459,7 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
         let len = self.cg.b.build_load(self.cg.usize_ty(), lp, "").unwrap().into_int_value();
         let et = self.cg.llty(elem);
         let slot = unsafe { self.cg.b.build_gep(et, data, &[len], "").unwrap() };
-        self.cg.b.build_store(slot, v).unwrap();
+        self.store(slot, v, elem);
         let n = self.cg.b.build_int_add(len, self.usize(1), "").unwrap();
         self.cg.b.build_store(lp, n).unwrap();
     }
@@ -775,7 +806,8 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             .collect();
         for (i, v) in arg_vals.iter().enumerate() {
             let fp = self.struct_field(env_ty.into(), env, i as u32);
-            self.cg.b.build_store(fp, *v).unwrap();
+            let t = arg_tys[i].clone();
+            self.store(fp, *v, &t);
             // An owned value made for the hole (`{name()}`) is a temporary
             // of the statement; a borrowed place is not ours to free.
             if !Self::is_borrowed(args[i]) {
@@ -823,14 +855,24 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                     let trait_id = cg.p.lang_item(lang).ok_or_else(|| format!("missing lang item `{lang}`"))?;
                     let t = &arg_tys[ai];
                     let fp = cg.b.build_struct_gep(env_ty, env, ai as u32, "").unwrap();
-                    let lt = cg.llty(t);
-                    let v = cg.b.build_load(lt, fp, "").unwrap();
                     let tr = TraitRef { trait_id, args: vec![] };
                     match cg.p.resolve_method(&tr, t, method, &[]) {
                         Some(MethodImpl::Fn { def, args }) => {
                             let callee = cg.instance(def, &args);
-                            // `fmt(&self, ..)` takes the value's address.
-                            let recv = if cg.p.param_by_ref(def, 0) { fp.into() } else { v.into() };
+                            // `fmt(&self, ..)` takes the value's address; a
+                            // value that lives in memory is passed as a
+                            // pointer to a copy.
+                            let recv = if cg.p.param_by_ref(def, 0) {
+                                fp.into()
+                            } else if cg.in_memory(t) {
+                                let lt = cg.llty(t);
+                                let copy = cg.entry_alloca(f, lt, "copy");
+                                cg.copy_mem(copy, fp, t);
+                                copy.into()
+                            } else {
+                                let lt = cg.llty(t);
+                                cg.b.build_load(lt, fp, "").unwrap().into()
+                            };
                             cg.b.build_call(callee, &[recv, out.into()], "").unwrap();
                         }
                         _ => return Err(format!("no `{name}` implementation for `{}`", cg.p.ty_str(t))),
