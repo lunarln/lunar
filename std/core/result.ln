@@ -41,7 +41,7 @@ impl::<T, E> Result::<T, E> {
     }
 }
 
-impl::<T: crater::fmt::Debug + Dull, E: crater::fmt::Debug + Dull> crater::fmt::Debug for Result::<T, E> {
+impl::<T: crater::fmt::Debug + Light, E: crater::fmt::Debug + Light> crater::fmt::Debug for Result::<T, E> {
     fn debug(&self, out: &mut String) {
         match self {
             Result::Ok(v) => {

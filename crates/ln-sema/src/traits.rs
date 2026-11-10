@@ -83,6 +83,42 @@ impl Program {
         }
     }
 
+    /// Whether `ty` is Light: owns no array or string (Dull types, views,
+    /// pointers, and anything built only from those). Light types are the
+    /// ones copied implicitly, and the only possible array items.
+    pub fn is_light(&self, ty: &Ty, env: &[Pred]) -> bool {
+        self.is_light_rec(ty, env, 0)
+    }
+
+    fn is_light_rec(&self, ty: &Ty, env: &[Pred], depth: u32) -> bool {
+        if depth > 64 {
+            return true; // recursive types are reported elsewhere
+        }
+        match ty {
+            Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Never | Ty::Error => true,
+            Ty::Str | Ty::FmtArgs | Ty::Ptr(..) | Ty::FnPtr(..) => true,
+            Ty::String => false,
+            Ty::Array(e, k) => !k.is_owner() && self.is_light_rec(e, env, depth + 1),
+            Ty::Grow(t) => self.is_light_rec(t, env, depth + 1),
+            Ty::Tuple(ts) => ts.iter().all(|t| self.is_light_rec(t, env, depth + 1)),
+            Ty::Adt(id, args) => {
+                let adt = self.adt(*id);
+                adt.variants.iter().all(|v| v.fields.iter().all(|f| self.is_light_rec(&f.ty.subst(args), env, depth + 1)))
+            }
+            // `T: Dull` implies `T: Light` (`Dull` is a subtrait).
+            Ty::Param(..) => {
+                let (Some(light), dull) = (self.lang_item("light"), self.lang_item("dull")) else { return false };
+                self.elaborate(env).iter().any(|p| p.ty == *ty && (p.trait_ref.trait_id == light || Some(p.trait_ref.trait_id) == dull))
+            }
+            Ty::Closure(def, args) => self.closure_fields(*def, args).iter().all(|t| self.is_light_rec(t, env, depth + 1)),
+            Ty::Opaque(def, i, args) => {
+                let (Some(light), dull) = (self.lang_item("light"), self.lang_item("dull")) else { return false };
+                self.elaborate(&self.opaque_preds(*def, *i, args)).iter().any(|p| p.trait_ref.trait_id == light || Some(p.trait_ref.trait_id) == dull)
+            }
+            Ty::Infer(_) => false,
+        }
+    }
+
     /// Whether a value of `ty` owns a data stack (directly or in a field).
     pub fn has_owner(&self, ty: &Ty) -> bool {
         self.has_owner_rec(ty, 0)
@@ -121,7 +157,7 @@ impl Program {
             Ty::String => true,
             Ty::Array(_, k) => k.is_owner(),
             // A generic parameter might be instantiated with an owner.
-            Ty::Param(..) | Ty::Opaque(..) => !self.is_dull(ty, env),
+            Ty::Param(..) | Ty::Opaque(..) => !self.is_light(ty, env),
             Ty::Tuple(ts) => ts.iter().any(|t| self.could_own_rec(t, env, depth + 1)),
             Ty::Adt(id, args) => {
                 let adt = self.adt(*id);
@@ -133,7 +169,8 @@ impl Program {
     }
 
     /// Whether values of `ty` are implicitly copied (rather than moved).
-    /// Generic parameters are copyable only when bounded by `Dull`.
+    /// Generic parameters are copyable only when bounded by `Light` (or
+    /// `Dull`).
     pub fn is_copy(&self, ty: &Ty, env: &[Pred]) -> bool {
         self.is_copy_rec(ty, env, 0)
     }
@@ -145,7 +182,7 @@ impl Program {
         match ty {
             Ty::String => false,
             Ty::Array(e, k) => !k.is_owner() && self.is_copy_rec(e, env, depth + 1),
-            Ty::Param(..) | Ty::Opaque(..) => self.is_dull(ty, env),
+            Ty::Param(..) | Ty::Opaque(..) => self.is_light(ty, env),
             Ty::Tuple(ts) => ts.iter().all(|t| self.is_copy_rec(t, env, depth + 1)),
             Ty::Adt(id, args) => {
                 let adt = self.adt(*id);
@@ -171,6 +208,7 @@ impl Program {
         let float = matches!(ty, Ty::Float(_));
         match lang {
             "dull" => self.is_dull(ty, env),
+            "light" => self.is_light(ty, env),
             "add" | "sub" | "mul" | "div" | "rem" => int || float,
             "neg" => signed || float,
             "not" => int || matches!(ty, Ty::Bool),
@@ -282,7 +320,7 @@ impl Program {
         if self.builtin_impl(ty, tr.trait_id, env) {
             return true;
         }
-        if self.is_lang(tr.trait_id, "dull") {
+        if self.is_lang(tr.trait_id, "dull") || self.is_lang(tr.trait_id, "light") {
             return false;
         }
         self.find_impl_depth(ty, tr, env, depth).is_some()
@@ -295,6 +333,7 @@ impl Program {
         if let Some(lang) = &lang
             && self.builtin_impl(self_ty, tr.trait_id, &[])
             && lang != "dull"
+            && lang != "light"
         {
             return Some(MethodImpl::Builtin { lang: lang.clone(), method: method.to_string() });
         }

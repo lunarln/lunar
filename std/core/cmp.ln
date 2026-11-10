@@ -71,12 +71,12 @@ impl crater::fmt::Display for Ordering {
     }
 }
 
-pub fn min::<T: Ord + Dull>(a: T, b: T): T {
+pub fn min::<T: Ord + Light>(a: T, b: T): T {
     if b < a { return b; }
     return a;
 }
 
-pub fn max::<T: Ord + Dull>(a: T, b: T): T {
+pub fn max::<T: Ord + Light>(a: T, b: T): T {
     if b > a { return b; }
     return a;
 }

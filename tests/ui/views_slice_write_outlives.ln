@@ -1,0 +1,11 @@
+// error: borrow::outlives_root
+// Writing through a slice stores into the array it views.
+fn main() {
+    let mut picks: [str; 2] = ["", ""];
+    {
+        let s = String::from("temporary");
+        let slots: [str; &mut] = picks[..];
+        slots[0] = s.as_str();
+    }
+    println("{picks[0]}");
+}

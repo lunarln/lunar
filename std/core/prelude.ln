@@ -2,7 +2,7 @@
 // imports its derive macro (they share a path: `#[derive(Eq)]`), and
 // importing `assert` / `assert_eq` also imports `assert!` / `assert_eq!`.
 
-pub use crater::ptr::Dull;
+pub use crater::ptr::{Dull, Light};
 pub use crater::option::Option::{self, Some, None};
 pub use crater::result::Result::{self, Ok, Err};
 pub use crater::cmp::{Eq, Ord, Ordering};

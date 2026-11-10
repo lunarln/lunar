@@ -232,10 +232,12 @@ impl<'a> Sema<'a> {
                 _ => {}
             }
         }
-        if let Some(dull) = self.p.lang_item("dull")
-            && let DefData::Trait(t) = &mut self.p.defs[dull.0 as usize].data
-        {
-            t.auto = true;
+        for lang in ["dull", "light"] {
+            if let Some(d) = self.p.lang_item(lang)
+                && let DefData::Trait(t) = &mut self.p.defs[d.0 as usize].data
+            {
+                t.auto = true;
+            }
         }
         // 2. Bounds and supertraits.
         for i in 0..n {
@@ -858,7 +860,7 @@ impl<'a> Sema<'a> {
             }
             match d.kind {
                 DeferKind::ArrayElem => {
-                    if !self.p.is_dull(&d.ty, &d.env) {
+                    if !self.p.is_light(&d.ty, &d.env) {
                         let diag = self.pointy_diag(&d.ty, d.span, d.generics_span);
                         self.err(diag);
                     }
@@ -893,22 +895,22 @@ impl<'a> Sema<'a> {
         }
     }
 
-    /// The `err(type::array_pointy_items)` diagnostic.
+    /// The `err(type::array_owner_items)` diagnostic.
     pub(crate) fn pointy_diag(&self, elem: &Ty, span: Span, generics_span: Span) -> Diagnostic {
         let s = self.p.ty_str(elem);
-        let mut d = Diagnostic::error(tyc::ARRAY_POINTY_ITEMS, span, "Arrays and slices must have an item type that is not pointy.")
-            .with_label(format!("`{s}` is not known to be `Dull`"));
+        let mut d = Diagnostic::error(tyc::ARRAY_OWNER_ITEMS, span, "Arrays and slices cannot hold items that own arrays or strings.")
+            .with_label(format!("`{s}` is not known to be `Light`"));
         match elem {
             Ty::Param(_, n) => {
-                d = d.with_help(format!("add Dull to {n}'s bounds: `{n}: Dull`"));
+                d = d.with_help(format!("add Light to {n}'s bounds: `{n}: Light`"));
                 if !generics_span.is_dummy() {
                     d = d.with_secondary(generics_span, format!("`{n}` is declared here"));
                 }
             }
             _ => {
                 d = d.with_note(format!(
-                    "`{s}` is pointy: it is or contains a pointer, slice, string or array. \
-                     Only Dull types (no pointers or arrays inside) can be array items"
+                    "`{s}` owns an array or string. Items may be views (`str`, slices) or Dull values, \
+                     but not owners: store the owners elsewhere (an arena, or one big array) and keep views or handles here"
                 ));
             }
         }
@@ -1031,6 +1033,18 @@ impl<'a> Sema<'a> {
             self.err(
                 Diagnostic::error(trait_::DULL_IMPL, tr_span, msg)
                     .with_note("the compiler implements `core::ptr::Dull` automatically for every type without pointers, slices, strings or arrays"),
+            );
+            return;
+        }
+        if self.p.is_lang(tr.trait_id, "light") {
+            let msg = if data.negative {
+                "`Light` cannot be negated: whether a type is Light is decided by the compiler"
+            } else {
+                "`Light` cannot be implemented manually: the compiler implements it"
+            };
+            self.err(
+                Diagnostic::error(trait_::DULL_IMPL, tr_span, msg)
+                    .with_note("the compiler implements `core::ptr::Light` automatically for every type that owns no array or string"),
             );
             return;
         }

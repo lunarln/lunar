@@ -24,7 +24,7 @@ codes! {
     // rendered as `type`.
     ty ("type") => {
         MISMATCH = "mismatch",
-        ARRAY_POINTY_ITEMS = "array_pointy_items",
+        ARRAY_OWNER_ITEMS = "array_owner_items",
         GROW_OUTSIDE_PARAM = "grow_outside_param",
         GROW_NO_OWNER = "grow_no_owner",
         GROW_WITHOUT_MUT = "grow_without_mut",

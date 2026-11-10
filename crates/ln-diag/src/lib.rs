@@ -1,7 +1,7 @@
 //! Diagnostics infrastructure for the Lunar compiler.
 //!
 //! Every error the compiler reports carries a *scoped* code such as
-//! `type::array_pointy_items`, rendered as `err(type::array_pointy_items): ...`.
+//! `type::array_owner_items`, rendered as `err(type::array_owner_items): ...`.
 
 pub mod codes;
 mod render;
@@ -18,7 +18,7 @@ pub enum Severity {
     Warning,
 }
 
-/// A scoped diagnostic code, e.g. `type::array_pointy_items`.
+/// A scoped diagnostic code, e.g. `type::array_owner_items`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Code {
     pub scope: &'static str,

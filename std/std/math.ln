@@ -17,15 +17,15 @@ pub fn pow::<T: Int>(base: T, exp: u32): T {
     return result;
 }
 
-pub fn min::<T: Ord + Dull>(a: T, b: T): T {
+pub fn min::<T: Ord + Light>(a: T, b: T): T {
     return core::cmp::min(a, b);
 }
 
-pub fn max::<T: Ord + Dull>(a: T, b: T): T {
+pub fn max::<T: Ord + Light>(a: T, b: T): T {
     return core::cmp::max(a, b);
 }
 
-pub fn clamp::<T: Ord + Dull>(x: T, lo: T, hi: T): T {
+pub fn clamp::<T: Ord + Light>(x: T, lo: T, hi: T): T {
     if x < lo { return lo; }
     if x > hi { return hi; }
     return x;

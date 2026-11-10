@@ -16,7 +16,7 @@
 
 use crate::Program;
 use crate::thir::*;
-use crate::ty::Ty;
+use crate::ty::{ArrKind, Ty};
 use ln_diag::{Diagnostic, Diagnostics, Span, codes::borrow, codes::lint};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -301,6 +301,59 @@ impl<'p> Cx<'p, '_> {
         }
     }
 
+    /// Whether a value of `t` has storage a view could point into: an owned
+    /// array or string, or an inline array, anywhere inside it. A value
+    /// without (a number, a `str`, an iterator holding only views) can only
+    /// be pointed *through*.
+    fn has_storage(&self, t: &Ty, depth: u32) -> bool {
+        if depth > 32 {
+            return true;
+        }
+        match t {
+            Ty::String => true,
+            // Owning and inline arrays are storage; a slice only points.
+            Ty::Array(_, k) => !k.is_slice(),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.has_storage(t, depth + 1)),
+            Ty::Adt(d, args) => {
+                let adt = self.p.adt(*d);
+                adt.variants.iter().any(|v| v.fields.iter().any(|f| self.has_storage(&f.ty.subst(args), depth + 1)))
+            }
+            Ty::Grow(t) => self.has_storage(t, depth + 1),
+            Ty::Closure(d, args) => self.p.closures.get(d).is_none_or(|c| c.captures.iter().any(|cap| !cap.by_ref && self.has_storage(&cap.ty.subst(args), depth + 1))),
+            // `impl Trait`: look at the type behind it once its function is
+            // checked (like an auto trait, this is not part of the bounds).
+            Ty::Opaque(d, i, args) => match self.p.opaques.get(&(*d, *i)).and_then(|o| o.concrete.as_ref()) {
+                Some(c) => self.has_storage(&c.subst(args), depth + 1),
+                None => !self.p.is_dull(t, self.env),
+            },
+            // Dull types hold no arrays; anything else generic might.
+            Ty::Param(..) | Ty::Infer(_) => !self.p.is_dull(t, self.env),
+            _ => false,
+        }
+    }
+
+    /// Whether a declared type (in a signature) can hold a view by itself,
+    /// not counting the function's generic parameters: their values are
+    /// the caller's, copied in and out.
+    fn has_own_view(&self, t: &Ty, depth: u32) -> bool {
+        if depth > 32 {
+            return true;
+        }
+        match t {
+            Ty::Str | Ty::FmtArgs => true,
+            Ty::Array(e, k) => k.is_slice() || self.has_own_view(e, depth + 1),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.has_own_view(t, depth + 1)),
+            Ty::Adt(d, args) => {
+                let adt = self.p.adt(*d);
+                adt.variants.iter().any(|v| v.fields.iter().any(|f| self.has_own_view(&f.ty.subst(args), depth + 1)))
+            }
+            Ty::Grow(t) => self.has_own_view(t, depth + 1),
+            Ty::Param(..) => false,
+            Ty::Closure(..) | Ty::Opaque(..) => true,
+            _ => false,
+        }
+    }
+
     // ===================================================================== roots
 
     fn place_root(&self, e: &Expr) -> Option<Root> {
@@ -331,7 +384,18 @@ impl<'p> Cx<'p, '_> {
                     // Slicing a slice: the data lives wherever the slice points.
                     self.roots.get(l).cloned().unwrap_or_default()
                 } else {
-                    [Root::Local(*l)].into()
+                    // The data lives in `l` (unless it has no storage of its
+                    // own, like an iterator holding only a `str`); if it
+                    // holds views (an array of `str`), the borrow also
+                    // reaches what they point into.
+                    let mut r = Roots::new();
+                    if self.has_storage(&self.local(*l).ty, 0) {
+                        r.insert(Root::Local(*l));
+                    }
+                    if self.has_view(&self.local(*l).ty) {
+                        r.extend(self.roots.get(l).into_iter().flatten().copied());
+                    }
+                    r
                 }
             }
             ExprKind::Field { base, .. } | ExprKind::Index { base, .. } => {
@@ -382,9 +446,23 @@ impl<'p> Cx<'p, '_> {
                 if let Callee::Value { callee: f, .. } = callee {
                     r.extend(if f.is_place() { self.value_roots_of_place(f) } else { self.value_roots(f) });
                 }
+                // A plain function whose declared return type has no view of
+                // its own (`pop(&mut self): Option::<T>`) cannot point into
+                // its arguments' storage: it can only hand back copies of
+                // items, which point where the items point. Trait methods
+                // stay conservative: an implementation may return views
+                // into itself.
+                let copies_only = match callee {
+                    Callee::Fn { def, .. } | Callee::Intrinsic { def, .. } => !self.has_own_view(&self.p.fn_data(*def).sig.ret, 0),
+                    _ => false,
+                };
                 for a in args {
                     match a {
+                        Arg::InOut(p) if copies_only => r.extend(self.value_roots_of_place(p)),
                         Arg::InOut(p) => r.extend(self.borrow_roots(p)),
+                        Arg::Value(Expr { kind: ExprKind::Read { place, mode: ReadMode::Borrow }, .. }) if copies_only => {
+                            r.extend(self.value_roots_of_place(place));
+                        }
                         Arg::Value(v) => r.extend(self.arg_roots(v)),
                     }
                 }
@@ -449,20 +527,50 @@ impl<'p> Cx<'p, '_> {
         Some(self.p.fn_data(def).sig.params.iter().map(|p| p.kept).collect())
     }
 
+    /// The storage a write into `place` changes: the root local, or, for a
+    /// write through a slice (`s[i] = v`), whatever the slice points into
+    /// (an owner `Local`, or a parameter's data `Arg`). A slice variable
+    /// `lent` in-out may be both reassigned and written through.
+    fn write_targets(&self, place: &Expr, lent: bool) -> Vec<Root> {
+        fn through(cx: &Cx, e: &Expr) -> Option<Roots> {
+            match &e.kind {
+                ExprKind::Field { base, .. } | ExprKind::Index { base, .. } => {
+                    if cx.is_view_container(&base.ty) {
+                        Some(cx.value_roots_of_place(base))
+                    } else {
+                        through(cx, base)
+                    }
+                }
+                _ => None,
+            }
+        }
+        let Some(Root::Local(l)) = self.place_root(place) else { return Vec::new() };
+        let mut out = match through(self, place) {
+            Some(roots) => roots.into_iter().collect(),
+            None => vec![Root::Local(l)],
+        };
+        if lent && matches!(place.kind, ExprKind::Local(_)) && self.is_view_container(&self.local(l).ty) {
+            out.extend(self.roots.get(&l).into_iter().flatten().copied());
+        }
+        out.retain(|r| matches!(r, Root::Local(_) | Root::Arg(_)));
+        out
+    }
+
     /// What a call may store where: a view from a `kept` argument may end up
     /// in any in-out argument that can hold one (`h.set(s)` doing
-    /// `self.rest = s`, or `push` onto an array of views), and a closure may
-    /// store any argument or capture into what it borrowed. Pairs of a local
-    /// and the roots it may gain.
-    fn call_flows(&self, callee: &Callee, args: &[Arg]) -> Vec<(LocalId, Roots)> {
-        let mut targets: Vec<LocalId> = Vec::new();
+    /// `self.rest = s`, or `push` onto an array of views), or be written
+    /// through a mutable slice argument (`s.fill(v)`); a closure may store
+    /// any argument or capture into what it borrowed. Pairs of a target (a
+    /// `Local`, or a parameter's data `Arg`) and the roots it may gain.
+    fn call_flows(&self, callee: &Callee, args: &[Arg]) -> Vec<(Root, Roots)> {
+        let mut targets: Vec<Root> = Vec::new();
         for a in args {
-            if let Arg::InOut(p) = a
-                && self.has_view(&p.ty)
-                && let Some(Root::Local(l)) = self.place_root(p)
-                && !self.place_through_view(p)
-            {
-                targets.push(l);
+            match a {
+                Arg::InOut(p) if self.has_view(&p.ty) => targets.extend(self.write_targets(p, true)),
+                Arg::Value(v) if matches!(&v.ty, Ty::Array(e, ArrKind::SliceMut) if self.has_view(e)) => {
+                    targets.extend(self.value_roots(v).into_iter().filter(|r| matches!(r, Root::Local(_) | Root::Arg(_))));
+                }
+                _ => {}
             }
         }
         let mut given = Roots::new();
@@ -470,7 +578,7 @@ impl<'p> Cx<'p, '_> {
             let fr = if f.is_place() { self.value_roots_of_place(f) } else { self.value_roots(f) };
             for r in fr {
                 match r {
-                    Root::Slot(l) if self.has_view(&self.local(l).ty) => targets.push(l),
+                    Root::Slot(l) if self.has_view(&self.local(l).ty) => targets.push(Root::Local(l)),
                     Root::Slot(_) => {}
                     // A view the closure captured by value.
                     other => {
@@ -493,13 +601,27 @@ impl<'p> Cx<'p, '_> {
                 Arg::InOut(_) => {}
             }
         }
+        let mut seen = BTreeSet::new();
         targets
             .into_iter()
-            .filter_map(|l| {
+            .filter(|t| seen.insert(*t))
+            .filter_map(|t| {
+                let (Root::Local(l) | Root::Arg(l)) = t else { return None };
                 let r: Roots = given.iter().copied().filter(|r| !matches!(r, Root::Local(x) | Root::Slot(x) | Root::Arg(x) if *x == l)).collect();
-                (!r.is_empty()).then_some((l, r))
+                (!r.is_empty()).then_some((t, r))
             })
             .collect()
+    }
+
+    /// Check storing a view with `roots` into `target` (from
+    /// [`write_targets`] or [`call_flows`]).
+    fn check_store_into(&mut self, target: Root, roots: &Roots, span: Span) {
+        match target {
+            Root::Local(l) if matches!(self.local(l).kind, LocalKind::Param { owned: false, .. }) => self.check_store_into_param(l, roots, span),
+            Root::Local(l) => self.check_store(l, roots, span),
+            Root::Arg(p) => self.check_store_into_param(p, roots, span),
+            Root::Slot(_) | Root::Temp => {}
+        }
     }
 
     /// Whether local `l` is a parameter declared `kept`.
@@ -696,31 +818,22 @@ impl<'p> Cx<'p, '_> {
                 self.check_views(value);
                 if self.has_view(&value.ty) {
                     let roots = self.value_roots(value);
-                    match self.place_root(place) {
-                        Some(Root::Local(l)) => {
-                            if let LocalKind::Param { owned: false, .. } = self.local(l).kind {
-                                if !self.place_through_view(place) {
-                                    self.check_store_into_param(l, &roots, value.span);
-                                }
-                            } else if !self.place_through_view(place) {
-                                self.check_store(l, &roots, value.span);
-                            }
-                        }
-                        None if matches!(place.kind, ExprKind::Static(_)) && !roots.is_empty() => {
+                    if matches!(place.kind, ExprKind::Static(_)) {
+                        if !roots.is_empty() {
                             self.err(Diagnostic::error(borrow::ESCAPES_FUNCTION, value.span, "cannot store a view of a local value into a static"));
                         }
-                        _ => {}
+                    } else {
+                        for t in self.write_targets(place, false) {
+                            let r: Roots = roots.iter().copied().filter(|r| !matches!((r, t), (Root::Local(x) | Root::Arg(x), Root::Local(y) | Root::Arg(y)) if *x == y)).collect();
+                            self.check_store_into(t, &r, value.span);
+                        }
                     }
                 }
             }
             ExprKind::Call { callee, args } => {
                 visit_children(e, &mut |c| self.check_views(c));
-                for (l, roots) in self.call_flows(callee, args) {
-                    if let LocalKind::Param { owned: false, .. } = self.local(l).kind {
-                        self.check_store_into_param(l, &roots, e.span);
-                    } else {
-                        self.check_store(l, &roots, e.span);
-                    }
+                for (t, roots) in self.call_flows(callee, args) {
+                    self.check_store_into(t, &roots, e.span);
                 }
             }
             ExprKind::Return(Some(v)) => {
@@ -1263,16 +1376,23 @@ fn collect_assigns_block(b: &Block, cx: &Cx, out: &mut Vec<(LocalId, Roots)>) {
 fn collect_assigns(e: &Expr, cx: &Cx, out: &mut Vec<(LocalId, Roots)>) {
     match &e.kind {
         ExprKind::Assign { place, value } => {
-            if let Some(Root::Local(l)) = cx.place_root(place)
-                && !cx.place_through_view(place)
-            {
-                let r = cx.value_roots(value);
-                if !r.is_empty() {
+            let r = cx.value_roots(value);
+            if !r.is_empty() {
+                // Into the variable, or through a slice into what it views.
+                for t in cx.write_targets(place, false) {
+                    if let Root::Local(l) = t {
+                        out.push((l, r.iter().copied().filter(|x| *x != Root::Local(l)).collect()));
+                    }
+                }
+            }
+        }
+        ExprKind::Call { callee, args } => {
+            for (t, r) in cx.call_flows(callee, args) {
+                if let Root::Local(l) = t {
                     out.push((l, r));
                 }
             }
         }
-        ExprKind::Call { callee, args } => out.extend(cx.call_flows(callee, args)),
         ExprKind::Match { scrut, arms } => {
             // Bindings inside arms view whatever the scrutinee views.
             let r = if cx.has_view(&scrut.ty) { cx.value_roots_of_place(scrut) } else { Roots::new() };

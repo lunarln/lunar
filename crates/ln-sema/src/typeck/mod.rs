@@ -80,6 +80,10 @@ pub(crate) struct FnCtx<'s, 'a> {
 impl<'a> Sema<'a> {
     pub(crate) fn check_bodies(&mut self) {
         let n = self.p.defs.len();
+        // Borrow checking waits until every body is type checked: it looks
+        // through `impl Trait` results to the type behind them, which is
+        // only known once the function returning it is checked.
+        let mut checked: Vec<(thir::Body, bool, bool)> = Vec::new();
         for i in 0..n {
             let id = DefId(i as u32);
             if let AstRef::Fn(f, false) = self.ast(id)
@@ -96,19 +100,24 @@ impl<'a> Sema<'a> {
                 let (b, closures) = FnCtx::check_fn(self, id, f, body);
                 let krate = self.mod_data(self.p.defs[i].module).krate;
                 let is_std = self.p.crate_roots.iter().any(|(n, r)| *r == krate && (n == "core" || n == "std"));
+                let ok = self.diags.error_count() == errs_before;
                 // Closures first: their bodies are part of this function's.
                 for c in closures {
-                    self.finish_body(c, errs_before, is_std);
+                    checked.push((c, ok, is_std));
                 }
-                self.finish_body(b, errs_before, is_std);
+                checked.push((b, ok, is_std));
             }
+        }
+        for (b, ok, is_std) in checked {
+            self.finish_body(b, ok, is_std);
         }
     }
 
     /// Borrow check and lint a checked body (if type checking its function
-    /// found no errors), then keep it.
-    fn finish_body(&mut self, b: thir::Body, errs_before: usize, is_std: bool) {
-        if self.diags.error_count() == errs_before {
+    /// found no errors, `typeck_ok`), then keep it.
+    fn finish_body(&mut self, b: thir::Body, typeck_ok: bool, is_std: bool) {
+        let errs_before = self.diags.error_count();
+        if typeck_ok {
             // A closure's body has the bounds of the function it is in.
             let owner = self.p.closures.get(&b.def).map_or(b.def, |c| c.parent);
             let env = self.env_of(owner);
@@ -858,6 +867,8 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                     d = d.with_help(format!("add {tn} to {n}'s bounds: `{n}: {tn}`"));
                 } else if self.s.p.is_lang(tr.trait_id, "dull") {
                     d = d.with_note(format!("`{ts}` is pointy: it is or contains a pointer, slice, string or array"));
+                } else if self.s.p.is_lang(tr.trait_id, "light") {
+                    d = d.with_note(format!("`{ts}` owns an array or string"));
                 }
                 self.err(d);
             }
@@ -868,7 +879,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             if t.has_infer() || t.has_error() {
                 continue;
             }
-            if !self.s.p.is_dull(&t, &self.env) {
+            if !self.s.p.is_light(&t, &self.env) {
                 let d = self.s.pointy_diag(&t, span, self.cx.generics_span);
                 self.err(d);
             }

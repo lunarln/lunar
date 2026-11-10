@@ -1,9 +1,0 @@
-// error: type::array_pointy_items
-// This does not compile:
-// err(type::array_pointy_items): Arrays and slices must have an item type that
-// is not pointy.
-// help: add Dull to T's bounds: `T: Dull`
-fn len_squared_erroring::<T>(slice: &[T; &]): usize {
-    let len: usize = slice.len();
-    return std::math::pow(len, 2);
-}

@@ -1,0 +1,9 @@
+// error: type::array_owner_items
+// This does not compile:
+// err(type::array_owner_items): Arrays and slices cannot hold items that own
+// arrays or strings.
+// help: add Light to T's bounds: `T: Light`
+fn len_squared_erroring::<T>(slice: &[T; &]): usize {
+    let len: usize = slice.len();
+    return std::math::pow(len, 2);
+}

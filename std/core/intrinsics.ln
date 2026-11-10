@@ -4,25 +4,25 @@
 #[intrinsic] pub fn align_of::<T>(): usize;
 
 // ----- slices -----
-#[intrinsic] pub fn slice_len::<T: Dull>(s: [T; &]): usize;
-#[intrinsic] pub fn slice_ptr::<T: Dull>(s: [T; &]): *T;
-#[intrinsic] pub fn slice_mut_ptr::<T: Dull>(s: [T; &mut]): *mut T;
-#[intrinsic] pub unsafe fn slice_from_raw::<T: Dull>(p: *T, len: usize): [T; &];
-#[intrinsic] pub unsafe fn slice_mut_from_raw::<T: Dull>(p: *mut T, len: usize): [T; &mut];
+#[intrinsic] pub fn slice_len::<T: Light>(s: [T; &]): usize;
+#[intrinsic] pub fn slice_ptr::<T: Light>(s: [T; &]): *T;
+#[intrinsic] pub fn slice_mut_ptr::<T: Light>(s: [T; &mut]): *mut T;
+#[intrinsic] pub unsafe fn slice_from_raw::<T: Light>(p: *T, len: usize): [T; &];
+#[intrinsic] pub unsafe fn slice_mut_from_raw::<T: Light>(p: *mut T, len: usize): [T; &mut];
 
 // ----- owning arrays -----
 /// Append one element (grows the array's data stack in place).
-#[intrinsic] pub fn arr_push::<T: Dull>(a: &mut +[T; ..+], value: T);
+#[intrinsic] pub fn arr_push::<T: Light>(a: &mut +[T; ..+], kept value: T);
 /// Append a copy of every element of `s`.
-#[intrinsic] pub fn arr_extend::<T: Dull>(a: &mut +[T; ..+], s: [T; &]);
+#[intrinsic] pub fn arr_extend::<T: Light>(a: &mut +[T; ..+], kept s: [T; &]);
 /// Make room for `extra` more elements without changing the length.
-#[intrinsic] pub fn arr_reserve::<T: Dull>(a: &mut +[T; ..+], extra: usize);
-#[intrinsic] pub fn arr_cap::<T: Dull>(a: &mut [T; ..+], count: usize);
+#[intrinsic] pub fn arr_reserve::<T: Light>(a: &mut +[T; ..+], extra: usize);
+#[intrinsic] pub fn arr_cap::<T: Light>(a: &mut [T; ..+], count: usize);
 #[intrinsic] pub fn string_cap(s: &mut String, bytes: usize);
 /// Shrink to `len` elements (no-op if already shorter).
-#[intrinsic] pub fn arr_truncate::<T: Dull>(a: &mut [T; -..+], len: usize);
+#[intrinsic] pub fn arr_truncate::<T: Light>(a: &mut [T; -..+], len: usize);
 /// A frozen `[T]` holding a copy of `s`.
-#[intrinsic] pub fn arr_from_slice::<T: Dull>(s: [T; &]): [T];
+#[intrinsic] pub fn arr_from_slice::<T: Light>(s: [T; &]): [T];
 
 // ----- strings -----
 #[intrinsic] pub fn str_len(s: str): usize;

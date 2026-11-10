@@ -1,4 +1,4 @@
-// error: type::array_pointy_items
+// error: type::array_owner_items
 struct Bad {
     names: [String; 3],
 }

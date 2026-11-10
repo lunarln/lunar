@@ -1,0 +1,10 @@
+// error: borrow::outlives_root
+// `names` would keep a view into `s` after `s` is freed.
+fn main() {
+    let mut names: [str; ..+] = [];
+    {
+        let s = String::from("temporary");
+        names.push(s.as_str());
+    }
+    println("{names[0]}");
+}

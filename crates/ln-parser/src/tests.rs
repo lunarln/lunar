@@ -26,7 +26,7 @@ fn example_arrays_parses() {
 
 #[test]
 fn ui_pointy_parses() {
-    parse_ok(include_str!("../../../tests/ui/array_pointy_items.ln"));
+    parse_ok(include_str!("../../../tests/ui/array_owner_items.ln"));
 }
 
 #[test]

@@ -1,4 +1,0 @@
-// error: type::array_pointy_items
-fn main() {
-    let words: [str; 2] = ["a", "b"];
-}

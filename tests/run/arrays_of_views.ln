@@ -1,0 +1,77 @@
+// Arrays, slices, arenas and maps of views (`Light` items).
+use core::arena::Arena;
+use core::collections::HashMap;
+
+struct Token {
+    text: str,
+    line: u32,
+}
+
+fn longest(words: [str; &]): str {
+    let mut best = "";
+    for w in words {
+        if w.len() > best.len() {
+            best = w;
+        }
+    }
+    best
+}
+
+// Generic over Light items: views or Dull values.
+fn last::<T: Light>(items: [T; &]): Option::<T> {
+    if items.len() == 0 { None } else { Some(items[items.len() - 1]) }
+}
+
+fn main() {
+    let text = String::from("the quick brown fox\njumps over\nthe lazy dog");
+
+    // A growable array of views into `text`.
+    let mut words: [str; ..+] = [];
+    for line in text.as_str().lines() {
+        for w in line.split(" ") {
+            words.push(w);
+        }
+    }
+    println("{words.len()} words, longest {longest(words[..])}, last {last(words[..]):?}");
+
+    // A fixed array of views, and a slice of it.
+    let names: [str; 3] = ["ada", "grace", "edsger"];
+    let some = names[1..];
+    println("{some[0]} {some.len()} {last(names[..]):?}");
+
+    // Writing through a mutable slice of views.
+    let mut picks: [str; 2] = ["", ""];
+    let slots: [str; &mut] = picks[..];
+    slots[0] = words[1];
+    slots[1] = names[0];
+    println("{picks[0]} {picks[1]}");
+
+    // Popping views: each points into `text`, not into the stack, so the
+    // second pop does not end the first.
+    let mut stack: [str; -..+] = [];
+    stack.extend(words[0..3]);
+    let a = stack.pop();
+    let b = stack.pop();
+    stack.clear();
+    println("{a:?} {b:?} {stack.len()}");
+
+    // An arena of nodes holding views.
+    let mut toks: Arena::<Token> = Arena::new();
+    let mut n: u32 = 0;
+    for line in text.as_str().lines() {
+        n += 1;
+        toks.add(Token { text: line, line: n });
+    }
+    for t in toks.items() {
+        println("{t.line}: {t.text}");
+    }
+
+    // A map keyed by views.
+    let mut counts: HashMap::<str, i32> = HashMap::new();
+    for w in words {
+        if !counts.update(w, |c| c + 1) {
+            counts.insert(w, 1);
+        }
+    }
+    println("the={counts.get_or("the", 0)} fox={counts.get_or("fox", 0)} cat={counts.get_or("cat", 0)}");
+}

@@ -1,4 +1,4 @@
-// Hash maps. Keys and values are Dull, like array items. `HashMap` is
+// Hash maps. Keys and values are Light, like array items. `HashMap` is
 // unordered; `OrderedHashMap` iterates in insertion order (for
 // deterministic output). Changing a value in place goes through a closure:
 // `m.update(k, |v| v + 1)`.
@@ -6,12 +6,12 @@
 use crater::hash::{Hash, Hasher, hash_of};
 
 /// One slot of a table: empty, or a key with its value and hash.
-enum Slot::<K: Dull, V: Dull> {
+enum Slot::<K: Light, V: Light> {
     Empty,
     Full(u64, K, V),
 }
 
-fn is_full::<K: Dull, V: Dull>(s: Slot::<K, V>): bool {
+fn is_full::<K: Light, V: Light>(s: Slot::<K, V>): bool {
     return match s {
         Slot::Full(..) => true,
         Slot::Empty => false,
@@ -19,13 +19,13 @@ fn is_full::<K: Dull, V: Dull>(s: Slot::<K, V>): bool {
 }
 
 /// An unordered map from `K` to `V` (open addressing, linear probing).
-pub struct HashMap::<K: Dull + Hash + Eq, V: Dull> {
+pub struct HashMap::<K: Light + Hash + Eq, V: Light> {
     /// A power of two in length (or empty).
     slots: [Slot::<K, V>; ..+],
     len: usize,
 }
 
-impl::<K: Dull + Hash + Eq, V: Dull> HashMap::<K, V> {
+impl::<K: Light + Hash + Eq, V: Light> HashMap::<K, V> {
     pub fn new(): HashMap::<K, V> {
         return HashMap { slots: [], len: 0 };
     }
@@ -76,7 +76,7 @@ impl::<K: Dull + Hash + Eq, V: Dull> HashMap::<K, V> {
     /// Set the value for `k`; returns the value it replaced. A plain
     /// `&mut self`: growing replaces the table, so a loop over the map
     /// cannot insert into it.
-    pub fn insert(&mut self, k: K, v: V): Option::<V> {
+    pub fn insert(&mut self, kept k: K, kept v: V): Option::<V> {
         if (self.len + 1) * 4 > self.slots.len() * 3 {
             self.grow();
         }
@@ -119,7 +119,7 @@ impl::<K: Dull + Hash + Eq, V: Dull> HashMap::<K, V> {
 
     /// Replace the value for `k` with what `f` makes of it. Returns false
     /// (and does not call `f`) if there is no value for `k`.
-    pub fn update::<F: FnOnce(V): V>(&mut self, k: K, f: F): bool {
+    pub fn update::<F: FnOnce(V): V>(&mut self, kept k: K, kept f: F): bool {
         if self.len == 0 {
             return false;
         }
@@ -184,14 +184,14 @@ impl::<K: Dull + Hash + Eq, V: Dull> HashMap::<K, V> {
     }
 }
 
-impl::<K: Dull + Hash + Eq + Debug, V: Dull + Debug> Debug for HashMap::<K, V> {
+impl::<K: Light + Hash + Eq + Debug, V: Light + Debug> Debug for HashMap::<K, V> {
     fn debug(&self, out: &mut String) {
         debug_entries(self.iter(), out);
     }
 }
 
 /// `{k: v, ...}`.
-fn debug_entries::<K: Dull + Debug, V: Dull + Debug, I: Iterator::<(K, V)>>(mut it: I, out: &mut String) {
+fn debug_entries::<K: Light + Debug, V: Light + Debug, I: Iterator::<(K, V)>>(mut it: I, out: &mut String) {
     out.push('{');
     let mut first = true;
     for (k, v) in it {
@@ -206,12 +206,12 @@ fn debug_entries::<K: Dull + Debug, V: Dull + Debug, I: Iterator::<(K, V)>>(mut 
     out.push('}');
 }
 
-struct Entries::<K: Dull, V: Dull> {
+struct Entries::<K: Light, V: Light> {
     slots: [Slot::<K, V>; &],
     i: usize,
 }
 
-impl::<K: Dull, V: Dull> Iterator::<(K, V)> for Entries::<K, V> {
+impl::<K: Light, V: Light> Iterator::<(K, V)> for Entries::<K, V> {
     fn next(&mut self): Option::<(K, V)> {
         while self.i < self.slots.len() {
             let s = self.slots[self.i];
@@ -224,12 +224,12 @@ impl::<K: Dull, V: Dull> Iterator::<(K, V)> for Entries::<K, V> {
     }
 }
 
-struct Keys::<K: Dull, V: Dull> {
+struct Keys::<K: Light, V: Light> {
     slots: [Slot::<K, V>; &],
     i: usize,
 }
 
-impl::<K: Dull, V: Dull> Iterator::<K> for Keys::<K, V> {
+impl::<K: Light, V: Light> Iterator::<K> for Keys::<K, V> {
     fn next(&mut self): Option::<K> {
         while self.i < self.slots.len() {
             let s = self.slots[self.i];
@@ -242,12 +242,12 @@ impl::<K: Dull, V: Dull> Iterator::<K> for Keys::<K, V> {
     }
 }
 
-struct Values::<K: Dull, V: Dull> {
+struct Values::<K: Light, V: Light> {
     slots: [Slot::<K, V>; &],
     i: usize,
 }
 
-impl::<K: Dull, V: Dull> Iterator::<V> for Values::<K, V> {
+impl::<K: Light, V: Light> Iterator::<V> for Values::<K, V> {
     fn next(&mut self): Option::<V> {
         while self.i < self.slots.len() {
             let s = self.slots[self.i];
@@ -263,7 +263,7 @@ impl::<K: Dull, V: Dull> Iterator::<V> for Values::<K, V> {
 // ===================================================================== ordered
 
 /// One entry of an `OrderedHashMap`, in insertion order.
-struct Entry::<K: Dull, V: Dull> {
+struct Entry::<K: Light, V: Light> {
     hash: u64,
     key: K,
     value: V,
@@ -271,13 +271,13 @@ struct Entry::<K: Dull, V: Dull> {
 
 /// A map from `K` to `V` that iterates in insertion order: the entries in
 /// a dense array, with a hash table of their positions.
-pub struct OrderedHashMap::<K: Dull + Hash + Eq, V: Dull> {
+pub struct OrderedHashMap::<K: Light + Hash + Eq, V: Light> {
     entries: [Entry::<K, V>; -..+],
     /// Entry position + 1 per slot (0 = empty); a power of two in length.
     table: [u32; ..+],
 }
 
-impl::<K: Dull + Hash + Eq, V: Dull> OrderedHashMap::<K, V> {
+impl::<K: Light + Hash + Eq, V: Light> OrderedHashMap::<K, V> {
     pub fn new(): OrderedHashMap::<K, V> {
         return OrderedHashMap { entries: [], table: [] };
     }
@@ -329,7 +329,7 @@ impl::<K: Dull + Hash + Eq, V: Dull> OrderedHashMap::<K, V> {
 
     /// Set the value for `k`; returns the value it replaced. A new key goes
     /// last; a replaced value keeps its key's place.
-    pub fn insert(&mut self, k: K, v: V): Option::<V> {
+    pub fn insert(&mut self, kept k: K, kept v: V): Option::<V> {
         if (self.entries.len() + 1) * 4 > self.table.len() * 3 {
             self.rebuild();
         }
@@ -373,7 +373,7 @@ impl::<K: Dull + Hash + Eq, V: Dull> OrderedHashMap::<K, V> {
 
     /// Replace the value for `k` with what `f` makes of it. Returns false
     /// (and does not call `f`) if there is no value for `k`.
-    pub fn update::<F: FnOnce(V): V>(&mut self, k: K, f: F): bool {
+    pub fn update::<F: FnOnce(V): V>(&mut self, k: K, kept f: F): bool {
         if self.entries.len() == 0 {
             return false;
         }
@@ -396,7 +396,10 @@ impl::<K: Dull + Hash + Eq, V: Dull> OrderedHashMap::<K, V> {
         if e == 0 {
             return None;
         }
-        let old = self.entries.remove((e - 1) as usize);
+        // Read the entry first: a copy of an item points where the item
+        // points, while `remove`'s result might point into the map.
+        let old = self.entries[(e - 1) as usize];
+        self.entries.remove((e - 1) as usize);
         self.rebuild();
         return Some(old.value);
     }
@@ -417,18 +420,18 @@ impl::<K: Dull + Hash + Eq, V: Dull> OrderedHashMap::<K, V> {
     }
 }
 
-impl::<K: Dull + Hash + Eq + Debug, V: Dull + Debug> Debug for OrderedHashMap::<K, V> {
+impl::<K: Light + Hash + Eq + Debug, V: Light + Debug> Debug for OrderedHashMap::<K, V> {
     fn debug(&self, out: &mut String) {
         debug_entries(self.iter(), out);
     }
 }
 
-struct OrderedEntries::<K: Dull, V: Dull> {
+struct OrderedEntries::<K: Light, V: Light> {
     entries: [Entry::<K, V>; &],
     i: usize,
 }
 
-impl::<K: Dull, V: Dull> Iterator::<(K, V)> for OrderedEntries::<K, V> {
+impl::<K: Light, V: Light> Iterator::<(K, V)> for OrderedEntries::<K, V> {
     fn next(&mut self): Option::<(K, V)> {
         if self.i == self.entries.len() {
             return None;
@@ -439,12 +442,12 @@ impl::<K: Dull, V: Dull> Iterator::<(K, V)> for OrderedEntries::<K, V> {
     }
 }
 
-struct OrderedKeys::<K: Dull, V: Dull> {
+struct OrderedKeys::<K: Light, V: Light> {
     entries: [Entry::<K, V>; &],
     i: usize,
 }
 
-impl::<K: Dull, V: Dull> Iterator::<K> for OrderedKeys::<K, V> {
+impl::<K: Light, V: Light> Iterator::<K> for OrderedKeys::<K, V> {
     fn next(&mut self): Option::<K> {
         if self.i == self.entries.len() {
             return None;
@@ -455,12 +458,12 @@ impl::<K: Dull, V: Dull> Iterator::<K> for OrderedKeys::<K, V> {
     }
 }
 
-struct OrderedValues::<K: Dull, V: Dull> {
+struct OrderedValues::<K: Light, V: Light> {
     entries: [Entry::<K, V>; &],
     i: usize,
 }
 
-impl::<K: Dull, V: Dull> Iterator::<V> for OrderedValues::<K, V> {
+impl::<K: Light, V: Light> Iterator::<V> for OrderedValues::<K, V> {
     fn next(&mut self): Option::<V> {
         if self.i == self.entries.len() {
             return None;

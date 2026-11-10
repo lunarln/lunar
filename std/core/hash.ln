@@ -100,7 +100,7 @@ impl::<A: Hash, B: Hash, C: Hash> Hash for (A, B, C) {
     }
 }
 
-impl::<T: Dull + Hash> Hash for Option::<T> {
+impl::<T: Light + Hash> Hash for Option::<T> {
     fn hash(&self, h: &mut Hasher) {
         match self {
             Some(v) => {
@@ -112,7 +112,7 @@ impl::<T: Dull + Hash> Hash for Option::<T> {
     }
 }
 
-impl::<T: Dull + Hash> Hash for [T; &] {
+impl::<T: Light + Hash> Hash for [T; &] {
     fn hash(&self, h: &mut Hasher) {
         for x in self {
             x.hash(h);

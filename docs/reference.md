@@ -135,23 +135,33 @@ let m = max!(3, square!(2), 1);
 | `fn(A, &B, &mut C): R` | function pointers; parameter modes are part of the type |
 | `!` | the never type (return type of functions that never return) |
 
-### Dull and pointy types
+### Dull, Light and pointy types
 
-`core::ptr::Dull` is implemented **automatically by the compiler** for every
-type that is not a pointer, slice, string or array and contains none. Such
-types are *Dull*; all others are *pointy*. `Dull` cannot be implemented or
-`!`implemented manually (`err(trait::dull_impl)`).
+Two traits are implemented **automatically by the compiler** and cannot be
+implemented or `!`implemented manually (`err(trait::dull_impl)`):
 
-**Array and slice items must be Dull:**
+* `core::ptr::Dull`: the type is not a pointer, slice, string or array and
+  contains none. All other types are *pointy*.
+* `core::ptr::Light`: the type owns no array or string. Dull types are
+  Light (`Dull: Light`), and so are views (`str`, `[T; &]`, raw pointers)
+  and anything built only from Light types. `String`, owning arrays and
+  types containing them are not.
+
+**Array and slice items must be Light:**
 
 ```text
-err(type::array_pointy_items): Arrays and slices must have an item type that is not pointy.
-help: add Dull to T's bounds: `T: Dull`
+err(type::array_owner_items): Arrays and slices cannot hold items that own arrays or strings.
+help: add Light to T's bounds: `T: Light`
 ```
 
-Dull values are copied implicitly. Pointy views (slices, `str`) are copied
-too. Owning values (owning arrays, `String`, and types containing them) are
-**moved**.
+So `[str; ..+]`, `[[u8; &]; 4]` and an `Arena` of nodes holding `str` names
+are fine, and the borrow checker tracks what the views among the items
+point into: an array of views borrows from everything its items point
+into, `push`ing a view adds to that, and an item read out of it points
+where the item points.
+
+Light values are copied implicitly. Owning values (owning arrays, `String`,
+and types containing them) are **moved**.
 
 ## 4. Memory model: data stacks
 

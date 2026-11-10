@@ -1,8 +1,13 @@
 // `Dull` is implemented by the compiler for every type that is not a pointer
-// or array and contains none. Only Dull types can be array or slice items.
-// It cannot be implemented (or `!`implemented) manually.
+// or array and contains none. `Light` is implemented for every type that
+// owns no array or string (Dull types, and views such as `str` and slices),
+// and only Light types can be array or slice items. Neither can be
+// implemented (or `!`implemented) manually.
 #[lang = "dull"]
-pub trait Dull {}
+pub trait Dull: Light {}
+
+#[lang = "light"]
+pub trait Light {}
 
 /// Whether a raw pointer is null.
 pub fn is_null::<T>(p: *T): bool {

@@ -4,7 +4,7 @@
 
 use crater::intrinsics;
 
-impl::<T: Dull> [T; &] {
+impl::<T: Light> [T; &] {
     pub fn len(self): usize {
         return intrinsics::slice_len(self);
     }
@@ -49,7 +49,7 @@ impl::<T: Dull> [T; &] {
     }
 }
 
-impl::<T: Dull + Eq> [T; &] {
+impl::<T: Light + Eq> [T; &] {
     pub fn contains(self, x: T): bool {
         for v in self {
             if v == x {
@@ -85,7 +85,7 @@ impl::<T: Dull + Eq> [T; &] {
     }
 }
 
-impl::<T: Dull + Eq> Eq for [T; &] {
+impl::<T: Light + Eq> Eq for [T; &] {
     fn eq(&self, other: &[T; &]): bool {
         if self.len() != other.len() {
             return false;
@@ -101,12 +101,12 @@ impl::<T: Dull + Eq> Eq for [T; &] {
     }
 }
 
-impl::<T: Dull> [T; &mut] {
+impl::<T: Light> [T; &mut] {
     pub fn as_mut_ptr(self): *mut T {
         return intrinsics::slice_mut_ptr(self);
     }
 
-    pub fn fill(self, value: T) {
+    pub fn fill(self, kept value: T) {
         let mut i: usize = 0;
         let n = self.len();
         while i < n {
@@ -131,7 +131,7 @@ impl::<T: Dull> [T; &mut] {
     }
 
     /// Copy every element of `src` (which must have the same length).
-    pub fn copy_from(self, src: [T; &]) {
+    pub fn copy_from(self, kept src: [T; &]) {
         if src.len() != self.len() {
             panic("copy_from: length mismatch ({src.len()} vs {self.len()})");
         }
@@ -143,7 +143,7 @@ impl::<T: Dull> [T; &mut] {
     }
 }
 
-impl::<T: Dull + Ord> [T; &mut] {
+impl::<T: Light + Ord> [T; &mut] {
     /// Sort in ascending order (heapsort: in place, O(n log n), not stable).
     pub fn sort(self) {
         let n = self.len();
@@ -164,7 +164,7 @@ impl::<T: Dull + Ord> [T; &mut] {
     }
 }
 
-fn sift_down::<T: Dull + Ord>(s: [T; &mut], start: usize, end: usize) {
+fn sift_down::<T: Light + Ord>(s: [T; &mut], start: usize, end: usize) {
     let mut root = start;
     loop {
         let child = 2 * root + 1;
@@ -186,14 +186,14 @@ fn sift_down::<T: Dull + Ord>(s: [T; &mut], start: usize, end: usize) {
     }
 }
 
-impl::<T: Dull> [T; ..+] {
+impl::<T: Light> [T; ..+] {
     /// Append an element. Growth never moves existing elements, so slices
     /// into the array stay valid (`&mut +self`).
-    pub fn push(&mut +self, value: T) {
+    pub fn push(&mut +self, kept value: T) {
         intrinsics::arr_push(self, value);
     }
 
-    pub fn extend(&mut +self, items: [T; &]) {
+    pub fn extend(&mut +self, kept items: [T; &]) {
         intrinsics::arr_extend(self, items);
     }
 
@@ -210,7 +210,7 @@ impl::<T: Dull> [T; ..+] {
     }
 }
 
-impl::<T: Dull> [T; -..+] {
+impl::<T: Light> [T; -..+] {
     /// This empty array, limited to `count` elements (see `[T; ..+]::capped`).
     pub fn capped(mut self, count: usize): Self {
         intrinsics::arr_cap(&mut self, count);
@@ -255,7 +255,7 @@ impl::<T: Dull> [T; -..+] {
 
     /// Insert `value` at `i`, shifting later elements up. A plain
     /// `&mut self`: slices into the array would see the elements move.
-    pub fn insert(&mut self, i: usize, value: T) {
+    pub fn insert(&mut self, i: usize, kept value: T) {
         let n = self.len();
         if i > n {
             panic("insert index {i} out of bounds for length {n}");
@@ -270,13 +270,13 @@ impl::<T: Dull> [T; -..+] {
     }
 }
 
-impl::<T: Dull> Clone for [T] {
+impl::<T: Light> Clone for [T] {
     fn clone(&self): [T] {
         return intrinsics::arr_from_slice(self[..]);
     }
 }
 
-impl::<T: Dull> Clone for [T; ..+] {
+impl::<T: Light> Clone for [T; ..+] {
     fn clone(&self): [T; ..+] {
         let mut out: [T; ..+] = [];
         intrinsics::arr_extend(&mut out, self[..]);
@@ -284,7 +284,7 @@ impl::<T: Dull> Clone for [T; ..+] {
     }
 }
 
-impl::<T: Dull> Clone for [T; -..+] {
+impl::<T: Light> Clone for [T; -..+] {
     fn clone(&self): [T; -..+] {
         let mut out: [T; -..+] = [];
         intrinsics::arr_extend(&mut out, self[..]);
@@ -293,7 +293,7 @@ impl::<T: Dull> Clone for [T; -..+] {
 }
 
 /// `[1, 2, 3]`, each element with `Debug`.
-fn debug_items::<T: Dull + crater::fmt::Debug>(items: [T; &], out: &mut String) {
+fn debug_items::<T: Light + crater::fmt::Debug>(items: [T; &], out: &mut String) {
     out.push('[');
     let mut first = true;
     for x in items {
@@ -306,31 +306,31 @@ fn debug_items::<T: Dull + crater::fmt::Debug>(items: [T; &], out: &mut String) 
     out.push(']');
 }
 
-impl::<T: Dull + crater::fmt::Debug> crater::fmt::Debug for [T; &] {
+impl::<T: Light + crater::fmt::Debug> crater::fmt::Debug for [T; &] {
     fn debug(&self, out: &mut String) {
         debug_items(self, out);
     }
 }
 
-impl::<T: Dull + crater::fmt::Debug> crater::fmt::Debug for [T; &mut] {
+impl::<T: Light + crater::fmt::Debug> crater::fmt::Debug for [T; &mut] {
     fn debug(&self, out: &mut String) {
         debug_items(self[..], out);
     }
 }
 
-impl::<T: Dull + crater::fmt::Debug> crater::fmt::Debug for [T] {
+impl::<T: Light + crater::fmt::Debug> crater::fmt::Debug for [T] {
     fn debug(&self, out: &mut String) {
         debug_items(self[..], out);
     }
 }
 
-impl::<T: Dull + crater::fmt::Debug> crater::fmt::Debug for [T; ..+] {
+impl::<T: Light + crater::fmt::Debug> crater::fmt::Debug for [T; ..+] {
     fn debug(&self, out: &mut String) {
         debug_items(self[..], out);
     }
 }
 
-impl::<T: Dull + crater::fmt::Debug> crater::fmt::Debug for [T; -..+] {
+impl::<T: Light + crater::fmt::Debug> crater::fmt::Debug for [T; -..+] {
     fn debug(&self, out: &mut String) {
         debug_items(self[..], out);
     }

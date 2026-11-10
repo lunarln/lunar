@@ -1,0 +1,11 @@
+// error: borrow::shrink_while_borrowed
+// The array's items point into `text`, so clearing `text` ends the array.
+fn main() {
+    let mut text = String::from("a b c");
+    let mut words: [str; ..+] = [];
+    for w in text.as_str().split(" ") {
+        words.push(w);
+    }
+    text.clear();
+    println("{words[0]}");
+}

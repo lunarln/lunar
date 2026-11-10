@@ -1,0 +1,8 @@
+// error: trait::dull_impl
+struct Name {
+    text: String,
+}
+
+impl Light for Name {}
+
+fn main() {}

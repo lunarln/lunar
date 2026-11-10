@@ -34,14 +34,16 @@ fn main() {
 * **Parameter modes**: `x: T` takes ownership, `x: &T` borrows, `x: &mut T`
   is in-out. Call sites look the same either way, and the compiler catches
   any use of a moved value.
-* **`!` parameters**: functions that may shrink a value take it as
-  `x: &mut !T` (`![i32; -..+]`, `!String`, or a struct containing one), and
-  shrinking methods take `&mut !self`. Only the owner can make that
-  conversion, and only while no live view points into it. The compiler
-  checks this.
-* **`Dull`**: a compiler-implemented trait for types without pointers or
-  arrays. Only Dull types can be array items:
-  `err(type::array_pointy_items)`.
+* **Growing and shrinking**: a `&mut` parameter may shrink or replace its
+  argument, so lending a value in-out ends the views into it. A
+  `&mut +T` parameter promises to only grow it (`push`, `push_str`), so
+  views survive. A function that stores a view it was given into an
+  in-out argument marks that parameter `kept`. The compiler checks all of
+  this.
+* **`Dull` and `Light`**: compiler-implemented traits. Dull types hold no
+  pointers or arrays; Light types own no array or string (Dull values and
+  views such as `str`). Only Light types can be array items, so
+  `[str; ..+]` works and `[String; ..+]` is `err(type::array_owner_items)`.
 * **Strings**: `str` is a UTF-8 view; `String` is owned UTF-8 text laid out
   like a `[u8; -..+]`. A string literal passed to a `FmtArgs` parameter is
   interpolated: `println("x = {x}")`.

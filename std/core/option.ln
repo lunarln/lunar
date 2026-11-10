@@ -42,7 +42,7 @@ impl::<T> Option::<T> {
     }
 }
 
-impl::<T: Eq + Dull> Eq for Option::<T> {
+impl::<T: Eq + Light> Eq for Option::<T> {
     fn eq(&self, other: &Option::<T>): bool {
         return match self {
             Option::Some(a) => match other {
@@ -54,7 +54,7 @@ impl::<T: Eq + Dull> Eq for Option::<T> {
     }
 }
 
-impl::<T: crater::fmt::Display + Dull> crater::fmt::Display for Option::<T> {
+impl::<T: crater::fmt::Display + Light> crater::fmt::Display for Option::<T> {
     fn fmt(&self, out: &mut String) {
         match self {
             Option::Some(v) => {
@@ -67,7 +67,7 @@ impl::<T: crater::fmt::Display + Dull> crater::fmt::Display for Option::<T> {
     }
 }
 
-impl::<T: crater::fmt::Debug + Dull> crater::fmt::Debug for Option::<T> {
+impl::<T: crater::fmt::Debug + Light> crater::fmt::Debug for Option::<T> {
     fn debug(&self, out: &mut String) {
         match self {
             Option::Some(v) => {

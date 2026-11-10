@@ -99,17 +99,17 @@ impl::<T> Debug for List::<T> {
 }
 
 /// Items of type `T`, each reached by its `Id::<T>`.
-pub struct Arena::<T: Dull> {
+pub struct Arena::<T: Light> {
     items: [T; ..+],
 }
 
-impl::<T: Dull> Arena::<T> {
+impl::<T: Light> Arena::<T> {
     pub fn new(): Arena::<T> {
         return Arena { items: [] };
     }
 
     /// Add an item; returns its handle.
-    pub fn add(&mut +self, value: T): Id::<T> {
+    pub fn add(&mut +self, kept value: T): Id::<T> {
         let i = self.items.len();
         self.items.push(value);
         return Id { index: i as u32 };
@@ -121,12 +121,12 @@ impl::<T: Dull> Arena::<T> {
     }
 
     /// Replace the item.
-    pub fn set(&mut +self, id: Id::<T>, value: T) {
+    pub fn set(&mut +self, id: Id::<T>, kept value: T) {
         self.items[id.index as usize] = value;
     }
 
     /// Replace the item with what `f` makes of it.
-    pub fn update::<F: FnOnce(T): T>(&mut +self, id: Id::<T>, f: F) {
+    pub fn update::<F: FnOnce(T): T>(&mut +self, id: Id::<T>, kept f: F) {
         let i = id.index as usize;
         self.items[i] = f(self.items[i]);
     }
@@ -144,7 +144,7 @@ impl::<T: Dull> Arena::<T> {
     }
 
     /// Add `items` as one run; returns it as a list.
-    pub fn add_list(&mut +self, items: [T; &]): List::<T> {
+    pub fn add_list(&mut +self, kept items: [T; &]): List::<T> {
         let start = self.items.len();
         self.items.extend(items);
         return List { start: start as u32, len: items.len() as u32 };

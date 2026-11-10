@@ -1,0 +1,4 @@
+// error: type::array_owner_items
+fn main() {
+    let rows: [[i32; ..+]; 2] = [[1], [2]];
+}

@@ -1,14 +1,16 @@
-# trait::dull_impl: `Dull` implemented or `!`implemented by hand
+# trait::dull_impl: `Dull` or `Light` implemented or `!`implemented by hand
 
-An `impl Dull for T` or `impl !Dull for T` was written. `core::ptr::Dull` is
-implemented by the compiler, never by user code.
+An `impl Dull for T`, `impl Light for T`, or a negative impl of either was
+written. `core::ptr::Dull` and `core::ptr::Light` are implemented by the
+compiler, never by user code.
 
 A type is Dull exactly when it contains no pointers, slices, strings or
-arrays, at any depth. The compiler works this out from the type's fields, so
-there is nothing to write by hand. Array and slice items must be Dull, and
-Dull values are copied implicitly, so letting code claim `Dull` for a type
-that holds a pointer or an owning array would allow copies of values that
-must be moved, and arrays of values that may point into other arrays.
+arrays, at any depth, and Light when it owns no array or string. The
+compiler works both out from the type's fields, so there is nothing to
+write by hand. Array and slice items must be Light, and Light values are
+copied implicitly, so letting code claim `Light` for a type that owns an
+array would allow copies of values that must be moved, and arrays of
+owners.
 
 Removing `Dull` from a type with `impl !Dull` is not allowed either: whether
 a type is Dull is a fact about its layout, not a choice.
