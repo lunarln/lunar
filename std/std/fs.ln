@@ -73,6 +73,172 @@ pub fn remove_file(path: str): Result::<(), Error> {
     return Ok(());
 }
 
+/// Whether anything (a file or a directory) is at `path`.
+pub fn exists(path: str): bool {
+    return check_path(path).is_ok() && sys::file_kind(path) != 0;
+}
+
+/// Whether `path` is a directory (or a link to one).
+pub fn is_dir(path: str): bool {
+    return check_path(path).is_ok() && sys::file_kind(path) == 2;
+}
+
+/// Whether `path` is a file (or a link to one): something that is not a
+/// directory.
+pub fn is_file(path: str): bool {
+    return check_path(path).is_ok() && sys::file_kind(path) == 1;
+}
+
+/// Create the directory `path`. Its parent must exist.
+pub fn create_dir(path: str): Result::<(), Error> {
+    check_path(path)?;
+    if !sys::create_dir(path) {
+        return Err(Error::last_os_error());
+    }
+    return Ok(());
+}
+
+/// Create the directory `path` and any missing parents. A directory that
+/// already exists is fine.
+pub fn create_dir_all(path: str): Result::<(), Error> {
+    check_path(path)?;
+    if is_dir(path) || sys::create_dir(path) {
+        return Ok(());
+    }
+    let e = Error::last_os_error();
+    if let Some(up) = parent_dir(path) {
+        create_dir_all(up)?;
+        if sys::create_dir(path) || is_dir(path) {
+            return Ok(());
+        }
+        return Err(Error::last_os_error());
+    }
+    return Err(e);
+}
+
+/// Remove the empty directory `path`.
+pub fn remove_dir(path: str): Result::<(), Error> {
+    check_path(path)?;
+    if !sys::remove_dir(path) {
+        return Err(Error::last_os_error());
+    }
+    return Ok(());
+}
+
+/// Remove the directory `path` and everything in it. Links inside it are
+/// removed, not followed.
+pub fn remove_dir_all(path: str): Result::<(), Error> {
+    let entries = read_dir(path)?;
+    for i in 0..entries.len() {
+        let mut child = String::from(path);
+        if !path.ends_with("/") && !path.ends_with("\\") {
+            child.push('/');
+        }
+        child.push_str(entries.name(i));
+        let c = child.as_str();
+        if sys::is_link(c) {
+            // A link to a directory is a directory on Windows.
+            if !sys::remove_file(c) && !sys::remove_dir(c) {
+                return Err(Error::last_os_error());
+            }
+        } else if sys::file_kind(c) == 2 {
+            remove_dir_all(c)?;
+        } else {
+            sys::make_writable(c);
+            if !sys::remove_file(c) {
+                return Err(Error::last_os_error());
+            }
+        }
+    }
+    return remove_dir(path);
+}
+
+/// The names in a directory, from `read_dir`.
+pub struct DirEntries {
+    names: String,
+    ends: [usize; ..+],
+}
+
+impl DirEntries {
+    /// How many there are.
+    pub fn len(&self): usize {
+        return self.ends.len();
+    }
+
+    pub fn is_empty(&self): bool {
+        return self.ends.len() == 0;
+    }
+
+    /// The name of entry `i` (without its directory).
+    pub fn name(&self, i: usize): str {
+        let start = if i == 0 { 0 } else { self.ends[i - 1] };
+        return self.names.as_str()[start..self.ends[i]];
+    }
+}
+
+/// The names of the files and directories in the directory `path`
+/// (without `.` and `..`), sorted by their bytes.
+pub fn read_dir(path: str): Result::<DirEntries, Error> {
+    check_path(path)?;
+    let mut raw = String::new();
+    if !sys::read_dir(path, &mut raw) {
+        return Err(Error::last_os_error());
+    }
+    let mut names: [str; -..+] = [];
+    let text = raw.as_str();
+    let b = text.as_bytes();
+    let mut start: usize = 0;
+    for i in 0..b.len() {
+        if b[i] == 0 {
+            names.push(text[start..i]);
+            start = i + 1;
+        }
+    }
+    sort(names[..]);
+    let mut out = DirEntries { names: String::new(), ends: [] };
+    for n in names {
+        out.names.push_str(n);
+        out.ends.push(out.names.len());
+    }
+    return Ok(out);
+}
+
+/// The absolute form of `path`, with `.`, `..` and every link resolved.
+/// The path must exist. (On Windows, without the `\\?\` prefix.)
+pub fn canonicalize(path: str): Result::<String, Error> {
+    check_path(path)?;
+    let mut out = String::new();
+    if !sys::canonicalize(path, &mut out) {
+        return Err(Error::last_os_error());
+    }
+    return Ok(out);
+}
+
+fn sort(names: [str; &mut]) {
+    names.sort();
+}
+
+/// The directory part of `path`, if it has one: `a/b` for `a/b/c`, `/`
+/// for `/a`.
+fn parent_dir(path: str): Option::<str> {
+    let b = path.as_bytes();
+    let mut end = b.len();
+    while end > 1 && (b[end - 1] == b'/' || b[end - 1] == b'\\') {
+        end -= 1;
+    }
+    let mut i = end;
+    while i > 0 {
+        i -= 1;
+        if b[i] == b'/' || b[i] == b'\\' {
+            if i == 0 {
+                return Some(path[..1]);
+            }
+            return Some(path[..i]);
+        }
+    }
+    return None;
+}
+
 fn check_path(path: str): Result::<(), Error> {
     if path.is_empty() || path.contains("\0") {
         return Err(Error::new(ErrorKind::InvalidInput));

@@ -270,3 +270,355 @@ pub fn release(base: *mut u8, size: usize) {
         VirtualFree(base, 0, MEM_RELEASE);
     }
 }
+
+// ===================================================================== directories, paths, processes
+
+extern "C" {
+    fn CreateDirectoryW(name: *u16, security: *mut u8): i32;
+    fn RemoveDirectoryW(name: *u16): i32;
+    fn GetFileAttributesW(name: *u16): u32;
+    fn SetFileAttributesW(name: *u16, attributes: u32): i32;
+    fn FindFirstFileW(name: *u16, data: *mut u8): *mut u8;
+    fn FindNextFileW(h: *mut u8, data: *mut u8): i32;
+    fn FindClose(h: *mut u8): i32;
+    fn GetCurrentDirectoryW(n: u32, buf: *mut u16): u32;
+    fn GetFinalPathNameByHandleW(h: *mut u8, buf: *mut u16, n: u32, flags: u32): u32;
+    fn GetModuleFileNameW(module: *mut u8, buf: *mut u16, n: u32): u32;
+    fn GetTempPathW(n: u32, buf: *mut u16): u32;
+    fn GetCurrentProcessId(): u32;
+    fn GetCurrentProcess(): *mut u8;
+    fn DuplicateHandle(from_process: *mut u8, h: *mut u8, to_process: *mut u8, out: *mut usize, access: u32, inherit: i32, options: u32): i32;
+    fn CreateProcessW(app: *u16, cmd: *mut u16, pattr: *mut u8, tattr: *mut u8, inherit: i32, flags: u32, env: *mut u8, dir: *u16, si: *mut u8, pi: *mut u8): i32;
+    fn WaitForSingleObject(h: *mut u8, ms: u32): u32;
+    fn GetExitCodeProcess(h: *mut u8, code: *mut u32): i32;
+}
+
+const FILE_ATTRIBUTE_READONLY: u32 = 1;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 16;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 1024;
+const INVALID_FILE_ATTRIBUTES: u32 = 4294967295;
+
+/// Create the directory `path`; false on failure.
+pub fn create_dir(path: str): bool {
+    let w = wide(path);
+    return unsafe { CreateDirectoryW(w[..].as_ptr(), core::ptr::null_mut()) } != 0;
+}
+
+/// Remove the empty directory `path`; false on failure.
+pub fn remove_dir(path: str): bool {
+    let w = wide(path);
+    return unsafe { RemoveDirectoryW(w[..].as_ptr()) } != 0;
+}
+
+/// What is at `path`: 0 nothing (or nothing accessible), 1 a file, 2 a
+/// directory (following links).
+pub fn file_kind(path: str): i32 {
+    let w = wide(path);
+    let a = unsafe { GetFileAttributesW(w[..].as_ptr()) };
+    if a == INVALID_FILE_ATTRIBUTES {
+        return 0;
+    }
+    return if (a & FILE_ATTRIBUTE_DIRECTORY) != 0 { 2 } else { 1 };
+}
+
+/// Whether `path` is a link (a reparse point), which `remove_dir_all`
+/// removes without following.
+pub fn is_link(path: str): bool {
+    let w = wide(path);
+    let a = unsafe { GetFileAttributesW(w[..].as_ptr()) };
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+
+/// Clear the read-only attribute of `path` (git makes its objects
+/// read-only, and `DeleteFileW` refuses read-only files).
+pub fn make_writable(path: str) {
+    let w = wide(path);
+    let a = unsafe { GetFileAttributesW(w[..].as_ptr()) };
+    if a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_READONLY) != 0 {
+        unsafe {
+            SetFileAttributesW(w[..].as_ptr(), a - FILE_ATTRIBUTE_READONLY);
+        }
+    }
+}
+
+/// The names in the directory `path` (without `.` and `..`), each
+/// followed by a NUL, onto `out`; false on failure.
+pub fn read_dir(path: str, out: &mut +String): bool {
+    let mut pattern = String::from(path);
+    if !path.ends_with("/") && !path.ends_with("\\") {
+        pattern.push('\\');
+    }
+    pattern.push('*');
+    let w = wide(pattern.as_str());
+    // WIN32_FIND_DATAW (592 bytes); the name, in UTF-16, is at byte 44.
+    let mut data: [u32; 160] = [0; 160];
+    let p = (intrinsics::addr_of_mut(&mut data) as usize) as *mut u8;
+    let h = unsafe { FindFirstFileW(w[..].as_ptr(), p) };
+    if (h as usize) == 18446744073709551615 {
+        return false;
+    }
+    loop {
+        let mut units: [u16; 260] = [0; 260];
+        let mut n: usize = 0;
+        while n < 260 {
+            let word = data[11 + n / 2];
+            let u = if n % 2 == 0 { word & 65535 } else { word >> 16 };
+            if u == 0 {
+                break;
+            }
+            units[n] = u as u16;
+            n += 1;
+        }
+        let mut name = String::new();
+        from_wide(units[..n], &mut name);
+        if name.as_str() != "." && name.as_str() != ".." {
+            out.push_str(name.as_str());
+            out.push('\0');
+        }
+        if unsafe { FindNextFileW(h, p) } == 0 {
+            break;
+        }
+    }
+    unsafe {
+        FindClose(h);
+    }
+    return true;
+}
+
+/// The current directory, onto `out`; false on failure.
+pub fn current_dir(out: &mut +String): bool {
+    let mut size: u32 = 512;
+    loop {
+        let mut buf = zeroed_wide(size as usize);
+        let n = unsafe { GetCurrentDirectoryW(size, mut_ptr(buf[..])) };
+        if n == 0 {
+            return false;
+        }
+        if n < size {
+            from_wide(buf[..n as usize], out);
+            return true;
+        }
+        size = n + 1;
+    }
+}
+
+/// The absolute path of `path` with every link resolved, onto `out`
+/// (without the `\\?\` prefix Windows gives it); false on failure.
+pub fn canonicalize(path: str, out: &mut +String): bool {
+    let w = wide(path);
+    // FILE_FLAG_BACKUP_SEMANTICS (0x02000000) opens directories too.
+    let h = unsafe { CreateFileW(w[..].as_ptr(), 0, 7, core::ptr::null_mut(), OPEN_EXISTING, 33554432, core::ptr::null_mut()) };
+    if (h as usize) == 18446744073709551615 {
+        return false;
+    }
+    let mut size: u32 = 512;
+    let mut ok = false;
+    let mut full = String::new();
+    loop {
+        let mut buf = zeroed_wide(size as usize);
+        let n = unsafe { GetFinalPathNameByHandleW(h, mut_ptr(buf[..]), size, 0) };
+        if n == 0 {
+            break;
+        }
+        if n < size {
+            from_wide(buf[..n as usize], &mut full);
+            ok = true;
+            break;
+        }
+        size = n + 1;
+    }
+    unsafe {
+        CloseHandle(h);
+    }
+    if !ok {
+        return false;
+    }
+    let f = full.as_str();
+    if f.starts_with("\\\\?\\UNC\\") {
+        out.push_str("\\\\");
+        out.push_str(f[8..]);
+    } else if f.starts_with("\\\\?\\") {
+        out.push_str(f[4..]);
+    } else {
+        out.push_str(f);
+    }
+    return true;
+}
+
+/// The path of the running executable, onto `out`; false on failure.
+pub fn current_exe(out: &mut +String): bool {
+    let mut size: u32 = 512;
+    loop {
+        let mut buf = zeroed_wide(size as usize);
+        let n = unsafe { GetModuleFileNameW(core::ptr::null_mut(), mut_ptr(buf[..]), size) };
+        if n == 0 {
+            return false;
+        }
+        if n < size {
+            from_wide(buf[..n as usize], out);
+            return true;
+        }
+        size = size * 2;
+    }
+}
+
+/// The directory for temporary files, onto `out`.
+pub fn temp_dir(out: &mut +String) {
+    let mut buf = zeroed_wide(1024);
+    let n = unsafe { GetTempPathW(1024, mut_ptr(buf[..])) };
+    if n == 0 || n >= 1024 {
+        out.push_str("C:\\Windows\\Temp");
+        return;
+    }
+    let mut s = String::new();
+    from_wide(buf[..n as usize], &mut s);
+    let t = s.as_str();
+    // Without the trailing `\`.
+    if t.ends_with("\\") && t.len() > 3 {
+        out.push_str(t[..t.len() - 1]);
+    } else {
+        out.push_str(t);
+    }
+}
+
+pub fn process_id(): u32 {
+    return unsafe { GetCurrentProcessId() };
+}
+
+/// Run `args[0]` (searched for on `PATH`) with the arguments `args[1..]`
+/// and wait for it. Its standard output and error go to the files
+/// `out_path` and `err_path`, created for it, or, where empty, where this
+/// process's go. The result is the exit code (`0..=u32::MAX`), or, if it
+/// could not be started, `-1 - the error code`.
+pub fn spawn(args: [str; &], out_path: str, err_path: str): i64 {
+    let mut cmd = String::new();
+    for i in 0..args.len() {
+        if i > 0 {
+            cmd.push(' ');
+        }
+        quote_arg(&mut cmd, args[i]);
+    }
+    let mut wcmd = wide(cmd.as_str());
+    // SECURITY_ATTRIBUTES with bInheritHandle set: the files are the child's.
+    let mut sa: [u64; 3] = [24, 0, 1];
+    let sap = (intrinsics::addr_of_mut(&mut sa) as usize) as *mut u8;
+    let me = unsafe { GetCurrentProcess() };
+    let mut handles: [usize; 3] = [0, 0, 0];
+    let mut opened: [bool; 3] = [false, false, false];
+    for k in 0..3 {
+        let path = if k == 1 { out_path } else if k == 2 { err_path } else { "" };
+        if path.len() > 0 {
+            let w = wide(path);
+            let h = unsafe { CreateFileW(w[..].as_ptr(), GENERIC_WRITE, FILE_SHARE_READ_WRITE, sap, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, core::ptr::null_mut()) };
+            if (h as usize) == 18446744073709551615 {
+                let e = last_error();
+                close_handles(handles[..], opened[..]);
+                return -1 - (e as i64);
+            }
+            handles[k] = h as usize;
+            opened[k] = true;
+        } else {
+            // This process's own handle, duplicated for the child to inherit.
+            let mut dup: usize = 0;
+            // DUPLICATE_SAME_ACCESS = 2
+            if unsafe { DuplicateHandle(me, handle(k as i32), me, intrinsics::addr_of_mut(&mut dup), 0, 1, 2) } != 0 {
+                handles[k] = dup;
+                opened[k] = true;
+            }
+        }
+    }
+    // STARTUPINFOW (104 bytes): `cb`; `dwFlags` = STARTF_USESTDHANDLES at
+    // byte 60; the three handles at bytes 80, 88 and 96.
+    let mut si: [u64; 13] = [0; 13];
+    si[0] = 104;
+    si[7] = 1099511627776;
+    si[10] = handles[0] as u64;
+    si[11] = handles[1] as u64;
+    si[12] = handles[2] as u64;
+    let mut pi: [u64; 3] = [0; 3];
+    let sip = (intrinsics::addr_of_mut(&mut si) as usize) as *mut u8;
+    let pip = (intrinsics::addr_of_mut(&mut pi) as usize) as *mut u8;
+    let ok = unsafe { CreateProcessW(core::ptr::null(), mut_ptr(wcmd[..]),core::ptr::null_mut(), core::ptr::null_mut(), 1, 0, core::ptr::null_mut(), core::ptr::null(), sip, pip) };
+    let err = last_error();
+    close_handles(handles[..], opened[..]);
+    if ok == 0 {
+        return -1 - (err as i64);
+    }
+    let process = (pi[0] as usize) as *mut u8;
+    let mut code: u32 = 0;
+    unsafe {
+        WaitForSingleObject(process, 4294967295);
+        GetExitCodeProcess(process, intrinsics::addr_of_mut(&mut code));
+        CloseHandle(process);
+        CloseHandle((pi[1] as usize) as *mut u8);
+    }
+    return code as i64;
+}
+
+fn close_handles(handles: [usize; &], opened: [bool; &]) {
+    for k in 0..handles.len() {
+        if opened[k] {
+            unsafe {
+                CloseHandle(handles[k] as *mut u8);
+            }
+        }
+    }
+}
+
+/// `a`, quoted for a Windows command line if it needs to be (MSVC rules:
+/// backslashes before a quote are doubled, and the quote escaped).
+fn quote_arg(text: &mut +String, a: str) {
+    if a.len() > 0 && !a.contains(" ") && !a.contains("\t") && !a.contains("\"") {
+        text.push_str(a);
+        return;
+    }
+    text.push('"');
+    let mut backslashes: usize = 0;
+    for c in a.chars() {
+        if c == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        let n = if c == '"' { backslashes * 2 + 1 } else { backslashes };
+        for _ in 0..n {
+            text.push('\\');
+        }
+        backslashes = 0;
+        text.push(c);
+    }
+    for _ in 0..backslashes * 2 {
+        text.push('\\');
+    }
+    text.push('"');
+}
+
+/// The address of `b`'s first unit, for C to write to.
+fn mut_ptr(b: [u16; &mut]): *mut u16 {
+    return b.as_mut_ptr();
+}
+
+/// `n` zeroed UTF-16 units.
+fn zeroed_wide(n: usize): [u16; -..+] {
+    let mut w: [u16; -..+] = [];
+    for _ in 0..n {
+        w.push(0);
+    }
+    return w;
+}
+
+/// UTF-16 `w` as UTF-8 onto `out` (an unpaired surrogate becomes U+FFFD).
+fn from_wide(w: [u16; &], out: &mut +String) {
+    let mut i: usize = 0;
+    while i < w.len() {
+        let u = w[i] as u32;
+        let mut cp = u;
+        if u >= 55296 && u < 56320 && i + 1 < w.len() && (w[i + 1] as u32) >= 56320 && (w[i + 1] as u32) < 57344 {
+            cp = 65536 + ((u - 55296) << 10) + ((w[i + 1] as u32) - 56320);
+            i += 1;
+        } else if u >= 55296 && u < 57344 {
+            cp = 65533;
+        }
+        out.push(core::str::char_from_u32(cp));
+        i += 1;
+    }
+}
