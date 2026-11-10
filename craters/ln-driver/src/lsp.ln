@@ -1,0 +1,1824 @@
+// `ln-driver lsp`: the language server (a port of
+// crates/ln-driver/src/lsp.rs), speaking the Language Server Protocol over
+// standard input and output.
+//
+// It serves diagnostics (on open and change), hover and go to definition.
+// Every change re-analyzes the crate the file belongs to (the messages
+// already waiting are read first, so a burst of changes is analyzed once).
+// A file is analyzed as part of the crate of another file that loads it as
+// a module (`mod foo;`), otherwise as its own root; files of a standard
+// library source tree are analyzed as the standard library. Open documents
+// are read from the editor's buffers, not the disk.
+//
+// The transport is `lsp-server`'s: `Content-Length` framed JSON-RPC,
+// `initialize` then `initialized`, and `shutdown` then `exit`. Text
+// documents are synchronized in full.
+//
+// The standard library is the one on disk (`find_std_dir`), so definitions
+// in it are `file:` locations of real files. The Rust server's virtual
+// `lunar-std:` documents (`lunar/stdSource`) still work, read from there.
+//
+// The Rust server keeps every crate's analysis; this one keeps the four
+// used last (`Slots`), and analyzes a crate again when a request needs one
+// it dropped.
+
+use core::collections::HashMap;
+use core::intern::{Interner, Symbol};
+use std::env;
+use std::fs;
+use std::io;
+use ln_ast::Span;
+use ln_json::{Json, Kind, Value};
+use ln_sema::codes;
+use ln_sema::diag::{Diag, Severity, is_dummy};
+use ln_sema::loader::{CraterDep, Craters, Overlay, load_crate, path_key};
+use ln_sema::program::Program;
+use ln_sema::sema::{Options, Sema, analyze};
+use crater::ide;
+use crater::project;
+
+/// Run the server on standard input and output until the client shuts it
+/// down: the exit code.
+pub fn serve(): i32 {
+    let std_dir = match find_std_dir() {
+        Some(d) => d,
+        None => {
+            eprintln("lunar lsp: the standard library was not found (set LUNAR_STD_DIR to its directory)");
+            String::new()
+        }
+    };
+    let mut inp = Input { buf: [], pos: 0, eof: false };
+    if let Err(e) = initialize(&mut inp) {
+        eprintln("error: language server failed: {e}");
+        return 1;
+    }
+    let mut server = Server::new(std_dir);
+    return match server.main_loop(&mut inp) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln("error: language server failed: {e}");
+            1
+        }
+    };
+}
+
+/// Where `core` and `std` are: `$LUNAR_STD_DIR`, else
+/// `<exe dir>/../lib/lunar/std` (an installed compiler), else the `std` of
+/// the nearest ancestor of the executable's directory that has
+/// `std/core/lib.ln` (a compiler built in its source tree).
+pub fn find_std_dir(): Option::<String> {
+    if let Some(d) = env::var("LUNAR_STD_DIR") {
+        return Some(project::normalize(d.as_str()));
+    }
+    let exe = env::current_exe()?;
+    let dir = project::parent(project::normalize(exe.as_str()).as_str())?;
+    let installed = project::join(dir.as_str(), "../lib/lunar/std");
+    if fs::is_file(project::join(installed.as_str(), "core/lib.ln").as_str()) {
+        return Some(installed);
+    }
+    let mut cur: Option::<String> = Some(dir);
+    while let Some(d) = cur {
+        let s = project::join(d.as_str(), "std");
+        if fs::is_file(project::join(s.as_str(), "core/lib.ln").as_str()) {
+            return Some(s);
+        }
+        cur = project::parent(d.as_str());
+    }
+    return None;
+}
+
+// ===================================================================== transport
+
+/// Standard input, read in chunks.
+struct Input {
+    buf: [u8; -..+],
+    pos: usize,
+    eof: bool,
+}
+
+impl Input {
+    /// Read more (waiting for it); false at the end of the input.
+    fn fill(&mut self): bool {
+        if self.eof {
+            return false;
+        }
+        if self.pos > 0 && self.pos * 2 >= self.buf.len() {
+            let mut rest: [u8; -..+] = [];
+            rest.extend(self.buf[self.pos..]);
+            self.buf = rest;
+            self.pos = 0;
+        }
+        // Not bigger: a fixed array is copied as one LLVM value, and LLVM's
+        // instruction selection crashes on one of 64 KiB.
+        let mut chunk: [u8; 16384] = [0; 16384];
+        let n = io::read(0, chunk[..]);
+        if n <= 0 {
+            self.eof = true;
+            return false;
+        }
+        self.buf.extend(chunk[..n as usize]);
+        return true;
+    }
+
+    /// Whether a whole message is already read.
+    fn has_message(&self): bool {
+        let b = self.buf[self.pos..];
+        let mut i: usize = 0;
+        let mut len: usize = 0;
+        while i + 1 < b.len() {
+            // A header line.
+            let mut end = i;
+            while end + 1 < b.len() && !(b[end] == b'\r' && b[end + 1] == b'\n') {
+                end += 1;
+            }
+            if end + 1 >= b.len() {
+                return false;
+            }
+            if end == i {
+                return i + 2 + len <= b.len();
+            }
+            let line = unsafe { core::intrinsics::str_from_bytes(b[i..end]) };
+            if let Some(n) = content_length(line) {
+                len = n;
+            }
+            i = end + 2;
+        }
+        return false;
+    }
+}
+
+/// The value of a `Content-Length` header line.
+fn content_length(line: str): Option::<usize> {
+    let colon = line.find(": ")?;
+    if !eq_ignore_case(line[..colon], "content-length") {
+        return None;
+    }
+    let v = line[colon + 2..];
+    if v.len() == 0 || v.starts_with("-") || v.starts_with("+") {
+        return None;
+    }
+    let n = v.parse_i64()?;
+    return Some(n as usize);
+}
+
+fn eq_ignore_case(a: str, b: str): bool {
+    let x = a.as_bytes();
+    let y = b.as_bytes();
+    if x.len() != y.len() {
+        return false;
+    }
+    for i in 0..x.len() {
+        let mut c = x[i];
+        let mut d = y[i];
+        if c >= b'A' && c <= b'Z' {
+            c += 32;
+        }
+        if d >= b'A' && d <= b'Z' {
+            d += 32;
+        }
+        if c != d {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// What reading a message gave.
+enum Got {
+    Message,
+    End,
+}
+
+/// Read the next message's text into `body` (as `lsp-server` does: header
+/// lines ending in `\r\n`, an empty line, then `Content-Length` bytes).
+fn read_message(inp: &mut Input, body: &mut String): Result::<Got, String> {
+    let mut size: Option::<usize> = None;
+    let mut first = true;
+    loop {
+        // One header line, through its `\n`.
+        let mut k = inp.pos;
+        loop {
+            while k < inp.buf.len() && inp.buf[k] != b'\n' {
+                k += 1;
+            }
+            if k < inp.buf.len() {
+                break;
+            }
+            let scanned = k - inp.pos;
+            if !inp.fill() {
+                if first && inp.pos == inp.buf.len() {
+                    return Ok(Got::End);
+                }
+                let rest = lossy(inp.buf[inp.pos..]);
+                return Err(core::fmt::format("malformed header: {rest:?}"));
+            }
+            // Filling may have moved the unread bytes to the start.
+            k = inp.pos + scanned;
+        }
+        let end = k;
+        let line = lossy(inp.buf[inp.pos..end + 1]);
+        inp.pos = end + 1;
+        first = false;
+        if !line.as_str().ends_with("\r\n") {
+            return Err(core::fmt::format("malformed header: {line:?}"));
+        }
+        let text = line.as_str()[..line.len() - 2];
+        if text.len() == 0 {
+            break;
+        }
+        let colon = match text.find(": ") {
+            Some(c) => c,
+            None => return Err(core::fmt::format("malformed header: {text:?}")),
+        };
+        if eq_ignore_case(text[..colon], "content-length") {
+            match content_length(text) {
+                Some(n) => size = Some(n),
+                None => return Err(core::fmt::format("invalid Content-Length: {text:?}")),
+            }
+        }
+    }
+    let n = match size {
+        Some(n) => n,
+        None => return Err(String::from("no Content-Length")),
+    };
+    while inp.buf.len() - inp.pos < n {
+        if !inp.fill() {
+            return Err(String::from("failed to fill whole buffer"));
+        }
+    }
+    if !take_text(inp, n, body) {
+        return Err(String::from("invalid UTF-8 in a message"));
+    }
+    return Ok(Got::Message);
+}
+
+/// Move the next `n` bytes of `inp` (read already) to `body`; false if
+/// they are not UTF-8.
+fn take_text(inp: &mut Input, n: usize, body: &mut String): bool {
+    let start = inp.pos;
+    inp.pos += n;
+    return match str::from_utf8(inp.buf[start..start + n]) {
+        Some(s) => {
+            body.push_str(s);
+            true
+        }
+        None => false,
+    };
+}
+
+/// Bytes as text, with anything that is not UTF-8 as U+FFFD.
+fn lossy(b: [u8; &]): String {
+    let mut out = String::new();
+    match str::from_utf8(b) {
+        Some(s) => out.push_str(s),
+        None => {
+            for c in b {
+                out.push(if c < 128 { c as char } else { '\u{FFFD}' });
+            }
+        }
+    }
+    return out;
+}
+
+/// Write a message (`jsonrpc` first, then the members of `v`).
+fn send(j: &Json, v: Value): Result::<(), String> {
+    let mut body = String::from("{\"jsonrpc\":\"2.0\"");
+    let mut m = j.first(v);
+    while let Some(x) = m {
+        body.push(',');
+        ln_json::write_string(&mut body, j.key(x));
+        body.push(':');
+        j.write(x, &mut body);
+        m = j.next(x);
+    }
+    body.push('}');
+    let mut msg = String::new();
+    msg.write("Content-Length: {body.len()}\r\n\r\n");
+    msg.push_str(body.as_str());
+    if !io::write_bytes(1, msg.as_bytes()) {
+        return Err(String::from("cannot write to standard output"));
+    }
+    return Ok(());
+}
+
+/// What a message is.
+#[derive(Eq)]
+enum MsgKind {
+    Request,
+    Response,
+    Notification,
+}
+
+/// A message's kind (as `lsp-server`'s untagged `Message` reads it: an
+/// `id` and a `method` make a request, an `id` alone a response, a
+/// `method` alone a notification).
+fn kind_of(j: &Json): Option::<MsgKind> {
+    let r = j.root();
+    if j.kind(r) != Kind::Object {
+        return None;
+    }
+    let has_id = match j.get(r, "id") {
+        Some(id) => valid_id(j, id),
+        None => false,
+    };
+    let has_method = match j.get(r, "method") {
+        Some(m) => j.as_str(m).is_some(),
+        None => false,
+    };
+    if has_id && has_method {
+        return Some(MsgKind::Request);
+    }
+    if has_id {
+        return Some(MsgKind::Response);
+    }
+    if has_method {
+        return Some(MsgKind::Notification);
+    }
+    return None;
+}
+
+/// A request id: an `i32` or a string.
+fn valid_id(j: &Json, id: Value): bool {
+    if j.as_str(id).is_some() {
+        return true;
+    }
+    return match j.as_i64(id) {
+        Some(n) => n >= -2147483648 && n <= 2147483647,
+        None => false,
+    };
+}
+
+fn method_of(j: &Json): str {
+    return match j.get(j.root(), "method") {
+        Some(m) => j.as_str(m).unwrap_or(""),
+        None => "",
+    };
+}
+
+/// The message parsed, or why it is not one.
+fn parse_message(text: str): Result::<Json, String> {
+    let j = match ln_json::parse(text) {
+        Ok(j) => j,
+        Err(e) => return Err(core::fmt::format("malformed LSP payload: {e}")),
+    };
+    if kind_of(&j).is_none() {
+        return Err(String::from("malformed LSP payload: not a request, response or notification"));
+    }
+    return Ok(j);
+}
+
+/// Whether `j` is the `exit` notification.
+fn is_exit(j: &Json): bool {
+    return kind_of(j) == Some(MsgKind::Notification) && method_of(j) == "exit";
+}
+
+/// A response to the request `req`: its `result`, or an error.
+fn respond(req: &Json, out: &mut Json, result: Option::<Value>, error_code: i64, error: str): Result::<(), String> {
+    let m = out.object();
+    let id = out.copy_from(req, req.get(req.root(), "id").unwrap());
+    out.set(m, "id", id);
+    match result {
+        Some(r) => out.set(m, "result", r),
+        None => {
+            let e = out.object();
+            let c = out.int(error_code);
+            out.set(e, "code", c);
+            let msg = out.string(error);
+            out.set(e, "message", msg);
+            out.set(m, "error", e);
+        }
+    }
+    return send(out, m);
+}
+
+/// Wait for `initialize`, answer it with the server's capabilities, and
+/// wait for `initialized` (`lsp-server`'s `Connection::initialize`).
+fn initialize(inp: &mut Input): Result::<(), String> {
+    loop {
+        let mut body = String::new();
+        if let Got::End = read_message(inp, &mut body)? {
+            return Err(String::from("disconnected channel"));
+        }
+        let req = parse_message(body.as_str())?;
+        let kind = kind_of(&req).unwrap();
+        let method = method_of(&req);
+        if kind == MsgKind::Request && method == "initialize" {
+            let mut out = Json::new();
+            // Full text synchronization, hover, go to definition.
+            let caps = out.object();
+            let t = out.bool(true);
+            out.set(caps, "definitionProvider", t);
+            let t = out.bool(true);
+            out.set(caps, "hoverProvider", t);
+            let full = out.int(1);
+            out.set(caps, "textDocumentSync", full);
+            let result = out.object();
+            out.set(result, "capabilities", caps);
+            respond(&req, &mut out, Some(result), 0, "")?;
+            break;
+        }
+        if kind == MsgKind::Request {
+            let mut out = Json::new();
+            let msg = core::fmt::format("expected initialize request, got request `{method}`");
+            respond(&req, &mut out, None, -32002, msg.as_str())?;
+            continue;
+        }
+        if kind == MsgKind::Notification && method != "exit" {
+            continue;
+        }
+        return Err(core::fmt::format("expected initialize request, got {body}"));
+    }
+    let mut body = String::new();
+    if let Got::End = read_message(inp, &mut body)? {
+        return Err(String::from("disconnected channel"));
+    }
+    let n = parse_message(body.as_str())?;
+    if kind_of(&n) == Some(MsgKind::Notification) && method_of(&n) == "initialized" {
+        return Ok(());
+    }
+    return Err(core::fmt::format("expected initialized notification, got: {body}"));
+}
+
+// ===================================================================== analyses
+
+/// The analysis of a crate root.
+struct Analysis {
+    s: Sema,
+    /// The files could be loaded and were analyzed (Rust's `program` is
+    /// `Some`): queries can use it.
+    ok: bool,
+    /// It is a standard library source tree, whose files are the user's.
+    std_tree: bool,
+}
+
+/// No analysis.
+fn empty_analysis(): Analysis {
+    return Analysis { s: Sema::new(Program::new(), Craters::new(), Options::host(false)), ok: false, std_tree: false };
+}
+
+/// Analyze `root` as the crater it is in its package (`src/main.ln`,
+/// `src/lib.ln` or `tests/*.ln`, with its dependencies), or on its own
+/// if it is not one, with the open documents `ov`. A manifest error is
+/// reported on the file, which is then analyzed alone.
+fn analyze_in_project(ov: Overlay, std_dir: String, root: String): Analysis {
+    if let Some(tree) = std_tree_of(root.as_str()) {
+        return analyze_std_tree(ov, tree);
+    }
+    let norm = project::normalize(root.as_str());
+    let dir = match project::parent(norm.as_str()) {
+        Some(d) => d,
+        None => return analyze_alone(ov, std_dir, root, String::new()),
+    };
+    // The nearest directory with a manifest.
+    let mut cur: Option::<String> = Some(dir);
+    let mut pkg_dir = String::new();
+    while let Some(d) = cur {
+        if fs::is_file(project::join(d.as_str(), "lunar.toml").as_str()) {
+            pkg_dir = d;
+            break;
+        }
+        cur = project::parent(d.as_str());
+    }
+    if pkg_dir.len() == 0 {
+        return analyze_alone(ov, std_dir, root, String::new());
+    }
+    let is_package = match fs::read_to_string(project::join(pkg_dir.as_str(), "lunar.toml").as_str()) {
+        Ok(t) => t.as_str().contains("[package]"),
+        Err(_) => false,
+    };
+    if !is_package {
+        return analyze_alone(ov, std_dir, root, String::new());
+    }
+    let mut proj = project::Project::new();
+    let pkg = proj.load_package(pkg_dir.as_str());
+    if proj.errors.len() > 0 || pkg.is_none() {
+        return analyze_alone(ov, std_dir, root, project_errors(&proj));
+    }
+    let pkg = pkg.unwrap();
+    let info = proj.packages[pkg as usize];
+    if same_path(pkg_dir.as_str(), "src/main.ln", norm.as_str()) && info.has_main {
+        proj.craters(pkg, false);
+    } else if same_path(pkg_dir.as_str(), "src/lib.ln", norm.as_str()) && info.has_lib {
+        proj.craters(pkg, true);
+    } else if is_test_file(pkg_dir.as_str(), norm.as_str()) {
+        // A test crater uses the package's library like its program.
+        proj.craters(pkg, false);
+        let r = proj.names.intern(norm.as_str());
+        proj.specs[0].root = r;
+    } else {
+        return analyze_alone(ov, std_dir, root, String::new());
+    }
+    if proj.errors.len() > 0 {
+        return analyze_alone(ov, std_dir, root, project_errors(&proj));
+    }
+    let mut p = Program::new();
+    let mut cs = Craters::new();
+    cs.overlay = ov;
+    for s in proj.specs {
+        let r = proj.text(s.root);
+        match load_crate(&mut p, &mut cs, proj.text(s.name), r, "") {
+            Some(c) => {
+                let mut deps: [CraterDep; ..+] = [];
+                for d in proj.crater_deps.list(s.deps) {
+                    deps.push(CraterDep { name: p.sym(proj.text(d.alias)), index: d.index });
+                }
+                let mut c = c;
+                c.deps = cs.deps.add_list(deps[..]);
+                cs.list.push(c);
+            }
+            None => return not_read(p, cs, String::from(r)),
+        }
+    }
+    return finish_analysis(p, cs, std_dir, false);
+}
+
+/// `root` alone, with the problems with its package (`errors`, one per
+/// line).
+fn analyze_alone(ov: Overlay, std_dir: String, root: String, errors: String): Analysis {
+    let mut p = Program::new();
+    let mut cs = Craters::new();
+    cs.overlay = ov;
+    let name = sanitize_stem(root.as_str());
+    match load_crate(&mut p, &mut cs, name.as_str(), root.as_str(), "") {
+        Some(c) => cs.list.push(c),
+        None => return not_read(p, cs, root),
+    }
+    for e in errors.as_str().lines() {
+        let m = p.sym(e);
+        p.diags.error(codes::manifest::PARSE(), ln_sema::diag::dummy_span(), m);
+        p.diags.finish();
+    }
+    return finish_analysis(p, cs, std_dir, false);
+}
+
+/// The standard library tree at `dir` on its own, from disk and the open
+/// buffers, for working on std itself.
+fn analyze_std_tree(ov: Overlay, dir: String): Analysis {
+    let p = Program::new();
+    let mut cs = Craters::new();
+    cs.overlay = ov;
+    return finish_analysis(p, cs, dir, true);
+}
+
+/// Load `core` and `std` from `std_dir` and analyze, keeping going after
+/// errors.
+fn finish_analysis(p: Program, cs: Craters, std_dir: String, std_tree: bool): Analysis {
+    let mut p = p;
+    let mut cs = cs;
+    // Unsaved buffers of std files count only when std is what is being
+    // worked on.
+    if !std_tree {
+        cs.overlay = Overlay::new();
+    }
+    let names = ["core", "std"];
+    for n in names {
+        let mut root = String::new();
+        root.write("{std_dir}/{n}/lib.ln");
+        match load_crate(&mut p, &mut cs, n, root.as_str(), "") {
+            Some(c) => cs.list.push(c),
+            None => {
+                let m = p.sym(core::fmt::format("standard library crater `{n}` not found at {root}").as_str());
+                p.diags.error(codes::build::IO(), ln_sema::diag::dummy_span(), m);
+                p.diags.finish();
+                return Analysis { s: Sema::new(p, cs, Options::host(false)), ok: false, std_tree };
+            }
+        }
+    }
+    let mut opts = Options::host(false);
+    opts.keep_going = true;
+    let s = analyze(p, cs, opts);
+    return Analysis { s, ok: true, std_tree };
+}
+
+/// An analysis of files that could not all be read.
+fn not_read(p: Program, cs: Craters, path: String): Analysis {
+    let mut p = p;
+    let m = p.sym(core::fmt::format("could not read `{path}`").as_str());
+    p.diags.error(codes::build::IO(), ln_sema::diag::dummy_span(), m);
+    p.diags.finish();
+    return Analysis { s: Sema::new(p, cs, Options::host(false)), ok: false, std_tree: false };
+}
+
+/// The problems a project loader found, one per line.
+fn project_errors(proj: &project::Project): String {
+    let mut out = String::new();
+    for e in proj.errors {
+        if out.len() > 0 {
+            out.push('\n');
+        }
+        out.push_str(proj.text(e));
+    }
+    return out;
+}
+
+/// The file and offset of a position in `path`, if `a` has the file.
+fn find_in(a: &Analysis, path: str, line: u32, character: u32): Option::<(u32, u32)> {
+    if !a.ok {
+        return None;
+    }
+    let file = ide::file_for_path(&a.s.p, path)?;
+    let text = a.s.p.sources.file_text(file);
+    let start = a.s.p.sources.files[file as usize].start;
+    return Some((file, start + ide::offset_of(text, line, character)));
+}
+
+/// The hover at `offset` in `file`, or `null`.
+fn hover_in(a: &mut Analysis, file: u32, offset: u32, out: &mut Json): Value {
+    return match ide::hover(&mut a.s, file, offset) {
+        Some((span, text)) => {
+            let h = out.object();
+            let contents = out.object();
+            let kind = out.string("markdown");
+            out.set(contents, "kind", kind);
+            let value = out.string(text.as_str());
+            out.set(contents, "value", value);
+            out.set(h, "contents", contents);
+            let r = range_json(out, &a.s.p, span);
+            out.set(h, "range", r);
+            h
+        }
+        None => out.null(),
+    };
+}
+
+/// The definition of the name at `offset` in `file`, or `null`.
+fn definition_in(a: &Analysis, st: &State, file: u32, offset: u32, out: &mut Json): Value {
+    return match ide::definition(&a.s.p, file, offset) {
+        Some(span) => match st.location(out, &a.s.p, span) {
+            Some(l) => l,
+            None => out.null(),
+        },
+        None => out.null(),
+    };
+}
+
+/// Analyses kept in memory: the four used last. A crate whose analysis
+/// was dropped is analyzed again when a request needs it.
+struct Slots {
+    a0: Analysis,
+    a1: Analysis,
+    a2: Analysis,
+    a3: Analysis,
+    /// The root (key) each slot holds.
+    roots: [Option::<Symbol>; 4],
+    used: [u64; 4],
+    clock: u64,
+}
+
+impl Slots {
+    fn slot_of(&self, root: Symbol): Option::<usize> {
+        for i in 0..4 {
+            if self.roots[i] == Some(root) {
+                return Some(i);
+            }
+        }
+        return None;
+    }
+
+    fn touch(&mut self, i: usize) {
+        self.clock += 1;
+        self.used[i] = self.clock;
+    }
+
+    fn set(&mut self, i: usize, kept a: Analysis) {
+        match i {
+            0 => self.a0 = a,
+            1 => self.a1 = a,
+            2 => self.a2 = a,
+            _ => self.a3 = a,
+        }
+    }
+
+    /// Drop the analysis of `root`, if it is kept.
+    fn forget(&mut self, root: Symbol) {
+        if let Some(i) = self.slot_of(root) {
+            self.set(i, empty_analysis());
+            self.roots[i] = None;
+        }
+    }
+
+    /// Keep `a` as the analysis of `root`, in place of the least recently
+    /// used one if every slot is taken: its slot.
+    fn keep(&mut self, root: Symbol, kept a: Analysis): usize {
+        let mut i = match self.slot_of(root) {
+            Some(i) => i,
+            None => 4,
+        };
+        if i == 4 {
+            i = 0;
+            for k in 0..4 {
+                if self.roots[k].is_none() {
+                    i = k;
+                    break;
+                }
+                if self.used[k] < self.used[i] {
+                    i = k;
+                }
+            }
+        }
+        self.set(i, a);
+        self.roots[i] = Some(root);
+        self.touch(i);
+        return i;
+    }
+
+    fn ok(&self, i: usize): bool {
+        return match i {
+            0 => self.a0.ok,
+            1 => self.a1.ok,
+            2 => self.a2.ok,
+            _ => self.a3.ok,
+        };
+    }
+
+    fn find(&self, i: usize, path: str, line: u32, character: u32): Option::<(u32, u32)> {
+        return match i {
+            0 => find_in(&self.a0, path, line, character),
+            1 => find_in(&self.a1, path, line, character),
+            2 => find_in(&self.a2, path, line, character),
+            _ => find_in(&self.a3, path, line, character),
+        };
+    }
+
+    fn hover(&mut self, i: usize, file: u32, offset: u32, out: &mut Json): Value {
+        return match i {
+            0 => hover_in(&mut self.a0, file, offset, out),
+            1 => hover_in(&mut self.a1, file, offset, out),
+            2 => hover_in(&mut self.a2, file, offset, out),
+            _ => hover_in(&mut self.a3, file, offset, out),
+        };
+    }
+
+    fn definition(&self, i: usize, st: &State, file: u32, offset: u32, out: &mut Json): Value {
+        return match i {
+            0 => definition_in(&self.a0, st, file, offset, out),
+            1 => definition_in(&self.a1, st, file, offset, out),
+            2 => definition_in(&self.a2, st, file, offset, out),
+            _ => definition_in(&self.a3, st, file, offset, out),
+        };
+    }
+}
+
+// ===================================================================== the server
+
+/// The open documents' texts, by path key.
+struct Docs {
+    text: String,
+    list: [Doc; -..+],
+    /// Bytes of `text` no document uses any more.
+    dead: usize,
+}
+
+struct Doc {
+    key: Symbol,
+    lo: u32,
+    hi: u32,
+}
+
+impl Docs {
+    fn find(&self, key: Symbol): Option::<usize> {
+        for i in 0..self.list.len() {
+            if self.list[i].key == key {
+                return Some(i);
+            }
+        }
+        return None;
+    }
+
+    fn get(&self, key: Symbol): Option::<str> {
+        let i = self.find(key)?;
+        let d = self.list[i];
+        return Some(self.text.as_str()[d.lo as usize..d.hi as usize]);
+    }
+
+    fn set(&mut self, key: Symbol, text: str) {
+        self.remove(key);
+        let lo = self.text.len() as u32;
+        self.text.push_str(text);
+        self.list.push(Doc { key, lo, hi: self.text.len() as u32 });
+    }
+
+    fn remove(&mut self, key: Symbol) {
+        if let Some(i) = self.find(key) {
+            let d = self.list[i];
+            self.dead += (d.hi - d.lo) as usize;
+            let last = self.list.len() - 1;
+            self.list[i] = self.list[last];
+            self.list.pop();
+        }
+        // Copy the live texts once most of the buffer is dead.
+        if self.dead > 1048576 && self.dead * 2 > self.text.len() {
+            let mut text = String::new();
+            for i in 0..self.list.len() {
+                let d = self.list[i];
+                let lo = text.len() as u32;
+                text.push_str(self.text.as_str()[d.lo as usize..d.hi as usize]);
+                self.list[i] = Doc { key: d.key, lo, hi: text.len() as u32 };
+            }
+            self.text = text;
+            self.dead = 0;
+        }
+    }
+}
+
+/// A URI with published diagnostics, and the crate root they are from.
+struct Published {
+    root: Symbol,
+    uri: Symbol,
+}
+
+/// What the server knows besides the analyses.
+struct State {
+    std_dir: String,
+    /// Paths, path keys and URIs.
+    names: Interner,
+    /// Open documents by path key.
+    docs: Docs,
+    /// Crate roots analyzed, by key: the root's path.
+    crates: HashMap::<Symbol, Symbol>,
+    /// Which crate root each user file was last analyzed under.
+    file_root: HashMap::<Symbol, Symbol>,
+    /// URIs with published diagnostics, per crate root (to clear them).
+    published: [Published; -..+],
+    /// The URI the client used for each file it opened, by path key:
+    /// replies must use its spelling or it will not know the document.
+    uris: HashMap::<Symbol, Symbol>,
+}
+
+impl State {
+    fn sym(&mut +self, s: str): Symbol {
+        return self.names.intern(s);
+    }
+
+    fn text(&self, s: Symbol): str {
+        return self.names.resolve(s);
+    }
+
+    fn key_of(&mut +self, path: str): Symbol {
+        let k = path_key(path);
+        return self.names.intern(k.as_str());
+    }
+
+    /// The open documents.
+    fn overlay(&self): Overlay {
+        let mut o = Overlay::new();
+        for d in self.docs.list {
+            o.add(self.text(d.key), self.docs.text.as_str()[d.lo as usize..d.hi as usize]);
+        }
+        return o;
+    }
+
+    /// The URI to send the client for `path`: the one it opened the file
+    /// with, or one made from the path.
+    fn uri_of(&self, path: str): String {
+        let k = path_key(path);
+        if let Some(ks) = self.names.get(k.as_str()) {
+            if let Some(u) = self.uris.get(ks) {
+                return String::from(self.text(u));
+            }
+        }
+        return uri_from_path(path);
+    }
+
+    /// `span` as an LSP location.
+    fn location(&self, j: &mut Json, p: &Program, span: Span): Option::<Value> {
+        if is_dummy(span) || p.sources.files.len() == 0 {
+            return None;
+        }
+        let f = p.sources.files[p.sources.file_of(span.lo) as usize];
+        if f.expansion_site.is_some() {
+            return None;
+        }
+        let uri = self.uri_of(p.text(f.name));
+        let l = j.object();
+        let r = range_json(j, p, span);
+        j.set(l, "range", r);
+        let u = j.string(uri.as_str());
+        j.set(l, "uri", u);
+        return Some(l);
+    }
+
+    /// A diagnostic as the LSP has it (keys in the order serde_json writes
+    /// them).
+    fn lsp_diag(&self, j: &mut Json, p: &Program, d: Diag): Value {
+        let mut message = String::from(p.text(d.message));
+        if let Some(l) = d.label {
+            message.write(" ({p.text(l)})");
+        }
+        let span = if is_dummy(d.span) { d.span } else { p.source_span(d.span) };
+        if span != d.span {
+            let ef = p.sources.file_of(d.span.lo);
+            message.write("\nnote: inside the expansion `{p.text(p.sources.files[ef as usize].name)}`:\n{p.sources.file_text(ef)}");
+        }
+        for n in p.diags.texts.list(d.notes) {
+            message.write("\nnote: {p.text(n)}");
+        }
+        for h in p.diags.texts.list(d.helps) {
+            message.write("\nhelp: {p.text(h)}");
+        }
+        let o = j.object();
+        let mut code = String::new();
+        code.write("{d.code.scope}::{d.code.name}");
+        let c = j.string(code.as_str());
+        j.set(o, "code", c);
+        let m = j.string(message.as_str());
+        j.set(o, "message", m);
+        let r = if is_dummy(span) { range_of(j, 0, 0, 0, 0) } else { range_json(j, p, span) };
+        j.set(o, "range", r);
+        let related = j.array();
+        for l in p.diags.labels.list(d.labels) {
+            if is_dummy(l.span) {
+                continue;
+            }
+            if let Some(loc) = self.location(j, p, p.source_span(l.span)) {
+                let info = j.object();
+                j.set(info, "location", loc);
+                let lm = j.string(p.text(l.message));
+                j.set(info, "message", lm);
+                j.push(related, info);
+            }
+        }
+        if j.len(related) > 0 {
+            j.set(o, "relatedInformation", related);
+        }
+        let sev = j.int(if d.severity == Severity::Error { 1 } else { 2 });
+        j.set(o, "severity", sev);
+        let src = j.string("lunar");
+        j.set(o, "source", src);
+        return o;
+    }
+
+    /// Publish no diagnostics for the URIs `root`'s were published for,
+    /// except `keep`; forget them.
+    fn clear_published(&mut self, root: Symbol, keep: [Symbol; &]): Result::<(), String> {
+        let mut i: usize = 0;
+        while i < self.published.len() {
+            let p = self.published[i];
+            if p.root != root {
+                i += 1;
+                continue;
+            }
+            if !keep.contains(p.uri) {
+                let mut j = Json::new();
+                let empty = j.array();
+                publish(&mut j, self.text(p.uri), empty)?;
+            }
+            let last = self.published.len() - 1;
+            self.published[i] = self.published[last];
+            self.published.pop();
+        }
+        return Ok(());
+    }
+
+    /// The text of `path`: the open document's, else the file's.
+    fn read(&mut self, path: str): Option::<String> {
+        let k = self.key_of(path);
+        if let Some(t) = self.docs.get(k) {
+            return Some(String::from(t));
+        }
+        return fs::read_to_string(path).ok();
+    }
+
+    /// The root of the crate that `file` belongs to. `dir/foo.ln` and
+    /// `dir/foo/mod.ln` are module `foo`, declared by `mod foo;` in a file
+    /// whose child modules live in `dir`: a root file or `mod.ln` in `dir`,
+    /// or `dir.ln` next to `dir`. The declaring file may itself be a
+    /// module, so the search repeats upwards. A file nobody declares is its
+    /// own root.
+    fn crate_root_of(&mut self, file: str): String {
+        let mut cur = project::normalize(file);
+        for _ in 0..32 {
+            match self.declaring_file(cur.as_str()) {
+                Some(parent) => {
+                    if path_key(parent.as_str()).as_str() == path_key(cur.as_str()).as_str() {
+                        break;
+                    }
+                    cur = parent;
+                }
+                None => break,
+            }
+        }
+        return cur;
+    }
+
+    fn declaring_file(&mut self, file: str): Option::<String> {
+        let is_mod_ln = file_name(file) == "mod.ln";
+        let mut name = String::new();
+        let mut dir = String::new();
+        if is_mod_ln {
+            let d = project::parent(file)?;
+            name.push_str(file_name(d.as_str()));
+            dir = project::parent(d.as_str())?;
+        } else {
+            name.push_str(file_stem(file));
+            dir = project::parent(file)?;
+        }
+        // The candidates, end to end in `texts`.
+        let mut texts = String::new();
+        let mut ends: [usize; -..+] = [];
+        // `dir.ln`, a file whose children live in `dir/`.
+        if let Some(up) = project::parent(dir.as_str()) {
+            texts.write("{up}/{file_name(dir.as_str())}.ln");
+            ends.push(texts.len());
+        }
+        // Files in `dir` that own it: `mod.ln` and crate roots.
+        if let Ok(entries) = fs::read_dir(dir.as_str()) {
+            let mut order: [usize; -..+] = [];
+            for i in 0..entries.len() {
+                if !entries.is_dir(i) && entries.name(i).ends_with(".ln") {
+                    order.push(i);
+                }
+            }
+            // By name, as Rust sorts the paths.
+            let mut a: usize = 1;
+            while a < order.len() {
+                let mut b = a;
+                while b > 0 && less(entries.name(order[b]), entries.name(order[b - 1])) {
+                    let t = order[b - 1];
+                    order[b - 1] = order[b];
+                    order[b] = t;
+                    b -= 1;
+                }
+                a += 1;
+            }
+            for i in order {
+                texts.write("{dir}/{entries.name(i)}");
+                ends.push(texts.len());
+            }
+        }
+        let file_key = path_key(file);
+        let mut start: usize = 0;
+        for e in ends {
+            let c = String::from(texts.as_str()[start..e]);
+            start = e;
+            if path_key(c.as_str()).as_str() == file_key.as_str() {
+                continue;
+            }
+            if let Some(text) = self.read(c.as_str()) {
+                if declares_mod(text.as_str(), name.as_str()) {
+                    return Some(c);
+                }
+            }
+        }
+        return None;
+    }
+
+    /// The file of the standard library module `module` (`core::string`).
+    fn std_file_of(&self, module: str): Option::<String> {
+        if module.len() == 0 || self.std_dir.len() == 0 {
+            return None;
+        }
+        let mut parts = String::new();
+        let mut first = true;
+        for seg in module.split("::") {
+            if !first {
+                parts.push('/');
+            }
+            first = false;
+            parts.push_str(seg);
+        }
+        let base = project::join(self.std_dir.as_str(), parts.as_str());
+        if !module.contains("::") {
+            let lib = project::join(base.as_str(), "lib.ln");
+            if fs::is_file(lib.as_str()) {
+                return Some(lib);
+            }
+            return None;
+        }
+        let mut flat = String::from(base.as_str());
+        flat.push_str(".ln");
+        if fs::is_file(flat.as_str()) {
+            return Some(flat);
+        }
+        let nested = project::join(base.as_str(), "mod.ln");
+        if fs::is_file(nested.as_str()) {
+            return Some(nested);
+        }
+        return None;
+    }
+}
+
+struct Server {
+    st: State,
+    slots: Slots,
+}
+
+/// A request's position: the analysis (slot) of the document, the file
+/// in it, and the offset.
+struct Located {
+    slot: usize,
+    file: u32,
+    offset: u32,
+}
+
+impl Server {
+    fn new(std_dir: String): Server {
+        return Server {
+            st: State {
+                std_dir,
+                names: Interner::new(),
+                docs: Docs { text: String::new(), list: [], dead: 0 },
+                crates: HashMap::new(),
+                file_root: HashMap::new(),
+                published: [],
+                uris: HashMap::new(),
+            },
+            slots: Slots {
+                a0: empty_analysis(),
+                a1: empty_analysis(),
+                a2: empty_analysis(),
+                a3: empty_analysis(),
+                roots: [None; 4],
+                used: [0; 4],
+                clock: 0,
+            },
+        };
+    }
+
+    fn main_loop(&mut self, inp: &mut Input): Result::<(), String> {
+        loop {
+            // Everything already waiting is handled before re-analyzing.
+            let mut texts = String::new();
+            let mut batch: [(u32, u32); -..+] = [];
+            let mut failure = String::new();
+            let mut failed = false;
+            let mut ended = false;
+            loop {
+                let lo = texts.len() as u32;
+                match read_message(inp, &mut texts) {
+                    Ok(Got::Message) => batch.push((lo, texts.len() as u32)),
+                    Ok(Got::End) => {
+                        ended = true;
+                        break;
+                    }
+                    Err(e) => {
+                        failure = e;
+                        failed = true;
+                        break;
+                    }
+                }
+                // The client sends nothing after `exit`.
+                if let Ok(j) = parse_message(texts.as_str()[lo as usize..]) {
+                    if is_exit(&j) {
+                        ended = true;
+                        break;
+                    }
+                }
+                if !inp.has_message() && !io::input_available(0) {
+                    break;
+                }
+            }
+            let mut dirty: [Symbol; -..+] = [];
+            let mut k: usize = 0;
+            while k < batch.len() {
+                let (lo, hi) = batch[k];
+                k += 1;
+                let msg = parse_message(texts.as_str()[lo as usize..hi as usize])?;
+                let kind = kind_of(&msg).unwrap();
+                if kind == MsgKind::Request {
+                    if method_of(&msg) == "shutdown" {
+                        let mut out = Json::new();
+                        let null = out.null();
+                        respond(&msg, &mut out, Some(null), 0, "")?;
+                        // The next message must be `exit`.
+                        let mut next = String::new();
+                        if k < batch.len() {
+                            let (a, b) = batch[k];
+                            next.push_str(texts.as_str()[a as usize..b as usize]);
+                        } else if failed {
+                            return Err(failure);
+                        } else if ended {
+                            return Err(String::from("channel disconnected waiting for exit notification"));
+                        } else {
+                            if let Got::End = read_message(inp, &mut next)? {
+                                return Err(String::from("channel disconnected waiting for exit notification"));
+                            }
+                        }
+                        let n = parse_message(next.as_str())?;
+                        if is_exit(&n) {
+                            return Ok(());
+                        }
+                        return Err(core::fmt::format("unexpected message during shutdown: {next}"));
+                    }
+                    // Answer against up-to-date analyses.
+                    self.reanalyze(dirty[..])?;
+                    dirty.clear();
+                    self.request(&msg)?;
+                } else if kind == MsgKind::Notification {
+                    if let Some(path) = self.notification(&msg)? {
+                        if !dirty[..].contains(path) {
+                            dirty.push(path);
+                        }
+                    }
+                }
+            }
+            self.reanalyze(dirty[..])?;
+            if failed {
+                return Err(failure);
+            }
+            if ended {
+                return Ok(());
+            }
+        }
+    }
+
+    // ----------------------------------------------------------- notifications
+
+    /// Apply a document notification: the path of the file that changed.
+    fn notification(&mut self, n: &Json): Result::<Option::<Symbol>, String> {
+        let method = method_of(n);
+        let params = match n.get(n.root(), "params") {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let uri = match n.path(params, ["textDocument", "uri"][..]) {
+            Some(u) => n.as_str(u).unwrap_or(""),
+            None => "",
+        };
+        let path = match to_path(uri) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let path_sym = self.st.sym(path.as_str());
+        let key = self.st.key_of(path.as_str());
+        if method == "textDocument/didOpen" {
+            let text = match n.path(params, ["textDocument", "text"][..]) {
+                Some(t) => n.as_str(t).unwrap_or(""),
+                None => return Ok(None),
+            };
+            let u = self.st.sym(uri);
+            self.st.uris.insert(key, u);
+            self.st.docs.set(key, text);
+            return Ok(Some(path_sym));
+        }
+        if method == "textDocument/didChange" {
+            // Full synchronization: the last change is the whole text.
+            if let Some(changes) = n.get(params, "contentChanges") {
+                let mut last: Option::<Value> = None;
+                let mut c = n.first(changes);
+                while let Some(x) = c {
+                    last = Some(x);
+                    c = n.next(x);
+                }
+                if let Some(x) = last {
+                    if let Some(t) = n.get(x, "text") {
+                        self.st.docs.set(key, n.as_str(t).unwrap_or(""));
+                    }
+                }
+            }
+            return Ok(Some(path_sym));
+        }
+        if method == "textDocument/didClose" {
+            self.st.docs.remove(key);
+            // Drop crates that no longer have any open file.
+            let mut roots: [Symbol; -..+] = [];
+            for r in self.st.crates.keys() {
+                roots.push(r);
+            }
+            for root in roots {
+                let mut open = false;
+                for e in self.st.file_root.iter() {
+                    let (f, r) = e;
+                    if r == root && self.st.docs.find(f).is_some() {
+                        open = true;
+                        break;
+                    }
+                }
+                if !open {
+                    self.drop_crate(root)?;
+                }
+            }
+            // Other open files of its crate still see the text on disk.
+            if self.st.file_root.contains(key) {
+                return Ok(Some(path_sym));
+            }
+            return Ok(None);
+        }
+        return Ok(None);
+    }
+
+    /// Forget crate `root`: its analysis, its files, and its diagnostics
+    /// (cleared in the editor).
+    fn drop_crate(&mut self, root: Symbol): Result::<(), String> {
+        self.st.crates.remove(root);
+        self.slots.forget(root);
+        let mut gone: [Symbol; -..+] = [];
+        for e in self.st.file_root.iter() {
+            let (f, r) = e;
+            if r == root {
+                gone.push(f);
+            }
+        }
+        for f in gone {
+            self.st.file_root.remove(f);
+        }
+        return self.st.clear_published(root, [][..]);
+    }
+
+    // ----------------------------------------------------------- analysis
+
+    /// Re-analyze the crates of the files that changed.
+    fn reanalyze(&mut self, changed: [Symbol; &]): Result::<(), String> {
+        let mut roots: [Symbol; -..+] = [];
+        let mut keys: [Symbol; -..+] = [];
+        for path in changed {
+            let p = String::from(self.st.text(path));
+            let key = self.st.key_of(p.as_str());
+            let root = match self.st.file_root.get(key) {
+                Some(r) => match self.st.crates.get(r) {
+                    Some(rp) => String::from(self.st.text(rp)),
+                    None => p,
+                },
+                // Not part of any analyzed crate yet: a module file opened
+                // on its own belongs to the crate of the file that declares
+                // it. Every file of a std source tree is analyzed under one
+                // root.
+                None => match std_tree_of(p.as_str()) {
+                    Some(tree) => project::join(tree.as_str(), "std/lib.ln"),
+                    None => self.st.crate_root_of(p.as_str()),
+                },
+            };
+            let rs = self.st.sym(root.as_str());
+            let rk = self.st.key_of(root.as_str());
+            if !keys[..].contains(rk) {
+                keys.push(rk);
+                roots.push(rs);
+            }
+        }
+        for r in roots {
+            self.analyze_root(r)?;
+        }
+        return Ok(());
+    }
+
+    /// Analyze the crate rooted at `root` (a path), publish its
+    /// diagnostics and keep the analysis: its slot.
+    fn analyze_root(&mut self, root: Symbol): Result::<usize, String> {
+        let root_path = String::from(self.st.text(root));
+        let root_key = self.st.key_of(root_path.as_str());
+        let ov = self.st.overlay();
+        let a = analyze_in_project(ov, String::from(self.st.std_dir.as_str()), String::from(root_path.as_str()));
+        // Record which user files belong to this crate. A file that was its
+        // own root but is now a module of this crate stops being a root.
+        let mut files: [(u32, Symbol, Symbol); -..+] = [];
+        let std_key = path_key(self.st.std_dir.as_str());
+        for i in 0..a.s.p.sources.files.len() {
+            let f = a.s.p.sources.files[i];
+            if f.expansion_site.is_some() {
+                continue;
+            }
+            let name = String::from(a.s.p.text(f.name));
+            if !a.std_tree && under(std_key.as_str(), name.as_str()) {
+                continue;
+            }
+            let k = self.st.key_of(name.as_str());
+            let ps = self.st.sym(name.as_str());
+            files.push((i as u32, k, ps));
+        }
+        for x in files {
+            let (_, k, _) = x;
+            if k != root_key && self.st.crates.contains(k) {
+                self.drop_crate(k)?;
+            }
+            self.st.file_root.insert(k, root_key);
+        }
+        // Diagnostics per file.
+        let root_file = ide::file_for_path(&a.s.p, root_path.as_str());
+        let mut now: [Symbol; -..+] = [];
+        for x in files {
+            let (file, _, path) = x;
+            let uri = self.st.uri_of(self.st.text(path));
+            let mut j = Json::new();
+            let list = j.array();
+            for d in a.s.p.diags.list {
+                let in_file = if is_dummy(d.span) {
+                    root_file == Some(file)
+                } else {
+                    a.s.p.sources.file_of(a.s.p.source_span(d.span).lo) == file
+                };
+                if in_file {
+                    let v = self.st.lsp_diag(&mut j, &a.s.p, d);
+                    j.push(list, v);
+                }
+            }
+            publish(&mut j, uri.as_str(), list)?;
+            let us = self.st.sym(uri.as_str());
+            now.push(us);
+        }
+        self.st.clear_published(root_key, now[..])?;
+        for u in now {
+            self.st.published.push(Published { root: root_key, uri: u });
+        }
+        self.st.crates.insert(root_key, root);
+        return Ok(self.slots.keep(root_key, a));
+    }
+
+    // ----------------------------------------------------------- requests
+
+    fn request(&mut self, req: &Json): Result::<(), String> {
+        let method = String::from(method_of(req));
+        let mut out = Json::new();
+        let params = req.get(req.root(), "params");
+        if method.as_str() == "textDocument/hover" {
+            return match self.hover(req, params, &mut out) {
+                Ok(v) => respond(req, &mut out, Some(v), 0, ""),
+                Err(e) => respond(req, &mut out, None, -32602, e.as_str()),
+            };
+        }
+        if method.as_str() == "textDocument/definition" {
+            return match self.definition(req, params, &mut out) {
+                Ok(v) => respond(req, &mut out, Some(v), 0, ""),
+                Err(e) => respond(req, &mut out, None, -32602, e.as_str()),
+            };
+        }
+        if method.as_str() == "lunar/stdSource" {
+            return match self.st.std_source(req, params, &mut out) {
+                Ok(v) => respond(req, &mut out, Some(v), 0, ""),
+                Err(e) => respond(req, &mut out, None, -32602, e.as_str()),
+            };
+        }
+        let msg = core::fmt::format("unsupported request `{method}`");
+        return respond(req, &mut out, None, -32601, msg.as_str());
+    }
+
+    fn hover(&mut self, req: &Json, params: Option::<Value>, out: &mut Json): Result::<Value, String> {
+        let (uri, line, character) = position(req, params)?;
+        return match self.locate(uri.as_str(), line, character)? {
+            Some(loc) => Ok(self.slots.hover(loc.slot, loc.file, loc.offset, out)),
+            None => Ok(out.null()),
+        };
+    }
+
+    fn definition(&mut self, req: &Json, params: Option::<Value>, out: &mut Json): Result::<Value, String> {
+        let (uri, line, character) = position(req, params)?;
+        return match self.locate(uri.as_str(), line, character)? {
+            Some(loc) => Ok(self.slots.definition(loc.slot, &self.st, loc.file, loc.offset, out)),
+            None => Ok(out.null()),
+        };
+    }
+
+    /// The analysis, file and offset of a document position, analyzing the
+    /// document's crate again if its analysis is not kept.
+    fn locate(&mut self, uri: str, line: u32, character: u32): Result::<Option::<Located>, String> {
+        if uri.starts_with("lunar-std:") {
+            // Any analysis has the same standard library.
+            let module = std_module_of(uri);
+            let path = match self.st.std_file_of(module.as_str()) {
+                Some(p) => p,
+                None => return Ok(None),
+            };
+            for i in 0..4 {
+                if self.slots.roots[i].is_none() || !self.slots.ok(i) {
+                    continue;
+                }
+                if let Some((file, offset)) = self.slots.find(i, path.as_str(), line, character) {
+                    self.slots.touch(i);
+                    return Ok(Some(Located { slot: i, file, offset }));
+                }
+            }
+            return Ok(None);
+        }
+        let path = match to_path(uri) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let key = self.st.key_of(path.as_str());
+        let root = match self.st.file_root.get(key) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let slot = match self.slots.slot_of(root) {
+            Some(i) => i,
+            None => match self.st.crates.get(root) {
+                Some(rp) => self.analyze_root(rp)?,
+                None => return Ok(None),
+            },
+        };
+        self.slots.touch(slot);
+        return match self.slots.find(slot, path.as_str(), line, character) {
+            Some((file, offset)) => Ok(Some(Located { slot, file, offset })),
+            None => Ok(None),
+        };
+    }
+}
+
+impl State {
+    /// `lunar/stdSource`: the text of a `lunar-std:` document.
+    fn std_source(&self, req: &Json, params: Option::<Value>, out: &mut Json): Result::<Value, String> {
+        let uri = match params {
+            Some(p) => match req.get(p, "uri") {
+                Some(u) => req.as_str(u),
+                None => None,
+            },
+            None => None,
+        };
+        let uri = match uri {
+            Some(u) => u,
+            None => return Err(String::from("missing `uri`")),
+        };
+        if !uri.starts_with("lunar-std:") {
+            return Err(core::fmt::format("not a `lunar-std:` URI: {uri}"));
+        }
+        let module = std_module_of(uri);
+        if let Some(path) = self.std_file_of(module.as_str()) {
+            if let Ok(t) = fs::read_to_string(path.as_str()) {
+                return Ok(out.string(t.as_str()));
+            }
+        }
+        return Err(core::fmt::format("no standard library module `{module}`"));
+    }
+}
+
+/// The `textDocument` URI and `position` of a request.
+fn position(req: &Json, params: Option::<Value>): Result::<(String, u32, u32), String> {
+    let params = match params {
+        Some(p) => p,
+        None => return Err(String::from("invalid type: null, expected struct TextDocumentPositionParams")),
+    };
+    let uri = match req.path(params, ["textDocument", "uri"][..]) {
+        Some(u) => match req.as_str(u) {
+            Some(s) => s,
+            None => return Err(String::from("invalid type: expected a string for `textDocument.uri`")),
+        },
+        None => return Err(String::from("missing field `textDocument`")),
+    };
+    let pos = match req.get(params, "position") {
+        Some(p) => p,
+        None => return Err(String::from("missing field `position`")),
+    };
+    let line = match req.get(pos, "line") {
+        Some(l) => req.as_u64(l),
+        None => None,
+    };
+    let character = match req.get(pos, "character") {
+        Some(c) => req.as_u64(c),
+        None => None,
+    };
+    if line.is_none() || character.is_none() || line.unwrap() > 4294967295 || character.unwrap() > 4294967295 {
+        return Err(String::from("invalid `position`: expected `line` and `character` numbers"));
+    }
+    return Ok((String::from(uri), line.unwrap() as u32, character.unwrap() as u32));
+}
+
+// ===================================================================== JSON
+
+/// `textDocument/publishDiagnostics` for `uri`.
+fn publish(j: &mut Json, uri: str, diagnostics: Value): Result::<(), String> {
+    let m = j.object();
+    let method = j.string("textDocument/publishDiagnostics");
+    j.set(m, "method", method);
+    let params = j.object();
+    j.set(params, "diagnostics", diagnostics);
+    let u = j.string(uri);
+    j.set(params, "uri", u);
+    j.set(m, "params", params);
+    return send(j, m);
+}
+
+/// An LSP range for `span` (in its file).
+fn range_json(j: &mut Json, p: &Program, span: Span): Value {
+    let file = p.sources.file_of(span.lo);
+    let text = p.sources.file_text(file);
+    let start = p.sources.files[file as usize].start;
+    let (l0, c0) = ide::position_of(text, span.lo - start);
+    let (l1, c1) = ide::position_of(text, if span.hi >= start { span.hi - start } else { 0 });
+    return range_of(j, l0, c0, l1, c1);
+}
+
+fn range_of(j: &mut Json, l0: u32, c0: u32, l1: u32, c1: u32): Value {
+    let r = j.object();
+    let end = position_json(j, l1, c1);
+    j.set(r, "end", end);
+    let start = position_json(j, l0, c0);
+    j.set(r, "start", start);
+    return r;
+}
+
+fn position_json(j: &mut Json, line: u32, character: u32): Value {
+    let p = j.object();
+    let c = j.uint(character as u64);
+    j.set(p, "character", c);
+    let l = j.uint(line as u64);
+    j.set(p, "line", l);
+    return p;
+}
+
+// ===================================================================== paths and URIs
+
+/// The path of a `file:` URI.
+fn to_path(uri: str): Option::<String> {
+    if !uri.starts_with("file://") {
+        return None;
+    }
+    let rest = uri[7..];
+    // `file://host/path`: only the local host.
+    let slash = rest.find("/")?;
+    let host = rest[..slash];
+    if host.len() > 0 && host != "localhost" {
+        return None;
+    }
+    let mut path = percent_decode(rest[slash..]);
+    // `/C:/x` is `C:/x`.
+    if is_drive_path(path.as_str()) {
+        path = String::from(path.as_str()[1..]);
+    }
+    return Some(path);
+}
+
+/// Whether `p` is `/C:` and the rest of a Windows path.
+fn is_drive_path(p: str): bool {
+    let b = p.as_bytes();
+    return b.len() >= 3 && b[0] == b'/' && b[2] == b':' && ((b[1] >= b'a' && b[1] <= b'z') || (b[1] >= b'A' && b[1] <= b'Z'));
+}
+
+fn percent_decode(s: str): String {
+    let b = s.as_bytes();
+    let mut out: [u8; -..+] = [];
+    let mut i: usize = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() && hex_digit(b[i + 1]).is_some() && hex_digit(b[i + 2]).is_some() {
+            out.push(hex_digit(b[i + 1]).unwrap() * 16 + hex_digit(b[i + 2]).unwrap());
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    return lossy(out[..]);
+}
+
+fn hex_digit(c: u8): Option::<u8> {
+    if c >= b'0' && c <= b'9' {
+        return Some(c - b'0');
+    }
+    if c >= b'a' && c <= b'f' {
+        return Some(c - b'a' + 10);
+    }
+    if c >= b'A' && c <= b'F' {
+        return Some(c - b'A' + 10);
+    }
+    return None;
+}
+
+/// A `file:` URI for `path`, encoded as the `url` crate encodes paths.
+fn uri_from_path(path: str): String {
+    let mut out = String::from("file://");
+    let norm = project::normalize(path);
+    if !norm.as_str().starts_with("/") {
+        out.push('/');
+    }
+    let hex = "0123456789ABCDEF".as_bytes();
+    let b = norm.as_bytes();
+    let mut start: usize = 0;
+    for i in 0..b.len() {
+        let c = b[i];
+        let plain = c > 32 && c < 127 && c != b'"' && c != b'#' && c != b'<' && c != b'>' && c != b'?' && c != b'`' && c != b'{' && c != b'}' && c != b'%';
+        if plain {
+            continue;
+        }
+        out.push_str(norm.as_str()[start..i]);
+        out.push('%');
+        out.push(hex[(c >> 4) as usize] as char);
+        out.push(hex[(c & 15) as usize] as char);
+        start = i + 1;
+    }
+    out.push_str(norm.as_str()[start..]);
+    return out;
+}
+
+/// The module path of a `lunar-std:` URI. Clients may percent-encode it
+/// (VS Code sends `lunar-std:core%3A%3Aslice`).
+fn std_module_of(uri: str): String {
+    let decoded = percent_decode(uri[10..]);
+    let mut t = decoded.as_str();
+    while t.starts_with("/") {
+        t = t[1..];
+    }
+    return String::from(t);
+}
+
+/// Whether `path` is under the directory whose key is `dir_key`.
+fn under(dir_key: str, path: str): bool {
+    if dir_key.len() == 0 {
+        return false;
+    }
+    let k = path_key(path);
+    return k.len() > dir_key.len() && k.as_str().starts_with(dir_key) && k.as_bytes()[dir_key.len()] == b'/';
+}
+
+/// Whether `path` is `dir/rel`.
+fn same_path(dir: str, rel: str, path: str): bool {
+    return path_key(project::join(dir, rel).as_str()).as_str() == path_key(path).as_str();
+}
+
+/// The root of the standard library source tree that `path` belongs to:
+/// an ancestor directory with `core/lib.ln` and `std/lib.ln`, with `path`
+/// under its `core/` or `std/`. Such files are the standard library being
+/// worked on, not programs.
+fn std_tree_of(path: str): Option::<String> {
+    let norm = project::normalize(path);
+    let mut cur = project::parent(norm.as_str());
+    while let Some(d) = cur {
+        let core_dir = project::join(d.as_str(), "core");
+        let std_dir = project::join(d.as_str(), "std");
+        let inside = under(path_key(core_dir.as_str()).as_str(), norm.as_str()) || under(path_key(std_dir.as_str()).as_str(), norm.as_str());
+        if inside && fs::is_file(project::join(core_dir.as_str(), "lib.ln").as_str()) && fs::is_file(project::join(std_dir.as_str(), "lib.ln").as_str()) {
+            return Some(d);
+        }
+        cur = project::parent(d.as_str());
+    }
+    return None;
+}
+
+/// Whether `file` is a test of the package in `dir` (`tests/*.ln`).
+fn is_test_file(dir: str, file: str): bool {
+    let tests = project::join(dir, "tests");
+    return file.ends_with(".ln") && under(path_key(tests.as_str()).as_str(), file) && !file[tests.len() + 1..].contains("/");
+}
+
+/// The last component of a path.
+fn file_name(p: str): str {
+    let b = p.as_bytes();
+    let mut i = b.len();
+    while i > 0 && b[i - 1] != b'/' && b[i - 1] != b'\\' {
+        i -= 1;
+    }
+    return p[i..];
+}
+
+/// The file name without its extension.
+fn file_stem(p: str): str {
+    let name = file_name(p);
+    let b = name.as_bytes();
+    let mut i = b.len();
+    while i > 0 {
+        i -= 1;
+        if b[i] == b'.' {
+            if i == 0 {
+                return name;
+            }
+            return name[..i];
+        }
+    }
+    return name;
+}
+
+/// A crater name from a file name: letters, digits and `_` (as the Rust
+/// driver's `sanitize`).
+fn sanitize_stem(path: str): String {
+    let mut out = String::new();
+    for c in file_stem(path).chars() {
+        let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+        out.push(if ok { c } else { '_' });
+    }
+    if out.len() == 0 || (out.as_bytes()[0] >= b'0' && out.as_bytes()[0] <= b'9') {
+        let mut s = String::from("_");
+        s.push_str(out.as_str());
+        return s;
+    }
+    return out;
+}
+
+/// Whether `a` sorts before `b`, byte by byte.
+fn less(a: str, b: str): bool {
+    let x = a.as_bytes();
+    let y = b.as_bytes();
+    let mut i: usize = 0;
+    while i < x.len() && i < y.len() {
+        if x[i] != y[i] {
+            return x[i] < y[i];
+        }
+        i += 1;
+    }
+    return x.len() < y.len();
+}
+
+/// Whether `text` has a `mod name;` declaration (possibly `pub`).
+fn declares_mod(text: str, name: str): bool {
+    for line in text.lines() {
+        let mut t = line.trim();
+        if t.starts_with("pub ") {
+            t = trim_start(t[4..]);
+        }
+        if !t.starts_with("mod ") {
+            continue;
+        }
+        let rest = trim_start(t[4..]);
+        if !rest.starts_with(name) {
+            continue;
+        }
+        if trim_start(rest[name.len()..]).starts_with(";") {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn trim_start(s: str): str {
+    let b = s.as_bytes();
+    let mut i: usize = 0;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t' || b[i] == b'\r' || b[i] == b'\n') {
+        i += 1;
+    }
+    return s[i..];
+}

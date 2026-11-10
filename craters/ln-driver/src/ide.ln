@@ -1,0 +1,1053 @@
+// Editor queries over an analysis: hover, go to definition, and positions
+// (a port of crates/ln-driver/src/ide.rs). Protocol-independent; lsp.ln
+// serves them.
+//
+// Spans are global offsets into the program's source map (`p.sources`); a
+// position inside one file is an offset from the file's start, and a
+// file is its index in `p.sources.files`.
+
+use core::arena::{Id, List};
+use core::intern::Symbol;
+use ln_ast::{Ast, FieldDecl, GenericParam, Generics, Item, ItemKind, Span, StmtKind, VariantData, VariantDecl};
+use ln_ast::pretty;
+use ln_sema::defs::{DefData, DefId, DefKind};
+use ln_sema::diag::is_dummy;
+use ln_sema::layout::Layout;
+use ln_sema::loader::{Craters, path_key};
+use ln_sema::program::{Program, RefTarget};
+use ln_sema::sema::Sema;
+use ln_sema::thir;
+use ln_sema::ty::{Ty, TyKind};
+
+/// The file of the program loaded from `path` (not a macro expansion).
+pub fn file_for_path(p: &Program, path: str): Option::<u32> {
+    let key = path_key(path);
+    for i in 0..p.sources.files.len() {
+        let f = p.sources.files[i];
+        if f.expansion_site.is_none() && path_key(p.text(f.name)).as_str() == key.as_str() {
+            return Some(i as u32);
+        }
+    }
+    return None;
+}
+
+/// Byte offset of a 0-based (line, UTF-16 column) position, clamped to
+/// the text.
+pub fn offset_of(text: str, line: u32, col_utf16: u32): u32 {
+    let mut start: usize = 0;
+    for _ in 0..line {
+        match text[start..].find("\n") {
+            Some(i) => start += i + 1,
+            None => return text.len() as u32,
+        }
+    }
+    let mut units: u32 = 0;
+    let mut i = start;
+    for c in text[start..].chars() {
+        if units >= col_utf16 || c == '\n' {
+            return i as u32;
+        }
+        units += utf16_len(c);
+        i += c.len_utf8();
+    }
+    return text.len() as u32;
+}
+
+/// 0-based (line, UTF-16 column) of a byte offset.
+pub fn position_of(text: str, offset: u32): (u32, u32) {
+    let mut end = offset as usize;
+    if end > text.len() {
+        end = text.len();
+    }
+    let b = text.as_bytes();
+    let mut line: u32 = 0;
+    let mut line_start: usize = 0;
+    for i in 0..end {
+        if b[i] == b'\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+    let mut col: u32 = 0;
+    for c in text[line_start..end].chars() {
+        col += utf16_len(c);
+    }
+    return (line, col);
+}
+
+fn utf16_len(c: char): u32 {
+    return if (c as u32) >= 65536 { 2 } else { 1 };
+}
+
+/// Whether `s` is a real span in `file`.
+fn in_file(p: &Program, s: Span, file: u32): bool {
+    return !is_dummy(s) && p.sources.files.len() > 0 && p.sources.file_of(s.lo) == file;
+}
+
+/// The innermost name found so far around an offset.
+struct BestRef {
+    found: bool,
+    span: Span,
+    target: RefTarget,
+}
+
+fn consider(b: &mut BestRef, p: &Program, file: u32, offset: u32, s: Span, t: RefTarget) {
+    if in_file(p, s, file) && s.lo <= offset && offset <= s.hi && (!b.found || s.hi - s.lo <= b.span.hi - b.span.lo) {
+        b.found = true;
+        b.span = s;
+        b.target = t;
+    }
+}
+
+/// The innermost recorded name at `offset` (global) in `file`: a use of a
+/// name, or the name in an item or field declaration.
+fn ref_at(p: &Program, file: u32, offset: u32): Option::<(Span, RefTarget)> {
+    let mut b = BestRef { found: false, span: Span::new(0, 0), target: RefTarget::TyParam(Span::new(0, 0)) };
+    for r in p.refs {
+        consider(&mut b, p, file, offset, r.span, r.target);
+    }
+    for i in 0..p.defs.len() {
+        let d = p.defs[i];
+        if !in_file(p, d.span, file) || d.kind == DefKind::Impl || p.text(d.name).starts_with("<") {
+            continue;
+        }
+        let id = DefId::new(i);
+        consider(&mut b, p, file, offset, d.span, RefTarget::Def(id));
+        if let DefData::Adt(adt) = d.data {
+            let vs = p.variants.list(adt.variants);
+            for vi in 0..vs.len() {
+                let fs = p.fields.list(vs[vi].fields);
+                for fi in 0..fs.len() {
+                    consider(&mut b, p, file, offset, fs[fi].span, RefTarget::Field { adt: id, variant: vi as u32, field: fi as u32 });
+                }
+            }
+        }
+    }
+    if !b.found {
+        return None;
+    }
+    return Some((b.span, b.target));
+}
+
+/// Where the name at `offset` (global) in `file` is defined.
+pub fn definition(p: &Program, file: u32, offset: u32): Option::<Span> {
+    let (_, target) = ref_at(p, file, offset)?;
+    let span = match target {
+        RefTarget::Def(d) => p.def(d).span,
+        RefTarget::Field { adt, variant, field } => {
+            let v = p.variants_of(p.adt(adt))[variant as usize];
+            p.fields_of(v)[field as usize].span
+        }
+        RefTarget::Local { body, local } => match p.bodies.get(body) {
+            Some(b) => p.thir.local(b, local).span,
+            None => return None,
+        },
+        RefTarget::TyParam(decl) => decl,
+    };
+    if is_dummy(span) {
+        return None;
+    }
+    return Some(span);
+}
+
+// ===================================================================== declarations
+
+/// A declaration in the parsed source, found by the span of its name.
+enum Decl {
+    /// An item, the `impl` or `trait` it is declared in, and whether it is
+    /// in an `extern` block (and that block's ABI).
+    Item { item: Item, parent: Option::<Item>, in_extern: bool, abi: Option::<Symbol> },
+    Variant(VariantDecl),
+    Field(FieldDecl),
+    Param(GenericParam),
+}
+
+/// Its documentation, from its `doc` attributes.
+fn decl_docs(a: &Ast, d: Decl): String {
+    return match d {
+        Decl::Item { item, .. } => pretty::doc_text(a, item.attrs),
+        Decl::Variant(v) => pretty::doc_text(a, v.attrs),
+        Decl::Field(f) => pretty::doc_text(a, f.attrs),
+        Decl::Param(_) => String::new(),
+    };
+}
+
+/// The named field declared at `name` in `data`, if any.
+fn field_in(a: &Ast, data: VariantData, name: Span): Option::<Decl> {
+    if let VariantData::Named(fs) = data {
+        for f in a.field_decls.list(fs) {
+            if f.name.span == name {
+                return Some(Decl::Field(f));
+            }
+        }
+    }
+    return None;
+}
+
+/// The generic parameter declared at `name` in `g`, if any.
+fn param_in(a: &Ast, g: Generics, name: Span): Option::<Decl> {
+    for gp in a.generic_params.list(g.params) {
+        if gp.name.span == name {
+            return Some(Decl::Param(gp));
+        }
+    }
+    return None;
+}
+
+/// The declaration whose name is at `name`, in the module source of its
+/// file (macro expansions have none).
+fn find_decl(cs: &Craters, p: &Program, name: Span): Option::<Decl> {
+    if is_dummy(name) || p.sources.files.len() == 0 {
+        return None;
+    }
+    let file = p.sources.file_of(name.lo);
+    if p.sources.files[file as usize].expansion_site.is_some() {
+        return None;
+    }
+    for m in cs.mods.items() {
+        if m.file == file {
+            return decl_in_items(&p.ast, m.items, name, None, false, None);
+        }
+    }
+    return None;
+}
+
+fn decl_in_items(a: &Ast, items: List::<Id::<Item>>, name: Span, parent: Option::<Item>, in_extern: bool, abi: Option::<Symbol>): Option::<Decl> {
+    for id in a.item_ids.list(items) {
+        if let Some(d) = decl_in_item(a, id, name, parent, in_extern, abi) {
+            return Some(d);
+        }
+    }
+    return None;
+}
+
+fn decl_in_item(a: &Ast, id: Id::<Item>, name: Span, parent: Option::<Item>, in_extern: bool, abi: Option::<Symbol>): Option::<Decl> {
+    let item = a.items.get(id);
+    let here = Decl::Item { item, parent, in_extern, abi };
+    return match item.kind {
+        ItemKind::Fn(f) => {
+            if f.name.span == name {
+                return Some(here);
+            }
+            if let Some(d) = param_in(a, f.generics, name) {
+                return Some(d);
+            }
+            // Items declared inside the function's body.
+            if let Some(body) = f.body {
+                for s in a.stmts.list(a.blocks.get(body).stmts) {
+                    if let StmtKind::Item(i) = s.kind {
+                        if let Some(d) = decl_in_item(a, i, name, None, false, None) {
+                            return Some(d);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        ItemKind::Struct(s) => {
+            if s.name.span == name {
+                return Some(here);
+            }
+            if let Some(d) = param_in(a, s.generics, name) {
+                return Some(d);
+            }
+            field_in(a, s.kind, name)
+        }
+        ItemKind::Enum(e) => {
+            if e.name.span == name {
+                return Some(here);
+            }
+            if let Some(d) = param_in(a, e.generics, name) {
+                return Some(d);
+            }
+            for v in a.variants.list(e.variants) {
+                if v.name.span == name {
+                    return Some(Decl::Variant(v));
+                }
+                if let Some(d) = field_in(a, v.data, name) {
+                    return Some(d);
+                }
+            }
+            None
+        }
+        ItemKind::Trait(t) => {
+            if t.name.span == name {
+                return Some(here);
+            }
+            if let Some(d) = param_in(a, t.generics, name) {
+                return Some(d);
+            }
+            decl_in_items(a, t.items, name, Some(item), false, None)
+        }
+        ItemKind::Impl(i) => {
+            if let Some(d) = param_in(a, i.generics, name) {
+                return Some(d);
+            }
+            decl_in_items(a, i.items, name, Some(item), false, None)
+        }
+        ItemKind::Mod(m) => {
+            if m.name.span == name {
+                return Some(here);
+            }
+            match m.items {
+                Some(inner) => decl_in_items(a, inner, name, None, false, None),
+                None => None,
+            }
+        }
+        ItemKind::Const(c) => if c.name.span == name { Some(here) } else { None },
+        ItemKind::Static(s) => if s.name.span == name { Some(here) } else { None },
+        ItemKind::TypeAlias(t) => {
+            if t.name.span == name {
+                return Some(here);
+            }
+            param_in(a, t.generics, name)
+        }
+        ItemKind::Extern(b) => decl_in_items(a, b.items, name, None, true, b.abi),
+        ItemKind::Macro(m) => if m.name.span == name { Some(here) } else { None },
+        ItemKind::Use(_) => None,
+        ItemKind::MacCall(_) => None,
+    };
+}
+
+// ===================================================================== hover
+
+/// The type of the innermost expression found so far around an offset.
+struct BestExpr {
+    found: bool,
+    span: Span,
+    ty: Ty,
+}
+
+/// Markdown hover text for `offset` (global) in `file`, and the span it
+/// describes.
+pub fn hover(s: &mut +Sema, file: u32, offset: u32): Option::<(Span, String)> {
+    if let Some((span, target)) = ref_at(&s.p, file, offset) {
+        let text = match target {
+            RefTarget::Def(d) => describe_def(s, d),
+            // Just the parameter and its bounds: `T: Ord + Clone`.
+            RefTarget::TyParam(decl) => match find_decl(&s.craters, &s.p, decl) {
+                Some(Decl::Param(g)) => code_block(pretty::generic_param(&s.p.ast, s.p.sources.text.as_str(), g).as_str()),
+                _ => return None,
+            },
+            RefTarget::Field { adt, variant, field } => describe_field(s, adt, variant, field),
+            RefTarget::Local { body, local } => {
+                let b = match s.p.bodies.get(body) {
+                    Some(b) => b,
+                    None => return None,
+                };
+                let l = s.p.thir.local(b, local);
+                let mut_kw = if l.mutable { "mut " } else { "" };
+                let mut before = String::new();
+                let mut mode = "";
+                match l.kind {
+                    thir::LocalKind::Param { inout, owned, .. } => {
+                        if inout {
+                            mode = "&mut ";
+                        } else if !owned {
+                            mode = "&";
+                        } else {
+                            before.push_str(mut_kw);
+                        }
+                    }
+                    _ => {
+                        before.push_str("let ");
+                        before.push_str(mut_kw);
+                    }
+                }
+                let inner = strip_grow(&s.p, l.ty);
+                let lay = s.p.layout_of(inner);
+                let layout = layout_comment(lay, None);
+                let ty_text = s.p.ty_str(l.ty);
+                let mut text = String::new();
+                text.write("```lunar\n{layout}{before}{s.p.text(l.name)}: {mode}{ty_text}\n```");
+                text
+            }
+        };
+        return Some((span, text));
+    }
+    // Keywords explain themselves (rather than showing, say, `!` for
+    // `return`).
+    if let Some(k) = keyword_hover(&s.p, file, offset) {
+        return Some(k);
+    }
+    // Otherwise the type of the innermost expression under the cursor.
+    let mut best = BestExpr { found: false, span: Span::new(0, 0), ty: s.p.types.error() };
+    for b in s.p.bodies.values() {
+        if !in_file(&s.p, b.span, file) || offset < b.span.lo || offset > b.span.hi {
+            continue;
+        }
+        walk_block(&s.p, b.block, file, offset, &mut best);
+    }
+    if !best.found {
+        return None;
+    }
+    let t = s.p.ty_str(best.ty);
+    let mut text = String::new();
+    text.write("```lunar\n{t}\n```");
+    return Some((best.span, text));
+}
+
+/// A field: the struct (or variant), the field with its layout, its docs.
+fn describe_field(s: &mut +Sema, adt: DefId, variant: u32, field: u32): String {
+    let data = s.p.adt(adt);
+    let v = s.p.variants_of(data)[variant as usize];
+    let f = s.p.fields_of(v)[field as usize];
+    let owner = if data.is_enum { s.p.path_of(v.def) } else { s.p.path_of(adt) };
+    let offset: Option::<u64> = if data.is_enum {
+        None
+    } else {
+        match s.p.field_offsets(adt, List::empty()) {
+            Some(o) => Some(o[field as usize]),
+            None => None,
+        }
+    };
+    let lay = s.p.layout_of(f.ty);
+    let layout = layout_comment(lay, offset);
+    let vis = if f.is_pub { "pub " } else { "" };
+    let ty_text = s.p.ty_str(f.ty);
+    let mut text = String::new();
+    text.write("{code_block(owner.as_str())}\n\n```lunar\n{layout}{vis}{s.p.text(f.name)}: {ty_text}\n```");
+    let docs = match find_decl(&s.craters, &s.p, f.span) {
+        Some(d) => decl_docs(&s.p.ast, d),
+        None => String::new(),
+    };
+    push_docs(&mut text, docs.as_str());
+    return text;
+}
+
+fn strip_grow(p: &Program, t: Ty): Ty {
+    return match p.types.kind(t) {
+        TyKind::Grow(inner) => inner,
+        _ => t,
+    };
+}
+
+/// Declaration (printed from the syntax tree), container path and doc
+/// comments of a definition.
+fn describe_def(s: &mut +Sema, d: DefId): String {
+    let info = s.p.def(d);
+    // Like rust-analyzer: the container path, then the declaration (with
+    // the memory layout as a comment for types, and the enclosing `impl`
+    // or `trait` for methods), then the docs.
+    let mut decl = String::new();
+    if let DefData::Adt(adt) = info.data {
+        if adt.generics.names.len() == 0 {
+            let t = s.p.types.mk(TyKind::Adt(d, List::empty()));
+            let lay = s.p.layout_of(t);
+            decl.push_str(layout_comment(lay, None).as_str());
+        }
+    }
+    let found = if is_dummy(info.span) { None } else { find_decl(&s.craters, &s.p, info.span) };
+    let src = s.p.sources.text.as_str();
+    let sig = match found {
+        Some(Decl::Item { item, parent, in_extern, abi }) => {
+            if let Some(par) = parent {
+                decl.push_str(pretty::item(&s.p.ast, src, par, None).as_str());
+                decl.push('\n');
+            }
+            let abi_text: Option::<str> = if in_extern {
+                Some(match abi {
+                    Some(x) => s.p.text(x),
+                    None => "C",
+                })
+            } else {
+                None
+            };
+            pretty::item(&s.p.ast, src, item, abi_text)
+        }
+        Some(Decl::Variant(v)) => pretty::variant(&s.p.ast, src, v),
+        Some(Decl::Field(f)) => {
+            let mut t = String::new();
+            t.write("{s.p.text(f.name.name)}: {pretty::ty(&s.p.ast, src, f.ty)}");
+            t
+        }
+        Some(Decl::Param(g)) => pretty::generic_param(&s.p.ast, src, g),
+        None => String::from(s.p.text(info.name)),
+    };
+    decl.push_str(sig.as_str());
+    // Methods: the path of the type for user-defined types
+    // (`tour::Point`), else the module of the impl (`core::num` for
+    // `impl i32`), as rust-analyzer does.
+    let mut container = String::new();
+    let mut of_impl = false;
+    if let Some(pd) = info.parent {
+        let pdi = s.p.def(pd);
+        if pdi.kind == DefKind::Impl {
+            of_impl = true;
+            let st = s.p.impl_data(pd).self_ty;
+            container = match s.p.types.kind(st) {
+                TyKind::Adt(adt, _) => s.p.path_of(adt),
+                _ => s.p.path_of(pdi.module),
+            };
+        }
+    }
+    if !of_impl {
+        let path = s.p.path_of(d);
+        if let Some(i) = rfind(path.as_str(), "::") {
+            container.push_str(path.as_str()[..i]);
+        }
+    }
+    let mut out = String::new();
+    if container.len() > 0 {
+        out.push_str(code_block(container.as_str()).as_str());
+        out.push_str("\n\n");
+    }
+    out.push_str(code_block(decl.as_str()).as_str());
+    let docs = match found {
+        Some(x) => decl_docs(&s.p.ast, x),
+        None => String::new(),
+    };
+    push_docs(&mut out, docs.as_str());
+    return out;
+}
+
+/// The last occurrence of `needle` in `s`.
+fn rfind(s: str, needle: str): Option::<usize> {
+    let mut found: Option::<usize> = None;
+    let mut from: usize = 0;
+    while let Some(i) = s[from..].find(needle) {
+        found = Some(from + i);
+        from = from + i + 1;
+    }
+    return found;
+}
+
+/// Append documentation below a hover's code, as rust-analyzer does.
+fn push_docs(out: &mut String, docs: str) {
+    if docs.len() > 0 {
+        out.push_str("\n\n---\n\n");
+        out.push_str(docs);
+    }
+}
+
+fn code_block(code: str): String {
+    let mut out = String::new();
+    out.write("```lunar\n{code}\n```");
+    return out;
+}
+
+/// rust-analyzer's memory layout line: `// size = 24 (0x18), align = 0x8`,
+/// plus `offset` for fields. Empty when the layout is not known (generics).
+fn layout_comment(layout: Option::<Layout>, offset: Option::<u64>): String {
+    let mut out = String::new();
+    let l = match layout {
+        Some(l) => l,
+        None => return out,
+    };
+    out.push_str("// size = ");
+    if l.size >= 10 {
+        out.write("{l.size} ({hex(l.size)})");
+    } else {
+        out.write("{l.size}");
+    }
+    out.write(", align = {hex(l.align)}");
+    if let Some(o) = offset {
+        out.write(", offset = {hex(o)}");
+    }
+    out.push('\n');
+    return out;
+}
+
+/// `n` as Rust's `{:#X}` writes it: `0x18`.
+fn hex(n: u64): String {
+    let digits = "0123456789ABCDEF".as_bytes();
+    let mut buf: [u8; -..+] = [];
+    let mut v = n;
+    loop {
+        buf.push(digits[(v % 16) as usize]);
+        v /= 16;
+        if v == 0 {
+            break;
+        }
+    }
+    let mut out = String::from("0x");
+    let mut i = buf.len();
+    while i > 0 {
+        i -= 1;
+        out.push(buf[i] as char);
+    }
+    return out;
+}
+
+/// Documentation for the keyword under the cursor, in rust-analyzer's
+/// style.
+fn keyword_hover(p: &Program, file: u32, offset: u32): Option::<(Span, String)> {
+    let start = p.sources.files[file as usize].start;
+    let text = p.sources.file_text(file);
+    let local = offset - start;
+    let (toks, _) = ln_lexer::lex(text);
+    for t in toks {
+        if t.range.start as u32 <= local && local < t.range.end as u32 {
+            let word = text[t.range.start..t.range.end];
+            let doc = keyword_doc(word)?;
+            let mut out = String::new();
+            out.write("{code_block(word)}\n\n---\n\n{doc}");
+            return Some((Span::new(start + t.range.start as u32, start + t.range.end as u32), out));
+        }
+    }
+    return None;
+}
+
+// ===================================================================== THIR walk
+
+fn consider_expr(p: &Program, e: thir::Expr, file: u32, offset: u32, best: &mut BestExpr) {
+    let s = e.span;
+    if !in_file(p, s, file) || s.lo > offset || offset > s.hi {
+        return;
+    }
+    if let TyKind::Error = p.types.kind(e.ty) {
+        return;
+    }
+    if !best.found || s.hi - s.lo < best.span.hi - best.span.lo {
+        best.found = true;
+        best.span = s;
+        best.ty = e.ty;
+    }
+}
+
+fn walk_block(p: &Program, id: Id::<thir::Block>, file: u32, offset: u32, best: &mut BestExpr) {
+    let b = p.thir.block(id);
+    for st in p.thir.stmts.list(b.stmts) {
+        match st {
+            thir::Stmt::Let { init, .. } => {
+                if let Some(e) = init {
+                    walk_expr(p, e, file, offset, best);
+                }
+            }
+            thir::Stmt::Expr(e) => walk_expr(p, e, file, offset, best),
+        }
+    }
+    if let Some(t) = b.tail {
+        walk_expr(p, t, file, offset, best);
+    }
+}
+
+fn walk_exprs(p: &Program, l: List::<Id::<thir::Expr>>, file: u32, offset: u32, best: &mut BestExpr) {
+    for x in p.thir.expr_ids.list(l) {
+        walk_expr(p, x, file, offset, best);
+    }
+}
+
+fn walk_args(p: &Program, l: List::<thir::Arg>, file: u32, offset: u32, best: &mut BestExpr) {
+    for a in p.thir.args.list(l) {
+        walk_expr(p, a.expr(), file, offset, best);
+    }
+}
+
+fn walk_expr(p: &Program, id: Id::<thir::Expr>, file: u32, offset: u32, best: &mut BestExpr) {
+    let e = p.thir.expr(id);
+    consider_expr(p, e, file, offset, best);
+    match e.kind {
+        thir::ExprKind::Field { base, .. } => walk_expr(p, base, file, offset, best),
+        thir::ExprKind::Deref(base) => walk_expr(p, base, file, offset, best),
+        thir::ExprKind::Temp(base) => walk_expr(p, base, file, offset, best),
+        thir::ExprKind::Read { place, .. } => walk_expr(p, place, file, offset, best),
+        thir::ExprKind::Unary(_, x) => walk_expr(p, x, file, offset, best),
+        thir::ExprKind::Cast(x) => walk_expr(p, x, file, offset, best),
+        thir::ExprKind::Coerce { expr, .. } => walk_expr(p, expr, file, offset, best),
+        thir::ExprKind::Index { base, index } => {
+            walk_expr(p, base, file, offset, best);
+            walk_expr(p, index, file, offset, best);
+        }
+        thir::ExprKind::Call { callee, args } => {
+            match callee {
+                thir::Callee::Indirect(c) => walk_expr(p, c, file, offset, best),
+                thir::Callee::Value { callee: c, .. } => walk_expr(p, c, file, offset, best),
+                _ => {}
+            }
+            walk_args(p, args, file, offset, best);
+        }
+        // The body is the closure's own function (walked with the bodies).
+        thir::ExprKind::Closure { captures, .. } => walk_args(p, captures, file, offset, best),
+        thir::ExprKind::Binary(_, l, r) => {
+            walk_expr(p, l, file, offset, best);
+            walk_expr(p, r, file, offset, best);
+        }
+        thir::ExprKind::Logical { lhs, rhs, .. } => {
+            walk_expr(p, lhs, file, offset, best);
+            walk_expr(p, rhs, file, offset, best);
+        }
+        thir::ExprKind::Assign { place, value } => {
+            walk_expr(p, place, file, offset, best);
+            walk_expr(p, value, file, offset, best);
+        }
+        thir::ExprKind::AssignOp { place, value, .. } => {
+            walk_expr(p, place, file, offset, best);
+            walk_expr(p, value, file, offset, best);
+        }
+        thir::ExprKind::Tuple(xs) => walk_exprs(p, xs, file, offset, best),
+        thir::ExprKind::Array(xs) => walk_exprs(p, xs, file, offset, best),
+        thir::ExprKind::Adt { fields, .. } => {
+            for f in p.thir.field_exprs.list(fields) {
+                walk_expr(p, f.expr, file, offset, best);
+            }
+        }
+        thir::ExprKind::ArrayRepeat { value, count } => {
+            walk_expr(p, value, file, offset, best);
+            walk_expr(p, count, file, offset, best);
+        }
+        thir::ExprKind::Slice { base, start, end, .. } => {
+            walk_expr(p, base, file, offset, best);
+            if let Some(x) = start {
+                walk_expr(p, x, file, offset, best);
+            }
+            if let Some(x) = end {
+                walk_expr(p, x, file, offset, best);
+            }
+        }
+        thir::ExprKind::Block(b) => walk_block(p, b, file, offset, best),
+        thir::ExprKind::Loop { body, .. } => walk_block(p, body, file, offset, best),
+        thir::ExprKind::If { cond, then, else_ } => {
+            walk_expr(p, cond, file, offset, best);
+            walk_expr(p, then, file, offset, best);
+            if let Some(x) = else_ {
+                walk_expr(p, x, file, offset, best);
+            }
+        }
+        thir::ExprKind::Match { scrut, arms } => {
+            walk_expr(p, scrut, file, offset, best);
+            for a in p.thir.arms.list(arms) {
+                if let Some(g) = a.guard {
+                    walk_expr(p, g, file, offset, best);
+                }
+                walk_expr(p, a.body, file, offset, best);
+            }
+        }
+        thir::ExprKind::While { cond, body, .. } => {
+            walk_expr(p, cond, file, offset, best);
+            walk_block(p, body, file, offset, best);
+        }
+        thir::ExprKind::ForRange { start, end, body, .. } => {
+            walk_expr(p, start, file, offset, best);
+            walk_expr(p, end, file, offset, best);
+            walk_block(p, body, file, offset, best);
+        }
+        thir::ExprKind::ForArray { array, body, .. } => {
+            walk_expr(p, array, file, offset, best);
+            walk_block(p, body, file, offset, best);
+        }
+        thir::ExprKind::Break { value, .. } => {
+            if let Some(v) = value {
+                walk_expr(p, v, file, offset, best);
+            }
+        }
+        thir::ExprKind::Return(value) => {
+            if let Some(v) = value {
+                walk_expr(p, v, file, offset, best);
+            }
+        }
+        thir::ExprKind::FmtArgs(pieces) => {
+            for piece in p.thir.fmt_pieces.list(pieces) {
+                if let thir::FmtPiece::Arg(x, _) = piece {
+                    walk_expr(p, x, file, offset, best);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ===================================================================== keywords
+
+fn keyword_doc(word: str): Option::<str> {
+    if word == "fn" {
+        return Some("A function or function pointer.
+
+Functions are the primary way code is executed. A parameter `x: T` takes ownership of its argument, `x: &T` borrows it, and `x: &mut T` is in-out. The return type follows `:`, and generic parameters use `::<>`.
+
+```lunar
+fn max::<T: Ord>(a: T, b: T): T {
+    if a > b { a } else { b }
+}
+```");
+    }
+    if word == "let" {
+        return Some("Bind a value to a variable.
+
+`let` bindings are immutable; `let mut` makes them mutable. The type is usually inferred. The left side is a pattern, so `let` can also destructure.
+
+```lunar
+let x: i32 = 1;
+let mut total = 0;
+let (a, b) = (1, 2);
+```");
+    }
+    if word == "mut" {
+        return Some("A mutable variable, parameter, or in-out parameter.
+
+On a `let`, `mut` allows the variable to be reassigned and its contents changed. On a parameter that takes ownership (`mut x: T`, `mut self`), it lets the function change its own value; the caller does not see the change. As `&mut T` (or `&mut self`), the parameter is in-out: the caller passes a mutable place and sees the changes after the call. A `!` parameter must be `&mut`.
+
+```lunar
+fn bump(x: &mut i32) {
+    x += 1;
+}
+
+let mut n = 1;
+bump(n); // n == 2
+```");
+    }
+    if word == "return" {
+        return Some("Returns a value from a function.
+
+`return` exits the current function immediately. Without a value it returns `()`. The `return` expression itself has type `!`, so it fits anywhere a value is expected. A block's final expression without a semicolon is also its value.
+
+```lunar
+fn sign(x: i32): i32 {
+    if x < 0 {
+        return -1;
+    }
+    1
+}
+```");
+    }
+    if word == "if" {
+        return Some("Evaluate a block if a condition holds.
+
+`if` is an expression: with an `else` branch, it produces the value of the branch that ran.
+
+```lunar
+let kind = if n % 2 == 0 { \"even\" } else { \"odd\" };
+```");
+    }
+    if word == "else" {
+        return Some("What expression to evaluate when an `if` condition evaluates to `false`.
+
+```lunar
+if x > 0 {
+    println(\"positive\");
+} else if x < 0 {
+    println(\"negative\");
+} else {
+    println(\"zero\");
+}
+```");
+    }
+    if word == "match" {
+        return Some("Control flow based on pattern matching.
+
+Arms are tried in order; the first whose pattern matches (and whose `if` guard holds) runs. The arms must cover every possible value, or the compiler reports `err(type::non_exhaustive)`.
+
+```lunar
+match shape {
+    Shape::Circle(r) => 3.14 * r * r,
+    Shape::Rect { w, h } => w * h,
+    Shape::Empty => 0.0,
+}
+```");
+    }
+    if word == "for" {
+        return Some("Iteration over a range or the elements of an array.
+
+`for` loops over an integer range, or over the elements of a Dull array, slice or anything implementing `Iterator`. Elements are copied out.
+
+```lunar
+for i in 0..10 {
+    println(\"{i}\");
+}
+for x in numbers {
+    total += x;
+}
+```");
+    }
+    if word == "in" {
+        return Some("Iterate over a series of values with `for`.
+
+```lunar
+for i in 0..3 { }
+```");
+    }
+    if word == "while" {
+        return Some("Loop while a condition is upheld.
+
+```lunar
+let mut i = 0;
+while i < 10 {
+    i += 1;
+}
+```");
+    }
+    if word == "loop" {
+        return Some("Loop indefinitely.
+
+`loop` runs its body until a `break`. A `break` can carry a value, which becomes the value of the `loop` expression.
+
+```lunar
+let first_big = loop {
+    n += 1;
+    if n * n > 100 {
+        break n;
+    }
+};
+```");
+    }
+    if word == "break" {
+        return Some("Exit early from a loop.
+
+`break` leaves the innermost loop. Inside `loop`, it can carry a value. The expression has type `!`.");
+    }
+    if word == "continue" {
+        return Some("Skip to the next iteration of a loop.
+
+The expression has type `!`.");
+    }
+    if word == "struct" {
+        return Some("A type that is composed of other types.
+
+Structs come in three forms: with named fields, tuple structs, and unit structs. Fields are private to the module that declares the struct unless marked `pub`.
+
+```lunar
+struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
+struct Meters(f64);
+
+struct Marker;
+```");
+    }
+    if word == "enum" {
+        return Some("A type that can be any one of several variants.
+
+Variants can carry data, either as a tuple or with named fields. Variant fields are always public.
+
+```lunar
+enum Shape {
+    Circle(f64),
+    Rect { w: f64, h: f64 },
+    Empty,
+}
+```");
+    }
+    if word == "impl" {
+        return Some("Implementations of functionality for a type, or a type implementing some functionality.
+
+An inherent `impl` adds associated functions and methods to a type. A trait `impl` implements a trait for a type. Two impls of the same trait may not apply to the same type.
+
+```lunar
+impl Point {
+    pub fn origin(): Point {
+        return Point { x: 0.0, y: 0.0 };
+    }
+}
+
+impl Display for Point {
+    fn fmt(self, mut out: String) {
+        out.write(\"({self.x}, {self.y})\");
+    }
+}
+```");
+    }
+    if word == "trait" {
+        return Some("A common interface for a group of types.
+
+A trait declares methods that implementing types provide; methods may have default bodies. Supertraits are written `trait A: B`.
+
+```lunar
+trait Describe {
+    fn name(self): str;
+    fn describe(self) {
+        println(\"a {self.name()}\");
+    }
+}
+```");
+    }
+    if word == "type" {
+        return Some("Define an alias for an existing type.
+
+```lunar
+type Bytes = [u8; -..+];
+```");
+    }
+    if word == "mod" {
+        return Some("Organize code into modules.
+
+`mod m { ... }` declares a module inline. `mod m;` loads it from `m.ln` or `m/mod.ln` next to the declaring file.");
+    }
+    if word == "use" {
+        return Some("Import or rename items from other modules.
+
+```lunar
+use std::io::println;
+use core::ops::{Add, Sub};
+```");
+    }
+    if word == "pub" {
+        return Some("Make an item visible to others.
+
+Items, fields and methods are private to the module that declares them (and its children) unless marked `pub`.");
+    }
+    if word == "const" {
+        return Some("Compile-time constants.
+
+The value is evaluated during compilation and inlined at each use.
+
+```lunar
+const LIMIT: usize = 1024;
+```");
+    }
+    if word == "static" {
+        return Some("A static item is a value which is valid for the entire duration of your program.
+
+A `static` has a fixed address. A `static mut` can be changed, but every read or write of it requires `unsafe`.
+
+```lunar
+static GREETING: str = \"hello\";
+```");
+    }
+    if word == "unsafe" {
+        return Some("Code or interfaces whose memory safety cannot be verified by the type system.
+
+An `unsafe { }` block allows unsafe operations: calling `unsafe` or `extern` functions, dereferencing raw pointers, and accessing a `static mut`. Marking a function `unsafe fn` only makes it unsafe to call. Its body gets no implicit unsafe context, so unsafe operations inside it still need an `unsafe` block (a hard error otherwise).");
+    }
+    if word == "extern" {
+        return Some("Link to or import external code.
+
+An `extern \"C\"` block declares functions implemented elsewhere with the C calling convention. Calling them requires `unsafe`.
+
+```lunar
+extern \"C\" {
+    fn puts(s: *u8): i32;
+}
+```");
+    }
+    if word == "as" {
+        return Some("Cast between types, or rename an import.
+
+```lunar
+let n = x as u64;
+use std::io::println as say;
+```");
+    }
+    if word == "self" {
+        return Some("The receiver of a method, or the current module.
+
+As a method's first parameter, `self` is the value the method is called on: `self` takes ownership of it, `&self` borrows it, `&mut self` makes it in-out, and `&mut !self` may shrink it. In paths, `self::x` names an item of the current module.");
+    }
+    if word == "Self" {
+        return Some("The implementing type within a `trait` or `impl` block, or within a type definition.");
+    }
+    if word == "crater" {
+        return Some("A path segment that refers to the root of the current crater.
+
+A crater is what Lunar compiles as one unit: a root file and every module it loads with `mod`. Your program is a crater, and so are `core` and `std`. In a path, `crater` names the root module of the crater the code is in.
+
+```lunar
+crater::util::helper();
+```");
+    }
+    if word == "super" {
+        return Some("The parent of the current module.
+
+```lunar
+super::helper();
+```");
+    }
+    if word == "true" {
+        return Some("A value of type `bool` representing logical **true**.");
+    }
+    if word == "false" {
+        return Some("A value of type `bool` representing logical **false**.");
+    }
+    return None;
+}

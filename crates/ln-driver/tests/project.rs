@@ -213,7 +213,8 @@ struct Lsp {
 impl Lsp {
     fn start(home: &Path) -> Lsp {
         use std::process::Stdio;
-        let mut child = Command::new(env!("CARGO_BIN_EXE_lunar"))
+        // `$LUNAR_BIN` (such as the compiler built from craters/) if set.
+        let mut child = Command::new(std::env::var_os("LUNAR_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_lunar").into()))
             .args(["lsp", "--stdio"])
             .env("LUNAR_HOME", home)
             .env_remove("LUNAR_STD_DIR")

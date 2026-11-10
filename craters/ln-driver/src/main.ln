@@ -31,6 +31,8 @@
 
 mod project;
 mod link;
+mod ide;
+mod lsp;
 
 use std::env;
 use std::fs;
@@ -43,6 +45,10 @@ use ln_sema::sema::{Options, analyze};
 fn main() {
     if env::arg_count() > 1 && env::arg(1).unwrap() == "build" {
         std::process::exit(build());
+    }
+    // `lsp [--stdio]`: the language server.
+    if env::arg_count() > 1 && env::arg(1).unwrap() == "lsp" {
+        std::process::exit(lsp::serve());
     }
     if env::arg_count() > 2 && env::arg(1).unwrap() == "--craters" {
         list_craters(env::arg(2).unwrap());

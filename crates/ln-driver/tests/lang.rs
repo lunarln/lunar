@@ -195,10 +195,17 @@ fn fatal_tests_fail_cleanly() {
 }
 
 mod lsp {
-    use super::lunar;
     use serde_json::{Value, json};
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::process::{ChildStdin, ChildStdout, Stdio};
+    use std::process::{ChildStdin, ChildStdout, Command, Stdio};
+
+    /// The compiler whose language server is tested: `$LUNAR_BIN` if set
+    /// (such as the one built from craters/), else this crate's.
+    fn lunar() -> Command {
+        let mut c = Command::new(std::env::var_os("LUNAR_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_lunar").into()));
+        c.env_remove("LUNAR_STD_DIR");
+        c
+    }
 
     struct Client {
         stdin: ChildStdin,
@@ -319,7 +326,13 @@ mod lsp {
         assert_eq!(d["range"]["start"]["line"], json!(5), "definition of add: {d:#?}");
         let d = c.request("textDocument/definition", pos(13, 6));
         let target = d["uri"].as_str().unwrap_or_default().to_string();
-        assert_eq!(target, "lunar-std:std::io", "definition of println: {d:#?}");
+        // A virtual document of the embedded standard library, or the file
+        // itself for a compiler that reads std from disk.
+        let std_uri = "lunar-std:std::io".to_string();
+        if target != std_uri {
+            assert!(target.starts_with("file:///") && target.ends_with("/std/std/io.ln"), "definition of println: {d:#?}");
+        }
+        let target = std_uri;
         // The editor fetches the virtual document's text from the server...
         let text = c.request("lunar/stdSource", json!({ "uri": target }));
         let text = text.as_str().unwrap_or_default();
