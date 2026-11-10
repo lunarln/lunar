@@ -1,0 +1,832 @@
+// Trait solving: a port of crates/ln-sema/src/traits.rs. Impl selection,
+// the `Dull` auto trait, builtin impls for primitives, and type
+// classification (owners, copyability).
+//
+// These queries run on a finished `Program` so code generation can use
+// them during monomorphization. They are `&mut +self`: substituting generic
+// arguments interns types, which only grows the program, so views into it
+// (an environment of predicates from `Program::preds`) stay valid.
+
+use core::collections::HashMap;
+use core::intern::Symbol;
+use crater::defs::*;
+use crater::program::Program;
+use crater::thir::ClosureKind;
+use crater::ty::*;
+use ln_ast::ParamMode;
+
+/// How a trait method call is implemented for a concrete self type.
+pub enum MethodImpl {
+    /// A real function: `def` instantiated with `args`.
+    Fn { def: DefId, args: TyList },
+    /// A compiler-provided implementation (primitive operators, copies, ...),
+    /// identified by the trait's lang name and the method name.
+    Builtin { lang: Symbol, method: Symbol },
+}
+
+/// Operator traits that primitives implement natively.
+pub fn OP_TRAITS(): [str; 12] {
+    return ["add", "sub", "mul", "div", "rem", "neg", "not", "bitand", "bitor", "bitxor", "shl", "shr"];
+}
+
+impl Program {
+    /// Supertrait closure of a set of predicates, pushed onto `out`.
+    pub fn elaborate(&mut +self, env: [Pred; &], out: &mut +[Pred; ..+]) {
+        let start = out.len();
+        let mut stack: [Pred; -..+] = [];
+        stack.extend(env);
+        while let Some(p) = stack.pop() {
+            let mut seen = false;
+            for i in start..out.len() {
+                let q = out[i];
+                if q.ty == p.ty && q.trait_ref == p.trait_ref {
+                    seen = true;
+                    break;
+                }
+            }
+            if seen {
+                continue;
+            }
+            if let DefData::Trait(t) = self.defs[p.trait_ref.trait_id.index()].data {
+                // Supertraits are expressed with Self = Param(0) and the trait's params after.
+                let mut args: [Ty; ..+] = [p.ty];
+                args.extend(self.types.list(p.trait_ref.args));
+                let args = self.types.mk_list(args[..]);
+                for i in 0..t.supertraits.len() {
+                    let st = self.trait_refs.list(t.supertraits)[i];
+                    let tr = self.types.subst_trait_ref(st, args);
+                    stack.push(Pred { ty: p.ty, trait_ref: tr, span: p.span });
+                }
+            }
+            out.push(p);
+        }
+    }
+
+    /// Whether `env` (elaborated) has a predicate `ty: trait_id`.
+    fn env_has(&mut +self, ty: Ty, trait_id: DefId, env: [Pred; &]): bool {
+        let mut el: [Pred; ..+] = [];
+        self.elaborate(env, &mut el);
+        for p in el {
+            if p.ty == ty && p.trait_ref.trait_id == trait_id {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The traits an `impl Trait` type's bounds (elaborated) promise.
+    fn opaque_bounds(&mut +self, def: DefId, i: u32, args: TyList, out: &mut +[Pred; ..+]) {
+        let mut ps: [Pred; ..+] = [];
+        self.opaque_preds(def, i, args, &mut ps);
+        self.elaborate(ps[..], out);
+    }
+
+    /// The types of every field of every variant of ADT `id`, instantiated
+    /// with `args`.
+    pub fn adt_field_tys(&mut +self, id: DefId, args: TyList): TyList {
+        let adt = self.adt(id);
+        let mut out: [Ty; ..+] = [];
+        for v in self.variants.list(adt.variants) {
+            for f in self.fields.list(v.fields) {
+                out.push(self.types.subst(f.ty, args));
+            }
+        }
+        return self.types.mk_list(out[..]);
+    }
+
+    /// Whether `ty` is Dull: contains no pointers or arrays.
+    pub fn is_dull(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        return self.is_dull_rec(ty, env, 0);
+    }
+
+    fn all_dull(&mut +self, l: TyList, env: [Pred; &], depth: u32): bool {
+        for i in 0..l.len() {
+            if !self.is_dull_rec(self.types.at(l, i), env, depth) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn is_dull_rec(&mut +self, ty: Ty, env: [Pred; &], depth: u32): bool {
+        if depth > 64 {
+            return true; // recursive types are reported elsewhere
+        }
+        return match self.types.kind(ty) {
+            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Error => true,
+            TyKind::Tuple(ts) => self.all_dull(ts, env, depth + 1),
+            TyKind::Adt(id, args) => {
+                let fs = self.adt_field_tys(id, args);
+                self.all_dull(fs, env, depth + 1)
+            }
+            TyKind::Param(..) => {
+                let Some(dull) = self.lang_item("dull") else { return false; };
+                self.env_has(ty, dull, env)
+            }
+            // A closure is Dull when it holds only Dull values (no borrows).
+            TyKind::Closure(def, args) => {
+                let fs = self.closure_fields(def, args);
+                self.all_dull(fs, env, depth + 1)
+            }
+            // `impl Trait` is Dull when its bounds say so.
+            TyKind::Opaque(def, i, args) => {
+                let Some(dull) = self.lang_item("dull") else { return false; };
+                let mut el: [Pred; ..+] = [];
+                self.opaque_bounds(def, i, args, &mut el);
+                for p in el {
+                    if p.trait_ref.trait_id == dull {
+                        return true;
+                    }
+                }
+                false
+            }
+            TyKind::Str | TyKind::String | TyKind::FmtArgs | TyKind::Array(..) | TyKind::Grow(_) | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::Infer(_) => false,
+        };
+    }
+
+    /// Whether `ty` is Light: owns no array or string (Dull types, views,
+    /// pointers, and anything built only from those). Light types are the
+    /// ones copied implicitly, and the only possible array items.
+    pub fn is_light(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        return self.is_light_rec(ty, env, 0);
+    }
+
+    fn all_light(&mut +self, l: TyList, env: [Pred; &], depth: u32): bool {
+        for i in 0..l.len() {
+            if !self.is_light_rec(self.types.at(l, i), env, depth) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn is_light_rec(&mut +self, ty: Ty, env: [Pred; &], depth: u32): bool {
+        if depth > 64 {
+            return true; // recursive types are reported elsewhere
+        }
+        return match self.types.kind(ty) {
+            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Error => true,
+            TyKind::Str | TyKind::FmtArgs | TyKind::Ptr(..) | TyKind::FnPtr(..) => true,
+            TyKind::String => false,
+            TyKind::Array(e, k) => !k.is_owner() && self.is_light_rec(e, env, depth + 1),
+            TyKind::Grow(t) => self.is_light_rec(t, env, depth + 1),
+            TyKind::Tuple(ts) => self.all_light(ts, env, depth + 1),
+            TyKind::Adt(id, args) => {
+                let fs = self.adt_field_tys(id, args);
+                self.all_light(fs, env, depth + 1)
+            }
+            // `T: Dull` implies `T: Light` (`Dull` is a subtrait).
+            TyKind::Param(..) => {
+                let Some(light) = self.lang_item("light") else { return false; };
+                let dull = self.lang_item("dull");
+                let mut el: [Pred; ..+] = [];
+                self.elaborate(env, &mut el);
+                for p in el {
+                    if p.ty == ty && (p.trait_ref.trait_id == light || Some(p.trait_ref.trait_id) == dull) {
+                        return true;
+                    }
+                }
+                false
+            }
+            TyKind::Closure(def, args) => {
+                let fs = self.closure_fields(def, args);
+                self.all_light(fs, env, depth + 1)
+            }
+            TyKind::Opaque(def, i, args) => {
+                let Some(light) = self.lang_item("light") else { return false; };
+                let dull = self.lang_item("dull");
+                let mut el: [Pred; ..+] = [];
+                self.opaque_bounds(def, i, args, &mut el);
+                for p in el {
+                    if p.trait_ref.trait_id == light || Some(p.trait_ref.trait_id) == dull {
+                        return true;
+                    }
+                }
+                false
+            }
+            TyKind::Infer(_) => false,
+        };
+    }
+
+    /// Whether a value of `ty` owns a data stack (directly or in a field).
+    pub fn has_owner(&mut +self, ty: Ty): bool {
+        return self.has_owner_rec(ty, 0);
+    }
+
+    fn any_owner(&mut +self, l: TyList, depth: u32): bool {
+        for i in 0..l.len() {
+            if self.has_owner_rec(self.types.at(l, i), depth) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn has_owner_rec(&mut +self, ty: Ty, depth: u32): bool {
+        if depth > 64 {
+            return false;
+        }
+        return match self.types.kind(ty) {
+            TyKind::String => true,
+            TyKind::Array(_, k) => k.is_owner(),
+            TyKind::Tuple(ts) => self.any_owner(ts, depth + 1),
+            TyKind::Adt(id, args) => {
+                let fs = self.adt_field_tys(id, args);
+                self.any_owner(fs, depth + 1)
+            }
+            TyKind::Grow(t) => self.has_owner_rec(t, depth + 1),
+            TyKind::Closure(def, args) => {
+                let fs = self.closure_fields(def, args);
+                self.any_owner(fs, depth + 1)
+            }
+            _ => false,
+        };
+    }
+
+    /// Whether a value of `ty` may own a data stack (an array or `String`,
+    /// directly or in a field), so that changing it in place could shrink
+    /// or free one: a valid target for `+`.
+    pub fn could_own(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        return self.could_own_rec(ty, env, 0);
+    }
+
+    fn any_could_own(&mut +self, l: TyList, env: [Pred; &], depth: u32): bool {
+        for i in 0..l.len() {
+            if self.could_own_rec(self.types.at(l, i), env, depth) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn could_own_rec(&mut +self, ty: Ty, env: [Pred; &], depth: u32): bool {
+        if depth > 64 {
+            return false;
+        }
+        return match self.types.kind(ty) {
+            TyKind::String => true,
+            TyKind::Array(_, k) => k.is_owner(),
+            // A generic parameter might be instantiated with an owner.
+            TyKind::Param(..) | TyKind::Opaque(..) => !self.is_light(ty, env),
+            TyKind::Tuple(ts) => self.any_could_own(ts, env, depth + 1),
+            TyKind::Adt(id, args) => {
+                let fs = self.adt_field_tys(id, args);
+                self.any_could_own(fs, env, depth + 1)
+            }
+            TyKind::Closure(def, args) => {
+                let fs = self.closure_fields(def, args);
+                self.any_could_own(fs, env, depth + 1)
+            }
+            _ => false,
+        };
+    }
+
+    /// Whether values of `ty` are implicitly copied (rather than moved).
+    /// Generic parameters are copyable only when bounded by `Light` (or
+    /// `Dull`).
+    pub fn is_copy(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        return self.is_copy_rec(ty, env, 0);
+    }
+
+    fn all_copy(&mut +self, l: TyList, env: [Pred; &], depth: u32): bool {
+        for i in 0..l.len() {
+            if !self.is_copy_rec(self.types.at(l, i), env, depth) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn is_copy_rec(&mut +self, ty: Ty, env: [Pred; &], depth: u32): bool {
+        if depth > 64 {
+            return true;
+        }
+        return match self.types.kind(ty) {
+            TyKind::String => false,
+            TyKind::Array(e, k) => !k.is_owner() && self.is_copy_rec(e, env, depth + 1),
+            TyKind::Param(..) | TyKind::Opaque(..) => self.is_light(ty, env),
+            TyKind::Tuple(ts) => self.all_copy(ts, env, depth + 1),
+            TyKind::Adt(id, args) => {
+                let fs = self.adt_field_tys(id, args);
+                self.all_copy(fs, env, depth + 1)
+            }
+            TyKind::Grow(t) => self.is_copy_rec(t, env, depth + 1),
+            // A closure that changes a variable it borrows is not copied: two
+            // copies would both change it.
+            TyKind::Closure(def, args) => {
+                let mut changes_borrowed = false;
+                if let Some(c) = self.closures.get(def) {
+                    for cap in self.captures.list(c.captures) {
+                        if cap.by_ref && cap.mode == ParamMode::InOut {
+                            changes_borrowed = true;
+                        }
+                    }
+                }
+                if changes_borrowed {
+                    return false;
+                }
+                let fs = self.closure_fields(def, args);
+                self.all_copy(fs, env, depth + 1)
+            }
+            _ => true,
+        };
+    }
+
+    /// Builtin trait implementations for primitive types.
+    pub fn builtin_impl(&mut +self, ty: Ty, trait_id: DefId, env: [Pred; &]): bool {
+        let Some(lang) = self.lang_name(trait_id) else { return false; };
+        let k = self.types.kind(ty);
+        let int = match k {
+            TyKind::Int(_) => true,
+            _ => false,
+        };
+        let signed = match k {
+            TyKind::Int(i) => i.signed(),
+            _ => false,
+        };
+        let float = match k {
+            TyKind::Float(_) => true,
+            _ => false,
+        };
+        let is_bool = match k {
+            TyKind::Bool => true,
+            _ => false,
+        };
+        let is_char = match k {
+            TyKind::Char => true,
+            _ => false,
+        };
+        let is_str = match k {
+            TyKind::Str => true,
+            _ => false,
+        };
+        let is_param = match k {
+            TyKind::Param(..) => true,
+            _ => false,
+        };
+        let unit = self.types.is_unit(ty);
+        return match lang {
+            "dull" => self.is_dull(ty, env),
+            "light" => self.is_light(ty, env),
+            "add" | "sub" | "mul" | "div" | "rem" => int || float,
+            "neg" => signed || float,
+            "not" => int || is_bool,
+            "bitand" | "bitor" | "bitxor" => int || is_bool,
+            "shl" | "shr" => int,
+            "eq" => int || float || is_bool || is_char || is_str || unit,
+            "ord" => int || float || is_char || is_str,
+            "clone" => self.is_copy(ty, env) && !is_param,
+            "default" => int || float || is_bool || is_char || is_str || unit,
+            _ => false,
+        };
+    }
+
+    /// One-way matching of an impl's self type `pat` (containing the impl's
+    /// params) against `ty`, filling `out`.
+    pub fn match_ty(&self, pat: Ty, ty: Ty, out: &mut +[Option::<Ty>; ..+]): bool {
+        return match (self.types.kind(pat), self.types.kind(ty)) {
+            (TyKind::Param(i, _), _) => {
+                let i = i as usize;
+                while out.len() <= i {
+                    out.push(None);
+                }
+                match out[i] {
+                    Some(prev) => prev == ty,
+                    None => {
+                        out[i] = Some(ty);
+                        true
+                    }
+                }
+            },
+            (TyKind::Tuple(a), TyKind::Tuple(b)) => self.match_list(a, b, out),
+            (TyKind::Adt(a, xs), TyKind::Adt(b, ys)) => a == b && self.match_list(xs, ys, out),
+            (TyKind::Array(a, k1), TyKind::Array(b, k2)) => k1 == k2 && self.match_ty(a, b, out),
+            (TyKind::Ptr(a, m1), TyKind::Ptr(b, m2)) => m1 == m2 && self.match_ty(a, b, out),
+            (TyKind::Grow(a), TyKind::Grow(b)) => self.match_ty(a, b, out),
+            (TyKind::FnPtr(a, m1, r1), TyKind::FnPtr(b, m2, r2)) => m1 == m2 && self.match_list(a, b, out) && self.match_ty(r1, r2, out),
+            _ => pat == ty,
+        };
+    }
+
+    /// `match_ty` on each pair of two lists of the same length.
+    fn match_list(&self, a: TyList, b: TyList, out: &mut +[Option::<Ty>; ..+]): bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        for i in 0..a.len() {
+            if !self.match_ty(self.types.at(a, i), self.types.at(b, i), out) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Find a user impl of `tr` for `ty`. Returns the impl and its generic args.
+    pub fn find_impl(&mut +self, ty: Ty, tr: TraitRef, env: [Pred; &]): Option::<(DefId, TyList)> {
+        return self.find_impl_depth(ty, tr, env, 0);
+    }
+
+    fn find_impl_depth(&mut +self, ty: Ty, tr: TraitRef, env: [Pred; &], depth: u32): Option::<(DefId, TyList)> {
+        if depth > 32 {
+            return None;
+        }
+        for k in 0..self.impls.len() {
+            let imp = self.impls[k];
+            let DefData::Impl(data) = self.defs[imp.index()].data else { continue; };
+            let Some(itr) = data.trait_ref else { continue; };
+            if itr.trait_id != tr.trait_id || data.negative {
+                continue;
+            }
+            let mut subst: [Option::<Ty>; ..+] = [None; data.generics.count()];
+            if !self.match_ty(data.self_ty, ty, &mut subst) {
+                continue;
+            }
+            let mut ok = true;
+            let n = if itr.args.len() < tr.args.len() { itr.args.len() } else { tr.args.len() };
+            for i in 0..n {
+                if !self.match_ty(self.types.at(itr.args, i), self.types.at(tr.args, i), &mut subst) {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let err = self.types.error();
+            let mut tys: [Ty; ..+] = [];
+            for s in subst {
+                tys.push(match s {
+                    Some(t) => t,
+                    None => err,
+                });
+            }
+            let args = self.types.mk_list(tys[..]);
+            for i in 0..data.generics.preds.len() {
+                let p = self.preds.list(data.generics.preds)[i];
+                let pty = self.types.subst(p.ty, args);
+                let ptr = self.types.subst_trait_ref(p.trait_ref, args);
+                if !self.implements_depth(pty, ptr, env, depth + 1) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return Some((imp, args));
+            }
+        }
+        return None;
+    }
+
+    /// Whether `ty: tr` holds in environment `env`.
+    pub fn implements(&mut +self, ty: Ty, tr: TraitRef, env: [Pred; &]): bool {
+        return self.implements_depth(ty, tr, env, 0);
+    }
+
+    fn implements_depth(&mut +self, ty: Ty, tr: TraitRef, env: [Pred; &], depth: u32): bool {
+        if self.types.is_error(ty) {
+            return true;
+        }
+        for t in self.types.list(tr.args) {
+            if self.types.is_error(t) {
+                return true;
+            }
+        }
+        let k = self.types.kind(ty);
+        if let TyKind::Grow(inner) = k {
+            return self.implements_depth(inner, tr, env, depth);
+        }
+        let is_param = match k {
+            TyKind::Param(..) => true,
+            _ => false,
+        };
+        if is_param || self.types.has_params(ty) {
+            let mut el: [Pred; ..+] = [];
+            self.elaborate(env, &mut el);
+            for p in el {
+                if p.ty == ty && p.trait_ref == tr {
+                    return true;
+                }
+            }
+        }
+        // `impl Trait`: only what its bounds promise.
+        if let TyKind::Opaque(def, i, args) = k {
+            let mut el: [Pred; ..+] = [];
+            self.opaque_bounds(def, i, args, &mut el);
+            for p in el {
+                if p.trait_ref == tr {
+                    return true;
+                }
+            }
+            return false;
+        }
+        // `Fn(A): R`, `FnMut(..)`, `FnOnce(..)`: closures of that kind or a
+        // weaker one, and function pointers, with exactly that signature.
+        let want = match self.lang_name(tr.trait_id) {
+            Some(n) => ClosureKind::from_lang(n),
+            None => None,
+        };
+        if let Some(want) = want {
+            let sig: Option::<Ty> = if tr.args.len() > 0 { Some(self.types.at(tr.args, 0)) } else { None };
+            return match k {
+                TyKind::Closure(def, args) => {
+                    let kind_ok = match self.closures.get(def) {
+                        Some(c) => c.kind <= want,
+                        None => false,
+                    };
+                    kind_ok && match sig {
+                        Some(s) => s == self.closure_sig(def, args),
+                        None => true,
+                    }
+                }
+                TyKind::FnPtr(..) => match sig {
+                    Some(s) => s == ty,
+                    None => true,
+                },
+                _ => false,
+            };
+        }
+        if self.builtin_impl(ty, tr.trait_id, env) {
+            return true;
+        }
+        if self.is_lang(tr.trait_id, "dull") || self.is_lang(tr.trait_id, "light") {
+            return false;
+        }
+        return self.find_impl_depth(ty, tr, env, depth).is_some();
+    }
+
+    /// Resolve the implementation of trait method `method` for concrete `self_ty`.
+    pub fn resolve_method(&mut +self, tr: TraitRef, self_ty: Ty, method: Symbol, method_args: TyList): Option::<MethodImpl> {
+        let trait_data = self.trait_data(tr.trait_id);
+        let none: [Pred; 0] = [];
+        if let Some(lang) = self.defs[tr.trait_id.index()].attrs.lang {
+            if self.builtin_impl(self_ty, tr.trait_id, none[..]) && self.text(lang) != "dull" && self.text(lang) != "light" {
+                return Some(MethodImpl::Builtin { lang, method });
+            }
+        }
+        if let Some(found) = self.find_impl(self_ty, tr, none[..]) {
+            let (imp, args) = found;
+            if let Some(m) = self.impl_method(imp, method) {
+                let mut tys: [Ty; ..+] = [];
+                tys.extend(self.types.list(args));
+                tys.extend(self.types.list(method_args));
+                let all = self.types.mk_list(tys[..]);
+                return Some(MethodImpl::Fn { def: m, args: all });
+            }
+        }
+        // Default method body from the trait.
+        for tm in self.trait_methods.list(trait_data.methods) {
+            if tm.name != method {
+                continue;
+            }
+            if !tm.has_default {
+                return None;
+            }
+            let mut tys: [Ty; ..+] = [self_ty];
+            tys.extend(self.types.list(tr.args));
+            tys.extend(self.types.list(method_args));
+            let all = self.types.mk_list(tys[..]);
+            return Some(MethodImpl::Fn { def: tm.def, args: all });
+        }
+        return None;
+    }
+
+    /// Whether two impls of the same trait could both apply to some type
+    /// (coherence). Their headers must unify, and no bound of either impl may
+    /// be definitely false for the unified types: `impl::<T: Dull> X for T`
+    /// and `impl X for String` do not overlap, because `String` is not Dull.
+    ///
+    /// "Not Dull" only separates impls when it cannot change under the other
+    /// impl's feet: the type is pointy because of the language (strings,
+    /// arrays, slices, pointers) or because of types defined in the same
+    /// crater as that other impl. A type from another crater might lose its
+    /// last pointy field in a later version and become Dull.
+    ///
+    /// Returns false if the impls cannot overlap; else true, with notes
+    /// explaining why a bound did not separate them pushed onto `notes`
+    /// (interned texts).
+    pub fn impls_overlap(&mut +self, a: DefId, b: DefId, notes: &mut +[Symbol; ..+]): bool {
+        let da = self.impl_data(a);
+        let db = self.impl_data(b);
+        let Some(ta) = da.trait_ref else { return false; };
+        let Some(tb) = db.trait_ref else { return false; };
+        if ta.trait_id != tb.trait_id || da.negative || db.negative {
+            return false;
+        }
+        // Each impl's generics become distinct unification variables.
+        let na = da.generics.count();
+        let mut tys: [Ty; ..+] = [];
+        for i in 0..na {
+            tys.push(self.types.infer(i as u32));
+        }
+        let va = self.types.mk_list(tys[..]);
+        let mut tys: [Ty; ..+] = [];
+        for i in 0..db.generics.count() {
+            tys.push(self.types.infer((na + i) as u32));
+        }
+        let vb = self.types.mk_list(tys[..]);
+        let mut s: HashMap::<u32, Ty> = HashMap::new();
+        let mut pairs: [(Ty, Ty); ..+] = [(self.types.subst(da.self_ty, va), self.types.subst(db.self_ty, vb))];
+        let n = if ta.args.len() < tb.args.len() { ta.args.len() } else { tb.args.len() };
+        for i in 0..n {
+            let x = self.types.subst(self.types.at(ta.args, i), va);
+            let y = self.types.subst(self.types.at(tb.args, i), vb);
+            pairs.push((x, y));
+        }
+        for pr in pairs {
+            let (x, y) = pr;
+            if !unify(&mut self.types, x, y, &mut s) {
+                return false;
+            }
+        }
+        let dull = self.lang_item("dull");
+        if !self.overlap_side(da, va, b, &s, dull, notes) {
+            return false;
+        }
+        if !self.overlap_side(db, vb, a, &s, dull, notes) {
+            return false;
+        }
+        return true;
+    }
+
+    /// The bounds of impl `d` (its generics replaced by `v`) under the
+    /// unifier `s`: false if one is definitely false, so the impls cannot
+    /// overlap. `other` is the other impl.
+    fn overlap_side(&mut +self, d: ImplData, v: TyList, other: DefId, s: &HashMap::<u32, Ty>, dull: Option::<DefId>, notes: &mut +[Symbol; ..+]): bool {
+        let none: [Pred; 0] = [];
+        for i in 0..d.generics.preds.len() {
+            let p = self.preds.list(d.generics.preds)[i];
+            let ty = resolve(&mut self.types, self.types.subst(p.ty, v), s);
+            let tr0 = self.types.subst_trait_ref(p.trait_ref, v);
+            let mut tys: [Ty; ..+] = [];
+            for j in 0..tr0.args.len() {
+                tys.push(resolve(&mut self.types, self.types.at(tr0.args, j), s));
+            }
+            let tr = TraitRef { trait_id: tr0.trait_id, args: self.types.mk_list(tys[..]) };
+            let mut concrete = !has_infer(&self.types, ty);
+            for t in self.types.list(tr.args) {
+                if has_infer(&self.types, t) {
+                    concrete = false;
+                }
+            }
+            if !concrete || self.implements(ty, tr, none[..]) {
+                continue;
+            }
+            if Some(tr.trait_id) == dull {
+                let krate = self.crater_of(other);
+                if self.robustly_pointy(ty, krate, 0) {
+                    return false;
+                }
+                let ts = self.ty_str(ty);
+                let mut m = String::new();
+                m.write("`{ts}` is not Dull today, but that depends on types from another crater, which might drop their last pointer or array field in a later version");
+                notes.push(self.sym(m.as_str()));
+                continue;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    /// The crater (root module) a definition belongs to.
+    pub fn crater_of(&self, d: DefId): DefId {
+        let m = if self.defs[d.index()].kind == DefKind::Mod { d } else { self.defs[d.index()].module };
+        return match self.defs[m.index()].data {
+            DefData::Mod(md) => md.krate,
+            _ => m,
+        };
+    }
+
+    /// Whether `ty` is pointy for reasons that crater `krate` controls:
+    /// language types that are always pointy, or fields of types defined in
+    /// `krate`.
+    fn robustly_pointy(&mut +self, ty: Ty, krate: DefId, depth: u32): bool {
+        if depth > 32 {
+            return false;
+        }
+        return match self.types.kind(ty) {
+            TyKind::Str | TyKind::String | TyKind::FmtArgs | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::Array(..) => true,
+            TyKind::Grow(t) => self.robustly_pointy(t, krate, depth + 1),
+            TyKind::Tuple(ts) => {
+                for i in 0..ts.len() {
+                    if self.robustly_pointy(self.types.at(ts, i), krate, depth + 1) {
+                        return true;
+                    }
+                }
+                false
+            },
+            TyKind::Adt(d, args) if self.crater_of(d) == krate => {
+                let DefData::Adt(_) = self.defs[d.index()].data else { return false; };
+                let fs = self.adt_field_tys(d, args);
+                for i in 0..fs.len() {
+                    if self.robustly_pointy(self.types.at(fs, i), krate, depth + 1) {
+                        return true;
+                    }
+                }
+                false
+            },
+            _ => false,
+        };
+    }
+}
+
+fn shallow(types: &Types, t: Ty, s: &HashMap::<u32, Ty>): Ty {
+    let mut t = t;
+    while let TyKind::Infer(v) = types.kind(t) {
+        match s.get(v) {
+            Some(x) => t = x,
+            None => break,
+        }
+    }
+    return t;
+}
+
+fn resolve(types: &mut +Types, t: Ty, s: &HashMap::<u32, Ty>): Ty {
+    let t = shallow(types, t, s);
+    return match types.kind(t) {
+        TyKind::Tuple(ts) => {
+            let l = resolve_list(types, ts, s);
+            types.mk(TyKind::Tuple(l))
+        }
+        TyKind::Adt(d, args) => {
+            let l = resolve_list(types, args, s);
+            types.mk(TyKind::Adt(d, l))
+        }
+        TyKind::Array(e, k) => {
+            let e2 = resolve(types, e, s);
+            types.mk(TyKind::Array(e2, k))
+        }
+        TyKind::Grow(e) => {
+            let e2 = resolve(types, e, s);
+            types.mk(TyKind::Grow(e2))
+        }
+        TyKind::Ptr(e, m) => {
+            let e2 = resolve(types, e, s);
+            types.mk(TyKind::Ptr(e2, m))
+        }
+        TyKind::FnPtr(ps, modes, ret) => {
+            let l = resolve_list(types, ps, s);
+            let r = resolve(types, ret, s);
+            types.mk(TyKind::FnPtr(l, modes, r))
+        }
+        _ => t,
+    };
+}
+
+fn resolve_list(types: &mut +Types, l: TyList, s: &HashMap::<u32, Ty>): TyList {
+    let mut out: [Ty; ..+] = [];
+    for i in 0..l.len() {
+        out.push(resolve(types, types.at(l, i), s));
+    }
+    return types.mk_list(out[..]);
+}
+
+fn has_infer(types: &Types, t: Ty): bool {
+    return types.any(t, &|k| match k {
+        TyKind::Infer(_) => true,
+        _ => false,
+    });
+}
+
+/// Syntactic unification with occurs check, binding `Infer` variables.
+fn unify(types: &mut +Types, a: Ty, b: Ty, s: &mut HashMap::<u32, Ty>): bool {
+    let a = shallow(types, a, s);
+    let b = shallow(types, b, s);
+    if a == b {
+        return true;
+    }
+    return match (types.kind(a), types.kind(b)) {
+        (TyKind::Infer(v), _) => bind(types, v, b, s),
+        (_, TyKind::Infer(v)) => bind(types, v, a, s),
+        (TyKind::Error, _) | (_, TyKind::Error) => true,
+        (TyKind::Tuple(x), TyKind::Tuple(y)) => unify_list(types, x, y, s),
+        (TyKind::Adt(d1, x), TyKind::Adt(d2, y)) => d1 == d2 && unify_list(types, x, y, s),
+        (TyKind::Array(x, k1), TyKind::Array(y, k2)) => k1 == k2 && unify(types, x, y, s),
+        (TyKind::Grow(x), TyKind::Grow(y)) => unify(types, x, y, s),
+        (TyKind::Ptr(x, m1), TyKind::Ptr(y, m2)) => m1 == m2 && unify(types, x, y, s),
+        (TyKind::FnPtr(p1, m1, r1), TyKind::FnPtr(p2, m2, r2)) => m1 == m2 && unify_list(types, p1, p2, s) && unify(types, r1, r2, s),
+        _ => false,
+    };
+}
+
+/// Bind variable `v` to `t`, unless `t` contains `v`.
+fn bind(types: &mut +Types, v: u32, t: Ty, s: &mut HashMap::<u32, Ty>): bool {
+    let t = resolve(types, t, s);
+    let occurs = types.any(t, &|k| k == TyKind::Infer(v));
+    if occurs {
+        return false;
+    }
+    s.insert(v, t);
+    return true;
+}
+
+fn unify_list(types: &mut +Types, a: TyList, b: TyList, s: &mut HashMap::<u32, Ty>): bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if !unify(types, types.at(a, i), types.at(b, i), s) {
+            return false;
+        }
+    }
+    return true;
+}

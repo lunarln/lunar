@@ -55,15 +55,23 @@ pub fn is_dummy(s: Span): bool {
 
 /// Diagnostics being built: `start` one, add labels, notes and helps, then
 /// `finish` it. All texts are interned (`Symbol`s) by the caller.
+///
+/// Building a diagnostic only grows the tables (the labels, notes and helps
+/// of the one being built are the ends of `cur_*` from `cur_*_start`), so
+/// it works through a `&mut +` program: passes report errors while holding
+/// views into the program.
 pub struct Diags {
     pub list: [Diag; -..+],
     pub labels: Arena::<Label>,
     pub texts: Arena::<Symbol>,
     /// The diagnostic being built.
     cur: Diag,
-    cur_labels: [Label; -..+],
-    cur_notes: [Symbol; -..+],
-    cur_helps: [Symbol; -..+],
+    cur_labels: [Label; ..+],
+    cur_notes: [Symbol; ..+],
+    cur_helps: [Symbol; ..+],
+    cur_labels_start: usize,
+    cur_notes_start: usize,
+    cur_helps_start: usize,
     errors: usize,
 }
 
@@ -79,48 +87,60 @@ impl Diags {
             notes: List::empty(),
             helps: List::empty(),
         };
-        return Diags { list: [], labels: Arena::new(), texts: Arena::new(), cur: empty, cur_labels: [], cur_notes: [], cur_helps: [], errors: 0 };
+        return Diags {
+            list: [],
+            labels: Arena::new(),
+            texts: Arena::new(),
+            cur: empty,
+            cur_labels: [],
+            cur_notes: [],
+            cur_helps: [],
+            cur_labels_start: 0,
+            cur_notes_start: 0,
+            cur_helps_start: 0,
+            errors: 0,
+        };
     }
 
     /// Start building an error.
-    pub fn error(&mut self, kept code: Code, span: Span, message: Symbol) {
+    pub fn error(&mut +self, kept code: Code, span: Span, message: Symbol) {
         self.begin(Severity::Error, code, span, message);
     }
 
     /// Start building a warning.
-    pub fn warning(&mut self, kept code: Code, span: Span, message: Symbol) {
+    pub fn warning(&mut +self, kept code: Code, span: Span, message: Symbol) {
         self.begin(Severity::Warning, code, span, message);
     }
 
-    fn begin(&mut self, severity: Severity, kept code: Code, span: Span, message: Symbol) {
+    fn begin(&mut +self, severity: Severity, kept code: Code, span: Span, message: Symbol) {
         self.cur = Diag { severity, code, message, span, label: None, labels: List::empty(), notes: List::empty(), helps: List::empty() };
-        self.cur_labels.clear();
-        self.cur_notes.clear();
-        self.cur_helps.clear();
+        self.cur_labels_start = self.cur_labels.len();
+        self.cur_notes_start = self.cur_notes.len();
+        self.cur_helps_start = self.cur_helps.len();
     }
 
-    pub fn label(&mut self, text: Symbol) {
+    pub fn label(&mut +self, text: Symbol) {
         self.cur.label = Some(text);
     }
 
-    pub fn secondary(&mut self, span: Span, text: Symbol) {
+    pub fn secondary(&mut +self, span: Span, text: Symbol) {
         self.cur_labels.push(Label { span, message: text });
     }
 
-    pub fn note(&mut self, text: Symbol) {
+    pub fn note(&mut +self, text: Symbol) {
         self.cur_notes.push(text);
     }
 
-    pub fn help(&mut self, text: Symbol) {
+    pub fn help(&mut +self, text: Symbol) {
         self.cur_helps.push(text);
     }
 
     /// Record the diagnostic being built.
-    pub fn finish(&mut self) {
+    pub fn finish(&mut +self) {
         let mut d = self.cur;
-        d.labels = self.labels.add_list(self.cur_labels[..]);
-        d.notes = self.texts.add_list(self.cur_notes[..]);
-        d.helps = self.texts.add_list(self.cur_helps[..]);
+        d.labels = self.labels.add_list(self.cur_labels[self.cur_labels_start..]);
+        d.notes = self.texts.add_list(self.cur_notes[self.cur_notes_start..]);
+        d.helps = self.texts.add_list(self.cur_helps[self.cur_helps_start..]);
         if d.is_error() {
             self.errors += 1;
         }
@@ -128,11 +148,21 @@ impl Diags {
     }
 
     /// Record `d` (built elsewhere, with its lists in this `Diags`).
-    pub fn push(&mut self, kept d: Diag) {
+    pub fn push(&mut +self, kept d: Diag) {
         if d.is_error() {
             self.errors += 1;
         }
         self.list.push(d);
+    }
+
+    /// Record `d`, a diagnostic of `from` (another `Diags`), copying its
+    /// labels, notes and helps into this one.
+    pub fn push_from(&mut +self, from: &Diags, kept d: Diag) {
+        let mut d = d;
+        d.labels = self.labels.add_list(from.labels.list(d.labels));
+        d.notes = self.texts.add_list(from.texts.list(d.notes));
+        d.helps = self.texts.add_list(from.texts.list(d.helps));
+        self.push(d);
     }
 
     pub fn error_count(&self): usize {

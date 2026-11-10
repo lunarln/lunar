@@ -1,0 +1,457 @@
+// Unit checks of the passes that do not need the front end: trait
+// queries, layouts, and the borrow checker on hand-built THIR.
+
+use core::arena::{Id, List};
+use core::intern::Symbol;
+use crater::borrowck;
+use crater::defs::*;
+use crater::diag::Diags;
+use crater::layout::Layout;
+use crater::program::Program;
+use crater::thir::*;
+use crater::traits::MethodImpl;
+use crater::ty::*;
+use ln_ast::{ParamMode, Span};
+
+fn sp(i: u32): Span {
+    return Span::new(i, i + 1);
+}
+
+/// A program with a crater root module (def 0).
+fn program(): Program {
+    let mut p = Program::new();
+    let root = p.sym("main");
+    p.defs.push(DefInfo {
+        name: root,
+        kind: DefKind::Mod,
+        module: DefId::new(0),
+        parent: None,
+        is_pub: true,
+        span: sp(0),
+        attrs: ItemAttrs::none(),
+        data: DefData::Mod(ModData { parent: None, krate: DefId::new(0), is_block: false, first_glob: 0 }),
+    });
+    return p;
+}
+
+fn add_def(p: &mut Program, name: str, kind: DefKind, data: DefData): DefId {
+    let id = DefId::new(p.defs.len());
+    let n = p.sym(name);
+    p.defs.push(DefInfo { name: n, kind, module: DefId::new(0), parent: None, is_pub: true, span: sp(0), attrs: ItemAttrs::none(), data });
+    return id;
+}
+
+/// A trait that is lang item `lang`, with supertraits `supers`.
+fn add_trait(p: &mut Program, lang: str, supers: [TraitRef; &]): DefId {
+    let st = p.trait_refs.add_list(supers);
+    let id = add_def(p, lang, DefKind::Trait, DefData::Trait(TraitData { generics: Generics::none(), supertraits: st, methods: List::empty(), auto: false }));
+    let s = p.sym(lang);
+    p.defs[id.index()].attrs.lang = Some(s);
+    p.lang.insert(s, id);
+    return id;
+}
+
+fn trait_ref(t: DefId): TraitRef {
+    return TraitRef { trait_id: t, args: List::empty() };
+}
+
+/// A struct with fields of types `tys`.
+fn add_struct(p: &mut Program, name: str, tys: [Ty; &], is_enum: bool): DefId {
+    let id = DefId::new(p.defs.len());
+    let mut vs: [VariantDef; ..+] = [];
+    if is_enum {
+        // One variant per type, holding it.
+        for t in tys {
+            let f = p.fields.add_list([FieldDef { name: p.sym("0"), ty: t, is_pub: true, span: sp(0) }][..]);
+            vs.push(VariantDef { name: p.sym("V"), def: id, ctor: CtorKind::Tuple, fields: f, span: sp(0) });
+        }
+    } else {
+        let mut fs: [FieldDef; ..+] = [];
+        for t in tys {
+            fs.push(FieldDef { name: p.sym("f"), ty: t, is_pub: true, span: sp(0) });
+        }
+        let f = p.fields.add_list(fs[..]);
+        vs.push(VariantDef { name: p.sym(name), def: id, ctor: CtorKind::Named, fields: f, span: sp(0) });
+    }
+    let variants = p.variants.add_list(vs[..]);
+    let kind = if is_enum { DefKind::Enum } else { DefKind::Struct };
+    add_def(p, name, kind, DefData::Adt(AdtData { generics: Generics::none(), variants, is_enum }));
+    return id;
+}
+
+/// An impl of `tr` for `self_ty` with `n` generic parameters bounded by
+/// `preds`.
+fn add_impl(p: &mut Program, n: usize, preds: [Pred; &], tr: TraitRef, self_ty: Ty): DefId {
+    let mut names: [Symbol; ..+] = [];
+    for _ in 0..n {
+        names.push(p.sym("T"));
+    }
+    let names = p.symbols.add_list(names[..]);
+    let preds = p.preds.add_list(preds);
+    let g = Generics { parent_count: 0, names, preds, span: sp(0) };
+    let id = add_def(p, "impl", DefKind::Impl, DefData::Impl(ImplData { generics: g, trait_ref: Some(tr), self_ty, negative: false }));
+    p.impls.push(id);
+    return id;
+}
+
+fn param(p: &mut Program, i: u32): Ty {
+    let n = p.sym("T");
+    return p.types.mk(TyKind::Param(i, n));
+}
+
+#[test]
+fn layouts() {
+    let mut p = program();
+    let u8t = p.types.int(IntTy::U8);
+    let u16t = p.types.int(IntTy::U16);
+    let u32t = p.types.int(IntTy::U32);
+    let u64t = p.types.int(IntTy::U64);
+    let t = p.types.tuple([u8t, u32t, u64t][..]);
+    assert_eq!(p.layout_of(t), Some(Layout { size: 16, align: 8 }));
+    let a = p.types.array(u16t, ArrKind::Fixed(3));
+    assert_eq!(p.layout_of(a), Some(Layout { size: 6, align: 2 }));
+    let s = p.types.mk(TyKind::String);
+    assert_eq!(p.layout_of(s), Some(Layout { size: 24, align: 8 }));
+    let st = p.types.str();
+    assert_eq!(p.layout_of(st), Some(Layout { size: 16, align: 8 }));
+    let unit = p.types.unit();
+    assert_eq!(p.layout_of(unit), Some(Layout { size: 0, align: 1 }));
+    let tp = param(&mut p, 0);
+    assert!(p.layout_of(tp).is_none());
+    // struct { u8, u64, u16 }: offsets 0, 8, 16; size 24.
+    let d = add_struct(&mut p, "S", [u8t, u64t, u16t][..], false);
+    let sty = p.types.adt(d, List::empty());
+    assert_eq!(p.layout_of(sty), Some(Layout { size: 24, align: 8 }));
+    let offs = p.field_offsets(d, List::empty()).unwrap();
+    assert_eq!(offs.len(), 3);
+    assert_eq!(offs[0], 0);
+    assert_eq!(offs[1], 8);
+    assert_eq!(offs[2], 16);
+    // enum { V(u8), V(u64, ..) }: tag + one word.
+    let e = add_struct(&mut p, "E", [u8t, u64t][..], true);
+    let ety = p.types.adt(e, List::empty());
+    assert_eq!(p.layout_of(ety), Some(Layout { size: 16, align: 8 }));
+}
+
+#[test]
+fn classification() {
+    let mut p = program();
+    let none: [Pred; 0] = [];
+    let no_supers: [TraitRef; 0] = [];
+    let light = add_trait(&mut p, "light", no_supers[..]);
+    let dull = add_trait(&mut p, "dull", [trait_ref(light)][..]);
+    let u32t = p.types.int(IntTy::U32);
+    let s = p.types.mk(TyKind::String);
+    let st = p.types.str();
+    let grow = p.types.array(u32t, ArrKind::Grow);
+    let slice = p.types.array(u32t, ArrKind::Slice);
+    let pair = p.types.tuple([u32t, u32t][..]);
+    assert!(p.is_dull(pair, none[..]));
+    assert!(!p.is_dull(st, none[..]));
+    assert!(p.is_light(st, none[..]));
+    assert!(p.is_light(slice, none[..]));
+    assert!(!p.is_light(s, none[..]));
+    assert!(p.has_owner(grow));
+    assert!(!p.has_owner(slice));
+    assert!(!p.is_copy(s, none[..]));
+    assert!(p.is_copy(slice, none[..]));
+    let holder = add_struct(&mut p, "H", [u32t, grow][..], false);
+    let hty = p.types.adt(holder, List::empty());
+    assert!(p.has_owner(hty));
+    assert!(!p.is_light(hty, none[..]));
+    // A parameter bounded by `Dull` is Dull and (through the supertrait)
+    // Light; an unbounded one could own an array.
+    let t = param(&mut p, 0);
+    let env = [Pred { ty: t, trait_ref: trait_ref(dull), span: sp(0) }];
+    assert!(p.is_dull(t, env[..]));
+    assert!(p.is_light(t, env[..]));
+    assert!(p.implements(t, trait_ref(light), env[..]));
+    assert!(!p.is_dull(t, none[..]));
+    assert!(p.could_own(t, none[..]));
+    assert!(!p.could_own(t, env[..]));
+    let mut el: [Pred; ..+] = [];
+    p.elaborate(env[..], &mut el);
+    assert_eq!(el.len(), 2);
+}
+
+#[test]
+fn impls() {
+    let mut p = program();
+    let none: [Pred; 0] = [];
+    let no_supers: [TraitRef; 0] = [];
+    let light = add_trait(&mut p, "light", no_supers[..]);
+    let dull = add_trait(&mut p, "dull", [trait_ref(light)][..]);
+    let add = add_trait(&mut p, "add", no_supers[..]);
+    let x = add_def(&mut p, "X", DefKind::Trait, DefData::Trait(TraitData { generics: Generics::none(), supertraits: List::empty(), methods: List::empty(), auto: false }));
+    let u8t = p.types.int(IntTy::U8);
+    let u32t = p.types.int(IntTy::U32);
+    let s = p.types.mk(TyKind::String);
+    let t = param(&mut p, 0);
+    let grow_t = p.types.array(t, ArrKind::Grow);
+    let grow_u8 = p.types.array(u8t, ArrKind::Grow);
+    let a = add_impl(&mut p, 1, none[..], trait_ref(x), grow_t);
+    let b = add_impl(&mut p, 0, none[..], trait_ref(x), grow_u8);
+    let mut notes: [Symbol; ..+] = [];
+    assert!(p.impls_overlap(a, b, &mut notes));
+    assert_eq!(notes.len(), 0);
+    // `impl::<T: Dull> X for T` and `impl X for String` do not overlap.
+    let c = add_impl(&mut p, 1, [Pred { ty: t, trait_ref: trait_ref(dull), span: sp(0) }][..], trait_ref(x), t);
+    let d = add_impl(&mut p, 0, none[..], trait_ref(x), s);
+    assert!(!p.impls_overlap(c, d, &mut notes));
+    assert!(p.impls_overlap(c, b, &mut notes) == false);
+    // Selection: `[u8; ..+]` matches `a` first, with `T = u8`.
+    match p.find_impl(grow_u8, trait_ref(x), none[..]) {
+        Some(found) => {
+            let (imp, args) = found;
+            assert!(imp == a);
+            assert!(p.types.list(args)[0] == u8t);
+        }
+        None => assert!(false),
+    }
+    assert!(p.implements(u32t, trait_ref(x), none[..]));
+    assert!(!p.implements(s, trait_ref(add), none[..]));
+    assert!(p.builtin_impl(u32t, add, none[..]));
+    let m = p.sym("add");
+    match p.resolve_method(trait_ref(add), u32t, m, List::empty()) {
+        Some(MethodImpl::Builtin { lang, method }) => {
+            assert!(p.text(lang) == "add");
+            assert!(method == m);
+        }
+        _ => assert!(false),
+    }
+    assert!(p.crater_of(x) == DefId::new(0));
+}
+
+// ------------------------------------------------------------------------- borrowck
+
+/// A body being built: its locals and statements.
+struct B {
+    locals: [Local; ..+],
+    stmts: [Stmt; ..+],
+}
+
+fn local(b: &mut B, p: &mut Program, name: str, ty: Ty, kind: LocalKind): LocalId {
+    let id = LocalId::new(b.locals.len());
+    let n = p.sym(name);
+    b.locals.push(Local { name: n, ty, mutable: true, kind, span: sp(100 + id.index as u32), depth: 1 });
+    return id;
+}
+
+fn ex(p: &mut Program, kind: ExprKind, ty: Ty, at: u32): Id::<Expr> {
+    return p.thir.exprs.add(Expr { kind, ty, span: sp(at) });
+}
+
+fn place(p: &mut Program, b: &B, l: LocalId, at: u32): Id::<Expr> {
+    return ex(p, ExprKind::Local(l), b.locals[l.index()].ty, at);
+}
+
+fn bind(b: &mut B, p: &mut Program, l: LocalId, init: Id::<Expr>, at: u32) {
+    let pat = p.thir.pats.add(Pat { kind: PatKind::Binding { local: l, mode: ReadMode::Move, sub: None }, ty: b.locals[l.index()].ty, span: sp(at) });
+    b.stmts.push(Stmt::Let { pat, init: Some(init), span: sp(at) });
+}
+
+/// Finish the body of `def` (whose first `nparams` locals are its
+/// parameters), with tail `tail`, and check and lint it.
+fn finish(p: &mut Program, b: &B, def: DefId, nparams: usize, tail: Option::<Id::<Expr>>): Diags {
+    let locals = p.thir.locals.add_list(b.locals[..]);
+    let mut ids: [LocalId; ..+] = [];
+    for i in 0..b.locals.len() {
+        ids.push(LocalId::new(i));
+    }
+    let params = p.thir.local_ids.add_list(ids[0..nparams]);
+    let block_locals = p.thir.local_ids.add_list(ids[nparams..]);
+    let stmts = p.thir.stmts.add_list(b.stmts[..]);
+    let block = p.thir.blocks.add(Block { stmts, tail, locals: block_locals, span: sp(0) });
+    let body = Body { def, locals, params, block, span: sp(0) };
+    let none: [Pred; 0] = [];
+    borrowck::check(p, body, none[..]);
+    let mut lints = Diags::new();
+    borrowck::lint(p, body, &mut lints);
+    return lints;
+}
+
+fn add_fn(p: &mut Program, name: str, params: [Param; &], ret: Ty): DefId {
+    let ps = p.params.add_list(params);
+    let fd = FnData { generics: Generics::none(), sig: FnSig { params: ps, ret, ret_span: sp(0) }, is_unsafe: false, abi: Abi::Lunar, variadic: false, has_body: true, owner: None, has_self: false };
+    return add_def(p, name, DefKind::Fn, DefData::Fn(fd));
+}
+
+fn inout_param(p: &mut Program, ty: Ty): Param {
+    return Param { name: p.sym("v"), ctx: SyntaxCtx::root(), ty, mode: ParamMode::InOut, inout: true, mutable: false, is_self: false, kept: false, span: sp(0) };
+}
+
+/// The codes of `d`'s diagnostics, space separated.
+fn codes_of(d: &Diags): String {
+    let mut s = String::new();
+    for x in d.list[..] {
+        if s.len() > 0 {
+            s.push(' ');
+        }
+        s.write("{x.code.scope}::{x.code.name}");
+    }
+    return s;
+}
+
+#[test]
+fn shrink_while_borrowed() {
+    let mut p = program();
+    let u32t = p.types.int(IntTy::U32);
+    let unit = p.types.unit();
+    let arr = p.types.array(u32t, ArrKind::Shrink);
+    let slice = p.types.array(u32t, ArrKind::Slice);
+    let pop = add_fn(&mut p, "pop", [inout_param(&mut p, arr)][..], unit);
+    let none: [Param; 0] = [];
+    let f = add_fn(&mut p, "f", none[..], unit);
+    let mut b = B { locals: [], stmts: [] };
+    let a = local(&mut b, &mut p, "a", arr, LocalKind::Let);
+    let s = local(&mut b, &mut p, "s", slice, LocalKind::Let);
+    let t = local(&mut b, &mut p, "_t", slice, LocalKind::Let);
+    // let a = []; let s = a[..]; pop(&mut a); let _t = s;
+    let lit = ex(&mut p, ExprKind::Array(List::empty()), arr, 1);
+    bind(&mut b, &mut p, a, lit, 1);
+    let base = place(&mut p, &b, a, 2);
+    let sl = ex(&mut p, ExprKind::Slice { base, start: None, end: None, inclusive: false, mutable: false }, slice, 2);
+    bind(&mut b, &mut p, s, sl, 2);
+    let arg = place(&mut p, &b, a, 3);
+    let args = p.thir.args.add_list([Arg::InOut(arg)][..]);
+    let call = ex(&mut p, ExprKind::Call { callee: Callee::Fn { def: pop, args: List::empty() }, args }, unit, 3);
+    b.stmts.push(Stmt::Expr(call));
+    let sp4 = place(&mut p, &b, s, 4);
+    let rd = ex(&mut p, ExprKind::Read { place: sp4, mode: ReadMode::Copy }, slice, 4);
+    bind(&mut b, &mut p, t, rd, 4);
+    let lints = finish(&mut p, &b, f, 0, None);
+    assert_eq!(codes_of(&p.diags).as_str(), "borrow::shrink_while_borrowed");
+    assert!(p.diags.list[0].span == sp(3));
+    // `a` is lent in-out, `s` is never changed.
+    assert_eq!(codes_of(&lints).as_str(), "lint::unused_mut");
+    assert!(lints.list[0].span == b.locals[s.index()].span);
+}
+
+#[test]
+fn use_after_move_and_lints() {
+    let mut p = program();
+    let s = p.types.mk(TyKind::String);
+    let unit = p.types.unit();
+    let none: [Param; 0] = [];
+    let f = add_fn(&mut p, "f", none[..], unit);
+    let mut b = B { locals: [], stmts: [] };
+    let a = local(&mut b, &mut p, "a", s, LocalKind::Let);
+    let x = local(&mut b, &mut p, "x", s, LocalKind::Let);
+    let y = local(&mut b, &mut p, "_y", s, LocalKind::Let);
+    // let mut a = ..; let mut x = a; let mut _y = a;
+    let lit = ex(&mut p, ExprKind::Error, s, 1);
+    bind(&mut b, &mut p, a, lit, 1);
+    let pa = place(&mut p, &b, a, 2);
+    let m1 = ex(&mut p, ExprKind::Read { place: pa, mode: ReadMode::Move }, s, 2);
+    bind(&mut b, &mut p, x, m1, 2);
+    let pa2 = place(&mut p, &b, a, 3);
+    let m2 = ex(&mut p, ExprKind::Read { place: pa2, mode: ReadMode::Move }, s, 3);
+    bind(&mut b, &mut p, y, m2, 3);
+    let lints = finish(&mut p, &b, f, 0, None);
+    assert_eq!(codes_of(&p.diags).as_str(), "borrow::use_after_move");
+    assert!(p.diags.list[0].span == sp(3));
+    // `a` needs no `mut`, `x` is never used, `_y` is exempt.
+    assert_eq!(codes_of(&lints).as_str(), "lint::unused_mut lint::unused_variable");
+    let mut all = Diags::new();
+    all.push_from(&lints, lints.list[1]);
+    assert_eq!(all.list[0].notes.len() + all.list[0].helps.len(), 1);
+}
+
+#[test]
+fn escapes_and_grow_only() {
+    let mut p = program();
+    let u32t = p.types.int(IntTy::U32);
+    let unit = p.types.unit();
+    let s = p.types.mk(TyKind::String);
+    let st = p.types.str();
+    let arr = p.types.array(u32t, ArrKind::Shrink);
+    let grow = p.types.mk(TyKind::Grow(arr));
+    let pop = add_fn(&mut p, "pop", [inout_param(&mut p, arr)][..], unit);
+    // fn g(x: String): str { x }  (as a `str` view)
+    let xp = Param { name: p.sym("x"), ctx: SyntaxCtx::root(), ty: s, mode: ParamMode::Take, inout: false, mutable: false, is_self: false, kept: false, span: sp(0) };
+    let g = add_fn(&mut p, "g", [xp][..], st);
+    let mut b = B { locals: [], stmts: [] };
+    let x = local(&mut b, &mut p, "x", s, LocalKind::Param { index: 0, inout: false, grow: false, owned: true });
+    let px = place(&mut p, &b, x, 5);
+    let tail = ex(&mut p, ExprKind::Coerce { kind: Coercion::StringToStr, expr: px }, st, 5);
+    finish(&mut p, &b, g, 1, Some(tail));
+    assert_eq!(codes_of(&p.diags).as_str(), "borrow::escapes_function");
+    assert_eq!(p.diags.list[0].notes.len(), 1);
+    // fn h(v: &mut +[u32; -..+]) { pop(&mut v); }
+    let vp = inout_param(&mut p, grow);
+    let h = add_fn(&mut p, "h", [vp][..], unit);
+    let mut b = B { locals: [], stmts: [] };
+    let v = local(&mut b, &mut p, "v", grow, LocalKind::Param { index: 0, inout: true, grow: true, owned: false });
+    let arg = place(&mut p, &b, v, 6);
+    let args = p.thir.args.add_list([Arg::InOut(arg)][..]);
+    let call = ex(&mut p, ExprKind::Call { callee: Callee::Fn { def: pop, args: List::empty() }, args }, unit, 6);
+    b.stmts.push(Stmt::Expr(call));
+    finish(&mut p, &b, h, 1, None);
+    assert_eq!(codes_of(&p.diags).as_str(), "borrow::escapes_function borrow::grow_only");
+}
+
+#[test]
+fn moves_in_loops() {
+    let mut p = program();
+    let s = p.types.mk(TyKind::String);
+    let unit = p.types.unit();
+    let never = p.types.never();
+    let none: [Param; 0] = [];
+    let f = add_fn(&mut p, "f", none[..], unit);
+    for with_break in [false, true] {
+        let errors = p.diags.len();
+        // let a = ..; loop { let _x = a; [break;] }
+        let mut b = B { locals: [], stmts: [] };
+        let a = local(&mut b, &mut p, "a", s, LocalKind::Let);
+        let x = local(&mut b, &mut p, "_x", s, LocalKind::Let);
+        let lit = ex(&mut p, ExprKind::Error, s, 1);
+        bind(&mut b, &mut p, a, lit, 1);
+        let pa = place(&mut p, &b, a, 2);
+        let mv = ex(&mut p, ExprKind::Read { place: pa, mode: ReadMode::Move }, s, 2);
+        let pat = p.thir.pats.add(Pat { kind: PatKind::Binding { local: x, mode: ReadMode::Move, sub: None }, ty: s, span: sp(2) });
+        let mut inner: [Stmt; ..+] = [Stmt::Let { pat, init: Some(mv), span: sp(2) }];
+        let id = LoopId { index: 0 };
+        if with_break {
+            let brk = ex(&mut p, ExprKind::Break { id, value: None }, never, 3);
+            inner.push(Stmt::Expr(brk));
+        }
+        let stmts = p.thir.stmts.add_list(inner[..]);
+        let ids = p.thir.local_ids.add_list([x][..]);
+        let body = p.thir.blocks.add(Block { stmts, tail: None, locals: ids, span: sp(2) });
+        let lp = ex(&mut p, ExprKind::Loop { body, id }, if with_break { unit } else { never }, 2);
+        b.stmts.push(Stmt::Expr(lp));
+        finish(&mut p, &b, f, 0, None);
+        // Moved again on the second iteration, unless the loop breaks first.
+        assert_eq!(p.diags.len() - errors, if with_break { 0 } else { 1 });
+    }
+    assert_eq!(codes_of(&p.diags).as_str(), "borrow::use_after_move");
+}
+
+#[test]
+fn kept_arguments() {
+    let mut p = program();
+    let unit = p.types.unit();
+    let s = p.types.mk(TyKind::String);
+    let st = p.types.str();
+    let views = p.types.array(st, ArrKind::Grow);
+    // fn push(v: &mut [str; ..+], kept s: str)
+    let sp_ = Param { name: p.sym("s"), ctx: SyntaxCtx::root(), ty: st, mode: ParamMode::Take, inout: false, mutable: false, is_self: false, kept: true, span: sp(0) };
+    let push = add_fn(&mut p, "push", [inout_param(&mut p, views), sp_][..], unit);
+    // fn f(out: &mut [str; ..+]) { let t = ..; push(out, t.as_str()); }
+    let f = add_fn(&mut p, "f", [inout_param(&mut p, views)][..], unit);
+    let mut b = B { locals: [], stmts: [] };
+    let out = local(&mut b, &mut p, "out", views, LocalKind::Param { index: 0, inout: true, grow: false, owned: false });
+    let t = local(&mut b, &mut p, "t", s, LocalKind::Let);
+    let lit = ex(&mut p, ExprKind::Error, s, 1);
+    bind(&mut b, &mut p, t, lit, 1);
+    let po = place(&mut p, &b, out, 2);
+    let pt = place(&mut p, &b, t, 3);
+    let view = ex(&mut p, ExprKind::Coerce { kind: Coercion::StringToStr, expr: pt }, st, 3);
+    let args = p.thir.args.add_list([Arg::InOut(po), Arg::Value(view)][..]);
+    let call = ex(&mut p, ExprKind::Call { callee: Callee::Fn { def: push, args: List::empty() }, args }, unit, 4);
+    b.stmts.push(Stmt::Expr(call));
+    finish(&mut p, &b, f, 1, None);
+    assert_eq!(codes_of(&p.diags).as_str(), "borrow::escapes_via_param");
+    assert!(p.diags.list[0].span == sp(4));
+    assert!(p.text(p.diags.list[0].message) == "cannot store a view of a local value into parameter `out`");
+}

@@ -19,8 +19,8 @@ Rust `lunar`, rebuilds this workspace into an identical compiler.
 | Part | Rust source | Lunar file(s) | State |
 |------|-------------|---------------|-------|
 | front end | `loader.rs`, `expand.rs`, `collect.rs`, `resolve.rs`, `lower.rs`, parser expansion parsing | `ln-sema/src/{sema,loader,expand,collect,resolve,lower}.ln` | in progress |
-| traits, layout | `traits.rs`, `layout.rs` | `ln-sema/src/{traits,layout}.ln` | in progress |
-| borrow checker | `borrowck.rs` | `ln-sema/src/borrowck.ln` | in progress |
+| traits, layout | `traits.rs`, `layout.rs` | `ln-sema/src/{traits,layout}.ln` | done (unit checks in `tests.ln`) |
+| borrow checker | `borrowck.rs` | `ln-sema/src/borrowck.ln` | done (unit checks on hand-built THIR in `tests.ln`) |
 | type checker | `typeck/*.rs` | `ln-sema/src/typeck*.ln` | after the front end |
 | code generation | `crates/ln-codegen` | `ln-codegen/src/*.ln` | in progress |
 | driver | `crates/ln-driver` (build path only) | `ln-driver/src/main.ln` (`lunarc`) | after the passes |
@@ -38,6 +38,13 @@ Rust `lunar`, rebuilds this workspace into an identical compiler.
   to end); macro expansions are files too.
 * Diagnostics (`diag.ln`) are built with `Diags::error` / `label` /
   `note` / `help` / `finish`; codes are functions (`codes::ty::MISMATCH()`).
+  Building one only grows `Diags` (`&mut +self`), so a pass holding a
+  `p: &mut +Program` can report errors into `p.diags`.
+* Trait queries, layouts and the borrow checker take the program as
+  `&mut +Program` (substituting interns types): `p.is_dull(t, env)`,
+  `p.layout_of(t)`, `borrowck::check(p, body, env)`.
+  `borrowck::lint(p, body, &mut lints)` writes warnings into a separate
+  `Diags` (copy them over with `Diags::push_from`).
 
 ### Writing Lunar for the port
 
