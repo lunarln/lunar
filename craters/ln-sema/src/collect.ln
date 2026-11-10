@@ -1,0 +1,867 @@
+// Phase 1: create a `DefId` for every item and build module namespaces. A
+// port of crates/ln-sema/src/collect.rs.
+
+use core::arena::{Id, List};
+use core::intern::Symbol;
+use crater::codes;
+use crater::defs::*;
+use crater::expand::{Owner, Pending};
+use crater::loader::{CrateSource, ModSource};
+use crater::program::CraterRoot;
+use crater::resolve::hidden_name;
+use crater::sema::{AstRef, ImplItem, ImplItemRun, PendingUse, Sema};
+use ln_ast::{Attr, Block, ExprKind, Expr, Ident, Item, ItemKind, Meta, Span, StmtKind, VariantData};
+
+/// Values of `target_os` the compiler can be run for or with (the values
+/// of Rust's `std::env::consts::OS` for hosts LLVM supports).
+fn known_os(n: str): bool {
+    return n == "linux" || n == "macos" || n == "windows" || n == "ios" || n == "android" || n == "freebsd" || n == "netbsd" || n == "openbsd" || n == "dragonfly" || n == "solaris" || n == "illumos";
+}
+
+/// The known operating systems, as the help lists them.
+const KNOWN_OS_LIST: str = "`linux`, `macos`, `windows`, `ios`, `android`, `freebsd`, `netbsd`, `openbsd`, `dragonfly`, `solaris`, `illumos`";
+
+/// Common `target_arch` values, only used to suggest `target_arch = "..."`.
+fn known_arch(n: str): bool {
+    return n == "x86_64" || n == "x86" || n == "aarch64" || n == "arm" || n == "riscv64" || n == "wasm32";
+}
+
+/// The name of an attribute's meta item.
+pub fn meta_name(m: Meta): Ident {
+    return match m {
+        Meta::Word(n) => n,
+        Meta::NameValue(n, _) => n,
+        Meta::Nested(n, _) => n,
+    };
+}
+
+impl Sema {
+    pub fn new_def(&mut self, name: Symbol, kind: DefKind, module: Option::<DefId>, span: Span, ast: AstRef): DefId {
+        let id = DefId::new(self.p.defs.len());
+        let module = match module {
+            Some(m) => m,
+            None => id,
+        };
+        let data = match kind {
+            DefKind::Mod => DefData::Mod(ModData { parent: None, krate: DefId::new(0), is_block: false, first_glob: 0 }),
+            _ => DefData::None,
+        };
+        self.p.defs.push(DefInfo { name, kind, module, parent: None, is_pub: false, span, attrs: ItemAttrs::none(), data });
+        self.asts.push(ast);
+        return id;
+    }
+
+    pub fn set_mod_data(&mut self, m: DefId, md: ModData) {
+        self.p.defs[m.index()].data = DefData::Mod(md);
+    }
+
+    fn bind(&mut self, module: DefId, ns: Ns, name: Symbol, def: DefId, is_pub: bool, span: Span) {
+        if let Some(prev) = self.p.binding(module, ns, name) {
+            let n = self.str_of(name);
+            self.error(codes::name::DUPLICATE(), span, "`{n}` is defined multiple times");
+            self.secondary(prev.span, "previous definition here");
+            self.emit();
+            return;
+        }
+        self.p.bindings.insert(BindKey { module, ns, name }, Binding { def, is_pub, span });
+    }
+
+    pub fn collect_crate(&mut self, c: CrateSource): DefId {
+        let m = self.craters.mods.get(c.root);
+        let start = self.p.sources.files[m.file as usize].start;
+        let root = self.new_def(c.name, DefKind::Mod, None, Span::new(start, start), AstRef::None);
+        let mut md = self.p.mod_data(root);
+        md.krate = root;
+        self.set_mod_data(root, md);
+        self.p.defs[root.index()].is_pub = true;
+        self.p.crate_roots.push(CraterRoot { name: c.name, def: root });
+        let mut chain: [Symbol; -..+] = [];
+        self.collect_items(root, m.items, c.root, &mut chain);
+        return root;
+    }
+
+    // ----- attributes -----
+
+    /// Evaluate `#[cfg(...)]` attributes; `false` means the item is compiled out.
+    pub fn cfg_enabled(&mut self, attrs: List::<Attr>): bool {
+        for i in 0..attrs.len() {
+            let a = self.p.ast.attrs.list(attrs)[i];
+            if let Meta::Nested(n, args) = a.meta {
+                if self.p.text(n.name) == "cfg" {
+                    if args.len() != 1 {
+                        self.error(codes::syntax::BAD_ATTRIBUTE(), a.span, "`cfg` takes exactly one predicate");
+                        self.emit();
+                        continue;
+                    }
+                    let m = self.p.ast.metas.list(args)[0];
+                    if !self.eval_cfg(m) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    /// `lint::unknown_cfg`: a cfg name or value the compiler never sets, so
+    /// the predicate is always false (often a typo or a Rust-ism such as
+    /// `#[cfg(linux)]`).
+    fn unknown_cfg(&mut self, span: Span, what: str, help: Option::<String>) {
+        self.warning(codes::lint::UNKNOWN_CFG(), span, "unknown cfg {what}");
+        self.label("this is never set, so the condition is always false");
+        self.note("valid cfg options are `unix`, `windows`, `test`, `target_os = \"...\"`, `target_family = \"...\"` and `target_arch = \"...\"`, combined with `not(...)`, `all(...)` and `any(...)`");
+        if let Some(h) = help {
+            self.help("{h}");
+        }
+        self.emit();
+    }
+
+    fn eval_cfg(&mut self, m: Meta): bool {
+        match m {
+            Meta::Word(w) => {
+                let nstr = self.str_of(w.name);
+                let n = nstr.as_str();
+                if n == "windows" {
+                    return self.opts.target_family.as_str() == "windows";
+                }
+                if n == "unix" {
+                    return self.opts.target_family.as_str() == "unix";
+                }
+                if n == "test" {
+                    return self.opts.test;
+                }
+                let help = if known_os(n) {
+                    Some(core::fmt::format("to test the operating system, write `target_os = \"{n}\"`"))
+                } else if known_arch(n) {
+                    Some(core::fmt::format("to test the architecture, write `target_arch = \"{n}\"`"))
+                } else if n == "target_os" || n == "target_family" || n == "target_arch" {
+                    Some(core::fmt::format("`{n}` needs a value, as in `{n} = \"...\"`"))
+                } else {
+                    None
+                };
+                let what = core::fmt::format("name `{n}`");
+                self.unknown_cfg(w.span, what.as_str(), help);
+                return false;
+            }
+            Meta::NameValue(k, v) => {
+                let nstr = self.str_of(k.name);
+                let n = nstr.as_str();
+                let vstr = self.str_of(v);
+                let val = vstr.as_str();
+                if n == "target_os" {
+                    if !known_os(val) {
+                        let help = core::fmt::format("known operating systems: {KNOWN_OS_LIST}");
+                        let what = core::fmt::format("value `target_os = \"{val}\"`");
+                        self.unknown_cfg(k.span, what.as_str(), Some(help));
+                    }
+                    return self.opts.target_os.as_str() == val;
+                }
+                if n == "target_arch" {
+                    return self.opts.target_arch.as_str() == val;
+                }
+                if n == "target_family" {
+                    if val != "unix" && val != "windows" {
+                        let what = core::fmt::format("value `target_family = \"{val}\"`");
+                        self.unknown_cfg(k.span, what.as_str(), Some(String::from("the families are `\"unix\"` and `\"windows\"`")));
+                    }
+                    return self.opts.target_family.as_str() == val;
+                }
+                let help = if n == "unix" || n == "windows" || n == "test" { Some(core::fmt::format("`{n}` takes no value: write `{n}`")) } else { None };
+                let what = core::fmt::format("name `{n}`");
+                self.unknown_cfg(k.span, what.as_str(), help);
+                return false;
+            }
+            Meta::Nested(k, args) => {
+                let nstr = self.str_of(k.name);
+                let n = nstr.as_str();
+                if n == "not" && args.len() == 1 {
+                    let a = self.p.ast.metas.list(args)[0];
+                    return !self.eval_cfg(a);
+                }
+                // Evaluate every argument (no short-circuit) so each unknown
+                // name is reported.
+                if n == "all" {
+                    let mut acc = true;
+                    for i in 0..args.len() {
+                        let a = self.p.ast.metas.list(args)[i];
+                        let x = self.eval_cfg(a);
+                        acc = acc && x;
+                    }
+                    return acc;
+                }
+                if n == "any" {
+                    let mut acc = false;
+                    for i in 0..args.len() {
+                        let a = self.p.ast.metas.list(args)[i];
+                        let x = self.eval_cfg(a);
+                        acc = acc || x;
+                    }
+                    return acc;
+                }
+                self.error(codes::syntax::BAD_ATTRIBUTE(), k.span, "unknown cfg predicate `{n}`");
+                self.emit();
+                return false;
+            }
+        }
+    }
+
+    fn item_attrs(&mut self, attrs: List::<Attr>): ItemAttrs {
+        let mut out = ItemAttrs::none();
+        let mut derive: [Ident; ..+] = [];
+        for i in 0..attrs.len() {
+            let a = self.p.ast.attrs.list(attrs)[i];
+            let n = meta_name(a.meta);
+            let name_s = self.str_of(n.name);
+            let name = name_s.as_str();
+            let handled = match a.meta {
+                // `cfg` was evaluated already; `link` is read where extern
+                // blocks are collected.
+                Meta::Nested(_, list) => {
+                    if name == "cfg" || name == "allow" || name == "link" {
+                        true
+                    } else if name == "derive" {
+                        for j in 0..list.len() {
+                            let m = self.p.ast.metas.list(list)[j];
+                            match m {
+                                Meta::Word(d) => derive.push(d),
+                                _ => {
+                                    self.error(codes::syntax::BAD_ATTRIBUTE(), a.span, "write derives by name: `#[derive(Eq, Debug)]`");
+                                    self.emit();
+                                }
+                            }
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Meta::NameValue(_, v) => {
+                    if name == "lang" {
+                        out.lang = Some(v);
+                        true
+                    } else if name == "link_name" {
+                        out.link_name = Some(v);
+                        true
+                    } else {
+                        name == "doc"
+                    }
+                }
+                Meta::Word(w) => {
+                    if name == "intrinsic" {
+                        out.intrinsic = true;
+                        true
+                    } else if name == "test" {
+                        out.test = true;
+                        true
+                    } else if name == "inline" {
+                        out.inline = true;
+                        true
+                    } else if name == "derive_macro" {
+                        out.derive_macro = true;
+                        true
+                    } else if name == "export" {
+                        if w.ctx.is_root() {
+                            self.error(codes::syntax::BAD_ATTRIBUTE(), a.span, "`#[export]` only applies to items written in a macro's body");
+                            self.note("it makes an item a macro defines visible where the macro is invoked; items written by hand are visible anyway");
+                            self.emit();
+                        }
+                        out.export = true;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if handled {
+                continue;
+            }
+            // A known attribute written in the wrong form gets the right
+            // form, not "unknown attribute".
+            let usage = if name == "test" {
+                "#[test]"
+            } else if name == "inline" {
+                "#[inline]"
+            } else if name == "intrinsic" {
+                "#[intrinsic]"
+            } else if name == "lang" {
+                "#[lang = \"name\"]"
+            } else if name == "link_name" {
+                "#[link_name = \"symbol\"]"
+            } else if name == "doc" {
+                "#[doc = \"text\"] (or a `///` comment)"
+            } else if name == "cfg" {
+                "#[cfg(predicate)]"
+            } else if name == "allow" {
+                "#[allow(lint_name)]"
+            } else if name == "derive" {
+                "#[derive(Trait, ...)]"
+            } else if name == "derive_macro" {
+                "#[derive_macro]"
+            } else if name == "export" {
+                "#[export]"
+            } else {
+                ""
+            };
+            if usage.len() > 0 {
+                self.error(codes::syntax::BAD_ATTRIBUTE(), a.span, "malformed `{name}` attribute");
+                self.help("write it as `{usage}`");
+            } else {
+                self.error(codes::syntax::BAD_ATTRIBUTE(), a.span, "unknown attribute `{name}`");
+                self.note("known attributes: cfg, test, inline, lang, intrinsic, link_name, allow, doc, derive, derive_macro, export");
+            }
+            self.emit();
+        }
+        out.derive = self.p.idents.add_list(derive[..]);
+        return out;
+    }
+
+    // ----- items -----
+
+    fn collect_items(&mut self, module: DefId, items: List::<Id::<Item>>, src: Id::<ModSource>, chain: &mut [Symbol; -..+]) {
+        for i in 0..items.len() {
+            let item = self.p.ast.item_ids.list(items)[i];
+            self.collect_item(module, item, src, chain, None);
+        }
+    }
+
+    fn finish_def(&mut self, id: DefId, item: Item, attrs: ItemAttrs) {
+        self.p.defs[id.index()].is_pub = item.is_pub;
+        if let Some(lang) = attrs.lang {
+            self.p.lang.insert(lang, id);
+        }
+        self.p.defs[id.index()].attrs = attrs;
+    }
+
+    /// The name an item is bound under: hygiene hides an item a macro's
+    /// body names from other code unless it is `#[export]`ed
+    /// (docs/design/macros.md, section 4).
+    fn key(&mut self, id: Ident, export: bool): Symbol {
+        if id.ctx.is_root() || export {
+            return id.name;
+        }
+        let n = hidden_name(self.p.text(id.name), id.ctx);
+        return self.p.sym(n.as_str());
+    }
+
+    fn collect_item(&mut self, module: DefId, item_id: Id::<Item>, src: Id::<ModSource>, chain: &mut [Symbol; -..+], extern_abi: Option::<Symbol>) {
+        let item = self.p.ast.items.get(item_id);
+        if !self.cfg_enabled(item.attrs) {
+            return;
+        }
+        let attrs = self.item_attrs(item.attrs);
+        let export = attrs.export;
+        for i in 0..attrs.derive.len() {
+            let d = self.p.idents.list(attrs.derive)[i];
+            let ok = match item.kind {
+                ItemKind::Struct(_) | ItemKind::Enum(_) => true,
+                _ => false,
+            };
+            if !ok {
+                self.error(codes::syntax::BAD_ATTRIBUTE(), d.span, "`#[derive]` applies only to structs and enums");
+                self.emit();
+                break;
+            }
+            self.pending_macros.push(Pending::Derive { module, item: item_id, name: d });
+        }
+        match item.kind {
+            ItemKind::Fn(f) => {
+                let id = self.new_def(f.name.name, DefKind::Fn, Some(module), f.name.span, AstRef::Fn(f, extern_abi.is_some()));
+                // Only the crater being tested contributes tests, not the
+                // craters it depends on.
+                let krate = self.p.mod_data(module).krate;
+                let in_root = self.p.crate_roots.len() > 0 && self.p.crate_roots[0].def == krate;
+                if attrs.test && self.opts.test && in_root {
+                    self.p.tests.push(id);
+                }
+                self.finish_def(id, item, attrs);
+                let k = self.key(f.name, export);
+                self.bind(module, Ns::Value, k, id, item.is_pub, f.name.span);
+                if let Some(body) = f.body {
+                    self.collect_block_items(module, body, src);
+                }
+            }
+            ItemKind::Struct(s) => {
+                let id = self.new_def(s.name.name, DefKind::Struct, Some(module), s.name.span, AstRef::Struct(s));
+                self.finish_def(id, item, attrs);
+                let k = self.key(s.name, export);
+                self.bind(module, Ns::Type, k, id, item.is_pub, s.name.span);
+                let named = match s.kind {
+                    VariantData::Named(_) => true,
+                    _ => false,
+                };
+                if !named {
+                    self.bind(module, Ns::Value, k, id, item.is_pub, s.name.span);
+                }
+            }
+            ItemKind::Enum(e) => {
+                let id = self.new_def(e.name.name, DefKind::Enum, Some(module), e.name.span, AstRef::Enum(e));
+                self.finish_def(id, item, attrs);
+                let k = self.key(e.name, export);
+                self.bind(module, Ns::Type, k, id, item.is_pub, e.name.span);
+                let mut variants: [VariantDef; ..+] = [];
+                for i in 0..e.variants.len() {
+                    let v = self.p.ast.variants.list(e.variants)[i];
+                    for j in 0..v.attrs.len() {
+                        let a = self.p.ast.attrs.list(v.attrs)[j];
+                        let ok = match a.meta {
+                            Meta::NameValue(n, _) => self.p.text(n.name) == "doc",
+                            Meta::Word(n) => self.p.text(n.name) == "default",
+                            _ => false,
+                        };
+                        if !ok {
+                            let an = self.str_of(meta_name(a.meta).name);
+                            self.error(codes::syntax::BAD_ATTRIBUTE(), a.span, "unknown attribute `{an}` on an enum variant");
+                            self.note("variants take doc comments and `#[default]` (used by `#[derive(Default)]`)");
+                            self.emit();
+                        }
+                    }
+                    let vid = self.new_def(v.name.name, DefKind::Variant, Some(module), v.name.span, AstRef::Variant(v));
+                    self.p.defs[vid.index()].parent = Some(id);
+                    self.p.defs[vid.index()].is_pub = true;
+                    self.p.defs[vid.index()].data = DefData::Variant { enum_id: id, index: i as u32 };
+                    let ctor = match v.data {
+                        VariantData::Unit => CtorKind::Unit,
+                        VariantData::Tuple(_) => CtorKind::Tuple,
+                        VariantData::Named(_) => CtorKind::Named,
+                    };
+                    let mut dup = false;
+                    for x in variants {
+                        if x.name == v.name.name {
+                            dup = true;
+                        }
+                    }
+                    if dup {
+                        let vn = self.str_of(v.name.name);
+                        self.error(codes::name::DUPLICATE(), v.name.span, "variant `{vn}` is defined multiple times");
+                        self.emit();
+                    }
+                    variants.push(VariantDef { name: v.name.name, def: vid, ctor, fields: List::empty(), span: v.span });
+                }
+                let vl = self.p.variants.add_list(variants[..]);
+                self.p.defs[id.index()].data = DefData::Adt(AdtData { generics: Generics::none(), variants: vl, is_enum: true });
+            }
+            ItemKind::Trait(t) => {
+                let id = self.new_def(t.name.name, DefKind::Trait, Some(module), t.name.span, AstRef::Trait(t));
+                self.finish_def(id, item, attrs);
+                let k = self.key(t.name, export);
+                self.bind(module, Ns::Type, k, id, item.is_pub, t.name.span);
+                self.p.defs[id.index()].data = DefData::Trait(TraitData { generics: Generics::none(), supertraits: List::empty(), methods: List::empty(), auto: false });
+                self.collect_trait_items(id, module, t.items, src);
+            }
+            ItemKind::Impl(im) => {
+                let name = self.p.sym("<impl>");
+                let id = self.new_def(name, DefKind::Impl, Some(module), item.span, AstRef::Impl(im));
+                self.finish_def(id, item, attrs);
+                self.p.impls.push(id);
+                self.collect_impl_items(id, module, im.items, src);
+            }
+            ItemKind::Macro(m) => {
+                let id = self.new_def(m.name.name, DefKind::Macro, Some(module), m.name.span, AstRef::Macro(m));
+                self.finish_def(id, item, attrs);
+                let k = self.key(m.name, export);
+                self.bind(module, Ns::Macro, k, id, item.is_pub, m.name.span);
+                self.define_macro(id, m);
+            }
+            ItemKind::MacCall(call) => {
+                self.pending_macros.push(Pending::Call { module, call, owner: Owner::Module });
+            }
+            ItemKind::Use(tree) => self.pending_uses.push(PendingUse { module, tree, is_pub: item.is_pub }),
+            ItemKind::Mod(m) => {
+                let id = self.new_def(m.name.name, DefKind::Mod, Some(module), m.name.span, AstRef::None);
+                let krate = self.p.mod_data(module).krate;
+                let mut md = self.p.mod_data(id);
+                md.parent = Some(module);
+                md.krate = krate;
+                self.set_mod_data(id, md);
+                self.finish_def(id, item, attrs);
+                let k = self.key(m.name, export);
+                self.bind(module, Ns::Type, k, id, item.is_pub, m.name.span);
+                match m.items {
+                    Some(items) => {
+                        chain.push(m.name.name);
+                        self.collect_items(id, items, src, chain);
+                        chain.pop();
+                    }
+                    None => {
+                        let mut key: [Symbol; ..+] = [];
+                        key.extend(chain[..]);
+                        key.push(m.name.name);
+                        if let Some(child) = self.craters.child(src, key[..]) {
+                            let cm = self.craters.mods.get(child);
+                            let mut fresh: [Symbol; -..+] = [];
+                            self.collect_items(id, cm.items, child, &mut fresh);
+                        }
+                    }
+                }
+            }
+            ItemKind::Const(c) => {
+                let id = self.new_def(c.name.name, DefKind::Const, Some(module), c.name.span, AstRef::Const(c));
+                self.finish_def(id, item, attrs);
+                let k = self.key(c.name, export);
+                self.bind(module, Ns::Value, k, id, item.is_pub, c.name.span);
+            }
+            ItemKind::Static(s) => {
+                let id = self.new_def(s.name.name, DefKind::Static, Some(module), s.name.span, AstRef::Static(s));
+                self.finish_def(id, item, attrs);
+                let k = self.key(s.name, export);
+                self.bind(module, Ns::Value, k, id, item.is_pub, s.name.span);
+            }
+            ItemKind::Extern(block) => {
+                let abi = match block.abi {
+                    Some(a) => a,
+                    None => self.p.sym("C"),
+                };
+                if self.p.text(abi) != "C" {
+                    let a = self.str_of(abi);
+                    self.error(codes::syntax::BAD_ATTRIBUTE(), item.span, "unsupported ABI `{a}` (only \"C\" is supported)");
+                    self.emit();
+                }
+                // `#[link(name = "LLVM-C")]`: a native library to link.
+                for i in 0..item.attrs.len() {
+                    let a = self.p.ast.attrs.list(item.attrs)[i];
+                    if let Meta::Nested(n, list) = a.meta {
+                        if self.p.text(n.name) != "link" {
+                            continue;
+                        }
+                        let mut lib: Option::<Symbol> = None;
+                        if list.len() == 1 {
+                            if let Meta::NameValue(k, v) = self.p.ast.metas.list(list)[0] {
+                                if self.p.text(k.name) == "name" {
+                                    lib = Some(v);
+                                }
+                            }
+                        }
+                        match lib {
+                            Some(v) => {
+                                if !self.p.link_libs[..].contains(v) {
+                                    self.p.link_libs.push(v);
+                                }
+                            }
+                            None => {
+                                self.error(codes::syntax::BAD_ATTRIBUTE(), a.span, "write the library to link as `#[link(name = \"library\")]`");
+                                self.emit();
+                            }
+                        }
+                    }
+                }
+                for i in 0..block.items.len() {
+                    let inner_id = self.p.ast.item_ids.list(block.items)[i];
+                    let inner = self.p.ast.items.get(inner_id);
+                    let ok = match inner.kind {
+                        ItemKind::Fn(f) => f.body.is_none(),
+                        _ => false,
+                    };
+                    if ok {
+                        self.collect_item(module, inner_id, src, chain, Some(abi));
+                    } else {
+                        self.error(codes::syntax::UNEXPECTED_TOKEN(), inner.span, "extern blocks may only contain function declarations without bodies");
+                        self.emit();
+                    }
+                }
+            }
+            ItemKind::TypeAlias(t) => {
+                let id = self.new_def(t.name.name, DefKind::TypeAlias, Some(module), t.name.span, AstRef::Alias(t));
+                self.finish_def(id, item, attrs);
+                let k = self.key(t.name, export);
+                self.bind(module, Ns::Type, k, id, item.is_pub, t.name.span);
+            }
+        }
+    }
+
+    /// An item a macro expanded to, in item position of `module`.
+    pub fn collect_expanded_item(&mut self, module: DefId, item: Id::<Item>, src: Id::<ModSource>) {
+        let mut chain: [Symbol; -..+] = [];
+        self.collect_item(module, item, src, &mut chain, None);
+    }
+
+    /// The functions of trait `id` (also those a macro in its body expands to).
+    pub fn collect_trait_items(&mut self, id: DefId, module: DefId, items: List::<Id::<Item>>, src: Id::<ModSource>) {
+        for i in 0..items.len() {
+            let ti_id = self.p.ast.item_ids.list(items)[i];
+            let ti = self.p.ast.items.get(ti_id);
+            if !self.cfg_enabled(ti.attrs) {
+                continue;
+            }
+            let f = match ti.kind {
+                ItemKind::Fn(f) => f,
+                ItemKind::MacCall(call) => {
+                    self.pending_macros.push(Pending::Call { module, call, owner: Owner::Trait(id) });
+                    continue;
+                }
+                _ => {
+                    self.error(codes::syntax::UNEXPECTED_TOKEN(), ti.span, "only functions are allowed inside traits");
+                    self.emit();
+                    continue;
+                }
+            };
+            let fattrs = self.item_attrs(ti.attrs);
+            let fid = self.new_def(f.name.name, DefKind::Fn, Some(module), f.name.span, AstRef::Fn(f, false));
+            self.p.defs[fid.index()].parent = Some(id);
+            self.p.defs[fid.index()].is_pub = true;
+            self.p.defs[fid.index()].attrs = fattrs;
+            let mut t = self.p.trait_data(id);
+            let mut methods: [TraitMethod; ..+] = [];
+            let mut dup = false;
+            for m in self.p.trait_methods.list(t.methods) {
+                if m.name == f.name.name {
+                    dup = true;
+                }
+                methods.push(m);
+            }
+            methods.push(TraitMethod { name: f.name.name, def: fid, has_default: f.body.is_some() });
+            t.methods = self.p.trait_methods.add_list(methods[..]);
+            self.p.defs[id.index()].data = DefData::Trait(t);
+            if dup {
+                let n = self.str_of(f.name.name);
+                self.error(codes::name::DUPLICATE(), f.name.span, "method `{n}` is defined multiple times");
+                self.emit();
+            }
+            if let Some(body) = f.body {
+                self.collect_block_items(module, body, src);
+            }
+        }
+    }
+
+    /// The functions of impl `id` (also those a macro in its body expands to).
+    pub fn collect_impl_items(&mut self, id: DefId, module: DefId, items: List::<Id::<Item>>, src: Id::<ModSource>) {
+        let is_trait_impl = match self.ast(id) {
+            AstRef::Impl(im) => im.trait_ref.is_some(),
+            _ => false,
+        };
+        for i in 0..items.len() {
+            let ii_id = self.p.ast.item_ids.list(items)[i];
+            let ii = self.p.ast.items.get(ii_id);
+            if !self.cfg_enabled(ii.attrs) {
+                continue;
+            }
+            let f = match ii.kind {
+                ItemKind::Fn(f) => f,
+                ItemKind::MacCall(call) => {
+                    self.pending_macros.push(Pending::Call { module, call, owner: Owner::Impl(id) });
+                    continue;
+                }
+                _ => {
+                    self.error(codes::syntax::UNEXPECTED_TOKEN(), ii.span, "only functions are allowed inside impls");
+                    self.emit();
+                    continue;
+                }
+            };
+            let fattrs = self.item_attrs(ii.attrs);
+            let fid = self.new_def(f.name.name, DefKind::Fn, Some(module), f.name.span, AstRef::Fn(f, false));
+            self.p.defs[fid.index()].parent = Some(id);
+            self.p.defs[fid.index()].is_pub = ii.is_pub || is_trait_impl;
+            self.p.defs[fid.index()].attrs = fattrs;
+            self.add_impl_item(id, fid);
+            if let Some(body) = f.body {
+                self.collect_block_items(module, body, src);
+            }
+        }
+    }
+
+    fn add_impl_item(&mut self, imp: DefId, method: DefId) {
+        let at = self.impl_items.len() as u32 + 1;
+        self.impl_items.push(ImplItem { method, next: 0 });
+        match self.impl_item_runs.get(imp) {
+            Some(run) => {
+                self.impl_items[(run.last - 1) as usize].next = at;
+                self.impl_item_runs.insert(imp, ImplItemRun { first: run.first, last: at });
+            }
+            None => {
+                self.impl_item_runs.insert(imp, ImplItemRun { first: at, last: at });
+            }
+        }
+    }
+
+    /// The functions collected for impl `imp`, in order.
+    pub fn impl_items_of(&self, imp: DefId, out: &mut +[DefId; ..+]) {
+        let mut at = match self.impl_item_runs.get(imp) {
+            Some(run) => run.first,
+            None => 0,
+        };
+        while at != 0 {
+            let it = self.impl_items[(at - 1) as usize];
+            out.push(it.method);
+            at = it.next;
+        }
+    }
+
+    /// Items declared inside function bodies live in anonymous block modules.
+    fn collect_block_items(&mut self, module: DefId, block: Id::<Block>, src: Id::<ModSource>) {
+        let mut found: [FoundBlock; ..+] = [];
+        find_blocks(&self.p.ast, block, None, &mut found);
+        // Blocks are found outermost-first, so parents exist before children.
+        let mut scope_of: [(Id::<Block>, DefId); ..+] = [];
+        let krate = self.p.mod_data(module).krate;
+        for fb in found {
+            let mut parent = module;
+            if let Some(pb) = fb.parent {
+                for s in scope_of {
+                    let (id, d) = s;
+                    if id == pb {
+                        parent = d;
+                        break;
+                    }
+                }
+            }
+            let b = self.p.ast.blocks.get(fb.block);
+            let name = self.p.sym("<block>");
+            let anon = self.new_def(name, DefKind::Mod, Some(parent), b.span, AstRef::None);
+            let mut md = self.p.mod_data(anon);
+            md.parent = Some(parent);
+            md.krate = krate;
+            md.is_block = true;
+            self.set_mod_data(anon, md);
+            self.block_scopes.insert(fb.block, anon);
+            scope_of.push((fb.block, anon));
+            for i in 0..b.stmts.len() {
+                let s = self.p.ast.stmts.list(b.stmts)[i];
+                if let StmtKind::Item(item) = s.kind {
+                    let mut chain: [Symbol; -..+] = [];
+                    self.collect_item(anon, item, src, &mut chain, None);
+                }
+            }
+        }
+    }
+}
+
+/// A block that directly contains item statements, with the nearest
+/// enclosing such block.
+struct FoundBlock {
+    block: Id::<Block>,
+    parent: Option::<Id::<Block>>,
+}
+
+/// Finds blocks that directly contain item statements, outermost first
+/// (Rust's `BlockFinder`).
+fn find_blocks(a: &ln_ast::Ast, b: Id::<Block>, parent: Option::<Id::<Block>>, out: &mut +[FoundBlock; ..+]) {
+    let blk = a.blocks.get(b);
+    let mut has_items = false;
+    for s in a.stmts.list(blk.stmts) {
+        if let StmtKind::Item(_) = s.kind {
+            has_items = true;
+        }
+    }
+    let mine = if has_items {
+        out.push(FoundBlock { block: b, parent });
+        Some(b)
+    } else {
+        parent
+    };
+    for s in a.stmts.list(blk.stmts) {
+        match s.kind {
+            StmtKind::Let { init, else_, .. } => {
+                if let Some(e) = init {
+                    find_in_expr(a, e, mine, out);
+                    if let Some(eb) = else_ {
+                        find_blocks(a, eb, mine, out);
+                    }
+                }
+            }
+            StmtKind::Expr(e) => find_in_expr(a, e, mine, out),
+            _ => {}
+        }
+    }
+    if let Some(t) = blk.tail {
+        find_in_expr(a, t, mine, out);
+    }
+}
+
+fn find_in_exprs(a: &ln_ast::Ast, l: List::<Id::<Expr>>, p: Option::<Id::<Block>>, out: &mut +[FoundBlock; ..+]) {
+    for x in a.expr_ids.list(l) {
+        find_in_expr(a, x, p, out);
+    }
+}
+
+fn find_in_expr(a: &ln_ast::Ast, e: Id::<Expr>, p: Option::<Id::<Block>>, out: &mut +[FoundBlock; ..+]) {
+    match a.exprs.get(e).kind {
+        ExprKind::Block(b) => find_blocks(a, b, p, out),
+        ExprKind::Unsafe(b) => find_blocks(a, b, p, out),
+        ExprKind::Loop(b) => find_blocks(a, b, p, out),
+        ExprKind::If { cond, then, else_ } => {
+            find_in_expr(a, cond, p, out);
+            find_blocks(a, then, p, out);
+            if let Some(x) = else_ {
+                find_in_expr(a, x, p, out);
+            }
+        }
+        ExprKind::IfLet { scrut, then, else_, .. } => {
+            find_in_expr(a, scrut, p, out);
+            find_blocks(a, then, p, out);
+            if let Some(x) = else_ {
+                find_in_expr(a, x, p, out);
+            }
+        }
+        ExprKind::While { cond, body } => {
+            find_in_expr(a, cond, p, out);
+            find_blocks(a, body, p, out);
+        }
+        ExprKind::WhileLet { scrut, body, .. } => {
+            find_in_expr(a, scrut, p, out);
+            find_blocks(a, body, p, out);
+        }
+        ExprKind::For { iter, body, .. } => {
+            find_in_expr(a, iter, p, out);
+            find_blocks(a, body, p, out);
+        }
+        ExprKind::Match { scrut, arms } => {
+            find_in_expr(a, scrut, p, out);
+            for arm in a.arms.list(arms) {
+                find_in_expr(a, arm.body, p, out);
+            }
+        }
+        ExprKind::Unary(_, x) => find_in_expr(a, x, p, out),
+        ExprKind::Paren(x) => find_in_expr(a, x, p, out),
+        ExprKind::Try(x) => find_in_expr(a, x, p, out),
+        ExprKind::Cast(x, _) => find_in_expr(a, x, p, out),
+        ExprKind::Field(x, _) => find_in_expr(a, x, p, out),
+        ExprKind::TupleField(x, _, _) => find_in_expr(a, x, p, out),
+        ExprKind::Binary(_, l, r) => {
+            find_in_expr(a, l, p, out);
+            find_in_expr(a, r, p, out);
+        }
+        ExprKind::Assign(l, r) => {
+            find_in_expr(a, l, p, out);
+            find_in_expr(a, r, p, out);
+        }
+        ExprKind::AssignOp(_, l, r) => {
+            find_in_expr(a, l, p, out);
+            find_in_expr(a, r, p, out);
+        }
+        ExprKind::Index(l, r) => {
+            find_in_expr(a, l, p, out);
+            find_in_expr(a, r, p, out);
+        }
+        ExprKind::ArrayRepeat(l, r) => {
+            find_in_expr(a, l, p, out);
+            find_in_expr(a, r, p, out);
+        }
+        ExprKind::Call(f, args) => {
+            find_in_expr(a, f, p, out);
+            find_in_exprs(a, args, p, out);
+        }
+        ExprKind::MethodCall { recv, args, .. } => {
+            find_in_expr(a, recv, p, out);
+            find_in_exprs(a, args, p, out);
+        }
+        ExprKind::Array(es) => find_in_exprs(a, es, p, out),
+        ExprKind::Tuple(es) => find_in_exprs(a, es, p, out),
+        ExprKind::StructLit { fields, .. } => {
+            for f in a.field_inits.list(fields) {
+                if let Some(v) = f.value {
+                    find_in_expr(a, v, p, out);
+                }
+            }
+        }
+        ExprKind::Return(Some(x)) => find_in_expr(a, x, p, out),
+        ExprKind::Break(Some(x)) => find_in_expr(a, x, p, out),
+        ExprKind::Range { start, end, .. } => {
+            if let Some(s) = start {
+                find_in_expr(a, s, p, out);
+            }
+            if let Some(s) = end {
+                find_in_expr(a, s, p, out);
+            }
+        }
+        _ => {}
+    }
+}

@@ -1,0 +1,70 @@
+// STUB: replaced by the port of crates/ln-sema/src/traits.rs at merge. The
+// answers here are the permissive ones, so the front end's own checks can
+// run without the trait solver.
+
+use core::intern::Symbol;
+use crater::defs::*;
+use crater::program::Program;
+use crater::ty::*;
+
+pub enum MethodImpl {
+    Fn { def: DefId, args: TyList },
+    Builtin { lang: Symbol, method: Symbol },
+}
+
+impl Program {
+    pub fn elaborate(&mut +self, env: [Pred; &], out: &mut +[Pred; ..+]) {
+        out.extend(env);
+    }
+
+    pub fn is_dull(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        return false;
+    }
+
+    pub fn is_light(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        return true;
+    }
+
+    pub fn has_owner(&mut +self, ty: Ty): bool {
+        return false;
+    }
+
+    pub fn could_own(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        return true;
+    }
+
+    pub fn is_copy(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        return false;
+    }
+
+    pub fn builtin_impl(&mut +self, ty: Ty, trait_id: DefId, env: [Pred; &]): bool {
+        return false;
+    }
+
+    pub fn find_impl(&mut +self, ty: Ty, tr: TraitRef, env: [Pred; &]): Option::<(DefId, TyList)> {
+        return None;
+    }
+
+    pub fn implements(&mut +self, ty: Ty, tr: TraitRef, env: [Pred; &]): bool {
+        return true;
+    }
+
+    pub fn resolve_method(&mut +self, tr: TraitRef, self_ty: Ty, method: Symbol, method_args: TyList): Option::<MethodImpl> {
+        return None;
+    }
+
+    pub fn impls_overlap(&mut +self, a: DefId, b: DefId, notes: &mut +[Symbol; ..+]): bool {
+        return false;
+    }
+
+    /// The crater root `d` is defined in.
+    pub fn crater_of(&self, d: DefId): DefId {
+        let mut m = self.defs[d.index()].module;
+        loop {
+            match self.defs[m.index()].data {
+                DefData::Mod(md) => return md.krate,
+                _ => m = self.defs[m.index()].module,
+            }
+        }
+    }
+}

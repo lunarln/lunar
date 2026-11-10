@@ -1,0 +1,16 @@
+// STUB: replaced by the port of crates/ln-sema/src/layout.rs at merge.
+
+use crater::program::Program;
+use crater::ty::Ty;
+
+pub struct Layout {
+    pub size: u64,
+    pub align: u64,
+}
+
+impl Program {
+    /// STUB: no layout is known.
+    pub fn layout_of(&mut +self, t: Ty): Option::<Layout> {
+        return None;
+    }
+}

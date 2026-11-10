@@ -1,0 +1,332 @@
+// The state of semantic analysis and its entry point: a port of `Options`,
+// `AstRef`, `Sema` and `analyze` from crates/ln-sema/src/lib.rs.
+//
+// `Sema` owns the `Program` being built (`p`) and the state of every pass.
+// Rust's `Sema<'a>` borrows the syntax trees; here they live in `p.ast`
+// (shared by every file and expansion) and are reached by id, and an
+// `AstRef` holds the declaration of a definition (its fields are ids).
+//
+// Diagnostics are built in place: `error`/`warning` start one, `label`,
+// `secondary`, `note` and `help` add to it, and `emit` records it (Rust's
+// `Sema::err`, which drops lints inside macro expansions). Texts are
+// interpolated strings (`FmtArgs`); a text that comes from the program
+// (`self.p.text(..)`) must be copied into a `String` first, as the call
+// lends `self` in-out.
+
+use core::arena::{Arena, Id, List};
+use core::collections::HashMap;
+use core::intern::Symbol;
+use crater::defs::*;
+use crater::diag::{Code, dummy_span, is_dummy};
+use crater::expand::{Expander, Mark, Pending, Rule};
+use crater::loader::{Craters, CrateSource};
+use crater::lower::Deferred;
+use crater::program::{CraterRoot, Program};
+use crater::ty::Ty;
+use ln_ast::{Block, ConstDecl, EnumDecl, FnDecl, ImplDecl, MacroDef, Span, StaticDecl, StructDecl, TraitDecl, TypeAlias, UseTree, VariantDecl};
+
+/// Compilation target information used by `#[cfg(...)]`.
+pub struct Options {
+    /// `windows`, `linux`, `macos`, ...
+    pub target_os: String,
+    /// `windows` or `unix`.
+    pub target_family: String,
+    /// `x86_64`, `aarch64`, ...
+    pub target_arch: String,
+    /// Building the test harness (`lunar test`).
+    pub test: bool,
+    /// Type-check function bodies even after errors in item signatures, and
+    /// return the (partial) program despite errors. For editor tooling.
+    pub keep_going: bool,
+}
+
+impl Options {
+    pub fn host(test: bool): Options {
+        let family = if host_os() == "windows" { "windows" } else { "unix" };
+        return Options { target_os: String::from(host_os()), target_family: String::from(family), target_arch: String::from(host_arch()), test, keep_going: false };
+    }
+}
+
+#[cfg(windows)]
+fn host_os(): str {
+    return "windows";
+}
+
+#[cfg(target_os = "linux")]
+fn host_os(): str {
+    return "linux";
+}
+
+#[cfg(target_os = "macos")]
+fn host_os(): str {
+    return "macos";
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn host_os(): str {
+    return "unknown";
+}
+
+#[cfg(target_arch = "aarch64")]
+fn host_arch(): str {
+    return "aarch64";
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn host_arch(): str {
+    return "x86_64";
+}
+
+/// AST node backing a definition (only during analysis).
+pub enum AstRef {
+    None,
+    /// The bool marks functions declared in `extern` blocks.
+    Fn(FnDecl, bool),
+    Struct(StructDecl),
+    Enum(EnumDecl),
+    Variant(VariantDecl),
+    Trait(TraitDecl),
+    Impl(ImplDecl),
+    Const(ConstDecl),
+    Static(StaticDecl),
+    Alias(TypeAlias),
+    Macro(MacroDef),
+}
+
+/// A `use` waiting to be resolved: the module it is in, the tree, and
+/// whether it re-exports.
+pub struct PendingUse {
+    pub module: DefId,
+    pub tree: UseTree,
+    pub is_pub: bool,
+}
+
+/// A method of an impl, in the order collected; chained per impl through
+/// `next` (index + 1, 0 = end).
+pub struct ImplItem {
+    pub method: DefId,
+    pub next: u32,
+}
+
+/// The first and last of an impl's `ImplItem`s (index + 1).
+pub struct ImplItemRun {
+    pub first: u32,
+    pub last: u32,
+}
+
+pub struct Sema {
+    pub p: Program,
+    /// The declaration of each definition, by `DefId`.
+    pub asts: [AstRef; ..+],
+    pub opts: Options,
+    /// The loaded craters' module trees.
+    pub craters: Craters,
+    pub pending_uses: [PendingUse; -..+],
+    /// Each impl's functions (Rust's `impl_items` map).
+    pub impl_items: [ImplItem; ..+],
+    pub impl_item_runs: HashMap::<DefId, ImplItemRun>,
+    /// The anonymous module of each block that declares items.
+    pub block_scopes: HashMap::<Id::<Block>, DefId>,
+    pub prelude: Option::<DefId>,
+    /// Array element / `!` checks deferred until all ADT fields are known.
+    pub deferred: [Deferred; -..+],
+    pub alias_stack: [DefId; -..+],
+    /// For each crater root, the craters it may name and under what name
+    /// (lists in `dep_roots`).
+    pub crater_deps: HashMap::<DefId, List::<CraterRoot>>,
+    pub dep_roots: Arena::<CraterRoot>,
+    /// Lists of spans (generic parameters' declarations, for `LowerCx`).
+    pub spans: Arena::<Span>,
+
+    // ----- macros (see `expand`) -----
+    /// Syntax contexts of the tokens of expansion files, by global offset.
+    pub ctxs: HashMap::<u32, SyntaxCtx>,
+    /// One per expansion; index 0 stands for `SyntaxCtx::root()`.
+    pub marks: [Mark; ..+],
+    /// Compiled macro rules and the token trees they work on.
+    pub x: Expander,
+    pub macro_rules: HashMap::<DefId, List::<Rule>>,
+    pub pending_macros: [Pending; -..+],
+    /// Type-position expansions, by the invocation's start.
+    pub ty_expansions: HashMap::<u32, Option::<Id::<ln_ast::Ty>>>,
+
+    /// The diagnostic being built is a lint inside an expansion: `emit`
+    /// drops it.
+    drop_current: bool,
+}
+
+impl Sema {
+    pub fn new(p: Program, craters: Craters, opts: Options): Sema {
+        let mut marks: [Mark; ..+] = [];
+        marks.push(Mark { def_module: DefId::new(0), def_ctx: SyntaxCtx::root(), depth: 0 });
+        return Sema {
+            p,
+            asts: [],
+            opts,
+            craters,
+            pending_uses: [],
+            impl_items: [],
+            impl_item_runs: HashMap::new(),
+            block_scopes: HashMap::new(),
+            prelude: None,
+            deferred: [],
+            alias_stack: [],
+            crater_deps: HashMap::new(),
+            dep_roots: Arena::new(),
+            spans: Arena::new(),
+            ctxs: HashMap::new(),
+            marks,
+            x: Expander::new(),
+            macro_rules: HashMap::new(),
+            pending_macros: [],
+            ty_expansions: HashMap::new(),
+            drop_current: false,
+        };
+    }
+
+    // ----------------------------------------------------------- diagnostics
+
+    /// Start building an error.
+    pub fn error(&mut self, kept code: Code, span: Span, msg: FmtArgs) {
+        let m = self.intern_fmt(msg);
+        self.drop_current = false;
+        self.p.diags.error(code, span, m);
+    }
+
+    /// Start building a warning. Lints are about code someone wrote by
+    /// hand; inside a macro's expansion the caller could not act on them,
+    /// so `emit` drops them there.
+    pub fn warning(&mut self, kept code: Code, span: Span, msg: FmtArgs) {
+        let m = self.intern_fmt(msg);
+        self.drop_current = self.in_expansion(span);
+        self.p.diags.warning(code, span, m);
+    }
+
+    /// The text under the primary span.
+    pub fn label(&mut self, text: FmtArgs) {
+        let m = self.intern_fmt(text);
+        self.p.diags.label(m);
+    }
+
+    pub fn secondary(&mut self, span: Span, text: FmtArgs) {
+        let m = self.intern_fmt(text);
+        self.p.diags.secondary(span, m);
+    }
+
+    pub fn note(&mut self, text: FmtArgs) {
+        let m = self.intern_fmt(text);
+        self.p.diags.note(m);
+    }
+
+    pub fn help(&mut self, text: FmtArgs) {
+        let m = self.intern_fmt(text);
+        self.p.diags.help(m);
+    }
+
+    /// Record the diagnostic being built.
+    pub fn emit(&mut self) {
+        if !self.drop_current {
+            self.p.diags.finish();
+        }
+        self.drop_current = false;
+    }
+
+    /// Start building an error whose message is already interned.
+    pub fn error_sym(&mut self, kept code: Code, span: Span, msg: Symbol) {
+        self.drop_current = false;
+        self.p.diags.error(code, span, msg);
+    }
+
+    pub fn intern_fmt(&mut self, args: FmtArgs): Symbol {
+        let mut s = String::new();
+        s.write(args);
+        return self.p.sym(s.as_str());
+    }
+
+    /// Whether `span` is in the text of a macro expansion.
+    pub fn in_expansion(&self, span: Span): bool {
+        if is_dummy(span) || self.p.sources.files.len() == 0 {
+            return false;
+        }
+        let f = self.p.sources.files[self.p.sources.file_of(span.lo) as usize];
+        return f.expansion_site.is_some();
+    }
+
+    // ----------------------------------------------------------- small helpers
+
+    /// The text of a symbol, copied (so it survives calls that change
+    /// `self`).
+    pub fn str_of(&self, s: Symbol): String {
+        return String::from(self.p.text(s));
+    }
+
+    /// The name of a definition, copied.
+    pub fn def_name(&self, id: DefId): String {
+        return String::from(self.p.name(id));
+    }
+
+    pub fn sym(&mut self, s: str): Symbol {
+        return self.p.sym(s);
+    }
+
+    /// The declaration behind definition `id`.
+    pub fn ast(&self, id: DefId): AstRef {
+        return self.asts[id.index()];
+    }
+}
+
+/// Analyze a set of craters (loaded into `p` by `loader::load_crate`). The
+/// first crater is the user's; `core` and `std` must be among them. The
+/// diagnostics are in `s.p.diags`; the program is usable when there are no
+/// errors (or with `opts.keep_going`). Macro expansions are added to
+/// `p.sources` as files of their own.
+pub fn analyze(p: Program, craters: Craters, opts: Options): Sema {
+    let mut s = Sema::new(p, craters, opts);
+    let mut user_root: Option::<DefId> = None;
+    let mut roots: [DefId; ..+] = [];
+    for i in 0..s.craters.list.len() {
+        let c = s.craters.list[i];
+        let root = s.collect_crate(c);
+        roots.push(root);
+        if i == 0 {
+            user_root = Some(root);
+        }
+    }
+    for i in 0..s.craters.list.len() {
+        let c = s.craters.list[i];
+        let mut deps: [CraterRoot; ..+] = [];
+        for d in s.craters.deps.list(c.deps) {
+            if (d.index as usize) < roots.len() {
+                deps.push(CraterRoot { name: d.name, def: roots[d.index as usize] });
+            }
+        }
+        let l = s.dep_roots.add_list(deps[..]);
+        s.crater_deps.insert(roots[i], l);
+    }
+    let core_name = s.sym("core");
+    let prelude_name = s.sym("prelude");
+    for i in 0..s.p.crate_roots.len() {
+        let r = s.p.crate_roots[i];
+        if r.name == core_name {
+            if let Some(b) = s.lookup_in(r.def, prelude_name, Ns::Type) {
+                s.prelude = Some(b.def);
+            }
+            break;
+        }
+    }
+    s.resolve_imports();
+    s.expand_items();
+    s.lower_all();
+    if let Some(root) = user_root {
+        let main_name = s.sym("main");
+        if let Some(b) = s.lookup_in(root, main_name, Ns::Value) {
+            if s.p.def(b.def).kind == DefKind::Fn {
+                s.p.main = Some(b.def);
+            }
+        }
+    }
+    if !s.p.diags.has_errors() || s.opts.keep_going {
+        crater::typeck::check_bodies(&mut s);
+    }
+    return s;
+}

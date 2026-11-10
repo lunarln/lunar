@@ -1,0 +1,1971 @@
+// Phase 2: lower item signatures (generics, bounds, fields, function
+// signatures, impl headers, constants) from the AST, then validate them. A
+// port of crates/ln-sema/src/lower.rs.
+//
+// Rust's `Vec<Pred>` environments and generic name lists are `List`s in
+// the program's arenas here (`p.preds`, `p.symbols`, `Sema::spans`).
+// Constants are evaluated with 128-bit integers as in Rust, emulated by
+// `Wide` (two 64-bit words); results are stored as `ConstInt`.
+
+use core::arena::{Id, List};
+use core::intern::Symbol;
+use crater::codes;
+use crater::defs::*;
+use crater::diag::{dummy_span, is_dummy};
+use crater::program::{OpaqueInfo, Ref, RefTarget};
+use crater::resolve::{ModRes, Prefix};
+use crater::sema::{AstRef, Sema};
+use crater::ty::*;
+use ln_ast::{ArraySize, Expr, ExprKind, Ident, Lit, ParamKind, ParamMode, Path, Span, UnOp, BinOp, VariantData};
+
+/// Largest Dull value (in bytes) for which a borrow is reported as needless.
+const NEEDLESS_BORROW_MAX: u64 = 16;
+
+/// A check that needs complete ADT information.
+pub struct Deferred {
+    pub kind: DeferKind,
+    pub ty: Ty,
+    pub env: List::<Pred>,
+    pub span: Span,
+    /// Span of the generic parameter list, for "add Dull to T's bounds" help.
+    pub generics_span: Span,
+}
+
+#[derive(Eq)]
+pub enum DeferKind {
+    ArrayElem,
+    Grow,
+    /// `x: &T` where `T` might be Dull (a pointless borrow).
+    NeedlessBorrow,
+}
+
+/// Where a type appears.
+#[derive(Eq)]
+pub enum TyPos {
+    /// Directly a function parameter type: `+T` and `FmtArgs` allowed.
+    Param,
+    Other,
+}
+
+/// Context for lowering types inside one item.
+pub struct LowerCx {
+    pub module: DefId,
+    /// In `p.symbols`.
+    pub generic_names: List::<Symbol>,
+    /// Where each of `generic_names` is declared (dummy for a trait's
+    /// `Self`), in `Sema::spans`.
+    pub generic_spans: List::<Span>,
+    pub self_ty: Option::<Ty>,
+    /// In `p.preds`.
+    pub env: List::<Pred>,
+    pub allow_infer: bool,
+    pub generics_span: Span,
+    /// Lowering this function's return type, where `impl Trait` is allowed.
+    pub opaque_owner: Option::<DefId>,
+}
+
+impl LowerCx {
+    pub fn new(module: DefId): LowerCx {
+        return LowerCx {
+            module,
+            generic_names: List::empty(),
+            generic_spans: List::empty(),
+            self_ty: None,
+            env: List::empty(),
+            allow_infer: false,
+            generics_span: dummy_span(),
+            opaque_owner: None,
+        };
+    }
+}
+
+impl Sema {
+    fn def_count(&self): usize {
+        return self.p.defs.len();
+    }
+
+    /// The generic parameters a declaration writes.
+    pub fn ast_generics(&self, id: DefId): Option::<ln_ast::Generics> {
+        return match self.ast(id) {
+            AstRef::Fn(f, _) => Some(f.generics),
+            AstRef::Struct(s) => Some(s.generics),
+            AstRef::Enum(e) => Some(e.generics),
+            AstRef::Trait(t) => Some(t.generics),
+            AstRef::Impl(i) => Some(i.generics),
+            AstRef::Alias(a) => Some(a.generics),
+            _ => None,
+        };
+    }
+
+    /// Generic parameter names visible in an item, parents first (in
+    /// `p.symbols`).
+    pub fn generic_names_of(&mut self, id: DefId): List::<Symbol> {
+        let mut names: [Symbol; ..+] = [];
+        let mut spans: [Span; ..+] = [];
+        self.generic_params_of(id, &mut names, &mut spans);
+        return self.p.symbols.add_list(names[..]);
+    }
+
+    /// How many generic parameters are in scope for an item.
+    pub fn generic_count_of(&mut self, id: DefId): usize {
+        let mut names: [Symbol; ..+] = [];
+        let mut spans: [Span; ..+] = [];
+        self.generic_params_of(id, &mut names, &mut spans);
+        return names.len();
+    }
+
+    /// Generic parameters in scope for an item (parents' first) and where
+    /// each is declared. A trait's implicit `Self` has a dummy span.
+    pub fn generic_params_of(&mut +self, id: DefId, names: &mut +[Symbol; ..+], spans: &mut +[Span; ..+]) {
+        let d = self.p.defs[id.index()];
+        if d.kind == DefKind::Fn {
+            if let Some(parent) = d.parent {
+                self.generic_params_of(parent, names, spans);
+            }
+        }
+        if let AstRef::Trait(_) = self.ast(id) {
+            names.push(self.p.sym("Self"));
+            spans.push(dummy_span());
+        }
+        if let Some(g) = self.ast_generics(id) {
+            for p in self.p.ast.generic_params.list(g.params) {
+                names.push(p.name.name);
+                spans.push(p.name.span);
+            }
+        }
+    }
+
+    /// Predicates in scope for an item (own and parents'), in `p.preds`.
+    pub fn env_of(&mut self, id: DefId): List::<Pred> {
+        let mut out: [Pred; ..+] = [];
+        self.env_into(id, &mut out);
+        return self.p.preds.add_list(out[..]);
+    }
+
+    /// The predicates in scope for an item, appended to `out`.
+    pub fn env_into(&mut +self, id: DefId, out: &mut +[Pred; ..+]) {
+        let d = self.p.defs[id.index()];
+        if d.kind == DefKind::Fn {
+            if let Some(parent) = d.parent {
+                self.env_into(parent, out);
+                if self.p.defs[parent.index()].kind == DefKind::Trait {
+                    // Inside a trait, `Self: Trait` holds.
+                    let t = self.p.trait_data(parent);
+                    let mut args: [Ty; ..+] = [];
+                    for i in 0..t.generics.names.len() {
+                        let n = self.p.symbols.list(t.generics.names)[i];
+                        args.push(self.p.types.mk(TyKind::Param(i as u32 + 1, n)));
+                    }
+                    let al = self.p.types.mk_list(args[..]);
+                    let self_name = self.p.sym("Self");
+                    let self_ty = self.p.types.mk(TyKind::Param(0, self_name));
+                    out.push(Pred { ty: self_ty, trait_ref: TraitRef { trait_id: parent, args: al }, span: d.span });
+                }
+            }
+        }
+        if let Some(g) = self.generics(id) {
+            out.extend(self.p.preds.list(g.preds));
+        }
+    }
+
+    pub fn generics(&self, id: DefId): Option::<Generics> {
+        return match self.p.defs[id.index()].data {
+            DefData::Fn(f) => Some(f.generics),
+            DefData::Adt(a) => Some(a.generics),
+            DefData::Trait(t) => Some(t.generics),
+            DefData::Impl(i) => Some(i.generics),
+            DefData::Alias(a) => Some(a.generics),
+            _ => None,
+        };
+    }
+
+    /// The self type inside an impl or trait (or for a method's parent).
+    pub fn self_ty_of(&mut self, id: DefId): Option::<Ty> {
+        let d = self.p.defs[id.index()];
+        return match d.kind {
+            DefKind::Impl => match d.data {
+                DefData::Impl(i) => Some(i.self_ty),
+                _ => None,
+            },
+            DefKind::Trait => {
+                let n = self.p.sym("Self");
+                Some(self.p.types.mk(TyKind::Param(0, n)))
+            }
+            DefKind::Fn => match d.parent {
+                Some(p) => self.self_ty_of(p),
+                None => None,
+            },
+            DefKind::Struct | DefKind::Enum => {
+                let names = self.generic_names_of(id);
+                let mut args: [Ty; ..+] = [];
+                for i in 0..names.len() {
+                    let n = self.p.symbols.list(names)[i];
+                    args.push(self.p.types.mk(TyKind::Param(i as u32, n)));
+                }
+                let l = self.p.types.mk_list(args[..]);
+                Some(self.p.types.adt(id, l))
+            }
+            _ => None,
+        };
+    }
+
+    pub fn lower_cx(&mut self, id: DefId): LowerCx {
+        let d = self.p.defs[id.index()];
+        let gspan = match self.ast(id) {
+            AstRef::Fn(f, _) => {
+                if f.generics.params.len() == 0 {
+                    f.name.span.shrink_to_hi()
+                } else {
+                    f.generics.span
+                }
+            }
+            AstRef::Struct(s) => s.generics.span,
+            AstRef::Enum(e) => e.generics.span,
+            AstRef::Impl(i) => i.generics.span,
+            _ => d.span,
+        };
+        let mut names: [Symbol; ..+] = [];
+        let mut spans: [Span; ..+] = [];
+        self.generic_params_of(id, &mut names, &mut spans);
+        let generic_names = self.p.symbols.add_list(names[..]);
+        let generic_spans = self.spans.add_list(spans[..]);
+        let self_ty = self.self_ty_of(id);
+        let env = self.env_of(id);
+        return LowerCx { module: d.module, generic_names, generic_spans, self_ty, env, allow_infer: false, generics_span: gspan, opaque_owner: None };
+    }
+
+    // ===================================================================== driver
+
+    pub fn lower_all(&mut self) {
+        let n = self.def_count();
+        // 1. Generic parameter names.
+        for i in 0..n {
+            let id = DefId::new(i);
+            let ag = match self.ast(id) {
+                AstRef::Fn(f, _) => f.generics,
+                AstRef::Struct(s) => s.generics,
+                AstRef::Enum(e) => e.generics,
+                AstRef::Trait(t) => t.generics,
+                AstRef::Impl(im) => im.generics,
+                AstRef::Alias(a) => a.generics,
+                _ => continue,
+            };
+            let parent_count: usize = match self.ast(id) {
+                AstRef::Fn(_, _) => match self.p.defs[i].parent {
+                    Some(p) => self.generic_count_of(p),
+                    None => 0,
+                },
+                AstRef::Trait(_) => 1,
+                _ => 0,
+            };
+            let mut own: [Symbol; ..+] = [];
+            for p in self.p.ast.generic_params.list(ag.params) {
+                own.push(p.name.name);
+            }
+            let names = self.p.symbols.add_list(own[..]);
+            let g = Generics { parent_count: parent_count as u32, names, preds: List::empty(), span: ag.span };
+            self.check_dup_generics(id);
+            let kind = self.p.defs[i].kind;
+            let data = match self.p.defs[i].data {
+                DefData::Adt(a) => {
+                    let mut a = a;
+                    a.generics = g;
+                    DefData::Adt(a)
+                }
+                DefData::Trait(t) => {
+                    let mut t = t;
+                    t.generics = g;
+                    DefData::Trait(t)
+                }
+                DefData::None => match kind {
+                    DefKind::Fn => {
+                        let unit = self.p.types.unit();
+                        DefData::Fn(FnData {
+                            generics: g,
+                            sig: FnSig { params: List::empty(), ret: unit, ret_span: dummy_span() },
+                            is_unsafe: false,
+                            abi: Abi::Lunar,
+                            variadic: false,
+                            has_body: false,
+                            owner: None,
+                            has_self: false,
+                        })
+                    }
+                    DefKind::Struct => DefData::Adt(AdtData { generics: g, variants: List::empty(), is_enum: false }),
+                    DefKind::Impl => {
+                        let err = self.p.types.error();
+                        DefData::Impl(ImplData { generics: g, trait_ref: None, self_ty: err, negative: false })
+                    }
+                    DefKind::TypeAlias => DefData::Alias(AliasData { generics: g, ty: None }),
+                    _ => DefData::None,
+                },
+                other => other,
+            };
+            self.p.defs[i].data = data;
+        }
+        let langs = ["dull", "light"];
+        for lang in langs {
+            if let Some(d) = self.p.lang_item(lang) {
+                if let DefData::Trait(t) = self.p.defs[d.index()].data {
+                    let mut t = t;
+                    t.auto = true;
+                    self.p.defs[d.index()].data = DefData::Trait(t);
+                }
+            }
+        }
+        // 2. Bounds and supertraits.
+        for i in 0..n {
+            self.lower_preds(DefId::new(i));
+        }
+        // 3. ADT fields.
+        for i in 0..n {
+            let id = DefId::new(i);
+            match self.ast(id) {
+                AstRef::Struct(s) => self.lower_struct(id, s),
+                AstRef::Enum(e) => self.lower_enum(id, e),
+                _ => {}
+            }
+        }
+        // 4. Impl headers first (method signatures may mention `Self`).
+        for i in 0..n {
+            if let AstRef::Impl(im) = self.ast(DefId::new(i)) {
+                self.lower_impl_header(DefId::new(i), im);
+            }
+        }
+        for i in 0..n {
+            let id = DefId::new(i);
+            match self.ast(id) {
+                AstRef::Fn(f, ext) => self.lower_fn(id, f, ext),
+                AstRef::Alias(_) => {
+                    self.alias_ty(id);
+                }
+                _ => {}
+            }
+        }
+        for i in 0..n {
+            let id = DefId::new(i);
+            match self.ast(id) {
+                AstRef::Const(c) => self.lower_const(id, c),
+                AstRef::Static(s) => self.lower_static(id, s),
+                _ => {}
+            }
+        }
+        // 5. Deferred checks.
+        self.run_deferred();
+        self.check_infinite_size();
+        // 6. Impl validation.
+        for i in 0..n {
+            if let AstRef::Impl(im) = self.ast(DefId::new(i)) {
+                self.check_impl(DefId::new(i), im);
+            }
+        }
+        self.check_overlapping_impls();
+        self.check_main();
+    }
+
+    fn check_dup_generics(&mut self, id: DefId) {
+        let g = match self.ast(id) {
+            AstRef::Fn(f, _) => f.generics,
+            AstRef::Struct(s) => s.generics,
+            AstRef::Enum(e) => e.generics,
+            AstRef::Trait(t) => t.generics,
+            AstRef::Impl(i) => i.generics,
+            _ => return,
+        };
+        let mut seen: [Symbol; ..+] = [];
+        for i in 0..g.params.len() {
+            let p = self.p.ast.generic_params.list(g.params)[i];
+            if seen[..].contains(p.name.name) || self.p.text(p.name.name) == "Self" {
+                let n = self.str_of(p.name.name);
+                self.error(codes::name::DUPLICATE(), p.name.span, "generic parameter `{n}` is declared twice or shadows `Self`");
+                self.emit();
+            }
+            seen.push(p.name.name);
+        }
+    }
+
+    fn lower_preds(&mut self, id: DefId) {
+        let (g, supers) = match self.ast(id) {
+            AstRef::Fn(f, _) => (f.generics, List::empty()),
+            AstRef::Struct(s) => (s.generics, List::empty()),
+            AstRef::Enum(e) => (e.generics, List::empty()),
+            AstRef::Trait(t) => (t.generics, t.supertraits),
+            AstRef::Impl(i) => (i.generics, List::empty()),
+            _ => return,
+        };
+        let cx = self.lower_cx(id);
+        let offset: u32 = match self.p.defs[id.index()].data {
+            DefData::Fn(f) => f.generics.parent_count,
+            DefData::Trait(_) => 1,
+            _ => 0,
+        };
+        for i in 0..g.params.len() {
+            let p = self.p.ast.generic_params.list(g.params)[i];
+            self.p.refs.push(Ref { span: p.name.span, target: RefTarget::TyParam(p.name.span) });
+        }
+        let mut preds: [Pred; ..+] = [];
+        for i in 0..g.params.len() {
+            let p = self.p.ast.generic_params.list(g.params)[i];
+            for j in 0..p.bounds.len() {
+                let b = self.p.ast.paths.list(p.bounds)[j];
+                if let Some(tr) = self.lower_trait_ref(cx, b) {
+                    let idx = offset + i as u32;
+                    let ty = self.p.types.mk(TyKind::Param(idx, p.name.name));
+                    preds.push(Pred { ty, trait_ref: tr, span: b.span });
+                }
+            }
+        }
+        let mut sts: [TraitRef; ..+] = [];
+        for i in 0..supers.len() {
+            let s = self.p.ast.paths.list(supers)[i];
+            if let Some(tr) = self.lower_trait_ref(cx, s) {
+                sts.push(tr);
+            }
+        }
+        let pl = self.p.preds.add_list(preds[..]);
+        let data = match self.p.defs[id.index()].data {
+            DefData::Fn(f) => {
+                let mut f = f;
+                f.generics.preds = pl;
+                DefData::Fn(f)
+            }
+            DefData::Adt(a) => {
+                let mut a = a;
+                a.generics.preds = pl;
+                DefData::Adt(a)
+            }
+            DefData::Trait(t) => {
+                let mut t = t;
+                t.generics.preds = pl;
+                t.supertraits = self.p.trait_refs.add_list(sts[..]);
+                DefData::Trait(t)
+            }
+            DefData::Impl(i) => {
+                let mut i = i;
+                i.generics.preds = pl;
+                DefData::Impl(i)
+            }
+            other => other,
+        };
+        self.p.defs[id.index()].data = data;
+    }
+
+    /// `impl A + B` in a function's return type: a new opaque type with
+    /// those bounds, standing for whatever the function's body returns.
+    fn lower_impl_trait(&mut self, cx: LowerCx, bounds: List::<Path>, span: Span): Ty {
+        let owner = match cx.opaque_owner {
+            Some(o) => o,
+            None => {
+                self.error(codes::ty::IMPL_TRAIT_POSITION(), span, "`impl Trait` is only allowed as the return type of a function");
+                self.help("to accept any type with these bounds, add a generic parameter: `fn f::<T: Trait>(x: T)`");
+                self.emit();
+                return self.p.types.error();
+            }
+        };
+        let mut inner = cx;
+        inner.opaque_owner = None;
+        let mut trait_refs: [TraitRef; ..+] = [];
+        for i in 0..bounds.len() {
+            let b = self.p.ast.paths.list(bounds)[i];
+            if let Some(tr) = self.lower_trait_ref(inner, b) {
+                trait_refs.push(tr);
+            }
+        }
+        let mut idx: u32 = 0;
+        for k in self.p.opaques.keys() {
+            let (d, _) = k;
+            if d == owner {
+                idx += 1;
+            }
+        }
+        let bl = self.p.trait_refs.add_list(trait_refs[..]);
+        self.p.opaques.insert((owner, idx), OpaqueInfo { bounds: bl, concrete: None, span });
+        let mut args: [Ty; ..+] = [];
+        for i in 0..cx.generic_names.len() {
+            let n = self.p.symbols.list(cx.generic_names)[i];
+            args.push(self.p.types.mk(TyKind::Param(i as u32, n)));
+        }
+        let al = self.p.types.mk_list(args[..]);
+        return self.p.types.mk(TyKind::Opaque(owner, idx, al));
+    }
+
+    /// The identifiers of a path's segments.
+    pub fn path_idents(&self, path: Path, out: &mut +[Ident; ..+]) {
+        for s in self.p.ast.segments.list(path.segments) {
+            out.push(s.ident);
+        }
+    }
+
+    pub fn lower_trait_ref(&mut self, cx: LowerCx, path: Path): Option::<TraitRef> {
+        let mut idents: [Ident; ..+] = [];
+        self.path_idents(path, &mut idents);
+        let res = self.resolve_prefix(cx.module, idents[..], Ns::Type);
+        let (def, used) = match res {
+            Some(Prefix { res: ModRes::Def(d), used }) => (d, used),
+            _ => {
+                if res.is_none() && idents.len() == 1 {
+                    self.unresolved_diag(cx.module, idents[0], Ns::Type);
+                    self.emit();
+                }
+                return None;
+            }
+        };
+        if used != idents.len() || self.p.defs[def.index()].kind != DefKind::Trait {
+            let d = self.p.defs[def.index()];
+            let name = self.def_name(def);
+            self.error(codes::name::NOT_A_TRAIT(), path.span, "expected a trait, found {d.kind.describe()} `{name}`");
+            self.emit();
+            return None;
+        }
+        let seg = self.p.ast.segments.list(path.segments)[used - 1];
+        let mut args: [Ty; ..+] = [];
+        if let Some(a) = seg.args {
+            for i in 0..a.len() {
+                let t = self.p.ast.ty_ids.list(a)[i];
+                args.push(self.lower_ty(cx, t, TyPos::Other));
+            }
+        }
+        let want = match self.p.defs[def.index()].data {
+            DefData::Trait(t) => t.generics.names.len(),
+            _ => 0,
+        };
+        if args.len() != want {
+            let name = self.def_name(def);
+            self.error(codes::ty::GENERIC_COUNT(), path.span, "trait `{name}` takes {want} generic argument(s) but {args.len()} were supplied");
+            self.emit();
+            return None;
+        }
+        let al = self.p.types.mk_list(args[..]);
+        return Some(TraitRef { trait_id: def, args: al });
+    }
+
+    fn lower_fields(&mut self, cx: LowerCx, data: VariantData): (CtorKind, List::<FieldDef>) {
+        match data {
+            VariantData::Unit => return (CtorKind::Unit, List::empty()),
+            VariantData::Tuple(fs) => {
+                let mut out: [FieldDef; ..+] = [];
+                for i in 0..fs.len() {
+                    let f = self.p.ast.tuple_fields.list(fs)[i];
+                    let name = self.p.sym(core::fmt::format("{i}").as_str());
+                    let ty = self.lower_ty(cx, f.ty, TyPos::Other);
+                    let span = self.p.ast.tys.get(f.ty).span;
+                    out.push(FieldDef { name, ty, is_pub: f.is_pub, span });
+                }
+                return (CtorKind::Tuple, self.p.fields.add_list(out[..]));
+            }
+            VariantData::Named(fs) => {
+                let mut out: [FieldDef; ..+] = [];
+                for i in 0..fs.len() {
+                    let f = self.p.ast.field_decls.list(fs)[i];
+                    let mut dup = false;
+                    for x in out {
+                        if x.name == f.name.name {
+                            dup = true;
+                        }
+                    }
+                    if dup {
+                        let n = self.str_of(f.name.name);
+                        self.error(codes::name::DUPLICATE(), f.name.span, "field `{n}` is declared twice");
+                        self.emit();
+                    }
+                    let ty = self.lower_ty(cx, f.ty, TyPos::Other);
+                    out.push(FieldDef { name: f.name.name, ty, is_pub: f.is_pub, span: f.name.span });
+                }
+                return (CtorKind::Named, self.p.fields.add_list(out[..]));
+            }
+        }
+    }
+
+    fn lower_struct(&mut self, id: DefId, s: ln_ast::StructDecl) {
+        let cx = self.lower_cx(id);
+        let (ctor, fields) = self.lower_fields(cx, s.kind);
+        if let DefData::Adt(a) = self.p.defs[id.index()].data {
+            let mut a = a;
+            let v = [VariantDef { name: s.name.name, def: id, ctor, fields, span: s.name.span }];
+            a.variants = self.p.variants.add_list(v[..]);
+            self.p.defs[id.index()].data = DefData::Adt(a);
+        }
+    }
+
+    fn lower_enum(&mut self, id: DefId, e: ln_ast::EnumDecl) {
+        let cx = self.lower_cx(id);
+        let mut lowered: [(CtorKind, List::<FieldDef>); ..+] = [];
+        for i in 0..e.variants.len() {
+            let v = self.p.ast.variants.list(e.variants)[i];
+            lowered.push(self.lower_fields(cx, v.data));
+        }
+        if let DefData::Adt(a) = self.p.defs[id.index()].data {
+            let n = if a.variants.len() < lowered.len() { a.variants.len() } else { lowered.len() };
+            for i in 0..n {
+                let vid: Id::<VariantDef> = Id::from_index(a.variants.start() + i);
+                let mut v = self.p.variants.get(vid);
+                let (ctor, fields) = lowered[i];
+                v.ctor = ctor;
+                v.fields = fields;
+                self.p.variants.set(vid, v);
+            }
+        }
+    }
+
+    fn lower_impl_header(&mut self, id: DefId, im: ln_ast::ImplDecl) {
+        let mut cx = self.lower_cx(id);
+        cx.self_ty = None;
+        let self_ty = self.lower_ty(cx, im.self_ty, TyPos::Other);
+        cx.self_ty = Some(self_ty);
+        let trait_ref = match im.trait_ref {
+            Some(p) => self.lower_trait_ref(cx, p),
+            None => None,
+        };
+        let mut items: [DefId; ..+] = [];
+        self.impl_items_of(id, &mut items);
+        for m in items {
+            let name = self.p.defs[m.index()].name;
+            if self.p.impl_methods.insert((id, name), m).is_some() {
+                let sp = self.p.defs[m.index()].span;
+                let n = self.str_of(name);
+                self.error(codes::name::DUPLICATE(), sp, "method `{n}` is defined twice in this impl");
+                self.emit();
+            }
+        }
+        if let DefData::Impl(i) = self.p.defs[id.index()].data {
+            let mut i = i;
+            i.self_ty = self_ty;
+            i.trait_ref = trait_ref;
+            i.negative = im.negative;
+            self.p.defs[id.index()].data = DefData::Impl(i);
+        }
+    }
+
+    /// Whether `parent` is a trait, or an impl of one: its methods keep the
+    /// trait's signatures.
+    fn in_trait_item(&self, parent: Option::<DefId>): bool {
+        return match parent {
+            Some(pd) => match self.p.defs[pd.index()].data {
+                DefData::Impl(d) => d.trait_ref.is_some(),
+                DefData::Trait(_) => true,
+                _ => false,
+            },
+            None => false,
+        };
+    }
+
+    fn lower_fn(&mut self, id: DefId, f: ln_ast::FnDecl, is_extern: bool) {
+        let cx = self.lower_cx(id);
+        let parent = self.p.defs[id.index()].parent;
+        let mut params: [Param; ..+] = [];
+        let mut has_self = false;
+        for i in 0..f.params.len() {
+            let p = self.p.ast.params.list(f.params)[i];
+            let (pname, is_self) = match p.kind {
+                ParamKind::SelfParam => {
+                    if i != 0 || parent.is_none() {
+                        self.error(codes::name::BAD_SELF(), p.span, "`self` is only allowed as the first parameter of a method");
+                        self.emit();
+                    }
+                    has_self = true;
+                    (self.p.sym("self"), true)
+                }
+                ParamKind::Named(n) => (n.name, false),
+                ParamKind::Wild => (self.p.sym("_"), false),
+            };
+            let ty = match p.ty {
+                Some(t) => self.lower_ty(cx, t, TyPos::Param),
+                None => {
+                    let t = match cx.self_ty {
+                        Some(t) => t,
+                        None => self.p.types.error(),
+                    };
+                    if p.self_grow { self.p.types.mk(TyKind::Grow(t)) } else { t }
+                }
+            };
+            if is_extern {
+                self.check_ffi_ty(ty, p.span);
+            }
+            let is_grow = match self.p.types.kind(ty) {
+                TyKind::Grow(_) => true,
+                _ => false,
+            };
+            if is_grow && p.mode != ParamMode::InOut {
+                let pn = self.str_of(pname);
+                let fix = if is_self { String::from("&mut +self") } else { core::fmt::format("{pn}: &mut {self.p.ty_str(ty)}") };
+                let shown = if is_self { "self" } else { pn.as_str() };
+                self.error(codes::ty::GROW_WITHOUT_MUT(), p.span, "`+` parameter `{shown}` is not `&mut`");
+                self.label("a parameter that is not in-out cannot change the caller's value at all");
+                self.note("`+` promises that an in-out argument only grows");
+                self.help("declare it `{fix}`, or drop the `+`");
+                self.emit();
+            }
+            // `needless_borrow` deliberately skips:
+            // * `&self`: methods conventionally borrow their receiver whatever
+            //   its type, so a type's methods read alike and the receiver can
+            //   later grow an owned field without changing every signature;
+            // * trait methods and their impls, which must keep the trait's
+            //   modes even when the implementing type is Dull;
+            // * extern functions, whose signatures follow C.
+            let in_trait_item = self.in_trait_item(parent);
+            if p.mode == ParamMode::Borrow && !is_self && !is_extern && !in_trait_item {
+                self.deferred.push(Deferred { kind: DeferKind::NeedlessBorrow, ty, env: cx.env, span: p.span, generics_span: f.generics.span });
+            }
+            let ctx = match p.kind {
+                ParamKind::Named(n) => n.ctx,
+                _ => SyntaxCtx::root(),
+            };
+            params.push(Param { name: pname, ctx, ty, mode: p.mode, inout: p.mode == ParamMode::InOut, mutable: p.is_mut, is_self, kept: p.kept, span: p.span });
+        }
+        // `impl Trait` is allowed in the return type of functions with a
+        // body that are not part of a trait (a trait's implementations
+        // could not agree on one type).
+        let in_trait_item = self.in_trait_item(parent);
+        let mut rcx = cx;
+        if f.body.is_some() && !in_trait_item {
+            rcx.opaque_owner = Some(id);
+        }
+        let (ret, ret_span) = match f.ret {
+            Some(t) => {
+                let sp = self.p.ast.tys.get(t).span;
+                (self.lower_ty(rcx, t, TyPos::Other), sp)
+            }
+            None => (self.p.types.unit(), f.sig_span.shrink_to_hi()),
+        };
+        if is_extern {
+            self.check_ffi_ty(ret, ret_span);
+        }
+        let attrs = self.p.defs[id.index()].attrs;
+        if f.body.is_none() && !is_extern && !attrs.intrinsic {
+            let in_trait = match parent {
+                Some(p) => self.p.defs[p.index()].kind == DefKind::Trait,
+                None => false,
+            };
+            if !in_trait {
+                let n = self.str_of(f.name.name);
+                self.error(codes::syntax::MISSING_BODY(), f.sig_span, "function `{n}` has no body");
+                self.label("expected `{{ ... }}` after this signature");
+                self.help("add a body: `{{ ... }}`; only trait methods and functions in `extern` blocks are declared without one");
+                self.emit();
+            }
+        }
+        if f.variadic && !is_extern {
+            let n = self.str_of(f.name.name);
+            self.error(codes::ty::VARIADIC_NOT_EXTERN(), f.sig_span, "function `{n}` is variadic but not an extern function");
+            self.note("only functions declared in an `extern \"C\" {{ ... }}` block can take `...`");
+            self.help("take the extra arguments as a slice instead, e.g. `args: [i32; &]`");
+            self.emit();
+        }
+        let pl = self.p.params.add_list(params[..]);
+        if let DefData::Fn(fd) = self.p.defs[id.index()].data {
+            let mut fd = fd;
+            fd.sig = FnSig { params: pl, ret, ret_span };
+            fd.is_unsafe = f.is_unsafe || is_extern;
+            fd.abi = if is_extern { Abi::C } else { Abi::Lunar };
+            fd.variadic = f.variadic;
+            fd.has_body = f.body.is_some();
+            fd.owner = parent;
+            fd.has_self = has_self;
+            self.p.defs[id.index()].data = DefData::Fn(fd);
+        }
+    }
+
+    fn check_ffi_ty(&mut self, ty: Ty, span: Span) {
+        let ok = match self.p.types.kind(ty) {
+            TyKind::Int(_) | TyKind::Float(_) | TyKind::Ptr(..) | TyKind::Bool | TyKind::Never | TyKind::FnPtr(..) => true,
+            _ => self.p.types.is_unit(ty),
+        };
+        if !ok && !self.p.types.is_error(ty) {
+            let s = self.p.ty_str(ty);
+            self.error(codes::ty::FFI_TYPE(), span, "type `{s}` cannot cross the C ABI");
+            self.note("extern functions may only use integers, floats, bool, raw pointers and fn pointers");
+            self.emit();
+        }
+    }
+
+    fn lower_const(&mut self, id: DefId, c: ln_ast::ConstDecl) {
+        let cx = LowerCx::new(self.p.defs[id.index()].module);
+        let ty = self.lower_ty(cx, c.ty, TyPos::Other);
+        let value = self.eval_const(cx.module, c.value, ty);
+        self.p.defs[id.index()].data = DefData::Const(ConstData { ty, value });
+    }
+
+    fn lower_static(&mut self, id: DefId, s: ln_ast::StaticDecl) {
+        let cx = LowerCx::new(self.p.defs[id.index()].module);
+        let ty = self.lower_ty(cx, s.ty, TyPos::Other);
+        // `FmtArgs` is already rejected outside parameters by `lower_ty`.
+        if self.p.has_owner(ty) {
+            let t = self.p.ty_str(ty);
+            let what = match self.p.types.kind(ty) {
+                TyKind::String | TyKind::Array(..) => "is an owner",
+                _ => "contains an owning array or `String`",
+            };
+            let sp = self.p.ast.tys.get(s.ty).span;
+            self.error(codes::ty::CONST_EVAL(), sp, "a static cannot own data, but `{t}` {what}");
+            self.note("statics are not on any data stack, so they cannot hold an owning array, a `String`, or a type containing one");
+            self.emit();
+        }
+        let value = self.eval_const(cx.module, s.value, ty);
+        self.p.defs[id.index()].data = DefData::Static(StaticData { ty, mutable: s.is_mut, value });
+    }
+
+    // ===================================================================== types
+
+    pub fn lower_ty(&mut self, cx: LowerCx, t: Id::<ln_ast::Ty>, pos: TyPos): Ty {
+        let at = self.p.ast.tys.get(t);
+        let ty = match at.kind {
+            ln_ast::TyKind::Path(p) => self.lower_path_ty(cx, p),
+            ln_ast::TyKind::MacCall(m) => {
+                return match self.expand_ty(cx.module, m) {
+                    Some(t2) => self.lower_ty(cx, t2, pos),
+                    None => self.p.types.error(),
+                };
+            }
+            ln_ast::TyKind::Infer => {
+                if !cx.allow_infer {
+                    self.error(codes::ty::ANNOTATIONS_NEEDED(), at.span, "`_` is not allowed in item signatures");
+                    self.emit();
+                    return self.p.types.error();
+                }
+                return self.p.types.infer(4294967295);
+            }
+            ln_ast::TyKind::Never => self.p.types.never(),
+            ln_ast::TyKind::ImplTrait(bounds) => return self.lower_impl_trait(cx, bounds, at.span),
+            ln_ast::TyKind::Tuple(ts) => {
+                let mut tys: [Ty; ..+] = [];
+                for i in 0..ts.len() {
+                    let x = self.p.ast.ty_ids.list(ts)[i];
+                    tys.push(self.lower_ty(cx, x, TyPos::Other));
+                }
+                self.p.types.tuple(tys[..])
+            }
+            ln_ast::TyKind::Ptr { is_mut, inner } => {
+                let i = self.lower_ty(cx, inner, TyPos::Other);
+                self.p.types.ptr(i, is_mut)
+            }
+            ln_ast::TyKind::Fn { params, ret } => {
+                let mut tys: [Ty; ..+] = [];
+                let mut modes: [ParamMode; ..+] = [];
+                for i in 0..params.len() {
+                    let fp = self.p.ast.fn_ty_params.list(params)[i];
+                    modes.push(fp.mode);
+                    tys.push(self.lower_ty(cx, fp.ty, TyPos::Param));
+                }
+                let r = match ret {
+                    Some(r) => self.lower_ty(cx, r, TyPos::Other),
+                    None => self.p.types.unit(),
+                };
+                let l = self.p.types.mk_list(tys[..]);
+                self.p.types.mk(TyKind::FnPtr(l, Modes::of(modes[..]), r))
+            }
+            ln_ast::TyKind::Grow(inner) => {
+                let inner_ty = self.lower_ty(cx, inner, TyPos::Other);
+                if pos != TyPos::Param {
+                    self.error(codes::ty::GROW_OUTSIDE_PARAM(), at.span, "`+` types are only valid as function parameter types");
+                    self.note("`&mut +T` marks a parameter that only grows; it has no meaning elsewhere");
+                    self.emit();
+                    return inner_ty;
+                }
+                self.deferred.push(Deferred { kind: DeferKind::Grow, ty: inner_ty, env: cx.env, span: at.span, generics_span: cx.generics_span });
+                self.p.types.mk(TyKind::Grow(inner_ty))
+            }
+            ln_ast::TyKind::DynArray(elem) => {
+                let e = self.lower_ty(cx, elem, TyPos::Other);
+                let esp = self.p.ast.tys.get(elem).span;
+                self.defer_elem(cx, e, esp);
+                self.p.types.array(e, ArrKind::Dyn)
+            }
+            ln_ast::TyKind::Array(elem, size) => {
+                let e = self.lower_ty(cx, elem, TyPos::Other);
+                let esp = self.p.ast.tys.get(elem).span;
+                self.defer_elem(cx, e, esp);
+                let kind = match size {
+                    ArraySize::Fixed(expr) => {
+                        let usize_ty = self.p.types.usize();
+                        match self.eval_const(cx.module, expr, usize_ty) {
+                            Some(ConstVal::Int(n)) => {
+                                if n.neg && n.mag != 0 {
+                                    let sp = self.p.ast.exprs.get(expr).span;
+                                    self.error(codes::ty::ARRAY_LEN(), sp, "array length must be a non-negative integer");
+                                    self.emit();
+                                    ArrKind::Fixed(0)
+                                } else {
+                                    ArrKind::Fixed(n.mag)
+                                }
+                            }
+                            Some(_) => {
+                                let sp = self.p.ast.exprs.get(expr).span;
+                                self.error(codes::ty::ARRAY_LEN(), sp, "array length must be a non-negative integer");
+                                self.emit();
+                                ArrKind::Fixed(0)
+                            }
+                            None => ArrKind::Fixed(0),
+                        }
+                    }
+                    ArraySize::Inferred => {
+                        if !cx.allow_infer {
+                            self.error(codes::ty::ANNOTATIONS_NEEDED(), at.span, "inferred array lengths `[T; _]` are not allowed in item signatures");
+                            self.emit();
+                            ArrKind::Fixed(0)
+                        } else {
+                            ArrKind::FixedVar(4294967295)
+                        }
+                    }
+                    ArraySize::Grow => ArrKind::Grow,
+                    ArraySize::GrowShrink => ArrKind::Shrink,
+                    ArraySize::Slice => ArrKind::Slice,
+                    ArraySize::SliceMut => ArrKind::SliceMut,
+                };
+                self.p.types.array(e, kind)
+            }
+        };
+        let is_fmt = match self.p.types.kind(ty) {
+            TyKind::FmtArgs => true,
+            _ => false,
+        };
+        if is_fmt && pos != TyPos::Param {
+            self.error(codes::ty::FMTARGS_OUTSIDE_PARAM(), at.span, "`FmtArgs` is only valid as a function parameter type");
+            self.note("a string literal converts to `FmtArgs` when passed to such a parameter");
+            self.emit();
+        }
+        return ty;
+    }
+
+    fn defer_elem(&mut self, cx: LowerCx, elem: Ty, span: Span) {
+        self.deferred.push(Deferred { kind: DeferKind::ArrayElem, ty: elem, env: cx.env, span, generics_span: cx.generics_span });
+    }
+
+    /// Start building `name::not_a_type` for an associated type (the caller
+    /// emits it).
+    fn assoc_types_unsupported(&mut self, span: Span) {
+        self.error(codes::name::NOT_A_TYPE(), span, "associated types are not supported");
+        self.note("traits in Lunar have methods and associated functions, but no associated types");
+        self.help("make the type a generic parameter of the trait instead, as in `Iterator::<T>`");
+    }
+
+    fn lower_path_ty(&mut self, cx: LowerCx, p: Path): Ty {
+        let n_segs = p.segments.len();
+        // Generic parameters and `Self`.
+        if n_segs == 1 {
+            let seg = self.p.ast.segments.list(p.segments)[0];
+            if self.p.text(seg.ident.name) == "Self" {
+                return match cx.self_ty {
+                    Some(t) => t,
+                    None => {
+                        self.error(codes::name::UNRESOLVED(), seg.ident.span, "`Self` is only available inside impls and traits");
+                        self.emit();
+                        self.p.types.error()
+                    }
+                };
+            }
+            let mut found: Option::<usize> = None;
+            let mut i = cx.generic_names.len();
+            while i > 0 {
+                i -= 1;
+                if self.p.symbols.list(cx.generic_names)[i] == seg.ident.name {
+                    found = Some(i);
+                    break;
+                }
+            }
+            if let Some(i) = found {
+                if seg.args.is_some() {
+                    self.error(codes::ty::GENERIC_COUNT(), p.span, "generic parameters cannot take generic arguments");
+                    self.emit();
+                }
+                if i < cx.generic_spans.len() {
+                    let decl = self.spans.list(cx.generic_spans)[i];
+                    if !is_dummy(decl) {
+                        self.p.refs.push(Ref { span: seg.ident.span, target: RefTarget::TyParam(decl) });
+                    }
+                }
+                return self.p.types.mk(TyKind::Param(i as u32, seg.ident.name));
+            }
+        }
+        // `Self::Item`, `T::Item`: a path into a type, not a module.
+        if n_segs > 1 {
+            let first = self.p.ast.segments.list(p.segments)[0].ident;
+            let is_self = self.p.text(first.name) == "Self";
+            if is_self && cx.self_ty.is_none() {
+                self.error(codes::name::UNRESOLVED(), first.span, "`Self` is only available inside impls and traits");
+                self.emit();
+                return self.p.types.error();
+            }
+            if is_self || self.p.symbols.list(cx.generic_names).contains(first.name) {
+                self.assoc_types_unsupported(p.span);
+                self.emit();
+                return self.p.types.error();
+            }
+        }
+        let mut idents: [Ident; ..+] = [];
+        self.path_idents(p, &mut idents);
+        let (res, used) = match self.resolve_prefix(cx.module, idents[..], Ns::Type) {
+            Some(r) => (r.res, r.used),
+            None => {
+                if idents.len() == 1 {
+                    self.unresolved_diag(cx.module, idents[0], Ns::Type);
+                    self.emit();
+                }
+                return self.p.types.error();
+            }
+        };
+        if used != idents.len() {
+            let mut not_type: Option::<DefId> = None;
+            if let ModRes::Def(def) = res {
+                match self.p.defs[def.index()].kind {
+                    DefKind::Struct | DefKind::Enum | DefKind::TypeAlias | DefKind::Trait => {}
+                    _ => not_type = Some(def),
+                }
+            }
+            match not_type {
+                Some(def) => {
+                    let d = self.p.defs[def.index()];
+                    let mut prefix = String::new();
+                    for k in 0..used {
+                        if k > 0 {
+                            prefix.push_str("::");
+                        }
+                        prefix.push_str(self.p.text(idents[k].name));
+                    }
+                    self.error(codes::name::NOT_A_TYPE(), idents[used - 1].span, "expected a type or module, found {d.kind.describe()} `{prefix}`");
+                }
+                None => self.assoc_types_unsupported(p.span),
+            }
+            self.emit();
+            return self.p.types.error();
+        }
+        let seg_args = self.p.ast.segments.list(p.segments)[used - 1].args;
+        match res {
+            ModRes::Prim(t) => {
+                if seg_args.is_some() {
+                    self.error(codes::ty::GENERIC_COUNT(), p.span, "primitive types take no generic arguments");
+                    self.emit();
+                }
+                return t;
+            }
+            ModRes::Def(def) => {
+                let kind = self.p.defs[def.index()].kind;
+                match kind {
+                    DefKind::Struct | DefKind::Enum | DefKind::TypeAlias => {
+                        let want = self.generic_count_of(def);
+                        let mut args: [Ty; ..+] = [];
+                        match seg_args {
+                            Some(a) => {
+                                for i in 0..a.len() {
+                                    let x = self.p.ast.ty_ids.list(a)[i];
+                                    args.push(self.lower_ty(cx, x, TyPos::Other));
+                                }
+                            }
+                            None => {
+                                if want > 0 && cx.allow_infer {
+                                    for _ in 0..want {
+                                        args.push(self.p.types.infer(4294967295));
+                                    }
+                                }
+                            }
+                        }
+                        if args.len() != want {
+                            let name = self.def_name(def);
+                            self.error(codes::ty::GENERIC_COUNT(), p.span, "`{name}` takes {want} generic argument(s) but {args.len()} were supplied");
+                            self.help("write `{name}::<...>`");
+                            self.emit();
+                            return self.p.types.error();
+                        }
+                        let al = self.p.types.mk_list(args[..]);
+                        if kind == DefKind::TypeAlias {
+                            return match self.alias_ty(def) {
+                                Some(t) => self.p.types.subst(t, al),
+                                None => self.p.types.error(),
+                            };
+                        }
+                        return self.p.types.adt(def, al);
+                    }
+                    _ => {
+                        let d = self.p.defs[def.index()];
+                        let name = self.def_name(def);
+                        self.error(codes::name::NOT_A_TYPE(), p.span, "expected a type, found {d.kind.describe()} `{name}`");
+                        self.emit();
+                        return self.p.types.error();
+                    }
+                }
+            }
+        }
+    }
+
+    fn alias_ty(&mut self, id: DefId): Option::<Ty> {
+        if let DefData::Alias(a) = self.p.defs[id.index()].data {
+            if let Some(t) = a.ty {
+                return Some(t);
+            }
+        }
+        let a = match self.ast(id) {
+            AstRef::Alias(a) => a,
+            _ => return None,
+        };
+        if self.alias_stack[..].contains(id) {
+            let n = self.str_of(a.name.name);
+            self.error(codes::ty::INFINITE_SIZE(), a.name.span, "type alias `{n}` refers to itself");
+            self.emit();
+            return None;
+        }
+        self.alias_stack.push(id);
+        let cx = self.lower_cx(id);
+        let t = self.lower_ty(cx, a.ty, TyPos::Other);
+        self.alias_stack.pop();
+        if let DefData::Alias(ad) = self.p.defs[id.index()].data {
+            let mut ad = ad;
+            ad.ty = Some(t);
+            self.p.defs[id.index()].data = DefData::Alias(ad);
+        }
+        return Some(t);
+    }
+
+    // ===================================================================== checks
+
+    fn run_deferred(&mut self) {
+        let deferred = core::mem::replace(&mut self.deferred, []);
+        for d in deferred {
+            if self.p.types.is_error(d.ty) {
+                continue;
+            }
+            match d.kind {
+                DeferKind::ArrayElem => {
+                    if !self.p.is_light(d.ty, self.p.preds.list(d.env)) {
+                        self.pointy_diag(d.ty, d.span, d.generics_span);
+                        self.emit();
+                    }
+                }
+                DeferKind::Grow => {
+                    if !self.p.could_own(d.ty, self.p.preds.list(d.env)) {
+                        let s = self.p.ty_str(d.ty);
+                        self.error(codes::ty::GROW_NO_OWNER(), d.span, "`+{s}` is meaningless: `{s}` owns no array or string");
+                        self.note("`+` promises an argument is never shrunk or replaced; only owners (`[T]`, `[T; ..+]`, `[T; -..+]`, `String`, or types containing them) can be");
+                        self.emit();
+                    }
+                }
+                DeferKind::NeedlessBorrow => {
+                    // Borrowing passes an address, which pays off for large
+                    // values; for a small Dull value a copy is just as cheap.
+                    let inner = self.p.types.strip_grow(d.ty);
+                    let small = match self.p.layout_of(inner) {
+                        Some(l) => l.size <= NEEDLESS_BORROW_MAX,
+                        None => false,
+                    };
+                    if small && self.p.is_dull(inner, self.p.preds.list(d.env)) {
+                        let s = self.p.ty_str(inner);
+                        self.warning(codes::lint::NEEDLESS_BORROW(), d.span, "borrowing `{s}` is pointless: it is small and Dull, so copying it is just as cheap");
+                        self.help("take it by value: `: {s}`");
+                        self.emit();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Start building the `err(type::array_owner_items)` diagnostic (the
+    /// caller emits it).
+    pub fn pointy_diag(&mut self, elem: Ty, span: Span, generics_span: Span) {
+        let s = self.p.ty_str(elem);
+        self.error(codes::ty::ARRAY_OWNER_ITEMS(), span, "Arrays and slices cannot hold items that own arrays or strings.");
+        self.label("`{s}` is not known to be `Light`");
+        match self.p.types.kind(elem) {
+            TyKind::Param(_, n) => {
+                let ns = self.str_of(n);
+                self.help("add Light to {ns}'s bounds: `{ns}: Light`");
+                if !is_dummy(generics_span) {
+                    self.secondary(generics_span, "`{ns}` is declared here");
+                }
+            }
+            _ => {
+                self.note("`{s}` owns an array or string. Items may be views (`str`, slices) or Dull values, but not owners: store the owners elsewhere (an arena, or one big array) and keep views or handles here");
+            }
+        }
+    }
+
+    fn check_infinite_size(&mut self) {
+        for i in 0..self.p.defs.len() {
+            let id = DefId::new(i);
+            let kind = self.p.defs[i].kind;
+            if kind != DefKind::Struct && kind != DefKind::Enum {
+                continue;
+            }
+            let mut seen: [DefId; ..+] = [];
+            if self.adt_contains(id, id, &mut seen) {
+                let name = self.def_name(id);
+                let sp = self.p.defs[i].span;
+                self.error(codes::ty::INFINITE_SIZE(), sp, "recursive type `{name}` has infinite size");
+                self.help("store the recursive part in an array-backed pool and refer to it by index");
+                self.emit();
+            }
+        }
+    }
+
+    /// Whether ADT `cur` stores a `root` inside itself, by value.
+    fn adt_contains(&mut +self, root: DefId, cur: DefId, seen: &mut +[DefId; ..+]): bool {
+        let t = self.p.types.adt(cur, List::empty());
+        return self.contains_by_value(root, t, seen, true);
+    }
+
+    /// Whether a value of type `ty` stores a `root` inside itself. Only what
+    /// is stored inline counts: fields (with the type's arguments
+    /// substituted, so `Id::<Expr>` holding a `u32` does not contain an
+    /// `Expr`), tuple elements and fixed-size array items. Owners, slices
+    /// and pointers break the cycle.
+    fn contains_by_value(&mut +self, root: DefId, ty: Ty, seen: &mut +[DefId; ..+], top: bool): bool {
+        match self.p.types.kind(ty) {
+            TyKind::Adt(d, args) => {
+                if d == root && !top {
+                    return true;
+                }
+                if seen[..].contains(d) {
+                    return false;
+                }
+                seen.push(d);
+                let a = match self.p.defs[d.index()].data {
+                    DefData::Adt(a) => a,
+                    _ => return false,
+                };
+                for vi in 0..a.variants.len() {
+                    let v = self.p.variants.list(a.variants)[vi];
+                    for fi in 0..v.fields.len() {
+                        let f = self.p.fields.list(v.fields)[fi];
+                        let ft = self.p.types.subst(f.ty, args);
+                        if self.contains_by_value(root, ft, seen, false) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+            TyKind::Tuple(ts) => {
+                for i in 0..ts.len() {
+                    let t = self.p.types.at(ts, i);
+                    if self.contains_by_value(root, t, seen, false) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            TyKind::Array(e, k) => {
+                if k.is_owner() || k.is_slice() {
+                    return false;
+                }
+                return self.contains_by_value(root, e, seen, false);
+            }
+            TyKind::Grow(t) => return self.contains_by_value(root, t, seen, false),
+            _ => return false,
+        }
+    }
+
+    /// Whether `id` is in `core` or `std`.
+    fn in_std(&self, id: DefId): bool {
+        let k = self.p.crater_of(id);
+        for r in self.p.crate_roots {
+            if r.def == k {
+                let n = self.p.text(r.name);
+                return n == "core" || n == "std";
+            }
+        }
+        return false;
+    }
+
+    /// An impl's header: `Trait for Type` (or just the type).
+    fn impl_header_span(&self, id: DefId): Span {
+        return match self.ast(id) {
+            AstRef::Impl(im) => {
+                let st = self.p.ast.tys.get(im.self_ty).span;
+                match im.trait_ref {
+                    Some(t) => t.span.to(st),
+                    None => st,
+                }
+            }
+            _ => self.p.defs[id.index()].span,
+        };
+    }
+
+    /// Two impls of the same trait that can apply to the same type would make
+    /// method resolution ambiguous: `err(trait::conflicting_impl)`.
+    fn check_overlapping_impls(&mut self) {
+        let mut impls: [DefId; ..+] = [];
+        for i in self.p.impls {
+            if let DefData::Impl(d) = self.p.defs[i.index()].data {
+                if d.trait_ref.is_some() && !d.negative {
+                    impls.push(i);
+                }
+            }
+        }
+        for k in 0..impls.len() {
+            let b = impls[k];
+            for j in 0..k {
+                let a = impls[j];
+                let mut notes: [Symbol; ..+] = [];
+                if !self.p.impls_overlap(a, b, &mut notes) {
+                    continue;
+                }
+                // Report at the impl outside core/std when there is one.
+                let (here, first) = if self.in_std(b) && !self.in_std(a) { (a, b) } else { (b, a) };
+                let (sh, sf) = (self.impl_header_span(here), self.impl_header_span(first));
+                let td = self.p.impl_data(here);
+                let tname = self.def_name(td.trait_ref.unwrap().trait_id);
+                let tys = self.p.ty_str(td.self_ty);
+                self.error(codes::trait_::CONFLICTING_IMPL(), sh, "conflicting implementations of trait `{tname}` for `{tys}`");
+                self.label("conflicting implementation");
+                self.secondary(sf, "other implementation here");
+                self.note("two impls of a trait may not apply to the same type, or calls would be ambiguous");
+                for n in notes {
+                    self.p.diags.note(n);
+                }
+                self.emit();
+                break;
+            }
+        }
+    }
+
+    fn check_impl(&mut self, id: DefId, im: ln_ast::ImplDecl) {
+        let data = match self.p.defs[id.index()].data {
+            DefData::Impl(d) => d,
+            _ => return,
+        };
+        let krate = self.p.mod_data(self.p.defs[id.index()].module).krate;
+        let mut is_std = false;
+        for r in self.p.crate_roots {
+            if r.def == krate {
+                let n = self.p.text(r.name);
+                is_std = n == "core" || n == "std";
+            }
+        }
+        let self_span = self.p.ast.tys.get(im.self_ty).span;
+        let tr = match data.trait_ref {
+            Some(t) => t,
+            None => {
+                // Inherent impl.
+                let ok = match self.p.types.kind(data.self_ty) {
+                    TyKind::Adt(d, _) => self.p.mod_data(self.p.defs[d.index()].module).krate == krate,
+                    TyKind::Error => true,
+                    _ => is_std,
+                };
+                if !ok {
+                    let s = self.p.ty_str(data.self_ty);
+                    self.error(codes::trait_::INHERENT_FOREIGN(), self_span, "cannot define inherent methods on `{s}` outside the crater that defines it");
+                    self.help("define a trait with these methods and implement it instead");
+                    self.emit();
+                }
+                return;
+            }
+        };
+        let tname = self.def_name(tr.trait_id);
+        let tr_span = im.trait_ref.unwrap().span;
+        if self.p.is_lang(tr.trait_id, "dull") {
+            if data.negative {
+                self.error(codes::trait_::DULL_IMPL(), tr_span, "`Dull` cannot be negated: whether a type is Dull is decided by the compiler");
+            } else {
+                self.error(codes::trait_::DULL_IMPL(), tr_span, "`Dull` cannot be implemented manually: the compiler implements it");
+            }
+            self.note("the compiler implements `core::ptr::Dull` automatically for every type without pointers, slices, strings or arrays");
+            self.emit();
+            return;
+        }
+        if self.p.is_lang(tr.trait_id, "light") {
+            if data.negative {
+                self.error(codes::trait_::DULL_IMPL(), tr_span, "`Light` cannot be negated: whether a type is Light is decided by the compiler");
+            } else {
+                self.error(codes::trait_::DULL_IMPL(), tr_span, "`Light` cannot be implemented manually: the compiler implements it");
+            }
+            self.note("the compiler implements `core::ptr::Light` automatically for every type that owns no array or string");
+            self.emit();
+            return;
+        }
+        if data.negative {
+            self.error(codes::trait_::NEGATIVE_IMPL(), tr_span, "`{tname}` is not an auto trait, so it cannot have a negative impl");
+            self.note("negative impls are only meaningful for auto traits, and Lunar's only auto trait is `Dull`, which cannot be negated either");
+            self.help("a type without an `impl {tname}` already does not implement `{tname}`; remove this impl");
+            self.emit();
+            return;
+        }
+        let td = self.p.trait_data(tr.trait_id);
+        let impl_count = data.generics.count();
+        for i in 0..td.methods.len() {
+            let m = self.p.trait_methods.list(td.methods)[i];
+            match self.p.impl_methods.get((id, m.name)) {
+                None => {
+                    if !m.has_default {
+                        let mn = self.str_of(m.name);
+                        let msp = self.p.defs[m.def.index()].span;
+                        self.error(codes::trait_::MISSING_ITEM(), self_span, "missing method `{mn}` in implementation of `{tname}`");
+                        self.secondary(msp, "required by the trait here");
+                        self.emit();
+                    }
+                }
+                Some(imp_m) => self.compare_sigs(m.def, imp_m, data.self_ty, tr, impl_count),
+            }
+        }
+        let mut items: [DefId; ..+] = [];
+        self.impl_items_of(id, &mut items);
+        for m in items {
+            let name = self.p.defs[m.index()].name;
+            // A method defined twice was reported already; check the one
+            // the impl keeps.
+            if self.p.impl_methods.get((id, name)) != Some(m) {
+                continue;
+            }
+            let mut in_trait = false;
+            for tm in self.p.trait_methods.list(td.methods) {
+                if tm.name == name {
+                    in_trait = true;
+                }
+            }
+            if !in_trait {
+                let sp = self.p.defs[m.index()].span;
+                let n = self.str_of(name);
+                self.error(codes::trait_::EXTRA_ITEM(), sp, "method `{n}` is not a member of trait `{tname}`");
+                self.emit();
+            }
+        }
+        // Supertraits must also be implemented.
+        let mut args: [Ty; ..+] = [];
+        args.push(data.self_ty);
+        args.extend(self.p.types.list(tr.args));
+        let al = self.p.types.mk_list(args[..]);
+        for i in 0..td.supertraits.len() {
+            let st0 = self.p.trait_refs.list(td.supertraits)[i];
+            let st = self.p.types.subst_trait_ref(st0, al);
+            if !self.p.implements(data.self_ty, st, self.p.preds.list(data.generics.preds)) {
+                let s = self.p.ty_str(data.self_ty);
+                let sn = self.def_name(st.trait_id);
+                self.error(codes::ty::UNSATISFIED_BOUND(), self_span, "`{s}` implements `{tname}` but not its supertrait `{sn}`");
+                self.emit();
+            }
+        }
+    }
+
+    fn compare_sigs(&mut self, trait_m: DefId, impl_m: DefId, self_ty: Ty, tr: TraitRef, impl_count: usize) {
+        let tf = self.p.fn_data(trait_m);
+        let imf = self.p.fn_data(impl_m);
+        let sp = self.p.defs[impl_m.index()].span;
+        if tf.generics.own_count() != imf.generics.own_count() {
+            self.error(codes::trait_::SIGNATURE(), sp, "method has a different number of generic parameters than the trait declares");
+            self.emit();
+            return;
+        }
+        // Map trait-method params [Self, trait params.., method params..] to the impl numbering.
+        let mut args: [Ty; ..+] = [];
+        args.push(self_ty);
+        args.extend(self.p.types.list(tr.args));
+        for j in 0..imf.generics.names.len() {
+            let n = self.p.symbols.list(imf.generics.names)[j];
+            args.push(self.p.types.mk(TyKind::Param((impl_count + j) as u32, n)));
+        }
+        let al = self.p.types.mk_list(args[..]);
+        let (tn, imn) = (tf.sig.params.len(), imf.sig.params.len());
+        if tn != imn {
+            let tsp = self.p.defs[trait_m.index()].span;
+            self.error(codes::trait_::SIGNATURE(), sp, "method takes {imn} parameter(s) but the trait declares {tn}");
+            self.secondary(tsp, "trait method declared here");
+            self.emit();
+            return;
+        }
+        for i in 0..tn {
+            let tp = self.p.params.list(tf.sig.params)[i];
+            let ip = self.p.params.list(imf.sig.params)[i];
+            let want = self.p.types.subst(tp.ty, al);
+            if want != ip.ty || tp.mode != ip.mode {
+                let (w, g) = (self.p.ty_str(want), self.p.ty_str(ip.ty));
+                let (wm, gm) = (mode_prefix(tp.mode), mode_prefix(ip.mode));
+                self.error(codes::trait_::SIGNATURE(), ip.span, "parameter type mismatch with trait: expected `{wm}{w}`, found `{gm}{g}`");
+                self.secondary(tp.span, "trait parameter declared here");
+                self.emit();
+            } else if ip.kept && !tp.kept {
+                // Callers through the trait would not know the view is kept.
+                let n = self.str_of(ip.name);
+                self.error(codes::trait_::SIGNATURE(), ip.span, "parameter `{n}` is `kept`, but the trait's is not");
+                self.secondary(tp.span, "trait parameter declared here");
+                self.help("mark the trait's parameter `kept` too, or do not store views from this argument");
+                self.emit();
+            }
+        }
+        let want_ret = self.p.types.subst(tf.sig.ret, al);
+        if want_ret != imf.sig.ret {
+            let (w, g) = (self.p.ty_str(want_ret), self.p.ty_str(imf.sig.ret));
+            self.error(codes::trait_::SIGNATURE(), imf.sig.ret_span, "return type mismatch with trait: expected `{w}`, found `{g}`");
+            self.emit();
+        }
+    }
+
+    fn check_main(&mut self) {
+        if self.p.crate_roots.len() == 0 {
+            return;
+        }
+        let root = self.p.crate_roots[0].def;
+        let main_name = self.p.sym("main");
+        let b = match self.lookup_in(root, main_name, Ns::Value) {
+            Some(b) => b,
+            None => return,
+        };
+        let f = match self.p.defs[b.def.index()].data {
+            DefData::Fn(f) => f,
+            _ => return,
+        };
+        let i32_ty = self.p.types.int(IntTy::I32);
+        let ret_ok = self.p.types.is_unit(f.sig.ret) || f.sig.ret == i32_ty;
+        if f.sig.params.len() > 0 || !ret_ok || f.generics.count() > 0 {
+            self.error(codes::ty::BAD_MAIN(), b.span, "`main` must take no parameters and return `()` or `i32`");
+            self.emit();
+        }
+    }
+
+    // ===================================================================== const evaluation
+
+    /// Evaluate a constant expression of (expected) type `ty`.
+    pub fn eval_const(&mut self, module: DefId, e: Id::<Expr>, ty: Ty): Option::<ConstVal> {
+        return match self.eval_const_inner(module, e, ty) {
+            Ok(v) => Some(v),
+            Err(msg) => {
+                let sp = self.p.ast.exprs.get(e).span;
+                self.error(codes::ty::CONST_EVAL(), sp, "{msg}");
+                self.emit();
+                None
+            }
+        };
+    }
+
+    fn eval_const_inner(&mut self, module: DefId, e: Id::<Expr>, ty: Ty): Result::<ConstVal, String> {
+        let ex = self.p.ast.exprs.get(e);
+        match ex.kind {
+            ExprKind::Lit(l) => {
+                return Ok(match l {
+                    Lit::Int { value, .. } => {
+                        if let TyKind::Float(_) = self.p.types.kind(ty) {
+                            ConstVal::Float(value as f64)
+                        } else {
+                            ConstVal::Int(ConstInt::of_u64(value))
+                        }
+                    }
+                    Lit::Float { .. } => ConstVal::Float(float_lit_value(self.p.sources.snippet(ex.span))),
+                    Lit::Bool(b) => ConstVal::Bool(b),
+                    Lit::Char(c) => ConstVal::Char(c),
+                    Lit::Str { value, .. } => ConstVal::Str(value),
+                });
+            }
+            ExprKind::Paren(x) => return self.eval_const_inner(module, x, ty),
+            ExprKind::Unary(op, x) => {
+                let v = self.eval_const_inner(module, x, ty)?;
+                return match op {
+                    UnOp::Neg => match v {
+                        ConstVal::Int(i) => Ok(ConstVal::Int(Wide::of(i).neg().to_const())),
+                        ConstVal::Float(f) => Ok(ConstVal::Float(-f)),
+                        _ => Err(String::from("unsupported operation in constant")),
+                    },
+                    UnOp::Not => match v {
+                        ConstVal::Bool(b) => Ok(ConstVal::Bool(!b)),
+                        ConstVal::Int(i) => Ok(ConstVal::Int(Wide::of(i).not().to_const())),
+                        _ => Err(String::from("unsupported operation in constant")),
+                    },
+                    _ => Err(String::from("unsupported operation in constant")),
+                };
+            }
+            ExprKind::Binary(op, a, b) => {
+                let x = self.eval_const_inner(module, a, ty)?;
+                let y = self.eval_const_inner(module, b, ty)?;
+                return const_binary(op, x, y);
+            }
+            ExprKind::Cast(x, _) => {
+                let err = self.p.types.error();
+                let v = self.eval_const_inner(module, x, err)?;
+                return Ok(match v {
+                    ConstVal::Int(i) => match self.p.types.kind(ty) {
+                        TyKind::Float(_) => ConstVal::Float(int_to_f64(i)),
+                        _ => ConstVal::Int(i),
+                    },
+                    ConstVal::Float(f) => match self.p.types.kind(ty) {
+                        TyKind::Int(_) => ConstVal::Int(f64_to_int(f)),
+                        _ => ConstVal::Float(f),
+                    },
+                    other => other,
+                });
+            }
+            ExprKind::Path(p) => {
+                let mut idents: [Ident; ..+] = [];
+                self.path_idents(p, &mut idents);
+                let shown = self.p.ast.path_text(p);
+                return match self.resolve_prefix(module, idents[..], Ns::Value) {
+                    Some(Prefix { res: ModRes::Def(d), used }) => {
+                        if used != idents.len() {
+                            return Err(core::fmt::format("cannot find constant `{shown}`"));
+                        }
+                        match self.ast(d) {
+                            AstRef::Const(c) => {
+                                if let DefData::Const(cd) = self.p.defs[d.index()].data {
+                                    if let Some(v) = cd.value {
+                                        return Ok(v);
+                                    }
+                                }
+                                let m = self.p.defs[d.index()].module;
+                                let cx = LowerCx::new(m);
+                                let cty = self.lower_ty(cx, c.ty, TyPos::Other);
+                                self.eval_const_inner(m, c.value, cty)
+                            }
+                            _ => Err(core::fmt::format("`{shown}` is not a constant")),
+                        }
+                    }
+                    _ => Err(core::fmt::format("cannot find constant `{shown}`")),
+                };
+            }
+            ExprKind::Array(es) => {
+                let et = match self.p.types.kind(ty) {
+                    TyKind::Array(e, _) => e,
+                    _ => self.p.types.error(),
+                };
+                let mut out: [ConstVal; ..+] = [];
+                for i in 0..es.len() {
+                    let x = self.p.ast.expr_ids.list(es)[i];
+                    out.push(self.eval_const_inner(module, x, et)?);
+                }
+                return Ok(ConstVal::Array(self.p.consts.add_list(out[..])));
+            }
+            ExprKind::ArrayRepeat(v, n) => {
+                let et = match self.p.types.kind(ty) {
+                    TyKind::Array(e, _) => e,
+                    _ => self.p.types.error(),
+                };
+                let v = self.eval_const_inner(module, v, et)?;
+                let usize_ty = self.p.types.usize();
+                let count = match self.eval_const_inner(module, n, usize_ty)? {
+                    ConstVal::Int(c) => if c.neg { 0 } else { c.mag },
+                    _ => return Err(String::from("array repeat count must be an integer")),
+                };
+                let mut out: [ConstVal; ..+] = [];
+                for _ in 0..count {
+                    out.push(v);
+                }
+                return Ok(ConstVal::Array(self.p.consts.add_list(out[..])));
+            }
+            ExprKind::Tuple(es) => {
+                if es.len() == 0 {
+                    return Ok(ConstVal::Unit);
+                }
+                let mut out: [ConstVal; ..+] = [];
+                for i in 0..es.len() {
+                    let t = match self.p.types.kind(ty) {
+                        TyKind::Tuple(ts) => if i < ts.len() { self.p.types.at(ts, i) } else { self.p.types.error() },
+                        _ => self.p.types.error(),
+                    };
+                    let x = self.p.ast.expr_ids.list(es)[i];
+                    out.push(self.eval_const_inner(module, x, t)?);
+                }
+                return Ok(ConstVal::Tuple(self.p.consts.add_list(out[..])));
+            }
+            _ => return Err(String::from("this expression is not supported in constants")),
+        }
+    }
+}
+
+fn mode_prefix(m: ParamMode): str {
+    return match m {
+        ParamMode::Take => "",
+        ParamMode::Borrow => "&",
+        ParamMode::InOut => "&mut ",
+    };
+}
+
+/// A binary operation on constants.
+fn const_binary(op: BinOp, x: ConstVal, y: ConstVal): Result::<ConstVal, String> {
+    match (x, y) {
+        (ConstVal::Int(a), ConstVal::Int(b)) => {
+            let (wa, wb) = (Wide::of(a), Wide::of(b));
+            let r = match op {
+                BinOp::Add => ConstVal::Int(wa.add(wb).to_const()),
+                BinOp::Sub => ConstVal::Int(wa.sub(wb).to_const()),
+                BinOp::Mul => ConstVal::Int(wa.mul(wb).to_const()),
+                BinOp::Div => {
+                    if wb.is_zero() {
+                        return Err(String::from("division by zero in constant"));
+                    }
+                    ConstVal::Int(wa.div(wb).to_const())
+                }
+                BinOp::Rem => {
+                    if wb.is_zero() {
+                        return Err(String::from("division by zero in constant"));
+                    }
+                    ConstVal::Int(wa.rem(wb).to_const())
+                }
+                BinOp::Shl => ConstVal::Int(wa.shl((wb.lo & 127) as u32).to_const()),
+                BinOp::Shr => ConstVal::Int(wa.shr((wb.lo & 127) as u32).to_const()),
+                BinOp::BitAnd => ConstVal::Int(Wide { hi: wa.hi & wb.hi, lo: wa.lo & wb.lo }.to_const()),
+                BinOp::BitOr => ConstVal::Int(Wide { hi: wa.hi | wb.hi, lo: wa.lo | wb.lo }.to_const()),
+                BinOp::BitXor => ConstVal::Int(Wide { hi: wa.hi ^ wb.hi, lo: wa.lo ^ wb.lo }.to_const()),
+                BinOp::Eq => ConstVal::Bool(wa.cmp(wb) == 0),
+                BinOp::Ne => ConstVal::Bool(wa.cmp(wb) != 0),
+                BinOp::Lt => ConstVal::Bool(wa.cmp(wb) < 0),
+                BinOp::Le => ConstVal::Bool(wa.cmp(wb) <= 0),
+                BinOp::Gt => ConstVal::Bool(wa.cmp(wb) > 0),
+                BinOp::Ge => ConstVal::Bool(wa.cmp(wb) >= 0),
+                BinOp::And | BinOp::Or => return Err(String::from("`&&`/`||` need booleans")),
+            };
+            return Ok(r);
+        }
+        (ConstVal::Float(a), ConstVal::Float(b)) => {
+            return match op {
+                BinOp::Add => Ok(ConstVal::Float(a + b)),
+                BinOp::Sub => Ok(ConstVal::Float(a - b)),
+                BinOp::Mul => Ok(ConstVal::Float(a * b)),
+                BinOp::Div => Ok(ConstVal::Float(a / b)),
+                _ => Err(String::from("unsupported float operation in constant")),
+            };
+        }
+        (ConstVal::Bool(a), ConstVal::Bool(b)) => {
+            return match op {
+                BinOp::And => Ok(ConstVal::Bool(a && b)),
+                BinOp::Or => Ok(ConstVal::Bool(a || b)),
+                BinOp::Eq => Ok(ConstVal::Bool(a == b)),
+                BinOp::Ne => Ok(ConstVal::Bool(a != b)),
+                _ => Err(String::from("unsupported boolean operation in constant")),
+            };
+        }
+        _ => return Err(String::from("mismatched operand types in constant")),
+    }
+}
+
+fn int_to_f64(i: ConstInt): f64 {
+    let m = i.mag as f64;
+    return if i.neg { -m } else { m };
+}
+
+/// `f as i128`, saturating to what `ConstInt` holds.
+fn f64_to_int(f: f64): ConstInt {
+    if f != f {
+        return ConstInt::of_u64(0);
+    }
+    if f < 0.0 {
+        let m = -f;
+        let mag = if m >= 18446744073709551615.0 { 18446744073709551615 } else { m as u64 };
+        return ConstInt { neg: mag != 0, mag };
+    }
+    let mag = if f >= 18446744073709551615.0 { 18446744073709551615 } else { f as u64 };
+    return ConstInt::of_u64(mag);
+}
+
+/// The value of a float literal's text: digits with `_`, an optional
+/// fraction and exponent, and an optional `f32`/`f64` suffix.
+pub fn float_lit_value(text: str): f64 {
+    let b = text.as_bytes();
+    let mut mant: u64 = 0;
+    let mut digits: u32 = 0;
+    let mut exp10: i64 = 0;
+    let mut extra: i64 = 0;
+    let mut i: usize = 0;
+    let mut frac = false;
+    while i < b.len() {
+        let c = b[i];
+        if c >= b'0' && c <= b'9' {
+            if digits < 19 {
+                mant = mant * 10 + (c - b'0') as u64;
+                if mant != 0 {
+                    digits += 1;
+                }
+                if frac {
+                    exp10 -= 1;
+                }
+            } else if !frac {
+                extra += 1;
+            }
+        } else if c == b'.' {
+            frac = true;
+        } else if c == b'_' {
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        i += 1;
+        let mut neg = false;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            neg = b[i] == b'-';
+            i += 1;
+        }
+        let mut e: i64 = 0;
+        while i < b.len() && ((b[i] >= b'0' && b[i] <= b'9') || b[i] == b'_') {
+            if b[i] != b'_' && e < 100000 {
+                e = e * 10 + (b[i] - b'0') as i64;
+            }
+            i += 1;
+        }
+        exp10 += if neg { -e } else { e };
+    }
+    exp10 += extra;
+    let mut v = mant as f64;
+    if exp10 > 0 {
+        let mut k = exp10;
+        while k > 0 {
+            v = v * 10.0;
+            k -= 1;
+            if v > 1.0e308 * 10.0 {
+                break;
+            }
+        }
+    } else if exp10 < 0 {
+        let mut k = -exp10;
+        // Divide by exact powers of ten where possible.
+        while k >= 22 {
+            v = v / 1.0e22;
+            k -= 22;
+        }
+        let mut p = 1.0;
+        while k > 0 {
+            p = p * 10.0;
+            k -= 1;
+        }
+        v = v / p;
+    }
+    return v;
+}
+
+/// A 128-bit two's complement integer (Rust's `i128` in constant
+/// evaluation): high and low words.
+pub struct Wide {
+    pub hi: u64,
+    pub lo: u64,
+}
+
+impl Wide {
+    pub fn of(c: ConstInt): Wide {
+        let w = Wide { hi: 0, lo: c.mag };
+        if c.neg {
+            return w.neg();
+        }
+        return w;
+    }
+
+    /// Back to sign and magnitude (keeping the low 64 bits of the
+    /// magnitude).
+    pub fn to_const(self): ConstInt {
+        if self.is_negative() {
+            let m = self.neg();
+            return ConstInt { neg: m.lo != 0, mag: m.lo };
+        }
+        return ConstInt { neg: false, mag: self.lo };
+    }
+
+    pub fn is_negative(self): bool {
+        return (self.hi >> 63) == 1;
+    }
+
+    pub fn is_zero(self): bool {
+        return self.hi == 0 && self.lo == 0;
+    }
+
+    pub fn not(self): Wide {
+        return Wide { hi: !self.hi, lo: !self.lo };
+    }
+
+    pub fn neg(self): Wide {
+        return self.not().add(Wide { hi: 0, lo: 1 });
+    }
+
+    pub fn add(self, o: Wide): Wide {
+        let lo = self.lo.wrapping_add(o.lo);
+        let carry: u64 = if lo < self.lo { 1 } else { 0 };
+        return Wide { hi: self.hi.wrapping_add(o.hi).wrapping_add(carry), lo };
+    }
+
+    pub fn sub(self, o: Wide): Wide {
+        return self.add(o.neg());
+    }
+
+    /// The full 128-bit product of two 64-bit words.
+    fn mul64(a: u64, b: u64): Wide {
+        let (a1, a0) = (a >> 32, a & 0xffffffff);
+        let (b1, b0) = (b >> 32, b & 0xffffffff);
+        let p00 = a0 * b0;
+        let p01 = a0 * b1;
+        let p10 = a1 * b0;
+        let p11 = a1 * b1;
+        let mid = (p00 >> 32) + (p01 & 0xffffffff) + (p10 & 0xffffffff);
+        let lo = (p00 & 0xffffffff) | (mid << 32);
+        let hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+        return Wide { hi, lo };
+    }
+
+    pub fn mul(self, o: Wide): Wide {
+        let p = Wide::mul64(self.lo, o.lo);
+        let cross = self.hi.wrapping_mul(o.lo).wrapping_add(self.lo.wrapping_mul(o.hi));
+        return Wide { hi: p.hi.wrapping_add(cross), lo: p.lo };
+    }
+
+    pub fn shl(self, n: u32): Wide {
+        if n == 0 {
+            return self;
+        }
+        if n >= 64 {
+            return Wide { hi: self.lo << ((n - 64) as u64), lo: 0 };
+        }
+        return Wide { hi: (self.hi << (n as u64)) | (self.lo >> ((64 - n) as u64)), lo: self.lo << (n as u64) };
+    }
+
+    /// Arithmetic shift right.
+    pub fn shr(self, n: u32): Wide {
+        if n == 0 {
+            return self;
+        }
+        let fill: u64 = if self.is_negative() { 18446744073709551615 } else { 0 };
+        if n >= 64 {
+            let s = n - 64;
+            let lo = if s == 0 { self.hi } else { (self.hi >> (s as u64)) | (fill << ((64 - s) as u64)) };
+            return Wide { hi: fill, lo };
+        }
+        let lo = (self.lo >> (n as u64)) | (self.hi << ((64 - n) as u64));
+        let hi = (self.hi >> (n as u64)) | (fill << ((64 - n) as u64));
+        return Wide { hi, lo };
+    }
+
+    fn ucmp(self, o: Wide): i32 {
+        if self.hi != o.hi {
+            return if self.hi < o.hi { -1 } else { 1 };
+        }
+        if self.lo != o.lo {
+            return if self.lo < o.lo { -1 } else { 1 };
+        }
+        return 0;
+    }
+
+    /// Signed comparison: negative, zero or positive.
+    pub fn cmp(self, o: Wide): i32 {
+        let (na, nb) = (self.is_negative(), o.is_negative());
+        if na != nb {
+            return if na { -1 } else { 1 };
+        }
+        return self.ucmp(o);
+    }
+
+    /// Unsigned division with remainder.
+    fn udivrem(n: Wide, d: Wide): (Wide, Wide) {
+        let mut q = Wide { hi: 0, lo: 0 };
+        let mut r = Wide { hi: 0, lo: 0 };
+        let mut i: u32 = 128;
+        while i > 0 {
+            i -= 1;
+            r = r.shl(1);
+            let bit = if i >= 64 { (n.hi >> ((i - 64) as u64)) & 1 } else { (n.lo >> (i as u64)) & 1 };
+            r.lo = r.lo | bit;
+            if r.ucmp(d) >= 0 {
+                r = r.sub(d);
+                if i >= 64 {
+                    q.hi = q.hi | (1u64 << ((i - 64) as u64));
+                } else {
+                    q.lo = q.lo | (1u64 << (i as u64));
+                }
+            }
+        }
+        return (q, r);
+    }
+
+    fn abs(self): Wide {
+        return if self.is_negative() { self.neg() } else { self };
+    }
+
+    /// Signed division, rounding toward zero.
+    pub fn div(self, o: Wide): Wide {
+        let (q, _) = Wide::udivrem(self.abs(), o.abs());
+        return if self.is_negative() != o.is_negative() { q.neg() } else { q };
+    }
+
+    /// Signed remainder (the sign of the dividend).
+    pub fn rem(self, o: Wide): Wide {
+        let (_, r) = Wide::udivrem(self.abs(), o.abs());
+        return if self.is_negative() { r.neg() } else { r };
+    }
+}

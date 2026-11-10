@@ -1,0 +1,622 @@
+// Module-level name resolution: `use` imports and item paths. A port of
+// crates/ln-sema/src/resolve.rs.
+
+use core::arena::List;
+use core::intern::Symbol;
+use crater::codes;
+use crater::defs::*;
+use crater::program::RefTarget;
+use crater::program::Ref;
+use crater::sema::{PendingUse, Sema};
+use crater::ty::{FloatTy, IntTy, Ty, TyKind, Types};
+use ln_ast::{Ident, Span, UseKind, UseTree};
+
+/// The name an item a macro expansion defines is bound under, unless it is
+/// `#[export]`ed: `#` cannot appear in an identifier, so only names from the
+/// same expansion (same context) find it.
+pub fn hidden_name(name: str, ctx: SyntaxCtx): String {
+    return core::fmt::format("{name}#{ctx.index}");
+}
+
+/// What a module-level path resolves to.
+#[derive(Eq)]
+pub enum ModRes {
+    Def(DefId),
+    Prim(Ty),
+}
+
+pub fn prim_type(types: &mut +Types, name: str): Option::<Ty> {
+    let k = if name == "bool" {
+        TyKind::Bool
+    } else if name == "char" {
+        TyKind::Char
+    } else if name == "str" {
+        TyKind::Str
+    } else if name == "String" {
+        TyKind::String
+    } else if name == "FmtArgs" {
+        TyKind::FmtArgs
+    } else if name == "f32" {
+        TyKind::Float(FloatTy::F32)
+    } else if name == "f64" {
+        TyKind::Float(FloatTy::F64)
+    } else {
+        match IntTy::from_name(name) {
+            Some(i) => TyKind::Int(i),
+            None => return None,
+        }
+    };
+    return Some(types.mk(k));
+}
+
+/// A resolved prefix of a path: what it names and how many segments it
+/// took.
+pub struct Prefix {
+    pub res: ModRes,
+    pub used: usize,
+}
+
+/// A flattened import: the module it is in, its path (`len` identifiers
+/// of `Sema::spans`-like storage: `p.idents` from `start`), the tree it
+/// came from, and whether it re-exports.
+struct FlatUse {
+    module: DefId,
+    path: List::<Ident>,
+    tree: UseTree,
+    is_pub: bool,
+}
+
+impl Sema {
+    /// The nearest enclosing non-block module.
+    pub fn normal_module(&self, m: DefId): DefId {
+        let mut m = m;
+        while self.p.mod_data(m).is_block {
+            m = self.p.mod_data(m).parent.unwrap();
+        }
+        return m;
+    }
+
+    /// Whether code in module `from` may see private items of module `owner`.
+    pub fn is_ancestor_or_self(&self, owner: DefId, from: DefId): bool {
+        let mut cur = Some(from);
+        while let Some(m) = cur {
+            if m == owner {
+                return true;
+            }
+            cur = self.p.mod_data(m).parent;
+        }
+        return false;
+    }
+
+    /// Look `name` up directly in module (or enum) `m`, including globs.
+    pub fn lookup_in(&self, m: DefId, name: Symbol, ns: Ns): Option::<Binding> {
+        let mut seen: [DefId; ..+] = [];
+        return self.lookup_in_rec(m, name, ns, &mut seen);
+    }
+
+    fn lookup_in_rec(&self, m: DefId, name: Symbol, ns: Ns, seen: &mut +[DefId; ..+]): Option::<Binding> {
+        if seen[..].contains(m) {
+            return None;
+        }
+        seen.push(m);
+        return match self.p.defs[m.index()].data {
+            DefData::Mod(md) => {
+                if let Some(b) = self.p.binding(m, ns, name) {
+                    return Some(b);
+                }
+                let mut g = md.first_glob;
+                while g != 0 {
+                    let glob = self.p.globs[(g - 1) as usize];
+                    if let Some(b) = self.lookup_in_rec(glob.target, name, ns, seen) {
+                        if b.is_pub || self.p.defs[glob.target.index()].kind == DefKind::Enum {
+                            return Some(Binding { def: b.def, is_pub: glob.is_pub, span: b.span });
+                        }
+                    }
+                    g = glob.next;
+                }
+                None
+            }
+            DefData::Adt(adt) => {
+                if !adt.is_enum {
+                    return None;
+                }
+                for v in self.p.variants.list(adt.variants) {
+                    if v.name == name {
+                        return Some(Binding { def: v.def, is_pub: true, span: v.span });
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+    }
+
+    /// Unqualified lookup from inside module `from`: block scopes, the
+    /// module itself, then the prelude, crate names and primitive types.
+    pub fn lookup_unqualified(&mut self, from: DefId, name: Symbol, ns: Ns): Option::<ModRes> {
+        let mut m = from;
+        loop {
+            if let Some(b) = self.lookup_in(m, name, ns) {
+                return Some(ModRes::Def(b.def));
+            }
+            let md = self.p.mod_data(m);
+            if md.is_block {
+                m = md.parent.unwrap();
+                continue;
+            }
+            break;
+        }
+        if let Some(prelude) = self.prelude {
+            if let Some(b) = self.lookup_in(prelude, name, ns) {
+                return Some(ModRes::Def(b.def));
+            }
+        }
+        if ns == Ns::Type {
+            // Craters by name: this crater's declared dependencies, then
+            // `core` and `std`, which every crater can see.
+            let krate = self.p.mod_data(from).krate;
+            if let Some(deps) = self.crater_deps.get(krate) {
+                for d in self.dep_roots.list(deps) {
+                    if d.name == name {
+                        return Some(ModRes::Def(d.def));
+                    }
+                }
+            }
+            let text = self.p.text(name);
+            if text == "core" || text == "std" {
+                for r in self.p.crate_roots {
+                    if r.name == name {
+                        return Some(ModRes::Def(r.def));
+                    }
+                }
+            }
+            let n = self.str_of(name);
+            if let Some(t) = prim_type(&mut self.p.types, n.as_str()) {
+                return Some(ModRes::Prim(t));
+            }
+        }
+        return None;
+    }
+
+    /// Unqualified lookup of an identifier, with hygiene (docs/design/macros.md
+    /// section 4). A name written by hand resolves from `from`. A name a
+    /// macro's body wrote resolves first among the items that same
+    /// expansion defined (bound under a hidden name, so nothing else sees
+    /// them), then where the macro is defined.
+    pub fn lookup_ident(&mut self, from: DefId, id: Ident, ns: Ns): Option::<ModRes> {
+        if id.ctx.is_root() {
+            return self.lookup_unqualified(from, id.name, ns);
+        }
+        let hidden = hidden_name(self.p.text(id.name), id.ctx);
+        let h = self.p.sym(hidden.as_str());
+        if let Some(r) = self.lookup_unqualified(from, h, ns) {
+            return Some(r);
+        }
+        let mark = self.marks[id.ctx.index as usize];
+        let at_def = Ident { name: id.name, span: id.span, ctx: mark.def_ctx };
+        return self.lookup_ident(mark.def_module, at_def, ns);
+    }
+
+    /// The module `crater`, `self` and `super` in a path are relative to:
+    /// for a name a macro's body wrote, the module the macro is defined in.
+    fn path_base(&self, from: DefId, first: Ident): DefId {
+        let mut from = from;
+        let mut ctx = first.ctx;
+        while !ctx.is_root() {
+            let mark = self.marks[ctx.index as usize];
+            from = mark.def_module;
+            ctx = mark.def_ctx;
+        }
+        return from;
+    }
+
+    /// Resolve the longest module-level prefix of `segs`. Returns the result
+    /// and how many segments were consumed; remaining segments are
+    /// type-relative (associated items). Reports errors.
+    pub fn resolve_prefix(&mut self, from: DefId, segs: [Ident; &], last_ns: Ns): Option::<Prefix> {
+        let first = segs[0];
+        let n_segs = segs.len();
+        let first_ns = if n_segs == 1 { last_ns } else { Ns::Type };
+        let base = self.path_base(from, first);
+        let first_s = self.str_of(first.name);
+        let first_text = first_s.as_str();
+        let mut cur = if first_text == "crater" {
+            self.p.mod_data(base).krate
+        } else if first_text == "self" && n_segs > 1 {
+            self.normal_module(base)
+        } else if first_text == "super" {
+            let m = self.normal_module(base);
+            match self.p.mod_data(m).parent {
+                Some(p) => p,
+                None => {
+                    self.error(codes::name::UNRESOLVED(), first.span, "`super` used in a crater root");
+                    self.emit();
+                    return None;
+                }
+            }
+        } else {
+            match self.lookup_ident(from, first, first_ns) {
+                Some(ModRes::Def(d)) => d,
+                Some(ModRes::Prim(t)) => return Some(Prefix { res: ModRes::Prim(t), used: 1 }),
+                None => {
+                    // A single segment might name a value while we looked for a
+                    // type or vice versa; let the caller decide.
+                    if n_segs == 1 {
+                        return None;
+                    }
+                    self.unresolved_diag(from, first, Ns::Type);
+                    self.emit();
+                    return None;
+                }
+            }
+        };
+        self.record(first.span, cur);
+        let mut i: usize = 1;
+        while i < n_segs {
+            let kind = self.p.defs[cur.index()].kind;
+            if kind != DefKind::Mod && kind != DefKind::Enum {
+                break;
+            }
+            let seg = segs[i];
+            let ns = if i + 1 == n_segs { last_ns } else { Ns::Type };
+            let other = match ns {
+                Ns::Type => Ns::Value,
+                Ns::Value => Ns::Type,
+                Ns::Macro => Ns::Type,
+            };
+            // Enum variants live in both namespaces. In a module, a name
+            // found only in the other namespace is still returned, so the
+            // caller can say "expected a value, found module `std::io`"
+            // instead of claiming that `io` does not exist.
+            let found = match self.lookup_in(cur, seg.name, ns) {
+                Some(b) => Some(b),
+                None => self.lookup_in(cur, seg.name, other),
+            };
+            let b = match found {
+                Some(b) => b,
+                None => {
+                    if kind == DefKind::Enum {
+                        // Possibly an associated function on the enum.
+                        break;
+                    }
+                    let what = self.def_name(cur);
+                    let sn = self.str_of(seg.name);
+                    self.error(codes::name::UNRESOLVED(), seg.span, "cannot find `{sn}` in `{what}`");
+                    self.emit();
+                    return None;
+                }
+            };
+            if kind == DefKind::Mod && !b.is_pub && !self.is_ancestor_or_self(cur, from) {
+                let d = self.p.defs[b.def.index()];
+                let sn = self.str_of(seg.name);
+                self.error(codes::name::PRIVATE(), seg.span, "{d.kind.describe()} `{sn}` is private");
+                self.secondary(d.span, "defined here");
+                self.help("mark it `pub` to use it from other modules");
+                self.emit();
+            }
+            cur = b.def;
+            self.record(seg.span, cur);
+            i += 1;
+        }
+        return Some(Prefix { res: ModRes::Def(cur), used: i });
+    }
+
+    /// Remember that the identifier at `span` names `def` (editor tooling).
+    pub fn record(&mut self, span: Span, def: DefId) {
+        self.p.refs.push(Ref { span, target: RefTarget::Def(def) });
+    }
+
+    /// Start building `name::unresolved` for `id` (the caller emits it).
+    pub fn unresolved_diag(&mut self, from: DefId, id: Ident, ns: Ns) {
+        let what = match ns {
+            Ns::Type => "type or module",
+            Ns::Value => "value",
+            Ns::Macro => "macro",
+        };
+        let n = self.str_of(id.name);
+        self.error(codes::name::UNRESOLVED(), id.span, "cannot find {what} `{n}` in this scope");
+        if n.as_str() == "crate" {
+            // Habit from Rust.
+            self.help("Lunar calls the root of the current program or library a crater: write `crater::`");
+            return;
+        }
+        if let Some(s) = self.suggest(from, id.name, ns) {
+            self.help("a similar name exists: `{s}`");
+        }
+    }
+
+    /// Edit-distance based suggestion from the module scope.
+    fn suggest(&self, from: DefId, name: Symbol, ns: Ns): Option::<String> {
+        let m = self.normal_module(from);
+        let text = self.p.text(name);
+        let limit = if text.len() / 3 > 1 { text.len() / 3 } else { 1 };
+        let mut best: Option::<(usize, Symbol)> = None;
+        for e in self.p.bindings.iter() {
+            let (k, _) = e;
+            let in_scope = k.ns == ns && (k.module == m || Some(k.module) == self.prelude);
+            if !in_scope {
+                continue;
+            }
+            let c = self.p.text(k.name);
+            // Names hidden by macro hygiene (`name#3`) are never suggested.
+            if c.contains("#") {
+                continue;
+            }
+            let dist = edit_distance(text, c);
+            let better = match best {
+                Some(b) => dist < b.0,
+                None => true,
+            };
+            if dist <= limit && better {
+                best = Some((dist, k.name));
+            }
+        }
+        return match best {
+            Some(b) => Some(String::from(self.p.text(b.1))),
+            None => None,
+        };
+    }
+
+    // ----- imports -----
+
+    pub fn resolve_imports(&mut self) {
+        let mut pending: [FlatUse; -..+] = [];
+        let n = self.pending_uses.len();
+        for i in 0..n {
+            let u = self.pending_uses[i];
+            let empty: [Ident; ..+] = [];
+            self.flatten_use(u.module, empty[..], u.tree, u.is_pub, &mut pending);
+        }
+        self.pending_uses.clear();
+        // Iterate to a fixpoint: imports may depend on other imports.
+        loop {
+            let mut progress = false;
+            let mut still: [FlatUse; -..+] = [];
+            for u in pending {
+                if self.try_import(u) {
+                    progress = true;
+                } else {
+                    still.push(u);
+                }
+            }
+            pending = still;
+            if !progress || pending.len() == 0 {
+                break;
+            }
+        }
+        for u in pending {
+            // Report through the normal resolver for a good message.
+            if u.path.len() == 0 {
+                continue;
+            }
+            let mut segs: [Ident; ..+] = [];
+            segs.extend(self.p.idents.list(u.path));
+            let joined = self.join(segs[..]);
+            match self.resolve_prefix(u.module, segs[..], Ns::Type) {
+                Some(_) => {
+                    let last = segs[segs.len() - 1];
+                    self.error(codes::name::UNRESOLVED(), last.span, "unresolved import `{joined}`");
+                    self.emit();
+                }
+                None => {
+                    if segs.len() == 1 {
+                        self.error(codes::name::UNRESOLVED(), u.tree.span, "unresolved import `{joined}`");
+                        self.emit();
+                    }
+                }
+            }
+        }
+    }
+
+    fn join(&self, segs: [Ident; &]): String {
+        let mut out = String::new();
+        for i in 0..segs.len() {
+            if i > 0 {
+                out.push_str("::");
+            }
+            out.push_str(self.p.text(segs[i].name));
+        }
+        return out;
+    }
+
+    /// Try to perform one flattened import; false if a prefix is not yet resolvable.
+    fn try_import(&mut self, u: FlatUse): bool {
+        let glob = match u.tree.kind {
+            UseKind::Glob => true,
+            _ => false,
+        };
+        if u.path.len() == 0 {
+            return true;
+        }
+        let mut path: [Ident; ..+] = [];
+        path.extend(self.p.idents.list(u.path));
+        // Silent resolution attempt, in every namespace the name exists in.
+        let target_ty = self.silent_resolve(u.module, path[..], Ns::Type);
+        if glob {
+            let target = match target_ty {
+                Some(t) => t,
+                None => return false,
+            };
+            self.add_glob(u.module, target, u.is_pub);
+            return true;
+        }
+        let v = self.silent_resolve(u.module, path[..], Ns::Value);
+        let mac = self.silent_resolve(u.module, path[..], Ns::Macro);
+        if target_ty.is_none() && v.is_none() && mac.is_none() {
+            return false;
+        }
+        self.add_import(u.module, path[..], u.tree, u.is_pub, target_ty, v, mac);
+        return true;
+    }
+
+    /// `use target::*` in module `m` (once per target), after its other
+    /// globs.
+    fn add_glob(&mut self, m: DefId, target: DefId, is_pub: bool) {
+        let mut md = self.p.mod_data(m);
+        let mut last: u32 = 0;
+        let mut g = md.first_glob;
+        while g != 0 {
+            let glob = self.p.globs[(g - 1) as usize];
+            if glob.target == target {
+                return;
+            }
+            last = g;
+            g = glob.next;
+        }
+        self.p.globs.push(Glob { module: m, target, is_pub, next: 0 });
+        let at = self.p.globs.len() as u32;
+        if last == 0 {
+            md.first_glob = at;
+            self.set_mod_data(m, md);
+        } else {
+            self.p.globs[(last - 1) as usize].next = at;
+        }
+    }
+
+    fn add_import(&mut self, m: DefId, path: [Ident; &], tree: UseTree, is_pub: bool, ty_def: Option::<DefId>, value_def: Option::<DefId>, macro_def: Option::<DefId>) {
+        let last = path[path.len() - 1];
+        let (local_name, span) = match tree.kind {
+            UseKind::Simple(Some(rename)) => (rename.name, rename.span),
+            _ => (last.name, last.span),
+        };
+        let nss = [Ns::Type, Ns::Value, Ns::Macro];
+        let defs = [ty_def, value_def, macro_def];
+        for k in 0..3 {
+            let ns = nss[k];
+            let def = match defs[k] {
+                Some(d) => d,
+                None => continue,
+            };
+            if let Some(prev) = self.p.binding(m, ns, local_name) {
+                if prev.def == def {
+                    continue;
+                }
+                let ln = self.str_of(local_name);
+                self.error(codes::name::DUPLICATE(), span, "`{ln}` is imported or defined multiple times");
+                self.secondary(prev.span, "previously bound here");
+                self.emit();
+                continue;
+            }
+            self.p.bindings.insert(BindKey { module: m, ns, name: local_name }, Binding { def, is_pub, span });
+        }
+    }
+
+    /// Resolve a full module-level path without reporting errors.
+    fn silent_resolve(&mut self, from: DefId, segs: [Ident; &], last_ns: Ns): Option::<DefId> {
+        let first = segs[0];
+        let first_ns = if segs.len() == 1 { last_ns } else { Ns::Type };
+        let base = self.path_base(from, first);
+        let first_s = self.str_of(first.name);
+        let first_text = first_s.as_str();
+        let mut cur = if first_text == "crater" {
+            self.p.mod_data(base).krate
+        } else if first_text == "self" {
+            self.normal_module(base)
+        } else if first_text == "super" {
+            self.p.mod_data(self.normal_module(base)).parent?
+        } else {
+            match self.lookup_ident(from, first, first_ns)? {
+                ModRes::Def(d) => d,
+                ModRes::Prim(_) => return None,
+            }
+        };
+        for i in 1..segs.len() {
+            let seg = segs[i];
+            let ns = if i + 1 == segs.len() { last_ns } else { Ns::Type };
+            let kind = self.p.defs[cur.index()].kind;
+            if kind != DefKind::Mod && kind != DefKind::Enum {
+                return None;
+            }
+            let b = match self.lookup_in(cur, seg.name, ns) {
+                Some(b) => b,
+                None => {
+                    if kind == DefKind::Enum {
+                        self.lookup_in(cur, seg.name, Ns::Value)?
+                    } else {
+                        return None;
+                    }
+                }
+            };
+            cur = b.def;
+        }
+        // `use a::b` where `b` is a value but we asked for a type: reject.
+        let kind = self.p.defs[cur.index()].kind;
+        let ok = match last_ns {
+            Ns::Type => match kind {
+                DefKind::Mod | DefKind::Struct | DefKind::Enum | DefKind::Trait | DefKind::TypeAlias | DefKind::Variant => true,
+                _ => false,
+            },
+            Ns::Value => match kind {
+                DefKind::Fn | DefKind::Const | DefKind::Static | DefKind::Struct | DefKind::Variant => true,
+                _ => false,
+            },
+            Ns::Macro => kind == DefKind::Macro,
+        };
+        if ok {
+            return Some(cur);
+        }
+        return None;
+    }
+
+    fn flatten_use(&mut self, m: DefId, prefix: [Ident; &], tree: UseTree, is_pub: bool, out: &mut +[FlatUse; -..+]) {
+        let mut full: [Ident; ..+] = [];
+        full.extend(prefix);
+        full.extend(self.p.ast.idents.list(tree.prefix));
+        match tree.kind {
+            UseKind::Nested(children) => {
+                for i in 0..children.len() {
+                    let c = self.p.ast.use_trees.list(children)[i];
+                    // `use a::{self}` imports `a` itself.
+                    let is_self = c.prefix.len() == 1 && self.p.text(self.p.ast.idents.list(c.prefix)[0].name) == "self" && match c.kind {
+                        UseKind::Simple(_) => true,
+                        _ => false,
+                    };
+                    if is_self {
+                        let path = self.p.idents.add_list(full[..]);
+                        out.push(FlatUse { module: m, path, tree: c, is_pub });
+                    } else {
+                        self.flatten_use(m, full[..], c, is_pub, out);
+                    }
+                }
+            }
+            _ => {
+                let path = self.p.idents.add_list(full[..]);
+                out.push(FlatUse { module: m, path, tree, is_pub });
+            }
+        }
+    }
+}
+
+pub fn edit_distance(a: str, b: str): usize {
+    let mut av: [char; ..+] = [];
+    for c in a.chars() {
+        av.push(c);
+    }
+    let mut bv: [char; ..+] = [];
+    for c in b.chars() {
+        bv.push(c);
+    }
+    let mut prev: [usize; -..+] = [];
+    for j in 0..bv.len() + 1 {
+        prev.push(j);
+    }
+    for i in 1..av.len() + 1 {
+        let mut cur: [usize; -..+] = [];
+        for _ in 0..bv.len() + 1 {
+            cur.push(i);
+        }
+        for j in 1..bv.len() + 1 {
+            let cost: usize = if av[i - 1] != bv[j - 1] { 1 } else { 0 };
+            let mut best = prev[j] + 1;
+            if cur[j - 1] + 1 < best {
+                best = cur[j - 1] + 1;
+            }
+            if prev[j - 1] + cost < best {
+                best = prev[j - 1] + cost;
+            }
+            cur[j] = best;
+        }
+        prev = cur;
+    }
+    return prev[bv.len()];
+}
