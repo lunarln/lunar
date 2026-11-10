@@ -5,7 +5,7 @@
 use core::intern::Symbol;
 use crater::defs::{DefId, Pred};
 use crater::program::Program;
-use crater::ty::{TraitRef, Ty, TyList};
+use crater::ty::{TraitRef, Ty, TyKind, TyList};
 
 /// How a trait method is implemented for a type.
 pub enum MethodImpl {
@@ -29,8 +29,56 @@ impl Program {
         panic("stub");
     }
 
+    /// Whether a value of `ty` owns a data stack (directly or in a field).
+    /// (Ported in full, so code generation can be tested before the rest of
+    /// this file is.)
     pub fn has_owner(&mut +self, ty: Ty): bool {
-        panic("stub");
+        return self.has_owner_rec(ty, 0);
+    }
+
+    fn has_owner_rec(&mut +self, ty: Ty, depth: u32): bool {
+        if depth > 64 {
+            return false;
+        }
+        return match self.types.kind(ty) {
+            TyKind::String => true,
+            TyKind::Array(_, k) => k.is_owner(),
+            TyKind::Tuple(ts) => {
+                for i in 0..ts.len() {
+                    let t = self.types.at(ts, i);
+                    if self.has_owner_rec(t, depth + 1) {
+                        return true;
+                    }
+                }
+                false
+            }
+            TyKind::Adt(id, args) => {
+                let adt = self.adt(id);
+                for vi in 0..adt.variants.len() {
+                    let v = self.variants.list(adt.variants)[vi];
+                    for fi in 0..v.fields.len() {
+                        let fty = self.fields.list(v.fields)[fi].ty;
+                        let t = self.types.subst(fty, args);
+                        if self.has_owner_rec(t, depth + 1) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            TyKind::Grow(t) => self.has_owner_rec(t, depth + 1),
+            TyKind::Closure(def, args) => {
+                let fs = self.closure_fields(def, args);
+                for i in 0..fs.len() {
+                    let t = self.types.at(fs, i);
+                    if self.has_owner_rec(t, depth + 1) {
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        };
     }
 
     pub fn could_own(&mut +self, ty: Ty, env: [Pred; &]): bool {

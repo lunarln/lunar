@@ -23,6 +23,8 @@ mod func;
 mod ops;
 #[cfg(test)]
 mod smoke;
+#[cfg(test)]
+mod e2e;
 
 use core::arena::List;
 use core::collections::HashMap;
