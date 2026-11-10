@@ -27,6 +27,10 @@ enum Root {
     /// The local variable itself: a closure that borrows a capture points
     /// at it.
     Slot(LocalId),
+    /// Whatever the argument of parameter `.0` points into: the caller's
+    /// data, which outlives the call. Tracked so that storing it into an
+    /// in-out argument can be checked against `kept`.
+    Arg(LocalId),
     /// A statement-scoped temporary.
     Temp,
 }
@@ -228,6 +232,12 @@ fn unreachable_expr(e: &Expr, diags: &mut Diagnostics) {
 pub fn check(p: &Program, body: &Body, env: &[crate::defs::Pred], diags: &mut Diagnostics) {
     let mut cx =
         Cx { p, body, env, diags, roots: HashMap::new(), reported: HashSet::new(), loop_exit: HashMap::new(), loop_head: HashMap::new(), held: Vec::new() };
+    // A parameter that can hold a view points into its caller's data.
+    for &l in &body.params {
+        if cx.has_view(&cx.local(l).ty) {
+            cx.roots.insert(l, [Root::Arg(l)].into());
+        }
+    }
     cx.compute_roots();
     cx.check_views_block(&body.block);
     if let Some(t) = &body.block.tail {
@@ -353,7 +363,7 @@ impl<'p> Cx<'p, '_> {
                 ExprKind::Temp(inner) => self.value_roots(inner),
                 _ => [Root::Temp].into(),
             },
-            Some(Root::Slot(_)) | None => Roots::new(),
+            Some(Root::Slot(_) | Root::Arg(_)) | None => Roots::new(),
         }
     }
 
@@ -429,6 +439,110 @@ impl<'p> Cx<'p, '_> {
         }
     }
 
+    /// Which parameters of what is called are `kept`, when known.
+    fn callee_kept(&self, c: &Callee) -> Option<Vec<bool>> {
+        let def = match c {
+            Callee::Fn { def, .. } | Callee::Intrinsic { def, .. } => *def,
+            Callee::Trait { trait_ref, method, .. } => self.p.trait_data(trait_ref.trait_id).methods.iter().find(|m| m.name == *method)?.def,
+            Callee::Indirect(_) | Callee::Value { .. } => return None,
+        };
+        Some(self.p.fn_data(def).sig.params.iter().map(|p| p.kept).collect())
+    }
+
+    /// What a call may store where: a view from a `kept` argument may end up
+    /// in any in-out argument that can hold one (`h.set(s)` doing
+    /// `self.rest = s`, or `push` onto an array of views), and a closure may
+    /// store any argument or capture into what it borrowed. Pairs of a local
+    /// and the roots it may gain.
+    fn call_flows(&self, callee: &Callee, args: &[Arg]) -> Vec<(LocalId, Roots)> {
+        let mut targets: Vec<LocalId> = Vec::new();
+        for a in args {
+            if let Arg::InOut(p) = a
+                && self.has_view(&p.ty)
+                && let Some(Root::Local(l)) = self.place_root(p)
+                && !self.place_through_view(p)
+            {
+                targets.push(l);
+            }
+        }
+        let mut given = Roots::new();
+        if let Callee::Value { callee: f, .. } = callee {
+            let fr = if f.is_place() { self.value_roots_of_place(f) } else { self.value_roots(f) };
+            for r in fr {
+                match r {
+                    Root::Slot(l) if self.has_view(&self.local(l).ty) => targets.push(l),
+                    Root::Slot(_) => {}
+                    // A view the closure captured by value.
+                    other => {
+                        given.insert(other);
+                    }
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Vec::new();
+        }
+        let kept = self.callee_kept(callee);
+        for (i, a) in args.iter().enumerate() {
+            if kept.as_ref().is_some_and(|k| !k.get(i).copied().unwrap_or(true)) {
+                continue;
+            }
+            match a {
+                Arg::Value(v) => given.extend(self.arg_roots(v)),
+                Arg::InOut(p) if self.has_view(&p.ty) => given.extend(self.value_roots_of_place(p)),
+                Arg::InOut(_) => {}
+            }
+        }
+        targets
+            .into_iter()
+            .filter_map(|l| {
+                let r: Roots = given.iter().copied().filter(|r| !matches!(r, Root::Local(x) | Root::Slot(x) | Root::Arg(x) if *x == l)).collect();
+                (!r.is_empty()).then_some((l, r))
+            })
+            .collect()
+    }
+
+    /// Whether local `l` is a parameter declared `kept`.
+    fn is_kept_param(&self, l: LocalId) -> bool {
+        match self.local(l).kind {
+            LocalKind::Param { index, .. } => self.p.fn_data(self.body.def).sig.params.get(index).is_some_and(|p| p.kept),
+            _ => false,
+        }
+    }
+
+    /// Storing a view with `roots` into in-out parameter `dest` hands it to
+    /// the caller: allowed for what `dest` already pointed into and for
+    /// `kept` parameters' data, never for this function's own locals.
+    fn check_store_into_param(&mut self, dest: LocalId, roots: &Roots, span: Span) {
+        for r in roots {
+            let (l, of_param) = match *r {
+                Root::Local(x) | Root::Slot(x) => (Some(x), matches!(self.local(x).kind, LocalKind::Param { owned: false, .. })),
+                Root::Arg(x) => (Some(x), true),
+                Root::Temp => (None, false),
+            };
+            if l == Some(dest) || l.is_some_and(|x| of_param && self.is_kept_param(x)) {
+                continue;
+            }
+            if !self.reported.insert((span, 9)) {
+                return;
+            }
+            let dn = self.local(dest).name.clone();
+            let d = match l {
+                Some(x) if of_param => {
+                    let n = self.local(x).name.clone();
+                    let ls = self.local(x).span;
+                    Diagnostic::error(borrow::ESCAPES_VIA_PARAM, span, format!("a view from parameter `{n}` may be stored into parameter `{dn}`"))
+                        .with_secondary(ls, format!("`{n}` is not declared `kept`, so callers do not expect `{dn}` to point into it"))
+                        .with_help(format!("declare it `kept {n}: ...`"))
+                }
+                _ => Diagnostic::error(borrow::ESCAPES_VIA_PARAM, span, format!("cannot store a view of a local value into parameter `{dn}`"))
+                    .with_note("the caller's data may outlive the value being viewed"),
+            };
+            self.err(d);
+            return;
+        }
+    }
+
     /// Roots contributed by a by-value argument: a borrowed owner handle (or
     /// fixed array) points into its owner.
     fn arg_roots(&self, v: &Expr) -> Roots {
@@ -460,6 +574,7 @@ impl<'p> Cx<'p, '_> {
     fn root_name(&self, r: Root) -> String {
         match r {
             Root::Local(l) | Root::Slot(l) => format!("`{}`", self.local(l).name),
+            Root::Arg(l) => format!("what `{}` points into", self.local(l).name),
             Root::Temp => "a temporary value".into(),
         }
     }
@@ -498,6 +613,8 @@ impl<'p> Cx<'p, '_> {
                         );
                     }
                 }
+                // The caller's data outlives every local.
+                Root::Arg(_) => {}
             }
         }
     }
@@ -513,6 +630,7 @@ impl<'p> Cx<'p, '_> {
                     LocalKind::Param { owned, .. } => !owned,
                     _ => false,
                 },
+                Root::Arg(_) => true,
                 Root::Slot(_) | Root::Temp => false,
             };
             if let Root::Slot(l) = r
@@ -581,16 +699,8 @@ impl<'p> Cx<'p, '_> {
                     match self.place_root(place) {
                         Some(Root::Local(l)) => {
                             if let LocalKind::Param { owned: false, .. } = self.local(l).kind {
-                                if !roots.is_empty() && self.reported.insert((value.span, 9)) {
-                                    let n = self.local(l).name.clone();
-                                    self.err(
-                                        Diagnostic::error(
-                                            borrow::ESCAPES_VIA_PARAM,
-                                            value.span,
-                                            format!("cannot store a view of a local value into parameter `{n}`"),
-                                        )
-                                        .with_note("the caller's data may outlive the value being viewed"),
-                                    );
+                                if !self.place_through_view(place) {
+                                    self.check_store_into_param(l, &roots, value.span);
                                 }
                             } else if !self.place_through_view(place) {
                                 self.check_store(l, &roots, value.span);
@@ -600,6 +710,16 @@ impl<'p> Cx<'p, '_> {
                             self.err(Diagnostic::error(borrow::ESCAPES_FUNCTION, value.span, "cannot store a view of a local value into a static"));
                         }
                         _ => {}
+                    }
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                visit_children(e, &mut |c| self.check_views(c));
+                for (l, roots) in self.call_flows(callee, args) {
+                    if let LocalKind::Param { owned: false, .. } = self.local(l).kind {
+                        self.check_store_into_param(l, &roots, e.span);
+                    } else {
+                        self.check_store(l, &roots, e.span);
                     }
                 }
             }
@@ -1152,6 +1272,7 @@ fn collect_assigns(e: &Expr, cx: &Cx, out: &mut Vec<(LocalId, Roots)>) {
                 }
             }
         }
+        ExprKind::Call { callee, args } => out.extend(cx.call_flows(callee, args)),
         ExprKind::Match { scrut, arms } => {
             // Bindings inside arms view whatever the scrutinee views.
             let r = if cx.has_view(&scrut.ty) { cx.value_roots_of_place(scrut) } else { Roots::new() };
@@ -1266,7 +1387,7 @@ impl Moves<'_, '_, '_> {
                     s.insert(p);
                 }
             }
-            Some(Root::Temp | Root::Slot(_)) => {}
+            Some(Root::Temp | Root::Slot(_) | Root::Arg(_)) => {}
             None => {
                 if self.cx.reported.insert((span, 6 << 27)) {
                     self.cx.err(Diagnostic::error(borrow::MOVE_OUT_OF_BORROW, span, "cannot move an owned value out of a static or through a pointer"));

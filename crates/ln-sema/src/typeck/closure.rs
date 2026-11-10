@@ -197,6 +197,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 inout: c.mode == ParamMode::InOut,
                 mutable: c.mode == ParamMode::InOut,
                 is_self: false,
+                // A call of a closure assumes it may store any argument (or
+                // capture) into anything it borrowed in-out.
+                kept: true,
                 span: Span::DUMMY,
             });
         }
@@ -209,6 +212,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 inout: m == ParamMode::InOut,
                 mutable: m == ParamMode::InOut,
                 is_self: false,
+                kept: true,
                 span: Span::DUMMY,
             });
         }

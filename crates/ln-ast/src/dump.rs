@@ -206,7 +206,8 @@ impl Dump {
             ParamKind::Named(i) => ident(i),
             ParamKind::Wild => "_".to_string(),
         };
-        let head = format!("param {}{}{} {kind} {}", mode(p.mode), if p.is_mut { " mut" } else { "" }, if p.self_grow { " grow" } else { "" }, at(p.span));
+        let flags = format!("{}{}{}", if p.kept { " kept" } else { "" }, if p.is_mut { " mut" } else { "" }, if p.self_grow { " grow" } else { "" });
+        let head = format!("param {}{flags} {kind} {}", mode(p.mode), at(p.span));
         self.node(head, |d| {
             if let Some(t) = &p.ty {
                 d.ty(t);

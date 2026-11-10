@@ -224,6 +224,9 @@ pub struct Param {
     /// `&mut +self`: the receiver only grows (it is never shrunk or
     /// replaced).
     pub self_grow: bool,
+    /// `kept x: T`: the function may store views from this argument into
+    /// its in-out arguments.
+    pub kept: bool,
     pub span: Span,
 }
 

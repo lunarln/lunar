@@ -153,6 +153,9 @@ pub struct Param {
     /// `mut x: T`: an owned parameter the function may change.
     pub mutable: bool,
     pub is_self: bool,
+    /// `kept x: T`: views from this argument may be stored into the
+    /// function's in-out arguments.
+    pub kept: bool,
     pub span: Span,
 }
 

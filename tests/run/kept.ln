@@ -1,0 +1,39 @@
+// `kept`: a function that stores a view argument into an in-out argument
+// says so, and callers track where the view went.
+
+struct Cursor {
+    rest: str,
+    seen: usize,
+}
+
+impl Cursor {
+    // Stores `s` in `self`: `kept`.
+    fn reset(&mut self, kept s: str) {
+        self.rest = s;
+        self.seen = 0;
+    }
+
+    // Only reads `s`: not kept, so callers may pass a short-lived view.
+    fn count(&mut self, s: str) {
+        self.seen += s.len();
+    }
+
+    fn advance(&mut self) {
+        // Reslicing its own view is always fine.
+        if self.rest.len() > 0 {
+            self.rest = self.rest[1..];
+        }
+    }
+}
+
+fn main() {
+    let text = String::from("hello");
+    let mut c = Cursor { rest: "", seen: 0 };
+    c.reset(text.as_str());
+    {
+        let tmp = String::from("temporary");
+        c.count(tmp.as_str());
+    }
+    c.advance();
+    println("{c.rest} {c.seen}");
+}

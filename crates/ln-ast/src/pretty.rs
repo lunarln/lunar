@@ -120,7 +120,12 @@ pub fn generics(g: &Generics) -> String {
 }
 
 pub fn param(p: &Param) -> String {
-    let mut_kw = if p.is_mut { "mut " } else { "" };
+    let mut_kw = match (p.kept, p.is_mut) {
+        (true, true) => "kept mut ",
+        (true, false) => "kept ",
+        (false, true) => "mut ",
+        (false, false) => "",
+    };
     match &p.kind {
         ParamKind::SelfParam => match p.mode {
             ParamMode::Take => format!("{mut_kw}self"),
@@ -129,7 +134,7 @@ pub fn param(p: &Param) -> String {
             ParamMode::InOut => "&mut self".into(),
         },
         ParamKind::Named(name) => format!("{mut_kw}{}: {}{}", name.name, mode_prefix(p.mode), p.ty.as_ref().map(ty).unwrap_or_default()),
-        ParamKind::Wild => format!("_: {}{}", mode_prefix(p.mode), p.ty.as_ref().map(ty).unwrap_or_default()),
+        ParamKind::Wild => format!("{mut_kw}_: {}{}", mode_prefix(p.mode), p.ty.as_ref().map(ty).unwrap_or_default()),
     }
 }
 

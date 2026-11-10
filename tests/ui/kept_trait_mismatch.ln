@@ -1,0 +1,17 @@
+// error: trait::signature
+// An implementation may not keep what its trait does not.
+struct Holder {
+    rest: str,
+}
+
+trait Set {
+    fn set(&mut self, s: str);
+}
+
+impl Set for Holder {
+    fn set(&mut self, kept s: str) {
+        self.rest = s;
+    }
+}
+
+fn main() {}

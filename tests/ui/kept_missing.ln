@@ -1,0 +1,17 @@
+// error: borrow::escapes_via_param
+// Storing a view argument into `self` needs `kept s: str`.
+struct Holder {
+    rest: str,
+}
+
+impl Holder {
+    fn set(&mut self, s: str) {
+        self.rest = s;
+    }
+}
+
+fn main() {
+    let mut h = Holder { rest: "" };
+    h.set("x");
+    println("{h.rest}");
+}

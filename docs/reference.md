@@ -246,6 +246,18 @@ How a function receives each argument is part of its signature:
 | `x: &T`, `&self` | **borrows**: the caller keeps ownership; the function can read it but not keep or move it |
 | `x: &mut T`, `&mut self` | **in-out**: the caller passes a mutable place and sees the changes |
 | `x: &mut +T`, `&mut +self` | in-out, and only grows it (see above) |
+| `kept x: T` (any mode) | the function may store views from this argument into its in-out arguments |
+
+A function that stores a view it was given (a `str`, a slice, or a view
+into a borrowed owner) into one of its in-out arguments declares that
+parameter `kept`: `fn set(&mut self, kept s: str) { self.rest = s; }`.
+Callers then treat the in-out arguments of the call as pointing into the
+kept arguments, so `h.set(s.as_str())` makes `h` borrow from `s`. Storing a
+view from a parameter that is not `kept` is
+`err(borrow::escapes_via_param)`; arguments that are not kept may be
+short-lived. An implementation of a trait method may only keep what the
+trait's declaration keeps. Closures are treated as keeping every argument
+and capture. `kept` is a word only in this position.
 
 Call sites say what happens to each argument. A plain argument is moved
 (or copied), `&x` lends `x` to a borrowing parameter, and `&mut x` lends it

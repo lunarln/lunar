@@ -1,0 +1,20 @@
+// error: borrow::outlives_root
+// `set` keeps the view, so `h` would point into `s` after it is freed.
+struct Holder {
+    rest: str,
+}
+
+impl Holder {
+    fn set(&mut self, kept s: str) {
+        self.rest = s;
+    }
+}
+
+fn main() {
+    let mut h = Holder { rest: "" };
+    {
+        let s = String::from("dangling");
+        h.set(s.as_str());
+    }
+    println("{h.rest}");
+}

@@ -537,7 +537,7 @@ impl<'a> Sema<'a> {
                 ast::ParamKind::Named(n) => n.ctx,
                 _ => ast::SyntaxCtx::ROOT,
             };
-            params.push(Param { name: pname, ctx, ty, mode: p.mode, inout: p.mode == ast::ParamMode::InOut, mutable: p.is_mut, is_self, span: p.span });
+            params.push(Param { name: pname, ctx, ty, mode: p.mode, inout: p.mode == ast::ParamMode::InOut, mutable: p.is_mut, is_self, kept: p.kept, span: p.span });
         }
         // `impl Trait` is allowed in the return type of functions with a
         // body that are not part of a trait (a trait's implementations
@@ -1114,6 +1114,13 @@ impl<'a> Sema<'a> {
                 self.err(
                     Diagnostic::error(trait_::SIGNATURE, ip.span, format!("parameter type mismatch with trait: expected `{wm}{w}`, found `{gm}{g}`"))
                         .with_secondary(tp.span, "trait parameter declared here"),
+                );
+            } else if ip.kept && !tp.kept {
+                // Callers through the trait would not know the view is kept.
+                self.err(
+                    Diagnostic::error(trait_::SIGNATURE, ip.span, format!("parameter `{}` is `kept`, but the trait's is not", ip.name))
+                        .with_secondary(tp.span, "trait parameter declared here")
+                        .with_help("mark the trait's parameter `kept` too, or do not store views from this argument"),
                 );
             }
         }

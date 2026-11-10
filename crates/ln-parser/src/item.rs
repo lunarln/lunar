@@ -302,19 +302,26 @@ impl P<'_, '_, '_> {
             let mode = if self.k.eat(T::Mut) { ParamMode::InOut } else { ParamMode::Borrow };
             let self_grow = self.k.eat(T::Plus);
             self.k.expect(T::SelfValue)?;
-            return Ok(Param { is_mut: false, mode, kind: ParamKind::SelfParam, ty: None, self_grow, span: self.span_from(start) });
+            return Ok(Param { is_mut: false, mode, kind: ParamKind::SelfParam, ty: None, self_grow, kept: false, span: self.span_from(start) });
+        }
+        // `kept x: T`. `kept` is a word only here, so a parameter may still
+        // be named `kept`.
+        let kept = matches!(self.k.nth_tok(0), Some(t) if t.kind == T::Ident && self.tok_text(t) == "kept")
+            && matches!(self.k.nth(1), Some(T::Ident | T::Mut | T::Placeholder));
+        if kept {
+            self.k.bump();
         }
         let is_mut = self.k.eat(T::Mut);
-        if self.k.eat(T::SelfValue) {
+        if !kept && self.k.eat(T::SelfValue) {
             let ty = if self.k.eat(T::Colon) { Some(self.ty()?) } else { None };
-            return Ok(Param { is_mut, mode: ParamMode::Take, kind: ParamKind::SelfParam, ty, self_grow: false, span: self.span_from(start) });
+            return Ok(Param { is_mut, mode: ParamMode::Take, kind: ParamKind::SelfParam, ty, self_grow: false, kept: false, span: self.span_from(start) });
         }
         let kind = if self.k.eat(T::Placeholder) { ParamKind::Wild } else { ParamKind::Named(self.ident()?) };
         self.k.expect(T::Colon)?;
         // `x: &T` borrows, `x: &mut T` is in-out, `x: T` takes ownership.
         let mode = if self.k.eat(T::Amp) { if self.k.eat(T::Mut) { ParamMode::InOut } else { ParamMode::Borrow } } else { ParamMode::Take };
         let ty = self.ty()?;
-        Ok(Param { is_mut, mode, kind, ty: Some(ty), self_grow: false, span: self.span_from(start) })
+        Ok(Param { is_mut, mode, kind, ty: Some(ty), self_grow: false, kept, span: self.span_from(start) })
     }
 
     fn struct_decl(&mut self) -> PResult<StructDecl> {
