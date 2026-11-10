@@ -1113,7 +1113,22 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
     /// moved owner values are zeroed in the source.
     pub fn bind_pat(&mut self, pat: &Pat, ptr: PointerValue<'ctx>, ty: &Ty, null_moves: bool) {
         match &pat.kind {
-            PatKind::Wild | PatKind::Lit(_) | PatKind::Range { .. } | PatKind::Or(_) => {}
+            PatKind::Wild | PatKind::Lit(_) | PatKind::Range { .. } => {}
+            PatKind::Or(alts) => {
+                if !binds(pat) {
+                    return;
+                }
+                // Every alternative binds the same variables: their drops
+                // are registered once, from the first.
+                let mark = self.cleanups.len();
+                let mut first = None;
+                self.through_matching_alt(alts, ptr, ty, &mut |fc, a| {
+                    fc.bind_pat(a, ptr, ty, null_moves);
+                    let regs = fc.cleanups.split_off(mark);
+                    first.get_or_insert(regs);
+                });
+                self.cleanups.extend(first.unwrap_or_default());
+            }
             PatKind::Binding { local, mode, sub } => {
                 let v = self.load(ptr, ty);
                 let slot = self.locals[local.0 as usize].unwrap();
@@ -1175,8 +1190,29 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
                     self.null_moves(p, fp, &ft);
                 }
             }
+            PatKind::Or(alts) if binds(pat) => {
+                self.through_matching_alt(alts, ptr, ty, &mut |fc, a| fc.null_moves(a, ptr, ty));
+            }
             _ => {}
         }
+    }
+
+    /// Run `f` on the alternative of a `|` pattern that the value at `ptr`
+    /// matches (the first that does: the pattern is known to match).
+    fn through_matching_alt(&mut self, alts: &[Pat], ptr: PointerValue<'ctx>, ty: &Ty, f: &mut dyn FnMut(&mut Self, &Pat)) {
+        let done = self.block_named("or_bound");
+        for (i, a) in alts.iter().enumerate() {
+            let next = (i + 1 < alts.len()).then(|| self.block_named("or_bind_next"));
+            if let Some(next) = next {
+                self.test_pat(a, ptr, ty, next);
+            }
+            f(self, a);
+            self.cg.b.build_unconditional_branch(done).unwrap();
+            if let Some(next) = next {
+                self.cg.b.position_at_end(next);
+            }
+        }
+        self.cg.b.position_at_end(done);
     }
 
     #[allow(dead_code)]
@@ -1185,5 +1221,15 @@ impl<'a, 'ctx, 'p> FnCg<'a, 'ctx, 'p> {
             ConstVal::Int(i) => *i,
             _ => 0,
         }
+    }
+}
+
+/// Whether `p` binds a variable.
+fn binds(p: &Pat) -> bool {
+    match &p.kind {
+        PatKind::Binding { .. } => true,
+        PatKind::Tuple(ps) | PatKind::Or(ps) => ps.iter().any(binds),
+        PatKind::Adt { fields, .. } => fields.iter().any(|(_, p)| binds(p)),
+        PatKind::Wild | PatKind::Lit(_) | PatKind::Range { .. } => false,
     }
 }

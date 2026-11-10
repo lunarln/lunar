@@ -1,7 +1,7 @@
 # type::bad_pattern: a pattern does not fit the shape of the value
 
-A pattern was written that cannot match the type being matched, or uses a
-form the compiler does not support. This error is reported when:
+A pattern was written that cannot match the type being matched. This error
+is reported when:
 
 * a variant or struct with fields is matched by its bare name, as in
   `Shape::Circle` instead of `Shape::Circle(r)` or `Shape::Circle(..)`;
@@ -14,8 +14,7 @@ form the compiler does not support. This error is reported when:
 * a path pattern names something other than a unit variant, unit struct or
   constant;
 * a range pattern (`'a'..='z'`) is used on a type other than an integer or
-  `char`;
-* an `|` pattern binds variables, which is not supported yet.
+  `char`.
 
 ## Erroneous example
 

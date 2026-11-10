@@ -82,6 +82,8 @@ codes! {
         NOT_A_TRAIT = "not_a_trait",
         MODULE_FILE = "module_file",
         BAD_SELF = "bad_self",
+        UNBOUND_IN_ALTERNATIVE = "unbound_in_alternative",
+        INCONSISTENT_BINDING = "inconsistent_binding",
     }
     trait_ ("trait") => {
         DULL_IMPL = "dull_impl",

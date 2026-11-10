@@ -1246,7 +1246,9 @@ fn pat_bindings(p: &Pat, out: &mut Vec<LocalId>) {
                 pat_bindings(s, out);
             }
         }
-        PatKind::Tuple(ps) | PatKind::Or(ps) => ps.iter().for_each(|p| pat_bindings(p, out)),
+        PatKind::Tuple(ps) => ps.iter().for_each(|p| pat_bindings(p, out)),
+        // Every alternative binds the same variables.
+        PatKind::Or(ps) => ps.iter().take(1).for_each(|p| pat_bindings(p, out)),
         PatKind::Adt { fields, .. } => fields.iter().for_each(|(_, p)| pat_bindings(p, out)),
         _ => {}
     }

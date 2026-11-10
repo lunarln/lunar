@@ -1052,7 +1052,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         }
         self.push_scope(None);
         let p = self.check_pat(pat, &st, false);
-        if p.is_irrefutable(&|d| self.s.p.is_enum(d)) {
+        if self.pat_covers(&p, &st) {
             self.err(
                 Diagnostic::warning(lint::IRREFUTABLE_LET_ELSE, pat.span, "this pattern always matches, so the `else` block never runs")
                     .with_help("remove the `else` block"),
@@ -1088,7 +1088,7 @@ impl<'s, 'a> FnCtx<'s, 'a> {
         };
         let t = declared.or_else(|| init.as_ref().map(|i| i.ty.clone())).unwrap_or(Ty::Error);
         let p = self.check_pat(pat, &t, true);
-        if !p.is_irrefutable(&|d| self.s.p.is_enum(d)) {
+        if !self.pat_covers(&p, &t) {
             self.err(
                 Diagnostic::error(tyc::NON_EXHAUSTIVE, pat.span, "refutable pattern in `let`")
                     .with_help("handle the other cases with `let .. else { .. }`, `if let` or `match`"),
