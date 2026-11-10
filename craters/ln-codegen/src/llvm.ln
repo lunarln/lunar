@@ -1,0 +1,277 @@
+// Bindings to the LLVM-C API (LLVM 20), for what code generation uses.
+// Every LLVM object is an opaque pointer; the aliases only document which
+// kind a function expects. Enumerations are passed as `u32`, `LLVMBool` as
+// `i32`, and strings as NUL-terminated `*u8` (see `z` and
+// `core::ffi::c_string`).
+
+/// `LLVMContextRef`, `LLVMModuleRef`, ...: opaque handles.
+pub type ContextRef = *mut u8;
+pub type ModuleRef = *mut u8;
+pub type BuilderRef = *mut u8;
+pub type TypeRef = *mut u8;
+pub type ValueRef = *mut u8;
+pub type BasicBlockRef = *mut u8;
+pub type TargetRef = *mut u8;
+pub type TargetMachineRef = *mut u8;
+pub type TargetDataRef = *mut u8;
+pub type PassBuilderOptionsRef = *mut u8;
+pub type ErrorRef = *mut u8;
+pub type AttributeRef = *mut u8;
+pub type UseRef = *mut u8;
+
+// ----- LLVMLinkage -----
+pub const EXTERNAL_LINKAGE: u32 = 0;
+pub const INTERNAL_LINKAGE: u32 = 8;
+pub const PRIVATE_LINKAGE: u32 = 9;
+
+// ----- LLVMTypeKind -----
+pub const VOID_TYPE_KIND: u32 = 0;
+
+// ----- LLVMIntPredicate -----
+pub const INT_EQ: u32 = 32;
+pub const INT_NE: u32 = 33;
+pub const INT_UGT: u32 = 34;
+pub const INT_UGE: u32 = 35;
+pub const INT_ULT: u32 = 36;
+pub const INT_ULE: u32 = 37;
+pub const INT_SGT: u32 = 38;
+pub const INT_SGE: u32 = 39;
+pub const INT_SLT: u32 = 40;
+pub const INT_SLE: u32 = 41;
+
+// ----- LLVMRealPredicate -----
+pub const REAL_OEQ: u32 = 1;
+pub const REAL_OGT: u32 = 2;
+pub const REAL_OGE: u32 = 3;
+pub const REAL_OLT: u32 = 4;
+pub const REAL_OLE: u32 = 5;
+pub const REAL_UNE: u32 = 14;
+
+// ----- LLVMVerifierFailureAction -----
+pub const RETURN_STATUS_ACTION: u32 = 2;
+
+// ----- LLVMCodeGenOptLevel -----
+pub const CODEGEN_LEVEL_NONE: u32 = 0;
+pub const CODEGEN_LEVEL_LESS: u32 = 1;
+pub const CODEGEN_LEVEL_DEFAULT: u32 = 2;
+pub const CODEGEN_LEVEL_AGGRESSIVE: u32 = 3;
+
+// ----- LLVMRelocMode, LLVMCodeModel, LLVMCodeGenFileType -----
+pub const RELOC_PIC: u32 = 2;
+pub const CODE_MODEL_DEFAULT: u32 = 0;
+pub const OBJECT_FILE: u32 = 1;
+
+// ----- LLVMUnnamedAddr -----
+pub const GLOBAL_UNNAMED_ADDR: u32 = 2;
+
+/// `LLVMAttributeFunctionIndex` (`~0U`).
+pub const ATTRIBUTE_FUNCTION_INDEX: u32 = 4294967295;
+
+#[link(name = "LLVM-C")]
+extern "C" {
+    // ----- messages -----
+    pub fn LLVMDisposeMessage(msg: *mut u8);
+
+    // ----- contexts and modules -----
+    pub fn LLVMContextCreate(): ContextRef;
+    pub fn LLVMContextDispose(c: ContextRef);
+    pub fn LLVMModuleCreateWithNameInContext(name: *u8, c: ContextRef): ModuleRef;
+    pub fn LLVMDisposeModule(m: ModuleRef);
+    pub fn LLVMSetTarget(m: ModuleRef, triple: *u8);
+    pub fn LLVMSetModuleDataLayout(m: ModuleRef, td: TargetDataRef);
+    pub fn LLVMPrintModuleToString(m: ModuleRef): *mut u8;
+    pub fn LLVMPrintModuleToFile(m: ModuleRef, filename: *u8, err: *mut *mut u8): i32;
+    pub fn LLVMVerifyModule(m: ModuleRef, action: u32, out: *mut *mut u8): i32;
+
+    // ----- targets -----
+    pub fn LLVMInitializeX86TargetInfo();
+    pub fn LLVMInitializeX86Target();
+    pub fn LLVMInitializeX86TargetMC();
+    pub fn LLVMInitializeX86AsmPrinter();
+    pub fn LLVMInitializeX86AsmParser();
+    pub fn LLVMInitializeAArch64TargetInfo();
+    pub fn LLVMInitializeAArch64Target();
+    pub fn LLVMInitializeAArch64TargetMC();
+    pub fn LLVMInitializeAArch64AsmPrinter();
+    pub fn LLVMInitializeAArch64AsmParser();
+    pub fn LLVMGetDefaultTargetTriple(): *mut u8;
+    pub fn LLVMGetTargetFromTriple(triple: *u8, t: *mut TargetRef, err: *mut *mut u8): i32;
+    pub fn LLVMCreateTargetMachine(t: TargetRef, triple: *u8, cpu: *u8, features: *u8, level: u32, reloc: u32, code_model: u32): TargetMachineRef;
+    pub fn LLVMDisposeTargetMachine(tm: TargetMachineRef);
+    pub fn LLVMCreateTargetDataLayout(tm: TargetMachineRef): TargetDataRef;
+    pub fn LLVMDisposeTargetData(td: TargetDataRef);
+    pub fn LLVMABISizeOfType(td: TargetDataRef, t: TypeRef): u64;
+    pub fn LLVMABIAlignmentOfType(td: TargetDataRef, t: TypeRef): u32;
+    pub fn LLVMTargetMachineEmitToFile(tm: TargetMachineRef, m: ModuleRef, filename: *u8, file_type: u32, err: *mut *mut u8): i32;
+
+    // ----- optimization -----
+    pub fn LLVMCreatePassBuilderOptions(): PassBuilderOptionsRef;
+    pub fn LLVMDisposePassBuilderOptions(o: PassBuilderOptionsRef);
+    pub fn LLVMRunPasses(m: ModuleRef, passes: *u8, tm: TargetMachineRef, o: PassBuilderOptionsRef): ErrorRef;
+    pub fn LLVMGetErrorMessage(e: ErrorRef): *mut u8;
+    pub fn LLVMDisposeErrorMessage(msg: *mut u8);
+
+    // ----- types -----
+    pub fn LLVMInt1TypeInContext(c: ContextRef): TypeRef;
+    pub fn LLVMInt8TypeInContext(c: ContextRef): TypeRef;
+    pub fn LLVMInt16TypeInContext(c: ContextRef): TypeRef;
+    pub fn LLVMInt32TypeInContext(c: ContextRef): TypeRef;
+    pub fn LLVMInt64TypeInContext(c: ContextRef): TypeRef;
+    pub fn LLVMFloatTypeInContext(c: ContextRef): TypeRef;
+    pub fn LLVMDoubleTypeInContext(c: ContextRef): TypeRef;
+    pub fn LLVMVoidTypeInContext(c: ContextRef): TypeRef;
+    pub fn LLVMPointerTypeInContext(c: ContextRef, address_space: u32): TypeRef;
+    pub fn LLVMStructTypeInContext(c: ContextRef, elems: *TypeRef, n: u32, packed: i32): TypeRef;
+    pub fn LLVMStructCreateNamed(c: ContextRef, name: *u8): TypeRef;
+    pub fn LLVMStructSetBody(st: TypeRef, elems: *TypeRef, n: u32, packed: i32);
+    pub fn LLVMArrayType2(elem: TypeRef, n: u64): TypeRef;
+    pub fn LLVMFunctionType(ret: TypeRef, params: *TypeRef, n: u32, variadic: i32): TypeRef;
+    pub fn LLVMTypeOf(v: ValueRef): TypeRef;
+    pub fn LLVMGetTypeKind(t: TypeRef): u32;
+    pub fn LLVMGetIntTypeWidth(t: TypeRef): u32;
+    pub fn LLVMGetReturnType(fn_ty: TypeRef): TypeRef;
+    pub fn LLVMGlobalGetValueType(g: ValueRef): TypeRef;
+
+    // ----- constants -----
+    pub fn LLVMConstInt(t: TypeRef, v: u64, sign_extend: i32): ValueRef;
+    pub fn LLVMConstReal(t: TypeRef, v: f64): ValueRef;
+    pub fn LLVMConstNull(t: TypeRef): ValueRef;
+    pub fn LLVMConstAllOnes(t: TypeRef): ValueRef;
+    pub fn LLVMConstPointerNull(t: TypeRef): ValueRef;
+    pub fn LLVMGetUndef(t: TypeRef): ValueRef;
+    pub fn LLVMConstStringInContext2(c: ContextRef, s: *u8, len: usize, dont_null_terminate: i32): ValueRef;
+    pub fn LLVMConstNamedStruct(t: TypeRef, vals: *ValueRef, n: u32): ValueRef;
+    pub fn LLVMConstArray2(elem: TypeRef, vals: *ValueRef, n: u64): ValueRef;
+    pub fn LLVMConstIntToPtr(v: ValueRef, t: TypeRef): ValueRef;
+    pub fn LLVMIsAConstantInt(v: ValueRef): ValueRef;
+    pub fn LLVMConstIntGetZExtValue(v: ValueRef): u64;
+
+    // ----- globals and functions -----
+    pub fn LLVMAddGlobal(m: ModuleRef, t: TypeRef, name: *u8): ValueRef;
+    pub fn LLVMSetInitializer(g: ValueRef, v: ValueRef);
+    pub fn LLVMSetGlobalConstant(g: ValueRef, is_constant: i32);
+    pub fn LLVMSetLinkage(g: ValueRef, linkage: u32);
+    pub fn LLVMSetUnnamedAddress(g: ValueRef, addr: u32);
+    pub fn LLVMAddFunction(m: ModuleRef, name: *u8, fn_ty: TypeRef): ValueRef;
+    pub fn LLVMGetNamedFunction(m: ModuleRef, name: *u8): ValueRef;
+    pub fn LLVMGetParam(f: ValueRef, i: u32): ValueRef;
+    pub fn LLVMGetEnumAttributeKindForName(name: *u8, len: usize): u32;
+    pub fn LLVMCreateEnumAttribute(c: ContextRef, kind: u32, v: u64): AttributeRef;
+    pub fn LLVMAddAttributeAtIndex(f: ValueRef, idx: u32, a: AttributeRef);
+    pub fn LLVMLookupIntrinsicID(name: *u8, len: usize): u32;
+    pub fn LLVMGetIntrinsicDeclaration(m: ModuleRef, id: u32, tys: *TypeRef, n: usize): ValueRef;
+
+    // ----- basic blocks and instructions -----
+    pub fn LLVMAppendBasicBlockInContext(c: ContextRef, f: ValueRef, name: *u8): BasicBlockRef;
+    pub fn LLVMGetFirstBasicBlock(f: ValueRef): BasicBlockRef;
+    pub fn LLVMGetFirstInstruction(bb: BasicBlockRef): ValueRef;
+    pub fn LLVMGetNextInstruction(i: ValueRef): ValueRef;
+    pub fn LLVMGetBasicBlockTerminator(bb: BasicBlockRef): ValueRef;
+    pub fn LLVMBasicBlockAsValue(bb: BasicBlockRef): ValueRef;
+    pub fn LLVMGetFirstUse(v: ValueRef): UseRef;
+
+    // ----- builders -----
+    pub fn LLVMCreateBuilderInContext(c: ContextRef): BuilderRef;
+    pub fn LLVMDisposeBuilder(b: BuilderRef);
+    pub fn LLVMPositionBuilderAtEnd(b: BuilderRef, bb: BasicBlockRef);
+    pub fn LLVMPositionBuilderBefore(b: BuilderRef, i: ValueRef);
+    pub fn LLVMGetInsertBlock(b: BuilderRef): BasicBlockRef;
+
+    // ----- terminators -----
+    pub fn LLVMBuildRetVoid(b: BuilderRef): ValueRef;
+    pub fn LLVMBuildRet(b: BuilderRef, v: ValueRef): ValueRef;
+    pub fn LLVMBuildBr(b: BuilderRef, dest: BasicBlockRef): ValueRef;
+    pub fn LLVMBuildCondBr(b: BuilderRef, c: ValueRef, then: BasicBlockRef, else_: BasicBlockRef): ValueRef;
+    pub fn LLVMBuildSwitch(b: BuilderRef, v: ValueRef, else_: BasicBlockRef, num_cases: u32): ValueRef;
+    pub fn LLVMAddCase(switch: ValueRef, on: ValueRef, dest: BasicBlockRef);
+    pub fn LLVMBuildUnreachable(b: BuilderRef): ValueRef;
+
+    // ----- arithmetic -----
+    pub fn LLVMBuildAdd(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildSub(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildMul(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildUDiv(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildSDiv(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildURem(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildSRem(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildShl(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildLShr(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildAShr(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildAnd(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildOr(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildXor(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildNot(b: BuilderRef, v: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildFAdd(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildFSub(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildFMul(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildFDiv(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildFRem(b: BuilderRef, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildFNeg(b: BuilderRef, v: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildICmp(b: BuilderRef, pred: u32, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildFCmp(b: BuilderRef, pred: u32, l: ValueRef, r: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildSelect(b: BuilderRef, c: ValueRef, then: ValueRef, else_: ValueRef, name: *u8): ValueRef;
+
+    // ----- memory -----
+    pub fn LLVMBuildAlloca(b: BuilderRef, t: TypeRef, name: *u8): ValueRef;
+    pub fn LLVMBuildLoad2(b: BuilderRef, t: TypeRef, p: ValueRef, name: *u8): ValueRef;
+    pub fn LLVMBuildStore(b: BuilderRef, v: ValueRef, p: ValueRef): ValueRef;
+    pub fn LLVMBuildGEP2(b: BuilderRef, t: TypeRef, p: ValueRef, indices: *ValueRef, n: u32, name: *u8): ValueRef;
+    pub fn LLVMBuildStructGEP2(b: BuilderRef, t: TypeRef, p: ValueRef, idx: u32, name: *u8): ValueRef;
+    pub fn LLVMBuildMemCpy(b: BuilderRef, dst: ValueRef, dst_align: u32, src: ValueRef, src_align: u32, size: ValueRef): ValueRef;
+    pub fn LLVMBuildMemMove(b: BuilderRef, dst: ValueRef, dst_align: u32, src: ValueRef, src_align: u32, size: ValueRef): ValueRef;
+
+    // ----- casts -----
+    pub fn LLVMBuildPtrToInt(b: BuilderRef, v: ValueRef, t: TypeRef, name: *u8): ValueRef;
+    pub fn LLVMBuildIntToPtr(b: BuilderRef, v: ValueRef, t: TypeRef, name: *u8): ValueRef;
+    pub fn LLVMBuildIntCast2(b: BuilderRef, v: ValueRef, t: TypeRef, is_signed: i32, name: *u8): ValueRef;
+    pub fn LLVMBuildSIToFP(b: BuilderRef, v: ValueRef, t: TypeRef, name: *u8): ValueRef;
+    pub fn LLVMBuildUIToFP(b: BuilderRef, v: ValueRef, t: TypeRef, name: *u8): ValueRef;
+    pub fn LLVMBuildFPCast(b: BuilderRef, v: ValueRef, t: TypeRef, name: *u8): ValueRef;
+
+    // ----- aggregates, phis and calls -----
+    pub fn LLVMBuildExtractValue(b: BuilderRef, agg: ValueRef, idx: u32, name: *u8): ValueRef;
+    pub fn LLVMBuildInsertValue(b: BuilderRef, agg: ValueRef, v: ValueRef, idx: u32, name: *u8): ValueRef;
+    pub fn LLVMBuildPhi(b: BuilderRef, t: TypeRef, name: *u8): ValueRef;
+    pub fn LLVMAddIncoming(phi: ValueRef, vals: *ValueRef, blocks: *BasicBlockRef, n: u32);
+    pub fn LLVMBuildCall2(b: BuilderRef, fn_ty: TypeRef, f: ValueRef, args: *ValueRef, n: u32, name: *u8): ValueRef;
+}
+
+/// The NUL-terminated literal `s` (which must end in `\0`) for C.
+pub fn z(s: str): *u8 {
+    let b = s.as_bytes();
+    if b.len() == 0 || b[b.len() - 1] != 0 {
+        panic("llvm::z: string is not NUL-terminated");
+    }
+    return b.as_ptr();
+}
+
+/// The empty name, for values LLVM numbers itself.
+pub fn noname(): *u8 {
+    return z("\0");
+}
+
+pub fn is_null(p: *mut u8): bool {
+    return (p as usize) == 0;
+}
+
+pub fn null(): *mut u8 {
+    return core::ptr::null_mut::<u8>();
+}
+
+/// The text of an LLVM message (`char*`), freed with `LLVMDisposeMessage`.
+pub fn take_message(msg: *mut u8): String {
+    if is_null(msg) {
+        return String::new();
+    }
+    let s = unsafe { core::ffi::c_str(msg as *u8) }.to_string();
+    unsafe { LLVMDisposeMessage(msg) };
+    return s;
+}
+
+/// The text of an `LLVMErrorRef`, which this consumes.
+pub fn take_error(e: ErrorRef): String {
+    let msg = unsafe { LLVMGetErrorMessage(e) };
+    let s = unsafe { core::ffi::c_str(msg as *u8) }.to_string();
+    unsafe { LLVMDisposeErrorMessage(msg) };
+    return s;
+}

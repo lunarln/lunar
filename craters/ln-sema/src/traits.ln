@@ -1,0 +1,63 @@
+// STUB, replaced at merge by the port of crates/ln-sema/src/traits.rs
+// (being written in parallel). Only the signatures code generation uses
+// are here.
+
+use core::intern::Symbol;
+use crater::defs::{DefId, Pred};
+use crater::program::Program;
+use crater::ty::{TraitRef, Ty, TyList};
+
+/// How a trait method is implemented for a type.
+pub enum MethodImpl {
+    /// A real function: `def` instantiated with `args`.
+    Fn { def: DefId, args: TyList },
+    /// A compiler-provided implementation (primitive operators, copies,
+    /// ...), identified by the trait's lang name and the method name.
+    Builtin { lang: Symbol, method: Symbol },
+}
+
+impl Program {
+    pub fn elaborate(&mut +self, env: [Pred; &], out: &mut +[Pred; ..+]) {
+        panic("stub");
+    }
+
+    pub fn is_dull(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        panic("stub");
+    }
+
+    pub fn is_light(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        panic("stub");
+    }
+
+    pub fn has_owner(&mut +self, ty: Ty): bool {
+        panic("stub");
+    }
+
+    pub fn could_own(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        panic("stub");
+    }
+
+    pub fn is_copy(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        panic("stub");
+    }
+
+    pub fn builtin_impl(&mut +self, ty: Ty, trait_id: DefId, env: [Pred; &]): bool {
+        panic("stub");
+    }
+
+    pub fn find_impl(&mut +self, ty: Ty, tr: TraitRef, env: [Pred; &]): Option::<(DefId, TyList)> {
+        panic("stub");
+    }
+
+    pub fn implements(&mut +self, ty: Ty, tr: TraitRef, env: [Pred; &]): bool {
+        panic("stub");
+    }
+
+    pub fn resolve_method(&mut +self, tr: TraitRef, self_ty: Ty, method: Symbol, method_args: TyList): Option::<MethodImpl> {
+        panic("stub");
+    }
+
+    pub fn crater_of(&self, d: DefId): DefId {
+        panic("stub");
+    }
+}

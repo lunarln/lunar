@@ -1,0 +1,17 @@
+// STUB, replaced at merge by the port of crates/ln-sema/src/layout.rs
+// (being written in parallel).
+
+use crater::program::Program;
+use crater::ty::Ty;
+
+/// The size and alignment of a type, in bytes.
+pub struct Layout {
+    pub size: u64,
+    pub align: u64,
+}
+
+impl Program {
+    pub fn layout_of(&mut +self, t: Ty): Option::<Layout> {
+        panic("stub");
+    }
+}

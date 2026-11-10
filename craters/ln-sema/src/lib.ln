@@ -12,3 +12,5 @@ pub mod thir;
 pub mod diag;
 pub mod codes;
 pub mod program;
+pub mod traits;
+pub mod layout;
