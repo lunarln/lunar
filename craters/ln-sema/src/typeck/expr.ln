@@ -1450,7 +1450,7 @@ impl Sema {
         }
         self.push_scope(None);
         let p = self.check_pat(pat, st, false);
-        if self.p.thir.is_irrefutable(p, &|d| self.p.is_enum(d)) && !self.in_expansion(pspan) {
+        if self.pat_covers(p, st) && !self.in_expansion(pspan) {
             self.warning_at(codes::lint::IRREFUTABLE_LET_ELSE(), pspan, "this pattern always matches, so the `else` block never runs");
             self.with_help("remove the `else` block");
             self.emit();
@@ -1500,7 +1500,7 @@ impl Sema {
             },
         };
         let p = self.check_pat(pat, t, true);
-        if !self.p.thir.is_irrefutable(p, &|d| self.p.is_enum(d)) {
+        if !self.pat_covers(p, t) {
             let pspan = self.p.ast.pats.get(pat).span;
             self.error_at(codes::ty::NON_EXHAUSTIVE(), pspan, "refutable pattern in `let`");
             self.with_help("handle the other cases with `let .. else { .. }`, `if let` or `match`");

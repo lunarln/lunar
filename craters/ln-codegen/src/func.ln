@@ -1195,7 +1195,39 @@ impl Cg {
     pub fn bind_pat(&mut self, p: &mut +Program, pat: Id::<Pat>, ptr: ValueRef, ty: Ty, null_moves: bool) {
         let pt = p.thir.pat(pat);
         match pt.kind {
-            PatKind::Wild | PatKind::Lit(_) | PatKind::Range { .. } | PatKind::Or(_) => {}
+            PatKind::Wild | PatKind::Lit(_) | PatKind::Range { .. } => {}
+            PatKind::Or(alts) => {
+                if !binds(&p.thir, pat) {
+                    return;
+                }
+                // The pattern matched: bind through the alternative that
+                // does (the first). Every alternative binds the same
+                // variables: their drops are registered once, from the first.
+                let mark = self.cleanups.len();
+                let mut first: [Cleanup; ..+] = [];
+                let done = self.block_named(z("or_bound\0"));
+                for i in 0..alts.len() {
+                    let a = p.thir.pat_ids.list(alts)[i];
+                    let more = i + 1 < alts.len();
+                    let next = if more { self.block_named(z("or_bind_next\0")) } else { done };
+                    if more {
+                        self.test_pat(p, a, ptr, ty, next);
+                    }
+                    self.bind_pat(p, a, ptr, ty, null_moves);
+                    if i == 0 {
+                        for k in mark..self.cleanups.len() {
+                            first.push(self.cleanups[k]);
+                        }
+                    }
+                    self.cleanups.truncate(mark);
+                    self.br(done);
+                    if more {
+                        self.position(next);
+                    }
+                }
+                self.cleanups.extend(first[..]);
+                self.position(done);
+            }
             PatKind::Binding { local, mode, sub } => {
                 let v = self.load(p, ptr, ty);
                 let slot = self.locals[local.index()];
@@ -1272,7 +1304,54 @@ impl Cg {
                     self.null_moves(p, fp.pat, at, ft);
                 }
             }
+            PatKind::Or(alts) => {
+                if !binds(&p.thir, pat) {
+                    return;
+                }
+                // Through the alternative that matches, as in `bind_pat`.
+                let done = self.block_named(z("or_bound\0"));
+                for i in 0..alts.len() {
+                    let a = p.thir.pat_ids.list(alts)[i];
+                    let more = i + 1 < alts.len();
+                    let next = if more { self.block_named(z("or_bind_next\0")) } else { done };
+                    if more {
+                        self.test_pat(p, a, ptr, ty, next);
+                    }
+                    self.null_moves(p, a, ptr, ty);
+                    self.br(done);
+                    if more {
+                        self.position(next);
+                    }
+                }
+                self.position(done);
+            }
             _ => {}
         }
     }
+}
+
+/// Whether pattern `pat` binds a variable.
+fn binds(thir: &Thir, pat: Id::<Pat>): bool {
+    return match thir.pat(pat).kind {
+        PatKind::Binding { .. } => true,
+        PatKind::Tuple(ps) | PatKind::Or(ps) => binds_any(thir, ps),
+        PatKind::Adt { fields, .. } => {
+            for f in thir.field_pats.list(fields) {
+                if binds(thir, f.pat) {
+                    return true;
+                }
+            }
+            false
+        }
+        PatKind::Wild | PatKind::Lit(_) | PatKind::Range { .. } => false,
+    };
+}
+
+fn binds_any(thir: &Thir, ps: List::<Id::<Pat>>): bool {
+    for q in thir.pat_ids.list(ps) {
+        if binds(thir, q) {
+            return true;
+        }
+    }
+    return false;
 }
