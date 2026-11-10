@@ -14,7 +14,9 @@ Callers that go through the trait rely on the trait's signature: what they
 pass, whether it is moved into the call or changed in place, and what they
 get back. An impl with a different signature would break those calls, so
 the two must match exactly. In particular `&self` in the trait requires
-`&self` in the impl, not `self` or `&mut self`. Only `mut` on a parameter
+`&self` in the impl, not `self` or `&mut self`, and `out: &mut +String` in
+`Display::fmt` requires `out: &mut +String`, since callers keep their views
+into a `+` argument across the call. Only `mut` on a parameter
 that takes ownership may differ: `mut x: T` matches `x: T`, since it only
 lets the function change its own value.
 

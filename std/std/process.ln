@@ -80,7 +80,7 @@ impl ExitStatus {
 
 impl Display for ExitStatus {
     /// `exit code: 1`, or `signal: 11`.
-    fn fmt(&self, out: &mut String) {
+    fn fmt(&self, out: &mut +String) {
         match self.signal() {
             Some(s) => out.write("signal: {s}"),
             None => out.write("exit code: {self.raw}"),

@@ -6,11 +6,11 @@ use crater::intrinsics;
 /// Types that can be written into a `String` by format strings.
 #[lang = "display"]
 pub trait Display {
-    fn fmt(&self, out: &mut String);
+    fn fmt(&self, out: &mut +String);
 }
 
 /// Append formatted text to `out`.
-pub fn write(out: &mut String, args: FmtArgs) {
+pub fn write(out: &mut +String, args: FmtArgs) {
     intrinsics::fmt_write(args, out);
 }
 
@@ -22,7 +22,7 @@ pub fn format(args: FmtArgs): String {
 }
 
 /// Write the decimal digits of `value`.
-pub fn write_u64(out: &mut String, value: u64) {
+pub fn write_u64(out: &mut +String, value: u64) {
     let mut buf: [u8; 20] = [0; 20];
     let mut i: usize = 20;
     let mut v = value;
@@ -38,7 +38,7 @@ pub fn write_u64(out: &mut String, value: u64) {
     out.push_str(unsafe { intrinsics::str_from_bytes(buf[i..]) });
 }
 
-pub fn write_i64(out: &mut String, value: i64) {
+pub fn write_i64(out: &mut +String, value: i64) {
     if value < 0 {
         out.push_str("-");
         // Negate in u64 so that i64::MIN works.
@@ -49,7 +49,7 @@ pub fn write_i64(out: &mut String, value: i64) {
 }
 
 /// Write `value` in the given radix (2..=36) without a prefix.
-pub fn write_radix(out: &mut String, value: u64, radix: u64) {
+pub fn write_radix(out: &mut +String, value: u64, radix: u64) {
     let mut buf: [u8; 64] = [0; 64];
     let mut i: usize = 64;
     let mut v = value;
@@ -66,37 +66,37 @@ pub fn write_radix(out: &mut String, value: u64, radix: u64) {
     out.push_str(unsafe { intrinsics::str_from_bytes(buf[i..]) });
 }
 
-impl Display for u8 { fn fmt(&self, out: &mut String) { write_u64(out, self as u64); } }
-impl Display for u16 { fn fmt(&self, out: &mut String) { write_u64(out, self as u64); } }
-impl Display for u32 { fn fmt(&self, out: &mut String) { write_u64(out, self as u64); } }
-impl Display for u64 { fn fmt(&self, out: &mut String) { write_u64(out, self); } }
-impl Display for usize { fn fmt(&self, out: &mut String) { write_u64(out, self as u64); } }
-impl Display for i8 { fn fmt(&self, out: &mut String) { write_i64(out, self as i64); } }
-impl Display for i16 { fn fmt(&self, out: &mut String) { write_i64(out, self as i64); } }
-impl Display for i32 { fn fmt(&self, out: &mut String) { write_i64(out, self as i64); } }
-impl Display for i64 { fn fmt(&self, out: &mut String) { write_i64(out, self); } }
-impl Display for isize { fn fmt(&self, out: &mut String) { write_i64(out, self as i64); } }
+impl Display for u8 { fn fmt(&self, out: &mut +String) { write_u64(out, self as u64); } }
+impl Display for u16 { fn fmt(&self, out: &mut +String) { write_u64(out, self as u64); } }
+impl Display for u32 { fn fmt(&self, out: &mut +String) { write_u64(out, self as u64); } }
+impl Display for u64 { fn fmt(&self, out: &mut +String) { write_u64(out, self); } }
+impl Display for usize { fn fmt(&self, out: &mut +String) { write_u64(out, self as u64); } }
+impl Display for i8 { fn fmt(&self, out: &mut +String) { write_i64(out, self as i64); } }
+impl Display for i16 { fn fmt(&self, out: &mut +String) { write_i64(out, self as i64); } }
+impl Display for i32 { fn fmt(&self, out: &mut +String) { write_i64(out, self as i64); } }
+impl Display for i64 { fn fmt(&self, out: &mut +String) { write_i64(out, self); } }
+impl Display for isize { fn fmt(&self, out: &mut +String) { write_i64(out, self as i64); } }
 
 impl Display for bool {
-    fn fmt(&self, out: &mut String) {
+    fn fmt(&self, out: &mut +String) {
         out.push_str(if self { "true" } else { "false" });
     }
 }
 
 impl Display for char {
-    fn fmt(&self, out: &mut String) {
+    fn fmt(&self, out: &mut +String) {
         out.push(self);
     }
 }
 
 impl Display for str {
-    fn fmt(&self, out: &mut String) {
+    fn fmt(&self, out: &mut +String) {
         out.push_str(self);
     }
 }
 
 impl Display for String {
-    fn fmt(&self, out: &mut String) {
+    fn fmt(&self, out: &mut +String) {
         out.push_str(self.as_str());
     }
 }
@@ -107,28 +107,28 @@ impl Display for String {
 /// they would be written in source, with strings quoted and escaped.
 #[lang = "debug"]
 pub trait Debug {
-    fn debug(&self, out: &mut String);
+    fn debug(&self, out: &mut +String);
 }
 
-impl Debug for u8 { fn debug(&self, out: &mut String) { write_u64(out, self as u64); } }
-impl Debug for u16 { fn debug(&self, out: &mut String) { write_u64(out, self as u64); } }
-impl Debug for u32 { fn debug(&self, out: &mut String) { write_u64(out, self as u64); } }
-impl Debug for u64 { fn debug(&self, out: &mut String) { write_u64(out, self); } }
-impl Debug for usize { fn debug(&self, out: &mut String) { write_u64(out, self as u64); } }
-impl Debug for i8 { fn debug(&self, out: &mut String) { write_i64(out, self as i64); } }
-impl Debug for i16 { fn debug(&self, out: &mut String) { write_i64(out, self as i64); } }
-impl Debug for i32 { fn debug(&self, out: &mut String) { write_i64(out, self as i64); } }
-impl Debug for i64 { fn debug(&self, out: &mut String) { write_i64(out, self); } }
-impl Debug for isize { fn debug(&self, out: &mut String) { write_i64(out, self as i64); } }
+impl Debug for u8 { fn debug(&self, out: &mut +String) { write_u64(out, self as u64); } }
+impl Debug for u16 { fn debug(&self, out: &mut +String) { write_u64(out, self as u64); } }
+impl Debug for u32 { fn debug(&self, out: &mut +String) { write_u64(out, self as u64); } }
+impl Debug for u64 { fn debug(&self, out: &mut +String) { write_u64(out, self); } }
+impl Debug for usize { fn debug(&self, out: &mut +String) { write_u64(out, self as u64); } }
+impl Debug for i8 { fn debug(&self, out: &mut +String) { write_i64(out, self as i64); } }
+impl Debug for i16 { fn debug(&self, out: &mut +String) { write_i64(out, self as i64); } }
+impl Debug for i32 { fn debug(&self, out: &mut +String) { write_i64(out, self as i64); } }
+impl Debug for i64 { fn debug(&self, out: &mut +String) { write_i64(out, self); } }
+impl Debug for isize { fn debug(&self, out: &mut +String) { write_i64(out, self as i64); } }
 
 impl Debug for bool {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         out.push_str(if self { "true" } else { "false" });
     }
 }
 
 impl Debug for char {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         out.push('\'');
         escape_char(out, self, '\'');
         out.push('\'');
@@ -136,7 +136,7 @@ impl Debug for char {
 }
 
 impl Debug for str {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         out.push('"');
         for c in self.chars() {
             escape_char(out, c, '"');
@@ -146,19 +146,19 @@ impl Debug for str {
 }
 
 impl Debug for String {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         self.as_str().debug(out);
     }
 }
 
 impl Debug for () {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         out.push_str("()");
     }
 }
 
 /// `c` as it is written inside a quoted literal.
-fn escape_char(out: &mut String, c: char, quote: char) {
+fn escape_char(out: &mut +String, c: char, quote: char) {
     if c == '\n' {
         out.push_str("\\n");
     } else if c == '\t' {
@@ -186,14 +186,14 @@ fn escape_char(out: &mut String, c: char, quote: char) {
 pub macro Debug {
     ($(#[$m:meta])* $v:vis struct $n:ident $g:generics { $(,)? }) => {
         impl $g.bound(Debug) Debug for $n $g.args {
-            fn debug(&self, out: &mut String) {
+            fn debug(&self, out: &mut +String) {
                 out.push_str(${stringify($n)});
             }
         }
     },
     ($(#[$m:meta])* $v:vis struct $n:ident $g:generics { $($(#[$fm:meta])* $fv:vis $f:ident: $ft:ty),* $(,)? }) => {
         impl $g.bound(Debug) Debug for $n $g.args {
-            fn debug(&self, out: &mut String) {
+            fn debug(&self, out: &mut +String) {
                 out.push_str(${stringify($n)});
                 out.push_str(" { ");
                 $(
@@ -210,7 +210,7 @@ pub macro Debug {
     },
     ($(#[$m:meta])* $v:vis struct $n:ident $g:generics ($($(#[$fm:meta])* $fv:vis $ft:ty),* $(,)?);) => {
         impl $g.bound(Debug) Debug for $n $g.args {
-            fn debug(&self, out: &mut String) {
+            fn debug(&self, out: &mut +String) {
                 out.push_str(${stringify($n)});
                 out.push('(');
                 $(
@@ -226,7 +226,7 @@ pub macro Debug {
     },
     ($(#[$m:meta])* $v:vis struct $n:ident $g:generics;) => {
         impl $g.bound(Debug) Debug for $n $g.args {
-            fn debug(&self, out: &mut String) {
+            fn debug(&self, out: &mut +String) {
                 out.push_str(${stringify($n)});
             }
         }
@@ -235,7 +235,7 @@ pub macro Debug {
         $($(#[$vm:meta])* $var:ident $(($($vt:ty),* $(,)?))? $({$($vf:ident: $vft:ty),* $(,)?})?),* $(,)?
     }) => {
         impl $g.bound(Debug) Debug for $n $g.args {
-            fn debug(&self, out: &mut String) {
+            fn debug(&self, out: &mut +String) {
                 match self {
                     $(
                         $n::$var $(($(${concat(a, index())} ${ignore($vt)}),*))? $({$($vf: ${concat(a_, $vf)}),*})? => {
@@ -278,7 +278,7 @@ pub macro Debug {
 pub macro Display {
     ($(#[$m:meta])* $v:vis enum $n:ident { $($(#[$vm:meta])* $var:ident),* $(,)? }) => {
         impl Display for $n {
-            fn fmt(&self, out: &mut String) {
+            fn fmt(&self, out: &mut +String) {
                 out.push_str(match self {
                     $($n::$var => ${stringify($var)}),*
                 });

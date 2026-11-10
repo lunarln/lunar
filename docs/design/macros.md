@@ -222,7 +222,7 @@ hygienic like the rest of the body).
 ```lunar
 // core/fmt.ln
 pub trait Debug {
-    fn debug(&self, out: &mut String);
+    fn debug(&self, out: &mut +String);
 }
 ```
 

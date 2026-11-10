@@ -10,7 +10,7 @@ impl Meters {
 }
 
 impl Display for Meters {
-    fn fmt(&self, out: &mut String) {
+    fn fmt(&self, out: &mut +String) {
         out.write("{self.v}m");
     }
 }

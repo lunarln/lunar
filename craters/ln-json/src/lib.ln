@@ -124,13 +124,13 @@ impl ParseError {
 }
 
 impl Display for ParseError {
-    fn fmt(&self, out: &mut String) {
+    fn fmt(&self, out: &mut +String) {
         out.write("{self.message()} at byte {self.offset}");
     }
 }
 
 impl Debug for ParseError {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         out.write("{self.message()} at byte {self.offset}");
     }
 }

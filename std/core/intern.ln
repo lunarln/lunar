@@ -33,7 +33,7 @@ impl Hash for Symbol {
 }
 
 impl Debug for Symbol {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         out.write("Symbol({self.index})");
     }
 }

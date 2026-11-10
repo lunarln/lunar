@@ -55,7 +55,7 @@ impl::<T: Eq + Light> Eq for Option::<T> {
 }
 
 impl::<T: crater::fmt::Display + Light> crater::fmt::Display for Option::<T> {
-    fn fmt(&self, out: &mut String) {
+    fn fmt(&self, out: &mut +String) {
         match self {
             Option::Some(v) => {
                 out.push_str("Some(");
@@ -68,7 +68,7 @@ impl::<T: crater::fmt::Display + Light> crater::fmt::Display for Option::<T> {
 }
 
 impl::<T: crater::fmt::Debug + Light> crater::fmt::Debug for Option::<T> {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         match self {
             Option::Some(v) => {
                 out.push_str("Some(");

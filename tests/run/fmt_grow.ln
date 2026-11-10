@@ -1,0 +1,63 @@
+// `String::write` only grows its string, so views into it stay valid while
+// it formats user `Display` and `Debug` values: their `out` is `&mut +`.
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+impl Display for Point {
+    fn fmt(&self, out: &mut +String) {
+        out.push('(');
+        label(out, "x");
+        out.write("{self.x}, ");
+        label(out, "y");
+        out.write("{self.y})");
+    }
+}
+
+impl Debug for Point {
+    fn debug(&self, out: &mut +String) {
+        out.write("Point at {self}");
+    }
+}
+
+/// A helper an implementation may hand `out` to: it is `+` as well.
+fn label(out: &mut +String, name: str) {
+    out.push_str(name);
+    out.push_str(": ");
+}
+
+#[derive(Debug)]
+struct Shape {
+    name: String,
+    corners: [Point; ..+],
+}
+
+#[derive(Debug, Display)]
+enum Color {
+    Red,
+    Blue,
+}
+
+fn main() {
+    let mut s = String::from("start");
+    let head = s.as_str()[0..5];
+    let p = Point { x: 1, y: -2 };
+    s.write(" {p} {p:?}");
+    let first = s.as_str()[6..];
+    let shape = Shape { name: String::from("tri"), corners: [Point { x: 0, y: 0 }, Point { x: 3, y: 4 }] };
+    s.write("; {shape:?}");
+    let c = Color::Blue;
+    let maybe: Option::<Point> = Some(Point { x: 7, y: 8 });
+    s.write("; {c} {c:?} {Color::Red} {maybe:?}");
+    let xs: [i32; ..+] = [1, 2, 3];
+    core::fmt::write(&mut s, "; {xs:?}");
+    // Make other strings come and go, in case a view had dangled.
+    let mut t = String::from("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+    t.push_str("Y");
+    println("head = {head}");
+    println("first = {first}");
+    println("s = {s}");
+    println("t = {t.len()}");
+}

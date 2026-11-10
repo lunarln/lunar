@@ -293,7 +293,7 @@ impl::<T: Light> Clone for [T; -..+] {
 }
 
 /// `[1, 2, 3]`, each element with `Debug`.
-fn debug_items::<T: Light + crater::fmt::Debug>(items: [T; &], out: &mut String) {
+fn debug_items::<T: Light + crater::fmt::Debug>(items: [T; &], out: &mut +String) {
     out.push('[');
     let mut first = true;
     for x in items {
@@ -307,31 +307,31 @@ fn debug_items::<T: Light + crater::fmt::Debug>(items: [T; &], out: &mut String)
 }
 
 impl::<T: Light + crater::fmt::Debug> crater::fmt::Debug for [T; &] {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         debug_items(self, out);
     }
 }
 
 impl::<T: Light + crater::fmt::Debug> crater::fmt::Debug for [T; &mut] {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         debug_items(self[..], out);
     }
 }
 
 impl::<T: Light + crater::fmt::Debug> crater::fmt::Debug for [T] {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         debug_items(self[..], out);
     }
 }
 
 impl::<T: Light + crater::fmt::Debug> crater::fmt::Debug for [T; ..+] {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         debug_items(self[..], out);
     }
 }
 
 impl::<T: Light + crater::fmt::Debug> crater::fmt::Debug for [T; -..+] {
-    fn debug(&self, out: &mut String) {
+    fn debug(&self, out: &mut +String) {
         debug_items(self[..], out);
     }
 }

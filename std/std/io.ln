@@ -48,7 +48,7 @@ impl Error {
 }
 
 impl Display for Error {
-    fn fmt(&self, out: &mut String) {
+    fn fmt(&self, out: &mut +String) {
         out.push_str(match self.kind {
             ErrorKind::NotFound => "not found",
             ErrorKind::PermissionDenied => "permission denied",

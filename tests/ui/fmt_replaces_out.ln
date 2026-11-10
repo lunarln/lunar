@@ -1,0 +1,20 @@
+// error: borrow::grow_only
+// `String::write` only grows the string, so views into it survive. The
+// `Display` implementations it calls for each hole must only grow it too:
+// replacing `out` would free what `v` points into.
+struct Evil {}
+
+impl Display for Evil {
+    fn fmt(&self, out: &mut +String) {
+        out = String::from("replaced!!!");
+    }
+}
+
+fn main() {
+    let mut s = String::from("hello world");
+    let v = s.as_str()[0..5];
+    s.write("{Evil {}}");
+    let mut t = String::from("XXXXXXXXXXXXXXXXXXXX");
+    t.push_str("Y");
+    println("s = {s}, v = {v}");
+}

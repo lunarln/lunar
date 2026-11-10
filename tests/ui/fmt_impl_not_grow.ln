@@ -1,0 +1,24 @@
+// error: trait::signature
+// `Display::fmt` and `Debug::debug` take `out: &mut +String`. An
+// implementation taking a plain `&mut String` could shrink or replace it
+// under the views of whoever called `String::write`.
+struct Evil {}
+
+impl Display for Evil {
+    fn fmt(&self, out: &mut String) {
+        out = String::from("replaced!!!");
+    }
+}
+
+impl Debug for Evil {
+    fn debug(&self, out: &mut String) {
+        out.clear();
+    }
+}
+
+fn main() {
+    let mut s = String::from("hello world");
+    let v = s.as_str()[0..5];
+    s.write("{Evil {}} {Evil {}:?}");
+    println("s = {s}, v = {v}");
+}
