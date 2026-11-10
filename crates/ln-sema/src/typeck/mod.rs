@@ -108,9 +108,21 @@ impl<'a> Sema<'a> {
                 checked.push((b, ok, is_std));
             }
         }
+        // What each function's result may point into, from its body, for
+        // the borrow checking of its callers.
+        let envs: Vec<Vec<crate::defs::Pred>> = checked.iter().filter(|c| c.1).map(|(b, _, _)| self.body_env(b.def)).collect();
+        let bodies: Vec<(&thir::Body, &[crate::defs::Pred])> = checked.iter().filter(|c| c.1).map(|c| &c.0).zip(envs.iter().map(|e| e.as_slice())).collect();
+        crate::borrowck::infer_ret_points(&mut self.p, &bodies);
         for (b, ok, is_std) in checked {
             self.finish_body(b, ok, is_std);
         }
+    }
+
+    /// The bounds a body is checked under: a closure's are those of the
+    /// function it is in.
+    fn body_env(&self, def: DefId) -> Vec<crate::defs::Pred> {
+        let owner = self.p.closures.get(&def).map_or(def, |c| c.parent);
+        self.env_of(owner)
     }
 
     /// Borrow check and lint a checked body (if type checking its function
@@ -118,9 +130,7 @@ impl<'a> Sema<'a> {
     fn finish_body(&mut self, b: thir::Body, typeck_ok: bool, is_std: bool) {
         let errs_before = self.diags.error_count();
         if typeck_ok {
-            // A closure's body has the bounds of the function it is in.
-            let owner = self.p.closures.get(&b.def).map_or(b.def, |c| c.parent);
-            let env = self.env_of(owner);
+            let env = self.body_env(b.def);
             crate::borrowck::check(&self.p, &b, &env, &mut self.diags);
             // Lints on a function with borrow errors would only add
             // noise (and may be wrong about code that will change).

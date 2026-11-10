@@ -91,6 +91,10 @@ pub struct Program {
     pub closures: HashMap<DefId, ClosureInfo>,
     /// `impl Trait` return types, by function and position (`Ty::Opaque`).
     pub opaques: HashMap<(DefId, u32), OpaqueInfo>,
+    /// For each function (and closure) with a checked body, which of its
+    /// parameters the value it returns may point into, inferred from the
+    /// body (see `borrowck::infer_ret_points`).
+    pub ret_points: HashMap<DefId, borrowck::RetPoints>,
     /// Native libraries to link, from `#[link(name = "...")]` on `extern`
     /// blocks, in first-seen order.
     pub link_libs: Vec<String>,
