@@ -1,0 +1,10 @@
+// error: borrow::shrink_while_borrowed
+// The closure returns a view into the variable it borrows, so its result
+// points into `s`.
+fn main() {
+    let mut s = String::from("hello");
+    let first = || s.as_str()[0..1];
+    let v = first();
+    s.clear();
+    println("{v}");
+}

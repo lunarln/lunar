@@ -1,0 +1,15 @@
+// error: borrow::shrink_while_borrowed
+// Called through a function pointer, the body is unknown: the result may
+// point into every argument.
+fn first(a: &String, b: &String): str {
+    return a.as_str();
+}
+
+fn main() {
+    let x = String::from("hello");
+    let mut y = String::from("world");
+    let f: fn(&String, &String): str = first;
+    let v = f(&x, &y);
+    y.clear();
+    println("{v}");
+}

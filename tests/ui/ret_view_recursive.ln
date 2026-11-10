@@ -1,0 +1,16 @@
+// error: borrow::shrink_while_borrowed
+// Each call swaps the arguments, so the result may point into either.
+fn alternate(a: &String, b: &String, n: usize): str {
+    if n == 0 {
+        return a.as_str();
+    }
+    return alternate(b, a, n - 1);
+}
+
+fn main() {
+    let x = String::from("left");
+    let mut y = String::from("right");
+    let v = alternate(&x, &y, 3);
+    y.clear();
+    println("{v}");
+}
