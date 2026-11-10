@@ -152,8 +152,7 @@ pub enum Arg {
 impl Arg {
     pub fn expr(self): Id::<Expr> {
         return match self {
-            Arg::Value(e) => e,
-            Arg::InOut(e) => e,
+            Arg::Value(e) | Arg::InOut(e) => e,
         };
     }
 }

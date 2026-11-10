@@ -483,13 +483,8 @@ impl Types {
             return true;
         }
         return match k {
-            TyKind::Tuple(l) => self.any_in(l, f),
-            TyKind::Adt(_, l) => self.any_in(l, f),
-            TyKind::Closure(_, l) => self.any_in(l, f),
-            TyKind::Opaque(_, _, l) => self.any_in(l, f),
-            TyKind::Array(e, _) => self.any(e, f),
-            TyKind::Grow(e) => self.any(e, f),
-            TyKind::Ptr(e, _) => self.any(e, f),
+            TyKind::Tuple(l) | TyKind::Adt(_, l) | TyKind::Closure(_, l) | TyKind::Opaque(_, _, l) => self.any_in(l, f),
+            TyKind::Array(e, _) | TyKind::Grow(e) | TyKind::Ptr(e, _) => self.any(e, f),
             TyKind::FnPtr(ps, _, r) => self.any_in(ps, f) || self.any(r, f),
             _ => false,
         };

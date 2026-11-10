@@ -1517,8 +1517,7 @@ impl Sema {
                     self.zonk_pat(s);
                 }
             }
-            PatKind::Tuple(ps) => self.zonk_pats(ps),
-            PatKind::Or(ps) => self.zonk_pats(ps),
+            PatKind::Tuple(ps) | PatKind::Or(ps) => self.zonk_pats(ps),
             PatKind::Adt { fields, .. } => {
                 for i in 0..fields.len() {
                     let f = self.p.thir.field_pats.list(fields)[i];
@@ -1584,37 +1583,24 @@ impl Sema {
                 self.zonk_expr(base);
                 self.zonk_expr(index);
             }
-            ExprKind::Deref(x) => self.zonk_expr(x),
-            ExprKind::Temp(x) => self.zonk_expr(x),
-            ExprKind::Unary(_, x) => self.zonk_expr(x),
-            ExprKind::Cast(x) => self.zonk_expr(x),
+            ExprKind::Deref(x) | ExprKind::Temp(x) | ExprKind::Unary(_, x) | ExprKind::Cast(x) => self.zonk_expr(x),
             ExprKind::Read { place, .. } => self.zonk_expr(place),
             ExprKind::Call { callee, args } => {
                 match callee {
-                    Callee::Indirect(f) => self.zonk_expr(f),
-                    Callee::Value { callee: f, .. } => self.zonk_expr(f),
+                    Callee::Indirect(f) | Callee::Value { callee: f, .. } => self.zonk_expr(f),
                     _ => {}
                 }
                 self.zonk_args(args);
             }
-            ExprKind::Binary(_, a, b) => {
+            ExprKind::Binary(_, a, b) | ExprKind::Logical { lhs: a, rhs: b, .. } => {
                 self.zonk_expr(a);
                 self.zonk_expr(b);
             }
-            ExprKind::Logical { lhs, rhs, .. } => {
-                self.zonk_expr(lhs);
-                self.zonk_expr(rhs);
-            }
-            ExprKind::Assign { place, value } => {
+            ExprKind::Assign { place, value } | ExprKind::AssignOp { place, value, .. } => {
                 self.zonk_expr(place);
                 self.zonk_expr(value);
             }
-            ExprKind::AssignOp { place, value, .. } => {
-                self.zonk_expr(place);
-                self.zonk_expr(value);
-            }
-            ExprKind::Tuple(es) => self.zonk_exprs(es),
-            ExprKind::Array(es) => self.zonk_exprs(es),
+            ExprKind::Tuple(es) | ExprKind::Array(es) => self.zonk_exprs(es),
             ExprKind::Adt { fields, .. } => {
                 for i in 0..fields.len() {
                     let f = self.p.thir.field_exprs.list(fields)[i];

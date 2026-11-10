@@ -29,9 +29,7 @@ fn known_arch(n: str): bool {
 /// The name of an attribute's meta item.
 pub fn meta_name(m: Meta): Ident {
     return match m {
-        Meta::Word(n) => n,
-        Meta::NameValue(n, _) => n,
-        Meta::Nested(n, _) => n,
+        Meta::Word(n) | Meta::NameValue(n, _) | Meta::Nested(n, _) => n,
     };
 }
 
@@ -774,9 +772,7 @@ fn find_in_exprs(a: &ln_ast::Ast, l: List::<Id::<Expr>>, p: Option::<Id::<Block>
 
 fn find_in_expr(a: &ln_ast::Ast, e: Id::<Expr>, p: Option::<Id::<Block>>, out: &mut +[FoundBlock; ..+]) {
     match a.exprs.get(e).kind {
-        ExprKind::Block(b) => find_blocks(a, b, p, out),
-        ExprKind::Unsafe(b) => find_blocks(a, b, p, out),
-        ExprKind::Loop(b) => find_blocks(a, b, p, out),
+        ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Loop(b) => find_blocks(a, b, p, out),
         ExprKind::If { cond, then, else_ } => {
             find_in_expr(a, cond, p, out);
             find_blocks(a, then, p, out);
@@ -809,29 +805,10 @@ fn find_in_expr(a: &ln_ast::Ast, e: Id::<Expr>, p: Option::<Id::<Block>>, out: &
                 find_in_expr(a, arm.body, p, out);
             }
         }
-        ExprKind::Unary(_, x) => find_in_expr(a, x, p, out),
-        ExprKind::Paren(x) => find_in_expr(a, x, p, out),
-        ExprKind::Try(x) => find_in_expr(a, x, p, out),
-        ExprKind::Cast(x, _) => find_in_expr(a, x, p, out),
-        ExprKind::Field(x, _) => find_in_expr(a, x, p, out),
-        ExprKind::TupleField(x, _, _) => find_in_expr(a, x, p, out),
-        ExprKind::Binary(_, l, r) => {
-            find_in_expr(a, l, p, out);
-            find_in_expr(a, r, p, out);
+        ExprKind::Unary(_, x) | ExprKind::Paren(x) | ExprKind::Try(x) | ExprKind::Cast(x, _) | ExprKind::Field(x, _) | ExprKind::TupleField(x, _, _) => {
+            find_in_expr(a, x, p, out)
         }
-        ExprKind::Assign(l, r) => {
-            find_in_expr(a, l, p, out);
-            find_in_expr(a, r, p, out);
-        }
-        ExprKind::AssignOp(_, l, r) => {
-            find_in_expr(a, l, p, out);
-            find_in_expr(a, r, p, out);
-        }
-        ExprKind::Index(l, r) => {
-            find_in_expr(a, l, p, out);
-            find_in_expr(a, r, p, out);
-        }
-        ExprKind::ArrayRepeat(l, r) => {
+        ExprKind::Binary(_, l, r) | ExprKind::Assign(l, r) | ExprKind::AssignOp(_, l, r) | ExprKind::Index(l, r) | ExprKind::ArrayRepeat(l, r) => {
             find_in_expr(a, l, p, out);
             find_in_expr(a, r, p, out);
         }
@@ -843,8 +820,7 @@ fn find_in_expr(a: &ln_ast::Ast, e: Id::<Expr>, p: Option::<Id::<Block>>, out: &
             find_in_expr(a, recv, p, out);
             find_in_exprs(a, args, p, out);
         }
-        ExprKind::Array(es) => find_in_exprs(a, es, p, out),
-        ExprKind::Tuple(es) => find_in_exprs(a, es, p, out),
+        ExprKind::Array(es) | ExprKind::Tuple(es) => find_in_exprs(a, es, p, out),
         ExprKind::StructLit { fields, .. } => {
             for f in a.field_inits.list(fields) {
                 if let Some(v) = f.value {
@@ -852,8 +828,7 @@ fn find_in_expr(a: &ln_ast::Ast, e: Id::<Expr>, p: Option::<Id::<Block>>, out: &
                 }
             }
         }
-        ExprKind::Return(Some(x)) => find_in_expr(a, x, p, out),
-        ExprKind::Break(Some(x)) => find_in_expr(a, x, p, out),
+        ExprKind::Return(Some(x)) | ExprKind::Break(Some(x)) => find_in_expr(a, x, p, out),
         ExprKind::Range { start, end, .. } => {
             if let Some(s) = start {
                 find_in_expr(a, s, p, out);

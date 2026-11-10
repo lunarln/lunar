@@ -113,7 +113,6 @@ failed builds show no `lunar explain` hint.
 * Array items, map keys and values must be Light (own no array or string).
 * Methods returning views of `&self` count as pointing into `self`; slice a
   `str` field through a free function instead (`tok_text(self.src, t)`).
-* No bindings inside `|` patterns; write separate arms.
 * Constants cannot hold structs.
 * `[T; ..+]` only grows; use `[T; -..+]` to `pop`/`truncate`/`clear`.
 * A `&mut` method may shrink what it is given, so it ends views into it;
