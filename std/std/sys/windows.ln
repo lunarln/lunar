@@ -236,6 +236,26 @@ fn is_msys_pty(h: *mut u8): bool {
     return (s.contains("msys-") || s.contains("cygwin-")) && s.contains("-pty");
 }
 
+extern "C" {
+    fn PeekNamedPipe(h: *mut u8, buf: *mut u8, size: u32, got: *mut u32, avail: *mut u32, left: *mut u32): i32;
+}
+
+/// Write all of `bytes` to `fd`; false on failure.
+pub fn write_all(fd: i32, bytes: [u8; &]): bool {
+    return write_file((handle(fd) as usize) as isize, bytes);
+}
+
+/// Whether reading `fd` now would not block: it is a pipe with bytes
+/// waiting (consoles and files cannot tell, and are false).
+pub fn input_available(fd: i32): bool {
+    let mut avail: u32 = 0;
+    let ok = unsafe {
+        PeekNamedPipe(handle(fd), core::ptr::null_mut(), 0, core::ptr::null_mut(), intrinsics::addr_of_mut(&mut avail), core::ptr::null_mut())
+    };
+    return ok != 0 && avail > 0;
+}
+
+
 pub fn read(fd: i32, buf: [u8; &mut]): isize {
     let h = handle(fd);
     let mut got: u32 = 0;

@@ -325,7 +325,13 @@ mod lsp {
         assert_eq!(d["range"]["start"]["line"], json!(5), "definition of add: {d:#?}");
         let d = c.request("textDocument/definition", pos(13, 6));
         let target = d["uri"].as_str().unwrap_or_default().to_string();
-        assert_eq!(target, "lunar-std:std::io", "definition of println: {d:#?}");
+        // A virtual document of the embedded standard library, or the file
+        // itself for a compiler that reads std from disk.
+        let std_uri = "lunar-std:std::io".to_string();
+        if target != std_uri {
+            assert!(target.starts_with("file:///") && target.ends_with("/std/std/io.ln"), "definition of println: {d:#?}");
+        }
+        let target = std_uri;
         // The editor fetches the virtual document's text from the server...
         let text = c.request("lunar/stdSource", json!({ "uri": target }));
         let text = text.as_str().unwrap_or_default();

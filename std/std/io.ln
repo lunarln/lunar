@@ -117,6 +117,40 @@ pub fn enable_colors(fd: i32): bool {
     return sys::enable_ansi(fd);
 }
 
+/// Read from `fd` (0 is standard input) into `buf`, unbuffered: the bytes
+/// that are there, up to `buf.len()`, waiting for at least one. How many,
+/// 0 at the end of the input, or -1 on failure.
+pub fn read(fd: i32, buf: [u8; &mut]): isize {
+    return sys::read(fd, buf);
+}
+
+/// Fill all of `buf` from `fd`; false if the input ends or fails first.
+pub fn read_exact(fd: i32, buf: [u8; &mut]): bool {
+    let mut off: usize = 0;
+    while off < buf.len() {
+        let n = sys::read(fd, buf[off..]);
+        if n <= 0 {
+            return false;
+        }
+        off += n as usize;
+    }
+    return true;
+}
+
+/// Write all of `bytes` to `fd` (1 is standard output, 2 standard error)
+/// as they are, unbuffered; false if that fails (such as when the reader
+/// has gone).
+pub fn write_bytes(fd: i32, bytes: [u8; &]): bool {
+    return sys::write_all(fd, bytes);
+}
+
+/// Whether input is waiting on `fd`, so that reading it now would not
+/// block. Pipes can tell (and on Unix also terminals and sockets); for
+/// anything else this is false.
+pub fn input_available(fd: i32): bool {
+    return sys::input_available(fd);
+}
+
 /// Read one line from standard input (without the trailing newline).
 /// Returns `false` at end of input.
 pub fn read_line(out: &mut String): bool {

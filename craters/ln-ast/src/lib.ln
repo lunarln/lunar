@@ -11,6 +11,8 @@ use core::arena::{Arena, Id, List};
 use core::intern::{Interner, Symbol};
 use ln_lexer::Token;
 
+pub mod pretty;
+
 /// A byte range in the source file.
 #[derive(Eq, Hash, Debug)]
 pub struct Span {

@@ -23,8 +23,7 @@ cmp stage2 stage3                                    # identical
 
 The executable, `target/release/lunar`, is a drop-in replacement for the
 Rust `lunar`: the same commands (`new`, `init`, `check`, `build`, `run`,
-`test`, `add`, `remove`, `update`, `clean`, `emit-llvm`, `explain`; `lsp`
-is being ported), options, help and error texts, status lines, exit codes
+`test`, `add`, `remove`, `update`, `clean`, `emit-llvm`, `explain`, `lsp`), options, help and error texts, status lines, exit codes
 and diagnostics. Diagnostics are drawn by `ln-ariadne` exactly as the Rust
 compiler draws them with ariadne (`ln-sema/src/render.ln` is the glue).
 When stderr is a terminal and `NO_COLOR` is not set they are in color, and
@@ -34,7 +33,7 @@ the quoted code is syntax highlighted from `ln-lexer`'s tokens
 The Rust integration tests run against it with `LUNAR_BIN`:
 
 ```sh
-LUNAR_BIN=$PWD/target/release/lunar cargo test -p ln-driver --test lang --test project
+LUNAR_BIN=$PWD/target/release/lunar cargo test -p ln-driver --test lang --test project --test hover --test lsp_session
 ```
 
 ### Where it finds the standard library
@@ -72,7 +71,22 @@ failed builds show no `lunar explain` hint.
 | `ln-codegen` | `crates/ln-codegen` | complete (LLVM through its C API, `llvm.ln`) |
 | `ln-toml`    | the `toml` and `toml_edit` crates | what manifests and lockfiles need: the whole TOML syntax, every key and value with its place in the text; `edit` sets and removes keys in place, keeping comments and layout as `toml_edit` does |
 | `ln-semver`  | the `semver` crate (1.0) | versions, requirements (`^`, `~`, `=`, `<`, `>`, wildcards, several comparators), matching with its pre-release rules, its display and error messages |
-| `lunar`      | `crates/ln-driver` but the language server | the `lunar` command (above): `cli.ln` (clap's parsing, help and errors), `commands.ln` (`main.rs`), `project.ln` and `git.ln` (`project.rs`), `compile.ln` (`lib.rs`), `explain.ln`, `link.ln`, `testing.ln`, `sysroot.ln`. Hidden modes for `selfhost.rs`: `--lex FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--render [--color] FILE...` the diagnostics drawn as `lunar check` draws them, `--craters DIR` the craters a package build loads. `lsp.ln` is a stub until the language server is ported |
+| `ln-json`    | what the language server gets from `serde_json` | JSON documents as arenas of linked nodes: strict parsing (escapes, `\u` surrogate pairs, numbers kept as written), building, compact writing with serde_json's escapes; tests in `src/tests.ln` |
+| `lunar`      | `crates/ln-driver` | the `lunar` command (above): `cli.ln` (clap's parsing, help and errors), `commands.ln` (`main.rs`), `project.ln` and `git.ln` (`project.rs`), `compile.ln` (`lib.rs`), `explain.ln`, `link.ln`, `testing.ln`, `sysroot.ln`, and the language server, `lsp.ln` and `ide.ln` (below). Hidden modes for `selfhost.rs`: `--lex FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--render [--color] FILE...` the diagnostics drawn as `lunar check` draws them, `--craters DIR` the craters a package build loads |
+
+### The language server
+
+`lunar lsp [--stdio]` (`lunar/src/{lsp,ide}.ln`, and `ln_ast::pretty` for
+declarations): `lsp-server`'s framing and lifecycle, full text
+synchronization, diagnostics as you type (for std itself too, when a file
+of a std source tree is open), hover with the Rust server's text, and go to
+definition. Open documents reach the loader as `Craters::overlay`. The
+standard library comes from the sysroot, so definitions in it are `file:`
+locations; `lunar-std:` URIs and `lunar/stdSource` still work. It keeps the
+analyses of the four crates used last and analyzes others again when asked
+about them. The LSP tests in `crates/ln-driver/tests` (`lang`, `project`,
+`hover`, `lsp_session`) run against it with `LUNAR_BIN`; `lsp_session`
+compares its answers with the Rust server's.
 
 ## The passes
 
@@ -84,6 +98,7 @@ failed builds show no `lunar explain` hint.
 | type checker | `typeck/*.rs` | `ln-sema/src/typeck/{mod,expr,call,pat,closure}.ln` | done; Rust's `FnCtx` is the `Sema::fcx` field |
 | code generation | `crates/ln-codegen` | `ln-codegen/src/{lib,func,ops,init,llvm}.ln` | done; the state of the function being lowered (Rust's `FnCg`) lives in `Cg` |
 | driver | `crates/ln-driver` (all but `lsp.rs`, `ide.rs`) | `lunar/src/*.ln` | done; std and `docs/errors` are read from the sysroot, not embedded |
+| language server | `lsp.rs`, `ide.rs`, `ln-ast/src/pretty.rs` | `lunar/src/{lsp,ide}.ln`, `ln-ast/src/pretty.ln` | done; the same answers as the Rust server (`tests/lsp_session.rs`) |
 
 ### Data model
 
@@ -116,6 +131,12 @@ failed builds show no `lunar explain` hint.
 * No bindings inside `|` patterns; write separate arms.
 * Constants cannot hold structs.
 * `[T; ..+]` only grows; use `[T; -..+]` to `pop`/`truncate`/`clear`.
+* Keep fixed arrays well under 64K elements: they are copied as one LLVM
+  value, and LLVM's instruction selection crashes on `[65536 x i8]`. Use
+  an owning array for big buffers.
+* A struct holding a `Sema` (or anything with a `str` in it) counts as
+  holding views: moving one out of a field and back trips the borrow
+  checker, so keep it in place and query it there.
 * A `&mut` method may shrink what it is given, so it ends views into it;
   `&mut +self` methods only grow. Parameters whose views a function stores
   into an in-out argument are `kept`.
@@ -150,8 +171,8 @@ every `.ln` file in the repository:
 Programs compiled by the Lunar compiler pass every run test
 (`tests/run`, `examples`), and `--check` reports the Rust compiler's
 codes at the same positions on `tests/ui`. With `LUNAR_BIN` set to it,
-the command-line tests (`tests/lang.rs`, `tests/project.rs`) pass but for
-the language server's.
+the command-line and language server tests (`tests/lang.rs`,
+`tests/project.rs`, `tests/hover.rs`, `tests/lsp_session.rs`) pass.
 
 ## Differences from the Rust driver
 

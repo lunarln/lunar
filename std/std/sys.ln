@@ -16,6 +16,8 @@
 //   write_file(h: isize, bytes: [u8; &]): bool
 //   close_file(h: isize)
 //   remove_file(path: str): bool
+//   write_all(fd: i32, bytes: [u8; &]): bool
+//   input_available(fd: i32): bool      (reading would not block)
 
 #[cfg(windows)]
 mod windows;

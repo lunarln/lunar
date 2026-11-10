@@ -1,0 +1,251 @@
+// Parsing, reading, building and writing JSON.
+
+use crater::{Json, Kind, Value, parse};
+
+/// `text` parsed and written back.
+fn round(text: str): String {
+    let j = match parse(text) {
+        Ok(j) => j,
+        Err(e) => panic("`{text}` did not parse: {e}"),
+    };
+    return j.to_string(j.root());
+}
+
+fn fails(text: str, message: str) {
+    match parse(text) {
+        Ok(j) => panic("`{text}` parsed, as {j.to_string(j.root())}"),
+        Err(e) => {
+            if e.message() != message {
+                panic("`{text}`: expected `{message}`, got `{e}`");
+            }
+        }
+    }
+}
+
+fn same(got: String, want: str) {
+    if got.as_str() != want {
+        panic("got {got}\nwant {want}");
+    }
+}
+
+#[test]
+fn values_round_trip() {
+    same(round("null"), "null");
+    same(round("true"), "true");
+    same(round("false"), "false");
+    same(round("[]"), "[]");
+    same(round("{}"), "{}");
+    same(round("{\"a\":[1,2.5,-3e2,true,false,null],\"b\":{\"c\":\"d\"}}"), "{\"a\":[1,2.5,-3e2,true,false,null],\"b\":{\"c\":\"d\"}}");
+    same(round(" \t\r\n{ \"a\" : [ 1 , 2 ] , \"b\" : { } }\n"), "{\"a\":[1,2],\"b\":{}}");
+    same(round("[[[]],[{}]]"), "[[[]],[{}]]");
+}
+
+#[test]
+fn escapes_are_read() {
+    let j = parse("\"\\\"\\\\\\/\\b\\f\\n\\r\\t\\u0041\\u00e9\\u20AC\"").unwrap();
+    let s = j.as_str(j.root()).unwrap();
+    assert_eq!(s, "\"\\/\u{8}\u{c}\n\r\tAé€");
+    same(j.to_string(j.root()), "\"\\\"\\\\/\\b\\f\\n\\r\\tAé€\"");
+}
+
+#[test]
+fn surrogate_pairs_and_lone_surrogates() {
+    let j = parse("\"\\ud83d\\ude00\"").unwrap();
+    let s = j.as_str(j.root()).unwrap();
+    assert_eq!(s, "😀");
+    assert_eq!(s.len(), 4);
+    let j = parse("[\"\\ud800\", \"\\udc00\", \"\\ud800\\u0041\", \"a\\uD834\\uDD1Eb\", \"\\ud800\\ud800\\udc00\"]").unwrap();
+    let r = j.root();
+    assert_eq!(j.as_str(j.at(r, 0).unwrap()).unwrap(), "\u{FFFD}");
+    assert_eq!(j.as_str(j.at(r, 1).unwrap()).unwrap(), "\u{FFFD}");
+    assert_eq!(j.as_str(j.at(r, 2).unwrap()).unwrap(), "\u{FFFD}A");
+    assert_eq!(j.as_str(j.at(r, 3).unwrap()).unwrap(), "a𝄞b");
+    assert_eq!(j.as_str(j.at(r, 4).unwrap()).unwrap(), "\u{FFFD}𐀀");
+}
+
+#[test]
+fn bad_strings() {
+    fails("\"abc", "unterminated string");
+    fails("\"a\nb\"", "control character in a string");
+    fails("\"\\x\"", "invalid escape");
+    fails("\"\\u12g4\"", "invalid `\\u` escape");
+    fails("\"\\u12", "unterminated `\\u` escape");
+    fails("{\"a\" 1}", "expected `:`");
+    fails("{1: 2}", "expected a key (a string)");
+}
+
+#[test]
+fn numbers() {
+    for good in ["0", "-0", "1.5", "1e10", "1E+2", "-1.5e-3", "123456789012345678901234567890"] {
+        same(round(good), good);
+    }
+    for bad in ["01", "1.", ".5", "-", "1e", "+1", "0x1", "1.e3", "--1", "1ee2"] {
+        if parse(bad).is_ok() {
+            panic("`{bad}` parsed");
+        }
+    }
+    let j = parse("[9223372036854775807, -9223372036854775808, 9223372036854775808, 18446744073709551615, 18446744073709551616, 1.0, 1e3, -7, 1.5e3]").unwrap();
+    let r = j.root();
+    let at = |i: usize| j.at(r, i).unwrap();
+    assert_eq!(j.as_i64(at(0)), Some(9223372036854775807));
+    assert_eq!(j.as_i64(at(1)), Some(-9223372036854775807 - 1));
+    assert_eq!(j.as_i64(at(2)), None);
+    assert_eq!(j.as_u64(at(2)), Some(9223372036854775808));
+    assert_eq!(j.as_u64(at(3)), Some(18446744073709551615));
+    assert_eq!(j.as_u64(at(4)), None);
+    assert_eq!(j.as_i64(at(5)), None);
+    assert_eq!(j.as_i64(at(6)), None);
+    assert_eq!(j.as_i64(at(7)), Some(-7));
+    assert_eq!(j.as_u64(at(7)), None);
+    assert!(j.as_f64(at(8)).unwrap() == 1500.0);
+    assert!(j.as_f64(at(5)).unwrap() == 1.0);
+    assert_eq!(j.as_f64(at(0)).is_some(), true);
+}
+
+#[test]
+fn structure_errors() {
+    fails("", "expected a value, found the end of the text");
+    fails("1 2", "trailing characters after the value");
+    fails("[1, 2", "unterminated array");
+    fails("[1 2]", "expected `,` or `]`");
+    fails("[1,]", "expected a value");
+    fails("{\"a\": 1,}", "expected a key (a string)");
+    fails("{\"a\": 1", "unterminated object");
+    fails("nul", "expected a value");
+    fails("tru e", "expected a value");
+    let mut deep = String::new();
+    for _ in 0..129 {
+        deep.push('[');
+    }
+    for _ in 0..129 {
+        deep.push(']');
+    }
+    fails(deep.as_str(), "arrays and objects nest too deeply");
+    let mut ok = String::new();
+    for _ in 0..128 {
+        ok.push('[');
+    }
+    for _ in 0..128 {
+        ok.push(']');
+    }
+    same(round(ok.as_str()), ok.as_str());
+}
+
+#[test]
+fn error_offsets() {
+    match parse("[1, x]") {
+        Ok(_) => panic("parsed"),
+        Err(e) => assert_eq!(e.offset, 4),
+    }
+}
+
+#[test]
+fn reading() {
+    let j = parse("{\"a\": 1, \"b\": {\"c\": [10, \"x\"]}, \"a\": 2}").unwrap();
+    let r = j.root();
+    assert_eq!(j.kind(r), Kind::Object);
+    // A repeated key: the last one.
+    assert_eq!(j.as_i64(j.get(r, "a").unwrap()), Some(2));
+    assert_eq!(j.len(r), 3);
+    let c = j.path(r, ["b", "c"][..]).unwrap();
+    assert_eq!(j.kind(c), Kind::Array);
+    assert_eq!(j.len(c), 2);
+    assert_eq!(j.as_str(j.at(c, 1).unwrap()), Some("x"));
+    assert!(j.at(c, 2).is_none());
+    assert!(j.get(r, "z").is_none());
+    assert!(j.get(c, "a").is_none());
+    assert!(j.path(r, ["b", "x"][..]).is_none());
+    // Members in order, with their keys.
+    let mut keys = String::new();
+    let mut m = j.first(r);
+    while let Some(v) = m {
+        keys.push_str(j.key(v));
+        m = j.next(v);
+    }
+    assert_eq!(keys.as_str(), "aba");
+    assert_eq!(j.as_bool(r), None);
+    assert_eq!(j.as_str(r), None);
+}
+
+#[test]
+fn building() {
+    let mut j = Json::new();
+    let o = j.object();
+    let one = j.int(1);
+    j.set(o, "a", one);
+    let s = j.string("two\n\u{1}\u{7f}é");
+    j.set(o, "b", s);
+    let three = j.uint(3);
+    // Replaced in place.
+    j.set(o, "a", three);
+    let arr = j.array();
+    let t = j.bool(true);
+    j.push(arr, t);
+    let n = j.null();
+    j.push(arr, n);
+    let neg = j.int(-42);
+    j.push(arr, neg);
+    j.set(o, "c", arr);
+    same(j.to_string(o), "{\"a\":3,\"b\":\"two\\n\\u0001\u{7f}é\",\"c\":[true,null,-42]}");
+    assert_eq!(j.len(o), 3);
+    j.set_root(o);
+    // What is written parses back to the same.
+    let text = j.to_string(j.root());
+    same(round(text.as_str()), text.as_str());
+}
+
+#[test]
+fn replacing_the_last_member() {
+    let mut j = Json::new();
+    let o = j.object();
+    let a = j.int(1);
+    j.set(o, "a", a);
+    let b = j.int(2);
+    j.set(o, "b", b);
+    let b2 = j.int(3);
+    j.set(o, "b", b2);
+    let c = j.int(4);
+    j.set(o, "c", c);
+    same(j.to_string(o), "{\"a\":1,\"b\":3,\"c\":4}");
+}
+
+#[test]
+fn floats() {
+    let mut j = Json::new();
+    let a = j.array();
+    for x in [1.0, 0.5, -2.25, 1e21, 0.1, 1e-7, 123456.0] {
+        let v = j.float(x);
+        j.push(a, v);
+    }
+    let nan = j.float(0.0 / 0.0);
+    j.push(a, nan);
+    same(j.to_string(a), "[1.0,0.5,-2.25,1e21,0.1,1e-7,123456.0,null]");
+    let k = j.number("-1.5e3").unwrap();
+    same(j.to_string(k), "-1.5e3");
+    assert!(j.number("1.").is_none());
+    assert!(j.number("1 ").is_none());
+}
+
+#[test]
+fn copying_between_documents() {
+    let src = parse("{\"id\": \"x\\\"y\", \"list\": [1, {\"k\": null}], \"n\": -0.5}").unwrap();
+    let mut j = Json::new();
+    let o = j.object();
+    let c = j.copy_from(&src, src.root());
+    j.set(o, "copy", c);
+    same(j.to_string(o), "{\"copy\":{\"id\":\"x\\\"y\",\"list\":[1,{\"k\":null}],\"n\":-0.5}}");
+}
+
+#[test]
+fn writing_escapes() {
+    let mut out = String::new();
+    crater::write_string(&mut out, "a\"b\\c\u{8}\u{c}\n\r\t\u{0}\u{1f}/é😀");
+    same(out, "\"a\\\"b\\\\c\\b\\f\\n\\r\\t\\u0000\\u001f/é😀\"");
+}
+
+#[test]
+fn values_are_handles() {
+    let j = parse("[1]").unwrap();
+    let r: Value = j.root();
+    assert_eq!(j.first(r), j.at(r, 0));
+}

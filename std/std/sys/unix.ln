@@ -211,7 +211,25 @@ pub fn write(fd: i32, bytes: [u8; &]) {
 }
 
 pub fn read(fd: i32, buf: [u8; &mut]): isize {
-    return unsafe { c_read(fd, buf.as_mut_ptr(), buf.len()) };
+    return read_file(fd as isize, buf);
+}
+
+/// Write all of `bytes` to `fd`; false on failure.
+pub fn write_all(fd: i32, bytes: [u8; &]): bool {
+    return write_file(fd as isize, bytes);
+}
+
+extern "C" {
+    fn poll(fds: *mut i32, n: u64, timeout: i32): i32;
+}
+
+/// Whether reading `fd` now would not block (`poll` says it is readable,
+/// or closed).
+pub fn input_available(fd: i32): bool {
+    // struct pollfd { int fd; short events; short revents; }, POLLIN = 1.
+    let mut fds: [i32; 2] = [fd, 1];
+    let r = unsafe { poll(fds.as_mut_ptr(), 1, 0) };
+    return r > 0;
 }
 
 pub fn exit(code: i32): ! {

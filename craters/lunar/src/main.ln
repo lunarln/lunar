@@ -32,6 +32,7 @@ mod commands;
 mod compile;
 mod explain;
 mod git;
+mod ide;
 mod link;
 mod lsp;
 mod paths;

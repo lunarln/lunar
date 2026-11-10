@@ -10,3 +10,4 @@ ln-sema = { path = "../ln-sema" }
 ln-codegen = { path = "../ln-codegen" }
 ln-toml = { path = "../ln-toml" }
 ln-semver = { path = "../ln-semver" }
+ln-json = { path = "../ln-json" }

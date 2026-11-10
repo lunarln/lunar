@@ -38,6 +38,31 @@ fn write_f64(out: &mut String, v: f64) {
     out.push_str(s);
 }
 
+/// Parse a decimal number such as `1.5`, `-2e10` or `0.1` (all of `s`:
+/// digits, a sign, a `.` and an exponent, without spaces), correctly
+/// rounded to the nearest `f64`. `None` if `s` is not one.
+pub fn parse_f64(s: str): Option::<f64> {
+    if s.len() == 0 {
+        return None;
+    }
+    // `strtod` also takes spaces, hexadecimal, `inf` and `nan`.
+    for b in s.as_bytes() {
+        let ok = (b >= b'0' && b <= b'9') || b == b'+' || b == b'-' || b == b'.' || b == b'e' || b == b'E';
+        if !ok {
+            return None;
+        }
+    }
+    let mut c = String::from(s);
+    c.push('\0');
+    let start = c.as_bytes().as_ptr();
+    let mut end: *mut u8 = intrinsics::ptr_null_mut::<u8>();
+    let v = unsafe { strtod(start, intrinsics::addr_of_mut(&mut end)) };
+    if (end as usize) - (start as usize) != s.len() {
+        return None;
+    }
+    return Some(v);
+}
+
 impl Display for f64 {
     fn fmt(&self, out: &mut String) {
         write_f64(out, self);
