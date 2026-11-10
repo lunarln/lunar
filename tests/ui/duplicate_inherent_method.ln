@@ -1,0 +1,30 @@
+// error: name::duplicate
+struct Pair::<T> {
+    a: T,
+    b: T,
+}
+
+impl Pair::<i32> {
+    fn sum(&self): i32 {
+        return self.a + self.b;
+    }
+}
+
+// Applies to `Pair::<i32>` too, so `p.sum()` would be ambiguous.
+impl::<T> Pair::<T> {
+    fn sum(&self): i32 {
+        return 0;
+    }
+}
+
+// Cannot apply to `Pair::<i32>`: no conflict.
+impl Pair::<bool> {
+    fn both(&self): bool {
+        return self.a && self.b;
+    }
+}
+
+fn main() {
+    let p = Pair { a: 1, b: 2 };
+    println("{p.sum()}");
+}

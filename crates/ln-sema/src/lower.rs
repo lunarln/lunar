@@ -286,7 +286,35 @@ impl<'a> Sema<'a> {
             }
         }
         self.check_overlapping_impls();
+        self.check_duplicate_methods();
         self.check_main();
+    }
+
+    /// Two inherent impls that can apply to the same type may not both
+    /// define a function of the same name, or calls to it would be
+    /// ambiguous: `err(name::duplicate)`.
+    fn check_duplicate_methods(&mut self) {
+        let impls: Vec<DefId> =
+            self.p.impls.iter().copied().filter(|i| matches!(&self.p.def(*i).data, DefData::Impl(d) if d.trait_ref.is_none())).collect();
+        for (k, &b) in impls.iter().enumerate() {
+            for &a in &impls[..k] {
+                let (ma, mb) = (&self.p.impl_data(a).methods, &self.p.impl_data(b).methods);
+                let mut dups: Vec<(DefId, DefId)> = mb.iter().filter_map(|(n, &m)| ma.get(n).map(|&o| (m, o))).collect();
+                if dups.is_empty() || !self.p.self_tys_overlap(a, b) {
+                    continue;
+                }
+                dups.sort_by_key(|(m, _)| m.0);
+                for (m, other) in dups {
+                    let fname = self.p.def(m).name.clone();
+                    let (span, other_span) = (self.p.def(m).span, self.p.def(other).span);
+                    self.err(
+                        Diagnostic::error(name::DUPLICATE, span, format!("duplicate definitions with name `{fname}`"))
+                            .with_secondary(other_span, "other definition here")
+                            .with_note("both impls can apply to the same type, so a call to it would be ambiguous"),
+                    );
+                }
+            }
+        }
     }
 
     fn check_dup_generics(&mut self, id: DefId) {

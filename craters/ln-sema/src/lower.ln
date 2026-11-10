@@ -360,7 +360,52 @@ impl Sema {
             }
         }
         self.check_overlapping_impls();
+        self.check_duplicate_methods();
         self.check_main();
+    }
+
+    /// Two inherent impls that can apply to the same type may not both
+    /// define a function of the same name, or calls to it would be
+    /// ambiguous: `err(name::duplicate)`.
+    fn check_duplicate_methods(&mut self) {
+        let mut impls: [DefId; ..+] = [];
+        for i in self.p.impls {
+            if let DefData::Impl(d) = self.p.defs[i.index()].data {
+                if d.trait_ref.is_none() {
+                    impls.push(i);
+                }
+            }
+        }
+        for k in 0..impls.len() {
+            let b = impls[k];
+            let mut items: [DefId; ..+] = [];
+            self.impl_items_of(b, &mut items);
+            for j in 0..k {
+                let a = impls[j];
+                // Whether the impls overlap, once a name is in both.
+                let mut checked = false;
+                for m in items[..] {
+                    let name = self.p.defs[m.index()].name;
+                    if self.p.impl_methods.get((b, name)) != Some(m) {
+                        continue;
+                    }
+                    let Some(other) = self.p.impl_methods.get((a, name)) else { continue; };
+                    if !checked {
+                        checked = true;
+                        if !self.p.self_tys_overlap(a, b) {
+                            break;
+                        }
+                    }
+                    let n = self.str_of(name);
+                    let span = self.p.defs[m.index()].span;
+                    let other_span = self.p.defs[other.index()].span;
+                    self.error(codes::name::DUPLICATE(), span, "duplicate definitions with name `{n}`");
+                    self.secondary(other_span, "other definition here");
+                    self.note("both impls can apply to the same type, so a call to it would be ambiguous");
+                    self.emit();
+                }
+            }
+        }
     }
 
     fn check_dup_generics(&mut self, id: DefId) {

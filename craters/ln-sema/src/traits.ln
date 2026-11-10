@@ -590,6 +590,28 @@ impl Program {
         return None;
     }
 
+    /// Whether the self types of impls `a` and `b` can be the same type, for
+    /// some choice of their generic arguments (bounds aside).
+    pub fn self_tys_overlap(&mut +self, a: DefId, b: DefId): bool {
+        let da = self.impl_data(a);
+        let db = self.impl_data(b);
+        let na = da.generics.count();
+        let mut tys: [Ty; ..+] = [];
+        for i in 0..na {
+            tys.push(self.types.infer(i as u32));
+        }
+        let va = self.types.mk_list(tys[..]);
+        let mut tys: [Ty; ..+] = [];
+        for i in 0..db.generics.count() {
+            tys.push(self.types.infer((na + i) as u32));
+        }
+        let vb = self.types.mk_list(tys[..]);
+        let sa = self.types.subst(da.self_ty, va);
+        let sb = self.types.subst(db.self_ty, vb);
+        let mut s: HashMap::<u32, Ty> = HashMap::new();
+        return unify(&mut self.types, sa, sb, &mut s);
+    }
+
     /// Whether two impls of the same trait could both apply to some type
     /// (coherence). Their headers must unify, and no bound of either impl may
     /// be definitely false for the unified types: `impl::<T: Dull> X for T`
