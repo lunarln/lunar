@@ -265,17 +265,18 @@ impl Sema {
             }
             checked.push(Checked { body: b, ok, is_std });
         }
-        // What each function's result may point into, from its body, for
-        // the borrow checking of its callers.
+        // What each closure's result may point into, from its body, for the
+        // borrow checking of its callers (a named function's comes from its
+        // signature).
         let mut bodies: [Body; ..+] = [];
         let mut envs: [List::<Pred>; ..+] = [];
         for c in checked[..] {
-            if c.ok {
+            if c.ok && self.p.closures.get(c.body.def).is_some() {
                 bodies.push(c.body);
                 envs.push(self.body_env(c.body.def));
             }
         }
-        borrowck::infer_ret_points(&mut self.p, bodies[..], envs[..]);
+        borrowck::infer_closure_ret_points(&mut self.p, bodies[..], envs[..]);
         for c in checked[..] {
             self.finish_body(c.body, c.ok, c.is_std);
         }

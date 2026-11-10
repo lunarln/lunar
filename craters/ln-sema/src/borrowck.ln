@@ -14,10 +14,12 @@
 //   argument, so lending to one invalidates nothing; inside the function,
 //   such a parameter may itself only be grown.
 // * **Results**: which arguments a call's result may point into comes from
-//   the called function's body (`infer_ret_points`, before any body is
-//   checked): the roots of the values it returns, mapped back to its
-//   parameters. Without a body to look at, the result may point into
-//   every argument.
+//   the called function's signature (its `from` clause, or what leaving it
+//   out means), and each function's returns are checked against its own.
+//   A closure's comes from its body (`infer_closure_ret_points`, before
+//   any body is checked): the roots of the values it returns, mapped back
+//   to its parameters. Through a function pointer, the result may point
+//   into every argument.
 //
 // The checks are the Rust ones; only the representation differs, because
 // array items and map values must be Light:
@@ -40,7 +42,7 @@ use core::arena::{Id, List};
 use core::collections::HashMap;
 use core::intern::Symbol;
 use crater::codes;
-use crater::defs::{DefId, Param, Pred};
+use crater::defs::{DefId, Param, Pred, RetFrom};
 use crater::diag::{Diags, is_dummy};
 use crater::program::Program;
 use crater::thir::*;
@@ -446,10 +448,12 @@ fn unreachable_expr(p: &mut +Program, e: Id::<Expr>, out: &mut +Diags) {
 
 // ========================================================================= what results point into
 
-/// Which parameters the value a function returns may point into, inferred
-/// from its body: bit `i` of `into` if into parameter `i`'s own storage
-/// (and wherever its views point), bit `i` of `through` if only where its
-/// views point. Parameters from the 64th on always count as `into`.
+/// Which parameters the value a function returns may point into: bit `i`
+/// of `into` if into parameter `i`'s own storage (and wherever its views
+/// point), bit `i` of `through` if only where its views point. Parameters
+/// from the 64th on always count as `into`. A named function's comes from
+/// its signature (`Program::ret_from`, all `into`); a closure's is inferred
+/// from its body (`infer_closure_ret_points`).
 pub struct RetPoints {
     pub into: u64,
     pub through: u64,
@@ -484,151 +488,32 @@ impl RetPoints {
     }
 }
 
-/// Infer the `RetPoints` of every body in `bodies` (with its bounds,
-/// `envs`) into `p.ret_points`. Over the call graph's strongly connected
-/// components, callees first; inside one, from nothing up to a fixed point.
-pub fn infer_ret_points(p: &mut Program, bodies: [Body; &], envs: [List::<Pred>; &]) {
-    let n = bodies.len();
-    let mut index: HashMap::<DefId, usize> = HashMap::new();
-    for i in 0..n {
-        index.insert(bodies[i].def, i);
+/// Infer the `RetPoints` of the closure bodies `bodies` (with their bounds,
+/// `envs`) into `p.ret_points`. A closure may return what another closure
+/// it calls returns, so this goes from nothing up to a fixed point.
+pub fn infer_closure_ret_points(p: &mut Program, bodies: [Body; &], envs: [List::<Pred>; &]) {
+    for b in bodies {
+        p.ret_points.insert(b.def, RetPoints::none());
     }
-    // The bodies body `i` calls are `edges[starts[i]..starts[i + 1]]`.
-    let mut starts: [usize; ..+] = [0];
-    let mut edges: [u64; ..+] = [];
-    for i in 0..n {
-        let mut out: [u64; -..+] = [];
-        let mut top: [Id::<Expr>; ..+] = [];
-        visit_block(&p.thir, bodies[i].block, &mut top);
-        for e in top {
-            collect_callees(p, e, &index, &mut out);
-        }
-        sort_dedup(&mut out);
-        edges.extend(out[..]);
-        starts.push(edges.len());
-    }
-    let mut ends: [usize; ..+] = [];
-    let order = sccs(starts[..], edges[..], &mut ends);
-    let mut begin: usize = 0;
-    for end in ends {
-        let scc = order[begin..end];
-        begin = end;
-        for m in scc {
-            p.ret_points.insert(bodies[m].def, RetPoints::none());
-        }
-        let first = scc[0];
-        let mut recursive = scc.len() > 1;
-        for j in starts[first]..starts[first + 1] {
-            if edges[j] as usize == first {
-                recursive = true;
+    loop {
+        let mut changed = false;
+        for m in 0..bodies.len() {
+            let new = body_ret_points(p, bodies[m], envs[m]);
+            let old = p.ret_points.get(bodies[m].def).unwrap();
+            let merged = RetPoints { into: old.into | new.into, through: old.through | new.through };
+            if merged.into != old.into || merged.through != old.through {
+                p.ret_points.insert(bodies[m].def, merged);
+                changed = true;
             }
         }
-        loop {
-            let mut changed = false;
-            for m in scc {
-                let new = body_ret_points(p, bodies[m], envs[m]);
-                let old = p.ret_points.get(bodies[m].def).unwrap();
-                let merged = RetPoints { into: old.into | new.into, through: old.through | new.through };
-                if merged.into != old.into || merged.through != old.through {
-                    p.ret_points.insert(bodies[m].def, merged);
-                    changed = true;
-                }
-            }
-            if !changed || !recursive {
-                break;
-            }
+        if !changed {
+            break;
         }
     }
 }
 
-/// The bodies (indexes into the inferred ones) that calls in `e` run, onto
-/// `out`.
-fn collect_callees(p: &mut +Program, e: Id::<Expr>, index: &HashMap::<DefId, usize>, out: &mut [u64; -..+]) {
-    if let ExprKind::Call { callee, .. } = p.thir.expr(e).kind {
-        if let Some(d) = callee_def(p, callee) {
-            if let Some(i) = index.get(d) {
-                out.push(i as u64);
-            }
-        }
-    }
-    let mut kids: [Id::<Expr>; ..+] = [];
-    visit_children(&p.thir, e, &mut kids);
-    for c in kids {
-        collect_callees(p, c, index, out);
-    }
-}
-
-/// The strongly connected components of the graph whose node `i` has the
-/// successors `edges[starts[i]..starts[i + 1]]`, callees (successors)
-/// before callers (Tarjan's algorithm): the nodes of each, sorted, end to
-/// end, and where each ends onto `ends`.
-fn sccs(starts: [usize; &], edges: [u64; &], ends: &mut [usize; ..+]): [usize; ..+] {
-    let n = starts.len() - 1;
-    let unseen: u32 = 4294967295;
-    let mut index: [u32; ..+] = [unseen; n];
-    let mut low: [u32; ..+] = [0u32; n];
-    let mut on: [bool; ..+] = [false; n];
-    let mut stack: [usize; -..+] = [];
-    let mut next: u32 = 0;
-    let mut out: [usize; ..+] = [];
-    // The path being searched: each node and its next edge to follow.
-    let mut work: [(usize, usize); -..+] = [];
-    for s in 0..n {
-        if index[s] != unseen {
-            continue;
-        }
-        index[s] = next;
-        low[s] = next;
-        next += 1;
-        stack.push(s);
-        on[s] = true;
-        work.push((s, starts[s]));
-        while work.len() > 0 {
-            let top = work.len() - 1;
-            let (v, ei) = work[top];
-            if ei < starts[v + 1] {
-                let w = edges[ei] as usize;
-                work[top] = (v, ei + 1);
-                if index[w] == unseen {
-                    index[w] = next;
-                    low[w] = next;
-                    next += 1;
-                    stack.push(w);
-                    on[w] = true;
-                    work.push((w, starts[w]));
-                } else if on[w] && index[w] < low[v] {
-                    low[v] = index[w];
-                }
-                continue;
-            }
-            work.pop();
-            if work.len() > 0 {
-                let (u, _) = work[work.len() - 1];
-                if low[v] < low[u] {
-                    low[u] = low[v];
-                }
-            }
-            if low[v] == index[v] {
-                let mut c: [usize; -..+] = [];
-                loop {
-                    let w = stack.pop().unwrap();
-                    on[w] = false;
-                    c.push(w);
-                    if w == v {
-                        break;
-                    }
-                }
-                c.sort();
-                out.extend(c[..]);
-                ends.push(out.len());
-            }
-        }
-    }
-    return out;
-}
-
-/// What the value `body` returns may point into, given the `RetPoints`
-/// known so far.
+/// What the value closure `body` returns may point into, given the
+/// `RetPoints` known so far.
 fn body_ret_points(p: &mut +Program, body: Body, env_list: List::<Pred>): RetPoints {
     let env = p.preds.list(env_list).to_grow();
     let mut cx = new_cx(p, body, env[..]);
@@ -645,14 +530,7 @@ fn body_ret_points(p: &mut +Program, body: Body, env_list: List::<Pred>): RetPoi
         }
     }
     cx.compute_roots(p);
-    let mut roots: Roots = [];
-    if let Some(t) = p.thir.block(body.block).tail {
-        let tr = cx.value_roots(p, t);
-        roots_extend(&mut roots, tr[..]);
-    }
-    for e in top {
-        cx.return_roots(p, e, &mut roots);
-    }
+    let roots = cx.returned_roots(p);
     let mut rp = RetPoints::none();
     for r in roots {
         let mut into = true;
@@ -702,32 +580,101 @@ fn is_concrete(p: &Program, t: Ty): bool {
     });
 }
 
-/// The function whose body a call runs, when that is known here: a named
-/// function, a trait method on a concrete type (its impl's, or the trait's
-/// default), or a closure called where its type is known.
+/// What says where a call's result points: the signature of a named
+/// function or of a trait method (on a concrete type, its impl's, or the
+/// trait's default; otherwise the trait's declaration), or the body of a
+/// closure called where its type is known.
 fn callee_def(p: &mut +Program, c: Callee): Option::<DefId> {
     return match c {
         Callee::Fn { def, .. } => Some(def),
+        Callee::Intrinsic { def, .. } => Some(def),
         Callee::Trait { trait_ref, self_ty, method, method_args } => {
             let mut concrete = is_concrete(p, self_ty);
             for t in p.types.list(trait_ref.args) {
                 concrete = concrete && is_concrete(p, t);
             }
-            if !concrete {
-                return None;
+            if concrete {
+                if let Some(MethodImpl::Fn { def, .. }) = p.resolve_method(trait_ref, self_ty, method, method_args) {
+                    return Some(def);
+                }
             }
-            match p.resolve_method(trait_ref, self_ty, method, method_args) {
-                Some(MethodImpl::Fn { def, .. }) => Some(def),
-                _ => None,
-            }
+            trait_method(p, trait_ref.trait_id, method)
         }
         Callee::Value { callee: f, .. } => match p.types.kind(p.thir.expr(f).ty) {
             TyKind::Closure(def, _) => Some(def),
             _ => None,
         },
-        Callee::Intrinsic { .. } => None,
         Callee::Indirect(_) => None,
     };
+}
+
+/// `` `a` ``, `` `a` and `b` ``, `` `a`, `b` and `c` ``.
+pub fn quoted_list(names: [str; &]): String {
+    let mut out = String::new();
+    for i in 0..names.len() {
+        if i > 0 {
+            out.push_str(if i + 1 == names.len() { " and " } else { ", " });
+        }
+        out.write("`{names[i]}`");
+    }
+    return out;
+}
+
+/// The names of the parameters of `def` in `set` (see `RetFrom`).
+pub fn from_names(p: &Program, def: DefId, set: u64): [str; ..+] {
+    let mut out: [str; ..+] = [];
+    let ps = p.params.list(p.fn_data(def).sig.params);
+    for i in 0..ps.len() {
+        if i < 64 && (set >> (i as u64)) & 1 == 1 {
+            out.push(p.text(ps[i].name));
+        }
+    }
+    return out;
+}
+
+/// Whether values of `t` point into storage they do not own, where the
+/// generic parameters have the bounds `env`.
+pub fn ty_has_view(p: &mut +Program, env: [Pred; &], t: Ty, depth: u32): bool {
+    if depth > 32 {
+        return false;
+    }
+    return match p.types.kind(t) {
+        TyKind::Str | TyKind::FmtArgs => true,
+        TyKind::Array(e, k) => k.is_slice() || ty_has_view(p, env, e, depth + 1),
+        TyKind::Tuple(ts) => any_view(p, env, ts, depth + 1),
+        TyKind::Adt(d, args) => {
+            let fs = p.adt_field_tys(d, args);
+            any_view(p, env, fs, depth + 1)
+        }
+        TyKind::Grow(t) => ty_has_view(p, env, t, depth + 1),
+        TyKind::Closure(d, args) => {
+            let Some(c) = p.closures.get(d) else { return false; };
+            for i in 0..c.captures.len() {
+                let cap = p.captures.list(c.captures)[i];
+                if cap.by_ref {
+                    return true;
+                }
+                let ct = p.types.subst(cap.ty, args);
+                if ty_has_view(p, env, ct, depth + 1) {
+                    return true;
+                }
+            }
+            false
+        }
+        // Generic values may be instantiated with views, and `impl Trait`
+        // may stand for one, unless bounded by `Dull`.
+        TyKind::Param(..) | TyKind::Opaque(..) => !p.is_dull(t, env),
+        _ => false,
+    };
+}
+
+fn any_view(p: &mut +Program, env: [Pred; &], l: TyList, depth: u32): bool {
+    for i in 0..l.len() {
+        if ty_has_view(p, env, p.types.at(l, i), depth) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ========================================================================= check
@@ -745,6 +692,7 @@ fn new_cx(p: &mut +Program, body: Body, env: [Pred; &]): Cx {
         saved_sets: [],
         words: (body.locals.len() + 63) / 64,
         held: [],
+        from: None,
     };
     for i in 0..body.params.len() {
         let l = p.thir.local_ids.list(body.params)[i];
@@ -761,6 +709,7 @@ fn new_cx(p: &mut +Program, body: Body, env: [Pred; &]): Cx {
 pub fn check(p: &mut +Program, body: Body, env: [Pred; &]) {
     let mut cx = new_cx(p, body, env);
     cx.compute_roots(p);
+    cx.from = cx.declared_from(p);
     cx.check_views_block(p, body.block);
     if let Some(t) = p.thir.block(body.block).tail {
         cx.check_escape(p, t, p.thir.expr(t).span);
@@ -787,6 +736,17 @@ struct Cx {
     words: usize,
     /// Roots of the other arguments of the call being checked.
     held: Roots,
+    /// For a named function, what its signature says its result points
+    /// into, to check what it returns against.
+    from: Option::<FromCheck>,
+}
+
+/// A named function's `from` (declared or left out), checked against the
+/// values its body returns.
+struct FromCheck {
+    declared: RetFrom,
+    /// The declared parameters and every one a returned value points into.
+    wanted: u64,
 }
 
 impl Cx {
@@ -842,50 +802,7 @@ impl Cx {
 
     /// Whether values of `t` point into storage they do not own.
     fn has_view(&self, p: &mut +Program, t: Ty): bool {
-        return self.has_view_rec(p, t, 0);
-    }
-
-    fn has_view_rec(&self, p: &mut +Program, t: Ty, depth: u32): bool {
-        if depth > 32 {
-            return false;
-        }
-        return match p.types.kind(t) {
-            TyKind::Str | TyKind::FmtArgs => true,
-            TyKind::Array(e, k) => k.is_slice() || self.has_view_rec(p, e, depth + 1),
-            TyKind::Tuple(ts) => self.any_view(p, ts, depth + 1),
-            TyKind::Adt(d, args) => {
-                let fs = p.adt_field_tys(d, args);
-                self.any_view(p, fs, depth + 1)
-            }
-            TyKind::Grow(t) => self.has_view_rec(p, t, depth + 1),
-            TyKind::Closure(d, args) => {
-                let Some(c) = p.closures.get(d) else { return false; };
-                for i in 0..c.captures.len() {
-                    let cap = p.captures.list(c.captures)[i];
-                    if cap.by_ref {
-                        return true;
-                    }
-                    let ct = p.types.subst(cap.ty, args);
-                    if self.has_view_rec(p, ct, depth + 1) {
-                        return true;
-                    }
-                }
-                false
-            }
-            // Generic values may be instantiated with views, and `impl Trait`
-            // may stand for one, unless bounded by `Dull`.
-            TyKind::Param(..) | TyKind::Opaque(..) => !p.is_dull(t, self.env),
-            _ => false,
-        };
-    }
-
-    fn any_view(&self, p: &mut +Program, l: TyList, depth: u32): bool {
-        for i in 0..l.len() {
-            if self.has_view_rec(p, p.types.at(l, i), depth) {
-                return true;
-            }
-        }
-        return false;
+        return ty_has_view(p, self.env, t, 0);
     }
 
     /// Whether a value of `t` has storage a view could point into: an owned
@@ -1218,6 +1135,22 @@ impl Cx {
         }
     }
 
+    /// The roots of every value the body being checked returns: its tail
+    /// and its `return`s.
+    fn returned_roots(&self, p: &mut +Program): Roots {
+        let mut roots: Roots = [];
+        if let Some(t) = p.thir.block(self.body.block).tail {
+            let tr = self.value_roots(p, t);
+            roots_extend(&mut roots, tr[..]);
+        }
+        let mut top: [Id::<Expr>; ..+] = [];
+        visit_block(&p.thir, self.body.block, &mut top);
+        for e in top {
+            self.return_roots(p, e, &mut roots);
+        }
+        return roots;
+    }
+
     /// The roots of the values `return`ed in `e`, into `out`.
     fn return_roots(&self, p: &mut +Program, e: Id::<Expr>, out: &mut Roots) {
         if let ExprKind::Return(Some(v)) = p.thir.expr(e).kind {
@@ -1246,10 +1179,13 @@ impl Cx {
         }
     }
 
-    /// What the result of a call points into, when the body of what is
-    /// called is known (see `infer_ret_points`).
+    /// What a call's result points into, when known: what the signature of
+    /// the function called says, or the body of the closure called.
     fn callee_ret_points(&self, p: &mut +Program, c: Callee): Option::<RetPoints> {
         let Some(def) = callee_def(p, c) else { return None; };
+        if let Some(rf) = p.ret_from.get(def) {
+            return Some(RetPoints { into: rf.set, through: 0 });
+        }
         return p.ret_points.get(def);
     }
 
@@ -1380,9 +1316,10 @@ impl Cx {
     }
 
     /// Why local `v` points into `root`, when that comes from what the
-    /// body of a function says its result points into: `v` is bound to the
-    /// result of a call, and an argument of it (or the closure called)
-    /// points into `root`. That argument's span, and what was called.
+    /// signature of a function (or the body of a closure) says its result
+    /// points into: `v` is bound to the result of a call, and an argument
+    /// of it (or the closure called) points into `root`. That argument's
+    /// span, and what was called.
     fn returned_into(&self, p: &mut +Program, v: LocalId, root: LocalId): Option::<(Span, Symbol)> {
         let mut found = false;
         let mut cause: Option::<(Span, Symbol)> = None;
@@ -1444,7 +1381,7 @@ impl Cx {
     }
 
     /// For `returned_into`: the argument of the call `init` (if it is one,
-    /// with an inferred result) whose roots give `root`.
+    /// with a known result) whose roots give `root`.
     fn call_cause(&self, p: &mut +Program, init: Id::<Expr>, root: LocalId): Option::<(Span, Symbol)> {
         let mut e = init;
         while let ExprKind::Coerce { expr, .. } = p.thir.expr(e).kind {
@@ -1945,6 +1882,117 @@ impl Cx {
                     }
                 }
                 p.diags.finish();
+            }
+        }
+        self.check_from(p, v);
+    }
+
+    /// For a named function, what its signature says its result points
+    /// into, and what its returned values do.
+    fn declared_from(&self, p: &mut +Program): Option::<FromCheck> {
+        let Some(declared) = p.ret_from.get(self.body.def) else { return None; };
+        let mut wanted = declared.set;
+        let roots = self.returned_roots(p);
+        for r in roots {
+            if let Some((i, _)) = self.returned_param(p, r) {
+                if i < 64 {
+                    wanted = wanted | (1u64 << i as u64);
+                }
+            }
+        }
+        return Some(FromCheck { declared, wanted });
+    }
+
+    /// The parameter (index and local) a returned value with root `r`
+    /// points into: a borrowed parameter's own data, or where a
+    /// parameter's views point.
+    fn returned_param(&self, p: &Program, r: Root): Option::<(u32, LocalId)> {
+        let (l, arg) = match r {
+            Root::Local(x) => (x, false),
+            Root::Arg(x) => (x, true),
+            Root::Slot(_) => return None,
+            Root::Temp => return None,
+        };
+        if let LocalKind::Param { index, owned, .. } = self.local(p, l).kind {
+            if !owned || arg {
+                return Some((index, l));
+            }
+        }
+        return None;
+    }
+
+    /// A value `v` leaving a named function may only point into the
+    /// parameters its signature names (`from`). Reported at the branch of
+    /// an `if` or `match` (or the tail of a block) that returns it.
+    fn check_from(&mut self, p: &mut +Program, v: Id::<Expr>) {
+        let Some(fc) = self.from else { return; };
+        match p.thir.expr(v).kind {
+            ExprKind::Block(b) => {
+                if let Some(t) = p.thir.block(b).tail {
+                    self.check_from(p, t);
+                }
+            }
+            ExprKind::If { then, else_, .. } => {
+                self.check_from(p, then);
+                if let Some(x) = else_ {
+                    self.check_from(p, x);
+                }
+            }
+            ExprKind::Match { arms, .. } => {
+                for i in 0..arms.len() {
+                    let a = p.thir.arms.list(arms)[i];
+                    self.check_from(p, a.body);
+                }
+            }
+            _ => {
+                let span = p.thir.expr(v).span;
+                let roots = self.value_roots(p, v);
+                for r in roots {
+                    let Some((i, l)) = self.returned_param(p, r) else { continue; };
+                    if i >= 64 || (fc.declared.set >> i as u64) & 1 == 1 {
+                        continue;
+                    }
+                    if !self.report(span, 10) {
+                        return;
+                    }
+                    let def = self.body.def;
+                    let fname = p.text(p.defs[def.index()].name);
+                    let n = p.text(self.local(p, l).name);
+                    let m = say(p, "`{fname}` returns a view from `{n}`, but its signature does not say so");
+                    p.diags.error(codes::borrow::ESCAPES_VIA_RETURN(), span, m);
+                    let sig = p.fn_data(def).sig;
+                    let ps = p.params.list(sig.params);
+                    let self_first = ps.len() > 0 && ps[0].is_self;
+                    let names = from_names(p, def, fc.declared.set);
+                    let only = quoted_list(names[..]);
+                    if !is_dummy(fc.declared.span) && fc.declared.set == 0 {
+                        let t = say(p, "the result is declared to point into no parameter");
+                        p.diags.secondary(fc.declared.span, t);
+                    } else if !is_dummy(fc.declared.span) {
+                        let t = say(p, "the result is declared to point only into {only}");
+                        p.diags.secondary(fc.declared.span, t);
+                    } else if self_first && fc.declared.set == 1 {
+                        let t = say(p, "without a `from` clause, a method's result points only into `self`");
+                        p.diags.secondary(sig.ret_span, t);
+                    } else if fc.declared.set == 0 {
+                        let t = say(p, "without a `from` clause, the result points into no parameter");
+                        p.diags.secondary(sig.ret_span, t);
+                    } else {
+                        let t = say(p, "without a `from` clause, the result points only into {only}");
+                        p.diags.secondary(sig.ret_span, t);
+                    }
+                    let wanted = from_names(p, def, fc.wanted);
+                    let mut w = String::new();
+                    for j in 0..wanted.len() {
+                        if j > 0 {
+                            w.push_str(", ");
+                        }
+                        w.push_str(wanted[j]);
+                    }
+                    p.diags.help(say(p, "say every parameter the result may point into: `from {w}`"));
+                    p.diags.finish();
+                    return;
+                }
             }
         }
     }

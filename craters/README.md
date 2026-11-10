@@ -126,14 +126,17 @@ compares its answers with the Rust server's.
 * Structs cannot hold references: state a Rust struct borrows is passed to
   methods as parameters, or owned.
 * Array items, map keys and values must be Light (own no array or string).
-* What a returned value's views point into is inferred from the body of the
-  function returning it (`docs/reference.md` §4): only the arguments it
-  really comes from stay borrowed. A method returning a slice of a `str`
-  field of `&self` points where the field points, not into `self`, and a
-  function may build a struct holding views (such as `Sema`) from a local
-  it lends. Calls through function pointers, trait methods on a generic
-  receiver and closures of unknown type still count as pointing into every
-  argument.
+* What a returned value's views point into is part of the signature
+  (`docs/reference.md` §4): a method's result points into `self`, any
+  other function's into every parameter a view could come from, unless a
+  `from` clause says otherwise. Say it when callers need the other
+  arguments free: `fn text(&self, src: str): str from src`. A result that
+  holds views only of static data, such as a `ProjectError` (whose `Code`
+  is two string literals) or a `Sema` built from copies, is `from static`:
+  `fn check_req(alias: str, req: str, path: str, lo: u32, hi: u32):
+  Result::<(), ProjectError> from static`. Closures are still inferred
+  from their bodies; calls through function pointers count as pointing
+  into every argument.
 * Constants cannot hold structs.
 * `[T; ..+]` only grows; use `[T; -..+]` to `pop`/`truncate`/`clear`.
 * Keep fixed arrays well under 64K elements: they are copied as one LLVM

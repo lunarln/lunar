@@ -58,27 +58,27 @@ pub struct ProjectError {
 }
 
 impl ProjectError {
-    pub fn new(code: Code, message: FmtArgs): ProjectError {
+    pub fn new(code: Code, message: FmtArgs): ProjectError from code {
         let mut m = String::new();
         m.write(message);
         return ProjectError { code, message: m, file: String::new(), lo: 0, hi: 0, label: String::new(), extra: String::new() };
     }
 
-    pub fn at(mut self, file: str, lo: u32, hi: u32): ProjectError {
+    pub fn at(mut self, file: str, lo: u32, hi: u32): ProjectError from self {
         self.file = String::from(file);
         self.lo = lo;
         self.hi = hi;
         return self;
     }
 
-    pub fn note(mut self, n: FmtArgs): ProjectError {
+    pub fn note(mut self, n: FmtArgs): ProjectError from self {
         self.extra.push('n');
         self.extra.write(n);
         self.extra.push('\0');
         return self;
     }
 
-    pub fn help(mut self, h: FmtArgs): ProjectError {
+    pub fn help(mut self, h: FmtArgs): ProjectError from self {
         self.extra.push('h');
         self.extra.write(h);
         self.extra.push('\0');
@@ -87,7 +87,7 @@ impl ProjectError {
 }
 
 /// An I/O failure while handling `path`.
-fn io_error(path: str, e: std::io::Error): ProjectError {
+fn io_error(path: str, e: std::io::Error): ProjectError from static {
     return ProjectError::new(build::IO(), "could not access `{display(path)}`: {e}");
 }
 
@@ -256,7 +256,7 @@ impl Project {
     // ----------------------------------------------------------- manifests
 
     /// Read and parse `dir/lunar.toml`.
-    fn load_manifest(&mut +self, dir: str): Result::<ManifestFile, ProjectError> {
+    fn load_manifest(&mut +self, dir: str): Result::<ManifestFile, ProjectError> from static {
         let path = join(dir, MANIFEST);
         let text = match fs::read_to_string(path.as_str()) {
             Ok(t) => t,
@@ -266,7 +266,7 @@ impl Project {
     }
 
     /// Parse the text of `dir/lunar.toml`.
-    fn parse_manifest(&mut +self, dir: str, text: str): Result::<ManifestFile, ProjectError> {
+    fn parse_manifest(&mut +self, dir: str, text: str): Result::<ManifestFile, ProjectError> from static {
         let path = join(dir, MANIFEST);
         let p = path.as_str();
         let d = match ln_toml::parse(text) {
@@ -362,7 +362,7 @@ impl Project {
 
     /// The package section `pk` (and the dependencies `deps`) of the
     /// manifest `path`, checked.
-    fn package_of(&mut +self, dir: str, path: str, d: &Doc, pk: u32, deps: Option::<u32>): Result::<Package, ProjectError> {
+    fn package_of(&mut +self, dir: str, path: str, d: &Doc, pk: u32, deps: Option::<u32>): Result::<Package, ProjectError> from static {
         let name_v = d.entries[d.get(pk, "name").unwrap() as usize].value;
         let version_v = d.entries[d.get(pk, "version").unwrap() as usize].value;
         let name = str_of(d, name_v);
@@ -395,7 +395,7 @@ impl Project {
     }
 
     /// The dependency entry `e` of a manifest, checked.
-    fn dependency(&mut +self, dir: str, path: str, d: &Doc, e: u32): Result::<Dependency, ProjectError> {
+    fn dependency(&mut +self, dir: str, path: str, d: &Doc, e: u32): Result::<Dependency, ProjectError> from static {
         let _ = dir;
         let entry = d.entries[e as usize];
         let alias = key_of(d, e);
@@ -478,7 +478,7 @@ impl Project {
     }
 
     /// The package manifest in `dir`.
-    pub fn load_package_manifest(&mut +self, dir: str): Result::<Package, ProjectError> {
+    pub fn load_package_manifest(&mut +self, dir: str): Result::<Package, ProjectError> from static {
         let file = self.load_manifest(dir)?;
         return match file.package {
             Some(p) => Ok(p),
@@ -490,7 +490,7 @@ impl Project {
 
     /// Find the workspace around `start`: the nearest manifest, and the
     /// workspace that lists it as a member (or itself).
-    pub fn find_workspace(&mut self, start: str): Result::<(), ProjectError> {
+    pub fn find_workspace(&mut self, start: str): Result::<(), ProjectError> from static {
         let found = match find_project(start) {
             Some(d) => d,
             None => {
@@ -548,7 +548,7 @@ impl Project {
 
     /// The member directories of the workspace `file` (at `root`), onto
     /// `out`.
-    fn expand_members(&mut +self, root: str, file: ManifestFile, out: &mut +[Symbol; ..+]): Result::<(), ProjectError> {
+    fn expand_members(&mut +self, root: str, file: ManifestFile, out: &mut +[Symbol; ..+]): Result::<(), ProjectError> from static {
         let manifest_path = self.text(file.path);
         if file.package.is_some() {
             let r = self.sym(root);
@@ -631,7 +631,7 @@ impl Project {
 
     /// Resolve the dependency graph of the workspace. Locked git commits are
     /// reused unless `update` is set; the lockfile is rewritten to match.
-    pub fn resolve(&mut +self, update: bool): Result::<(), ProjectError> {
+    pub fn resolve(&mut +self, update: bool): Result::<(), ProjectError> from static {
         let root = String::from(self.text(self.root));
         let mut lock: [Locked; ..+] = [];
         if !update {
@@ -809,7 +809,7 @@ impl Project {
     // ----------------------------------------------------------- lockfile
 
     /// `lunar.lock` in `root` (nothing if there is none).
-    fn load_lock(&mut +self, root: str, out: &mut +[Locked; ..+]): Result::<(), ProjectError> {
+    fn load_lock(&mut +self, root: str, out: &mut +[Locked; ..+]): Result::<(), ProjectError> from static {
         let path = join(root, LOCKFILE);
         let text = match fs::read_to_string(path.as_str()) {
             Ok(t) => t,
@@ -880,7 +880,7 @@ impl Project {
     }
 
     /// Write the lockfile if its contents changed.
-    fn save_lock(&mut +self, root: str, lock: &[Locked; ..+]): Result::<(), ProjectError> {
+    fn save_lock(&mut +self, root: str, lock: &[Locked; ..+]): Result::<(), ProjectError> from static {
         // Sorted and without repeats, as (name, version, source).
         let mut rows = String::new();
         for l in lock {
@@ -957,7 +957,7 @@ impl Project {
     /// Set `specs` to the craters to analyze for `target` of package
     /// `pkg`: the target crater first, then the libraries of every package
     /// it depends on, directly or not.
-    pub fn craters(&mut self, pkg: usize, target: Target): Result::<(), ProjectError> {
+    pub fn craters(&mut self, pkg: usize, target: Target): Result::<(), ProjectError> from static {
         self.specs.clear();
         let p = self.packages[pkg];
         let own = crater_name(self.text(p.name));
@@ -995,7 +995,7 @@ impl Project {
         return Ok(());
     }
 
-    fn lib_crater(&mut +self, pkg: usize, lib_of: &mut +[u32; ..+]): Result::<u32, ProjectError> {
+    fn lib_crater(&mut +self, pkg: usize, lib_of: &mut +[u32; ..+]): Result::<u32, ProjectError> from static {
         if lib_of[pkg] != 4294967295 {
             return Ok(lib_of[pkg]);
         }
@@ -1032,7 +1032,7 @@ impl Project {
 
     /// Add or replace a dependency in the package manifest in `dir`,
     /// keeping its formatting and comments.
-    pub fn add_dependency(&mut +self, dir: str, alias: str, spec: &DepSpec): Result::<(), ProjectError> {
+    pub fn add_dependency(&mut +self, dir: str, alias: str, spec: &DepSpec): Result::<(), ProjectError> from static {
         let path = join(dir, MANIFEST);
         if !valid_name(alias) {
             return Err(ProjectError::new(manifest::BAD_NAME(), "`{alias}` is not a valid dependency name").note("{NAME_RULE}"));
@@ -1058,7 +1058,7 @@ impl Project {
     }
 
     /// Remove a dependency from the package manifest in `dir`.
-    pub fn remove_dependency(&mut +self, dir: str, alias: str): Result::<(), ProjectError> {
+    pub fn remove_dependency(&mut +self, dir: str, alias: str): Result::<(), ProjectError> from static {
         let path = join(dir, MANIFEST);
         let text = match fs::read_to_string(path.as_str()) {
             Ok(t) => t,
@@ -1123,7 +1123,7 @@ fn field(d: &Doc, t: u32, name: str): Option::<str> {
 }
 
 /// A `manifest::lock` error in `lunar.lock` at `path`.
-fn lock_error(path: str, msg: str, lo: u32, hi: u32): ProjectError {
+fn lock_error(path: str, msg: str, lo: u32, hi: u32): ProjectError from static {
     return ProjectError::new(manifest::LOCK(), "`{LOCKFILE}` is invalid: {msg}").help("delete `{LOCKFILE}` and run `lunar update` to regenerate it").at(path, lo, hi);
 }
 
@@ -1155,7 +1155,7 @@ fn sort_strs(v: [str; &mut]) {
 }
 
 /// `v` must be a table (else serde's "invalid type").
-fn check_table(d: &Doc, v: u32, path: str, expected: str): Result::<(), ProjectError> {
+fn check_table(d: &Doc, v: u32, path: str, expected: str): Result::<(), ProjectError> from static {
     let x = d.values[v as usize];
     if x.kind != Kind::Table {
         return Err(ProjectError::new(manifest::PARSE(), "invalid `{MANIFEST}`: invalid type: {describe(x.kind)}, expected {expected}").at(path, x.lo, x.hi));
@@ -1163,7 +1163,7 @@ fn check_table(d: &Doc, v: u32, path: str, expected: str): Result::<(), ProjectE
     return Ok(());
 }
 
-fn check_kind(d: &Doc, v: u32, path: str, kind: Kind, expected: str): Result::<(), ProjectError> {
+fn check_kind(d: &Doc, v: u32, path: str, kind: Kind, expected: str): Result::<(), ProjectError> from static {
     let x = d.values[v as usize];
     if x.kind != kind {
         return Err(ProjectError::new(manifest::PARSE(), "invalid `{MANIFEST}`: invalid type: {describe(x.kind)}, expected {expected}").at(path, x.lo, x.hi));
@@ -1173,7 +1173,7 @@ fn check_kind(d: &Doc, v: u32, path: str, kind: Kind, expected: str): Result::<(
 
 /// Every key of table `t` must be one of `expected` (a list of quoted
 /// names, as serde shows it).
-fn check_fields(d: &Doc, t: u32, path: str, expected: str): Result::<(), ProjectError> {
+fn check_fields(d: &Doc, t: u32, path: str, expected: str): Result::<(), ProjectError> from static {
     for e in d.children(t) {
         let k = key_of(d, e);
         let mut quoted = String::new();
@@ -1195,7 +1195,7 @@ fn check_fields(d: &Doc, t: u32, path: str, expected: str): Result::<(), Project
 
 /// A dependency is a version string or a table of known string fields
 /// (else serde's message for an untagged enum).
-fn check_dep(d: &Doc, v: u32, path: str): Result::<(), ProjectError> {
+fn check_dep(d: &Doc, v: u32, path: str): Result::<(), ProjectError> from static {
     let x = d.values[v as usize];
     let mut ok = x.kind == Kind::String;
     if x.kind == Kind::Table {
@@ -1214,7 +1214,7 @@ fn check_dep(d: &Doc, v: u32, path: str): Result::<(), ProjectError> {
     return Ok(());
 }
 
-fn check_req(alias: str, req: str, path: str, lo: u32, hi: u32): Result::<(), ProjectError> {
+fn check_req(alias: str, req: str, path: str, lo: u32, hi: u32): Result::<(), ProjectError> from static {
     if let Err(e) = VersionReq::parse(req) {
         return Err(ProjectError::new(manifest::BAD_VERSION(), "dependency `{alias}`: `{req}` is not a valid version requirement: {e}")
             .at(path, lo, hi)
@@ -1266,7 +1266,7 @@ pub fn find_project(start: str): Option::<String> {
 
 /// Create a package in `dir` (which must not contain a manifest yet); its
 /// name.
-pub fn init(dir: str, lib: bool): Result::<String, ProjectError> {
+pub fn init(dir: str, lib: bool): Result::<String, ProjectError> from static {
     let manifest = join(dir, MANIFEST);
     if fs::exists(manifest.as_str()) {
         return Err(ProjectError::new(manifest::PARSE(), "`{display(manifest.as_str())}` already exists"));
@@ -1315,7 +1315,7 @@ pub fn init(dir: str, lib: bool): Result::<String, ProjectError> {
     return Ok(name);
 }
 
-fn write_new(path: str, text: str): Result::<(), ProjectError> {
+fn write_new(path: str, text: str): Result::<(), ProjectError> from static {
     return match fs::write(path, text.as_bytes()) {
         Ok(()) => Ok(()),
         Err(e) => Err(io_error(path, e)),
