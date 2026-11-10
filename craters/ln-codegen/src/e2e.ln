@@ -22,6 +22,9 @@
 //         let mut st = S { name: string_new(), n: 3 };
 //         string_push_str(&mut st.name, "ab");
 //         total += st.n;                                    // 63
+//         for y in v { total += y; }                        // 78
+//         while total < 100 && total != 80 { total += 1; }  // 80
+//         loop { if total > 81 { break; } total += 1; }     // 82
 //         total
 //     }
 //     fn t1() {}   // a `#[test]`
@@ -29,7 +32,6 @@
 // The C runtime counts data stacks, so a missing drop fails the run.
 
 use core::arena::{Id, List};
-use core::intern::Symbol;
 use ln_ast::{BinOp, ParamMode, Span};
 use ln_sema::defs::*;
 use ln_sema::program::Program;
@@ -316,6 +318,37 @@ fn build_program(): Program {
     let st_n = ex(&mut p, ExprKind::Field { base: st, variant: 0, field: 1 }, i32t);
     let st_n = read(&mut p, st_n, ReadMode::Copy);
     stmts.push(add_to_total(&mut p, st_n, i32t, unit));
+    // for y in v { total += y; }
+    let y_pat = p.thir.pats.add(Pat { kind: PatKind::Binding { local: LocalId::new(7), mode: ReadMode::Copy, sub: None }, ty: i32t, span: sp() });
+    let y = read_local(&mut p, 7, i32t);
+    let inc = add_to_total(&mut p, y, i32t, unit);
+    let each_body = block(&mut p, [inc][..], None);
+    let v = local(&mut p, 5, grow_i32);
+    stmts.push(Stmt::Expr(ex(&mut p, ExprKind::ForArray { pat: y_pat, array: v, index: LocalId::new(8), body: each_body, id: LoopId { index: 1 } }, unit)));
+    // while total < 100 && total != 80 { total += 1; }
+    let t = read_local(&mut p, 0, i32t);
+    let hundred = int(&mut p, 100, i32t);
+    let lhs = ex(&mut p, ExprKind::Binary(BinOp::Lt, t, hundred), boolt);
+    let t = read_local(&mut p, 0, i32t);
+    let eighty = int(&mut p, 80, i32t);
+    let rhs = ex(&mut p, ExprKind::Binary(BinOp::Ne, t, eighty), boolt);
+    let cond = ex(&mut p, ExprKind::Logical { and: true, lhs, rhs }, boolt);
+    let one = int(&mut p, 1, i32t);
+    let inc = add_to_total(&mut p, one, i32t, unit);
+    let while_body = block(&mut p, [inc][..], None);
+    stmts.push(Stmt::Expr(ex(&mut p, ExprKind::While { cond, body: while_body, id: LoopId { index: 2 } }, unit)));
+    // loop { if total > 81 { break; } total += 1; }
+    let t = read_local(&mut p, 0, i32t);
+    let limit = int(&mut p, 81, i32t);
+    let cond = ex(&mut p, ExprKind::Binary(BinOp::Gt, t, limit), boolt);
+    let brk = ex(&mut p, ExprKind::Break { id: LoopId { index: 3 }, value: None }, never);
+    let brk_block = block(&mut p, [Stmt::Expr(brk)][..], None);
+    let then = ex(&mut p, ExprKind::Block(brk_block), unit);
+    let check = ex(&mut p, ExprKind::If { cond, then, else_: None }, unit);
+    let one = int(&mut p, 1, i32t);
+    let inc = add_to_total(&mut p, one, i32t, unit);
+    let loop_body = block(&mut p, [Stmt::Expr(check), inc][..], None);
+    stmts.push(Stmt::Expr(ex(&mut p, ExprKind::Loop { body: loop_body, id: LoopId { index: 3 } }, unit)));
     // total
     let tail = read_local(&mut p, 0, i32t);
     let main_block = block(&mut p, stmts[..], Some(tail));
@@ -327,6 +360,8 @@ fn build_program(): Program {
         lt(&mut p, "x", i32t, LocalKind::Let),
         lt(&mut p, "v", grow_i32, LocalKind::Let),
         lt(&mut p, "st", s_ty, LocalKind::Let),
+        lt(&mut p, "y", i32t, LocalKind::Let),
+        lt(&mut p, "idx", usize, LocalKind::Temp),
     ];
     body(&mut p, main, main_locals[..], [][..], main_block);
     p.main = Some(main);
@@ -398,7 +433,7 @@ fn compiles_links_and_runs() {
         run.write("./{exe}");
         let none: [str; 0] = [];
         match std::process::run(run.as_str(), none[..]) {
-            Ok(code) => assert_eq!(code, 63),
+            Ok(code) => assert_eq!(code, 82),
             Err(e) => panic("could not run {exe}: {e}"),
         }
         std::fs::remove_file(obj.as_str());

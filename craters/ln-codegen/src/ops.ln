@@ -10,7 +10,7 @@ use ln_sema::diag::dummy_span;
 use ln_sema::program::Program;
 use ln_sema::thir::*;
 use ln_sema::traits::MethodImpl;
-use ln_sema::ty::{ArrKind, FloatTy, IntTy, Modes, TraitRef, Ty, TyKind, TyList};
+use ln_sema::ty::{ArrKind, IntTy, Modes, TraitRef, Ty, TyKind, TyList};
 use crater::Cg;
 use crater::llvm::*;
 
