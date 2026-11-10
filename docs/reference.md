@@ -194,10 +194,11 @@ to 64 MiB in total.
   closure that changes what it borrowed.
 * **`&mut +T` promises to only grow.** A parameter declared `&mut +T` (or a
   receiver `&mut +self`) is never shrunk or replaced, so the caller's views
-  survive the call. `push`, `extend`, `insert`, `String::push_str`,
-  `String::write`, `Arena::add` and `Interner::intern` are `+`
-  (`HashMap::insert` is not: growing replaces its table, so a loop over a
-  map cannot insert into it):
+  survive the call. `push`, `extend`, `reserve`, `String::push_str`,
+  `String::write`, `Arena::add` and `Interner::intern` are `+`. Methods
+  that move what views would see are not, even when nothing is freed:
+  array `insert` shifts elements, and `HashMap::insert` may rebuild its
+  table, so a loop over a map cannot insert into it:
 
   ```lunar
   let s = a[0..2];

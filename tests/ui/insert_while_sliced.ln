@@ -1,0 +1,8 @@
+// error: borrow::shrink_while_borrowed
+// `insert` shifts elements, so a slice taken before it would see them move.
+fn main() {
+    let mut a: [i32; -..+] = [1, 2, 3];
+    let s = a[0..2];
+    a.insert(0, 9);
+    println("{s[0]}");
+}
