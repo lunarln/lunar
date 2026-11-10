@@ -44,6 +44,11 @@ pub struct SrcId {
 }
 
 impl SrcId {
+    /// The id of the `index`th source added to a `Sources`.
+    pub fn from_index(index: usize): SrcId {
+        return SrcId { index: index as u32 };
+    }
+
     pub fn index(self): usize {
         return self.index as usize;
     }

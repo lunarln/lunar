@@ -389,7 +389,8 @@ fn colors() {
         .with_label(Label::new(id, 0, 1).with_message("here").with_color(Color::Red))
         .finish();
     let out = r.write_to_string(&srcs);
-    if !out.as_str().starts_with("\x1b[31mError:\x1b[0m no\n") || !out.as_str().ends_with("\x1b[0m\n") {
+    // A space keeps the style before it: it looks the same in any.
+    if !out.as_str().starts_with("\x1b[31mError: \x1b[0mno\n") || !out.as_str().ends_with("\x1b[0m\n") {
         panic("colors: {out:?}");
     }
 }

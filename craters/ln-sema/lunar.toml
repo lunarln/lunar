@@ -6,3 +6,4 @@ version = "0.1.0"
 ln-ast = { path = "../ln-ast" }
 ln-parser = { path = "../ln-parser" }
 ln-lexer = { path = "../ln-lexer" }
+ln-ariadne = { path = "../ln-ariadne" }

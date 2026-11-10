@@ -275,28 +275,58 @@ impl Out {
 
     /// Write `s` in `style`.
     pub fn paint(&mut +self, style: Option::<Style>, s: str) {
-        self.set(style);
+        if s.len() == 0 {
+            return;
+        }
+        let mut spaces = true;
+        for b in s.as_bytes() {
+            if b != b' ' {
+                spaces = false;
+            }
+        }
+        if spaces {
+            self.set_for(style, ' ');
+        } else {
+            self.set(style);
+        }
         self.text.push_str(s);
     }
 
     /// Write `c` in `style`.
     pub fn paint_char(&mut +self, style: Option::<Style>, c: char) {
-        self.set(style);
+        self.set_for(style, c);
         self.text.push(c);
     }
 
     /// Write `c` in `style`, `n` times.
     pub fn repeat(&mut +self, style: Option::<Style>, c: char, n: usize) {
-        self.set(style);
+        if n == 0 {
+            return;
+        }
+        self.set_for(style, c);
         for _ in 0..n {
             self.text.push(c);
         }
     }
 
+    /// Switch to `style` for writing `c`. A space looks the same in any
+    /// style without an underline, so it keeps the current one.
+    fn set_for(&mut +self, style: Option::<Style>, c: char) {
+        if c == ' ' && !self.cur.underline {
+            let under = match style {
+                Some(s) => s.underline,
+                None => false,
+            };
+            if !under {
+                return;
+            }
+        }
+        self.set(style);
+    }
+
     /// Write plain text.
     pub fn plain(&mut +self, s: str) {
-        self.set(None);
-        self.text.push_str(s);
+        self.paint(None, s);
     }
 
     /// End the line.

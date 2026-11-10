@@ -1,8 +1,9 @@
 //! The compiler written in Lunar (`craters/`) against the Rust one: built
 //! with `lunar`, run over every `.ln` file in the repository, and compared
 //! stage by stage: the lexer's tokens, then the parser's syntax trees and
-//! syntax errors. Then the bootstrap: it compiles itself, and the compiler
-//! that makes compiles itself into the same executable.
+//! syntax errors, then the diagnostics as `lunar check` draws them on
+//! tests/ui. Then the bootstrap: it compiles itself, and the compiler that
+//! makes compiles itself into the same executable.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -80,13 +81,13 @@ fn driver() -> &'static Path {
 fn compare(args: &[&str], what: &str, rust: impl Fn(&str) -> String) {
     let root = root();
     let files = all_files(&root);
-    compare_files(&root, &files, args, what, rust);
+    compare_files(&root, &files, args, what, |_, src| rust(src));
 }
 
 /// Run the Lunar driver over `files` (relative to `root`) and compare each
-/// file's output with `rust`'s for that file.
-fn compare_files(root: &Path, files: &[String], args: &[&str], what: &str, rust: impl Fn(&str) -> String) {
-    let run = Command::new(driver()).args(args).args(files).current_dir(root).output().unwrap();
+/// file's output with `rust`'s for that file (given its path and text).
+fn compare_files(root: &Path, files: &[String], args: &[&str], what: &str, rust: impl Fn(&str, &str) -> String) {
+    let run = Command::new(driver()).args(args).args(files).current_dir(root).env("LUNAR_STD_DIR", std_dir_of(root)).output().unwrap();
     assert!(run.status.success(), "ln-driver failed:\n{}", String::from_utf8_lossy(&run.stderr));
     let stdout = String::from_utf8(run.stdout).unwrap();
     let mut lunar: BTreeMap<&str, String> = BTreeMap::new();
@@ -105,7 +106,7 @@ fn compare_files(root: &Path, files: &[String], args: &[&str], what: &str, rust:
     let mut mismatches = Vec::new();
     for f in files {
         let src = std::fs::read_to_string(root.join(f)).unwrap();
-        let expected = rust(&src);
+        let expected = rust(f, &src);
         let got = lunar.get(f.as_str()).map(String::as_str).unwrap_or("<missing>");
         if got != expected {
             // The first differing line, with the source text around the
@@ -183,8 +184,37 @@ fn parser_matches_rust_parser_on_broken_programs() {
             files.push(name);
         }
     }
-    compare_files(&dir, &files, &["--parse"], "parse", rust_tree);
+    compare_files(&dir, &files, &["--parse"], "parse", |_, src| rust_tree(src));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What `lunar check FILE` (run from `root`, without color) prints before
+/// its summary line (`error: could not compile ...`): the diagnostics.
+fn rust_rendered(root: &Path, file: &str) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_lunar")).args(["check", file]).current_dir(root).env_remove("LUNAR_STD_DIR").output().unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let mut text = String::new();
+    for line in stderr.lines() {
+        if line.starts_with("error: could not compile") {
+            break;
+        }
+        text.push_str(line);
+        text.push('\n');
+    }
+    text
+}
+
+/// The Lunar compiler draws its diagnostics (with ln-ariadne) exactly as
+/// the Rust compiler does (with ariadne), byte for byte without color:
+/// the same codes, messages, labels, notes and helps, laid out the same.
+#[test]
+fn diagnostics_render_as_rust_renders_them() {
+    let root = root();
+    let mut files = Vec::new();
+    ln_files(&root, &root.join("tests/ui"), &mut files);
+    files.sort();
+    assert!(files.len() > 50, "found only {} files", files.len());
+    compare_files(&root, &files, &["--render"], "render diagnostics", |f, _| rust_rendered(&root, f));
 }
 
 /// The standard library's directory, for `$LUNAR_STD_DIR`: without

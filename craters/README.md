@@ -24,17 +24,21 @@ cmp stage2 stage3                                    # identical
 
 `ln-driver build [--release] [--test] [-o OUT] [--emit-llvm FILE] [PATH]`
 compiles `PATH`, a `.ln` file or a package directory (default `.`), with
-the libraries its `lunar.toml` names. Diagnostics are the Rust compiler's
-codes and messages in a plainer layout (`ln-sema/src/render.ln`).
+the libraries its `lunar.toml` names. Diagnostics are drawn by
+`ln-ariadne` exactly as the Rust compiler draws them with ariadne
+(`ln-sema/src/render.ln` is the glue). When stderr is a terminal and
+`NO_COLOR` is not set they are in color, and the quoted code is syntax
+highlighted from `ln-lexer`'s tokens (`ln-sema/src/highlight.ln`).
 
 | Crater       | Port of            | State |
 |--------------|--------------------|-------|
 | `ln-lexer`   | `crates/ln-lexer`  | complete |
 | `ln-ast`     | `crates/ln-ast`    | the syntax tree, in arenas (`core::arena`): every `Box` is an `Id`, every `Vec` a `List`, names and strings are interned |
 | `ln-parser`  | `crates/ln-parser` and `crates/ln-parse-kit` | complete: source files (`parse_file`, and `parse_file_into` a shared `Ast` with global offsets), macro expansions (`parse_expansion`, `parse_fragment`), hygiene contexts on identifiers and tokens |
+| `ln-ariadne` | the `ariadne` crate (0.6) | complete: sources, labels (color, order, priority), reports with notes and helps, the whole `Config` and the layout algorithm, both character sets; ariadne's tests. Beyond ariadne: a `Theme` for every part of a report, and per-byte source styles (`Sources::add_styled`, `add_highlighted` with a `Highlighter`). Character widths approximate `unicode-width` (common wide and zero-width ranges) |
 | `ln-sema`    | `crates/ln-sema` and `crates/ln-diag` | complete (see below) |
 | `ln-codegen` | `crates/ln-codegen` | complete (LLVM through its C API, `llvm.ln`) |
-| `ln-driver`  | `crates/ln-driver` (the build path) | `ln-driver build` (above); also `ln-driver FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--craters DIR` the craters a package build loads |
+| `ln-driver`  | `crates/ln-driver` (the build path) | `ln-driver build` (above); also `ln-driver FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--render [--color] FILE...` the diagnostics drawn as `lunar check` draws them, `--craters DIR` the craters a package build loads |
 
 ## The passes
 
@@ -95,6 +99,9 @@ every `.ln` file in the repository:
 * `parser_matches_rust_parser_on_broken_programs`: the same, for every
   program cut off a third and two thirds of the way through, which
   exercises error recovery;
+* `diagnostics_render_as_rust_renders_them`: on every file in `tests/ui`,
+  `--render` prints byte for byte what `lunar check` prints without color
+  (before its summary line): the same diagnostics, drawn the same;
 * `compiler_builds_itself`: the bootstrap above; stages 2 and 3 must have
   the same LLVM IR and the same bytes (on Windows the link is reproducible
   through `/Brepro`).
