@@ -121,6 +121,20 @@ fn check(path: str): i32 {
     }
     let s = analyze(p, cs, Options::host(false));
     print_diags(&s.p);
+    // `LN_EXPANSIONS=1`: also print what each macro invocation expanded to.
+    if env::var("LN_EXPANSIONS").is_some() {
+        let mut out = String::new();
+        let mut n_exp: usize = 0;
+        for i in 0..s.p.sources.files.len() {
+            let f = s.p.sources.files[i];
+            if let Some(site) = f.expansion_site {
+                n_exp += 1;
+                out.write("== {s.p.text(f.name)} at {position(&s.p, site)}\n{s.p.sources.file_text(i as u32)}\n");
+            }
+        }
+        out.write("-- {s.p.defs.len()} definitions, {s.p.impls.len()} impls, {n_exp} expansions\n");
+        std::io::write_str(out.as_str());
+    }
     if s.p.diags.has_errors() {
         return 1;
     }
