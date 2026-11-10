@@ -43,6 +43,18 @@ impl Sema {
 
     /// Check a pattern against `ty`, declaring its bindings in the current scope.
     pub fn check_pat(&mut self, id: Id::<ast::Pat>, ty: Ty, is_let: bool): Id::<Pat> {
+        self.fcx.pat_depth += 1;
+        let out = self.check_pat_in(id, ty, is_let);
+        self.fcx.pat_depth -= 1;
+        if self.fcx.pat_depth == 0 {
+            self.fcx.pat_names.clear();
+            self.fcx.pat_alts.clear();
+            self.fcx.or_ids = 0;
+        }
+        return out;
+    }
+
+    fn check_pat_in(&mut self, id: Id::<ast::Pat>, ty: Ty, is_let: bool): Id::<Pat> {
         let pe = self.p.ast.pats.get(id);
         let span = pe.span;
         let s0 = self.shallow(ty);
@@ -278,7 +290,9 @@ impl Sema {
                 // The first alternative declares the variables; the others
                 // bind the same ones (see `binding`).
                 let start = self.fcx.or_binds.len();
-                self.fcx.or_frames.push(OrFrame { start, alt: 0 });
+                let oid = self.fcx.or_ids;
+                self.fcx.or_ids += 1;
+                self.fcx.or_frames.push(OrFrame { start, alt: 0, id: oid });
                 let mut ps: [Id::<Pat>; ..+] = [];
                 for i in 0..alts.len() {
                     let top = self.fcx.or_frames.len() - 1;
@@ -344,6 +358,31 @@ impl Sema {
 
     fn binding(&mut self, name: Ident, is_mut: bool, ty: Ty, span: Span): PatKind {
         let ctx = self.ident_ctx(name);
+        let a0 = self.fcx.pat_alts.len();
+        for k in 0..self.fcx.or_frames.len() {
+            let f = self.fcx.or_frames[k];
+            self.fcx.pat_alts.push(AltOf { id: f.id, alt: f.alt });
+        }
+        let a1 = self.fcx.pat_alts.len();
+        let mut found = false;
+        let mut first = span;
+        for i in 0..self.fcx.pat_names.len() {
+            let b = self.fcx.pat_names[i];
+            if !found && b.name == name.name && b.ctx == ctx && same_match(self.fcx.pat_alts[b.alts_start..b.alts_end], self.fcx.pat_alts[a0..a1]) {
+                found = true;
+                first = b.span;
+            }
+        }
+        if found {
+            let mut m = String::new();
+            m.write("identifier `{self.p.text(name.name)}` is bound more than once in the same pattern");
+            self.error_at(codes::name::BOUND_TWICE(), span, m.as_str());
+            self.with_label("bound again here");
+            self.with_secondary(first, "first bound here");
+            self.with_help("rename one of them, or write `_` for the one you don't need");
+            self.emit();
+        }
+        self.fcx.pat_names.push(PatName { name: name.name, ctx, span, alts_start: a0, alts_end: a1 });
         let l = match self.or_binding(name.name, ctx) {
             Some(l) => {
                 self.rebind(l, name.name, is_mut, ty, span);
@@ -779,6 +818,38 @@ pub struct OrFrame {
     pub start: usize,
     /// The alternative being checked.
     pub alt: usize,
+    /// Tells this `|` pattern apart from the others of the same pattern.
+    pub id: u32,
+}
+
+/// Alternative `alt` of the `|` pattern with frame id `id`.
+pub struct AltOf {
+    pub id: u32,
+    pub alt: usize,
+}
+
+/// A variable bound so far by the pattern being checked.
+pub struct PatName {
+    pub name: Symbol,
+    pub ctx: SyntaxCtx,
+    pub span: Span,
+    /// The alternative of each enclosing `|` pattern it is in: a run of
+    /// `FnCtx::pat_alts`.
+    pub alts_start: usize,
+    pub alts_end: usize,
+}
+
+/// Whether two bindings can both be bound by one match: no `|` pattern
+/// around both has them in different alternatives.
+fn same_match(a: [AltOf; &], b: [AltOf; &]): bool {
+    for x in a {
+        for y in b {
+            if x.id == y.id && x.alt != y.alt {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 /// A variable bound by an alternative of a `|` pattern.

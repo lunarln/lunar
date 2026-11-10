@@ -80,6 +80,12 @@ pub(crate) struct FnCtx<'s, 'a> {
     /// The bindings of the alternatives of `or_frames`, each frame's from
     /// its `start` on.
     or_binds: Vec<pat::OrBind>,
+    /// The ids given to `|` patterns so far.
+    or_ids: u32,
+    /// How deep `check_pat` is: 0 outside any pattern.
+    pat_depth: u32,
+    /// The variables the outermost pattern being checked has bound so far.
+    pat_names: Vec<pat::PatName>,
 }
 
 impl<'a> Sema<'a> {
@@ -181,6 +187,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             opaque_vars: Vec::new(),
             or_frames: Vec::new(),
             or_binds: Vec::new(),
+            or_ids: 0,
+            pat_depth: 0,
+            pat_names: Vec::new(),
         };
         // Inside the body, each `impl Trait` it returns is the type it
         // actually returns: a variable to infer.

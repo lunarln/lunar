@@ -30,7 +30,18 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     }
 
     /// Check a pattern against `ty`, declaring its bindings in the current scope.
-    pub(crate) fn check_pat(&mut self, p: &ast::Pat, ty: &Ty, _is_let: bool) -> Pat {
+    pub(crate) fn check_pat(&mut self, p: &ast::Pat, ty: &Ty, is_let: bool) -> Pat {
+        self.pat_depth += 1;
+        let out = self.check_pat_in(p, ty, is_let);
+        self.pat_depth -= 1;
+        if self.pat_depth == 0 {
+            self.pat_names.clear();
+            self.or_ids = 0;
+        }
+        out
+    }
+
+    fn check_pat_in(&mut self, p: &ast::Pat, ty: &Ty, _is_let: bool) -> Pat {
         let span = p.span;
         let sty = self.shallow(ty);
         let sty = sty.strip_grow().clone();
@@ -176,7 +187,9 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 // The first alternative declares the variables; the others
                 // bind the same ones (see `binding`).
                 let start = self.or_binds.len();
-                self.or_frames.push(OrFrame { start, alt: 0 });
+                let id = self.or_ids;
+                self.or_ids += 1;
+                self.or_frames.push(OrFrame { start, alt: 0, id });
                 let mut ps = Vec::new();
                 for (i, a) in alts.iter().enumerate() {
                     self.or_frames.last_mut().unwrap().alt = i;
@@ -210,6 +223,17 @@ impl<'s, 'a> FnCtx<'s, 'a> {
     }
 
     fn binding(&mut self, name: &ast::Ident, is_mut: bool, ty: &Ty, span: Span) -> PatKind {
+        let alts: Vec<(u32, usize)> = self.or_frames.iter().map(|f| (f.id, f.alt)).collect();
+        if let Some(first) = self.pat_names.iter().find(|b| b.name == name.name && b.ctx == name.ctx && same_match(&b.alts, &alts)).map(|b| b.span) {
+            let n = &name.name;
+            self.err(
+                Diagnostic::error(ln_diag::codes::name::BOUND_TWICE, span, format!("identifier `{n}` is bound more than once in the same pattern"))
+                    .with_label("bound again here")
+                    .with_secondary(first, "first bound here")
+                    .with_help("rename one of them, or write `_` for the one you don't need"),
+            );
+        }
+        self.pat_names.push(PatName { name: name.name.clone(), ctx: name.ctx, span, alts });
         let l = match self.or_binding(name) {
             Some(l) => {
                 self.rebind(l, name, is_mut, ty, span);
@@ -489,6 +513,23 @@ pub(crate) struct OrFrame {
     start: usize,
     /// The alternative being checked.
     alt: usize,
+    /// Tells this `|` pattern apart from the others of the same pattern.
+    id: u32,
+}
+
+/// A variable bound so far by the pattern being checked.
+pub(crate) struct PatName {
+    name: String,
+    ctx: ast::SyntaxCtx,
+    span: Span,
+    /// The alternative of each enclosing `|` pattern it is in, by frame id.
+    alts: Vec<(u32, usize)>,
+}
+
+/// Whether two bindings can both be bound by one match: no `|` pattern
+/// around both has them in different alternatives.
+fn same_match(a: &[(u32, usize)], b: &[(u32, usize)]) -> bool {
+    a.iter().all(|(id, alt)| b.iter().all(|(id2, alt2)| id != id2 || alt == alt2))
 }
 
 /// A variable bound by an alternative of a `|` pattern.

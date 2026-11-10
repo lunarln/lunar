@@ -1,0 +1,17 @@
+// error: name::bound_twice
+// A pattern binds each name once; alternatives of a `|` pattern may each
+// bind it, but one alternative may not bind it twice.
+enum Shape {
+    Rect(i32, i32),
+    Square(i32),
+}
+
+fn side(s: Shape, extra: i32): i32 {
+    match (s, extra) {
+        (Shape::Rect(w, _) | Shape::Square(w), w) => w,
+    }
+}
+
+fn main() {
+    println("{side(Shape::Square(3), 1)}");
+}

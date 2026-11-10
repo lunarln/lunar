@@ -1,0 +1,6 @@
+// error: name::bound_twice
+// Two parameters of one closure cannot share a name.
+fn main() {
+    let add = |a: i32, a: i32| a + a;
+    println("{add(1, 2)}");
+}

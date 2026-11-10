@@ -84,6 +84,7 @@ codes! {
         BAD_SELF = "bad_self",
         UNBOUND_IN_ALTERNATIVE = "unbound_in_alternative",
         INCONSISTENT_BINDING = "inconsistent_binding",
+        BOUND_TWICE = "bound_twice",
     }
     trait_ ("trait") => {
         DULL_IMPL = "dull_impl",

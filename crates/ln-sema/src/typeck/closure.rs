@@ -116,6 +116,12 @@ impl<'s, 'a> FnCtx<'s, 'a> {
                 None => exp.as_ref().map(|(_, t)| t.clone()).unwrap_or_else(|| self.new_var(p.span)),
             };
             let mode = p.mode.or(exp.map(|(m, _)| m)).unwrap_or(ParamMode::Take);
+            if let Some(n) = &p.name {
+                let earlier = c.params[..i].iter().find_map(|q| q.name.as_ref().filter(|m| m.name == n.name && m.ctx == n.ctx).map(|m| m.span));
+                if let Some(first) = earlier {
+                    self.err(crate::lower::bound_twice_in_params(&n.name, n.span, first));
+                }
+            }
             let name = p.name.as_ref().map_or("_".to_string(), |n| n.name.clone());
             let l = self.new_local(&name, ty.clone(), p.is_mut || mode == ParamMode::InOut, LocalKind::Let, p.span, depth);
             if let Some(n) = &p.name {

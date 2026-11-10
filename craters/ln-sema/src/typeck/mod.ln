@@ -40,7 +40,7 @@ use crater::sema::{AstRef, Sema};
 use crater::thir::{Arg, Block, Body, Callee, Coercion, Expr, ExprKind, FmtPiece, Local, LocalId, LocalKind, LoopId, Pat, PatKind, ReadMode, Stmt};
 use crater::ty::*;
 use crater::typeck::closure::PendingClosure;
-use crater::typeck::pat::{OrBind, OrFrame};
+use crater::typeck::pat::{AltOf, OrBind, OrFrame, PatName};
 use ln_ast as ast;
 use ln_ast::{Ident, ParamMode, Span};
 
@@ -162,6 +162,14 @@ pub struct FnCtx {
     /// The bindings of the alternatives of `or_frames`, each frame's from
     /// its `start` on.
     pub or_binds: [OrBind; -..+],
+    /// The ids given to `|` patterns so far.
+    pub or_ids: u32,
+    /// How deep `check_pat` is: 0 outside any pattern.
+    pub pat_depth: u32,
+    /// The variables the outermost pattern being checked has bound so far.
+    pub pat_names: [PatName; -..+],
+    /// Their `PatName::alts_start..alts_end` runs.
+    pub pat_alts: [AltOf; -..+],
 }
 
 impl FnCtx {
@@ -190,6 +198,10 @@ impl FnCtx {
             opaque_vars: [],
             or_frames: [],
             or_binds: [],
+            or_ids: 0,
+            pat_depth: 0,
+            pat_names: [],
+            pat_alts: [],
         };
     }
 }

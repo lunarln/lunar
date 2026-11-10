@@ -713,6 +713,27 @@ impl Sema {
                 ParamKind::Named(n) => (n.name, false),
                 ParamKind::Wild => (self.p.sym("_"), false),
             };
+            if let ParamKind::Named(n) = p.kind {
+                let mut found = false;
+                let mut first = n.span;
+                for j in 0..i {
+                    let q = self.p.ast.params.list(f.params)[j];
+                    if let ParamKind::Named(m) = q.kind {
+                        if !found && m.name == n.name && m.ctx == n.ctx {
+                            found = true;
+                            first = m.span;
+                        }
+                    }
+                }
+                if found {
+                    let pn = self.str_of(n.name);
+                    self.error(codes::name::BOUND_TWICE(), n.span, "identifier `{pn}` is bound more than once in this parameter list");
+                    self.label("bound again here");
+                    self.secondary(first, "first bound here");
+                    self.help("rename one of them, or write `_` for the one you don't need");
+                    self.emit();
+                }
+            }
             let ty = match p.ty {
                 Some(t) => self.lower_ty(cx, t, TyPos::Param),
                 None => {

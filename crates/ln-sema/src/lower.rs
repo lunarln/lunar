@@ -8,6 +8,14 @@ use crate::{AstRef, Sema};
 use ln_ast as ast;
 use ln_diag::{Diagnostic, Span, codes::lint, codes::name, codes::syntax, codes::trait_, codes::ty as tyc};
 
+/// A parameter named like an earlier one of the same function or closure.
+pub(crate) fn bound_twice_in_params(n: &str, span: Span, first: Span) -> Diagnostic {
+    Diagnostic::error(name::BOUND_TWICE, span, format!("identifier `{n}` is bound more than once in this parameter list"))
+        .with_label("bound again here")
+        .with_secondary(first, "first bound here")
+        .with_help("rename one of them, or write `_` for the one you don't need")
+}
+
 /// A check that needs complete ADT information.
 /// Largest Dull value (in bytes) for which a borrow is reported as needless.
 const NEEDLESS_BORROW_MAX: u64 = 16;
@@ -523,6 +531,15 @@ impl<'a> Sema<'a> {
                 ast::ParamKind::Named(n) => (n.name.clone(), false),
                 ast::ParamKind::Wild => ("_".to_string(), false),
             };
+            if let ast::ParamKind::Named(n) = &p.kind {
+                let earlier = f.params[..i].iter().find_map(|q| match &q.kind {
+                    ast::ParamKind::Named(m) if m.name == n.name && m.ctx == n.ctx => Some(m.span),
+                    _ => None,
+                });
+                if let Some(first) = earlier {
+                    self.err(bound_twice_in_params(&n.name, n.span, first));
+                }
+            }
             let ty = match &p.ty {
                 Some(t) => self.lower_ty(&cx, t, TyPos::Param),
                 None => {
