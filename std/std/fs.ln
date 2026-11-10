@@ -73,6 +73,51 @@ pub fn remove_file(path: str): Result::<(), Error> {
     return Ok(());
 }
 
+/// Whether `path` is a file (that, on Unix, can be opened for reading).
+pub fn is_file(path: str): bool {
+    return check_path(path).is_ok() && sys::is_file(path);
+}
+
+/// Whether `path` is a directory (that, on Unix, can be listed).
+pub fn is_dir(path: str): bool {
+    return check_path(path).is_ok() && sys::is_dir(path);
+}
+
+/// The entries of a directory, from `read_dir`: their names (without `.`
+/// and `..`), in the order the system lists them.
+pub struct DirEntries {
+    names: String,
+    ends: [u32; ..+],
+    dirs: [bool; ..+],
+}
+
+impl DirEntries {
+    pub fn len(&self): usize {
+        return self.ends.len();
+    }
+
+    /// The name of entry `i` (not its path).
+    pub fn name(&self, i: usize): str {
+        let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };
+        return self.names.as_str()[start..self.ends[i] as usize];
+    }
+
+    /// Whether entry `i` is a directory.
+    pub fn is_dir(&self, i: usize): bool {
+        return self.dirs[i];
+    }
+}
+
+/// The entries of the directory `path`.
+pub fn read_dir(path: str): Result::<DirEntries, Error> {
+    check_path(path)?;
+    let mut d = DirEntries { names: String::new(), ends: [], dirs: [] };
+    if !sys::read_dir(path, &mut d.names, &mut d.ends, &mut d.dirs) {
+        return Err(Error::last_os_error());
+    }
+    return Ok(d);
+}
+
 fn check_path(path: str): Result::<(), Error> {
     if path.is_empty() || path.contains("\0") {
         return Err(Error::new(ErrorKind::InvalidInput));

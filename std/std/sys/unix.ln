@@ -211,7 +211,165 @@ pub fn write(fd: i32, bytes: [u8; &]) {
 }
 
 pub fn read(fd: i32, buf: [u8; &mut]): isize {
-    return unsafe { c_read(fd, buf.as_mut_ptr(), buf.len()) };
+    return read_file(fd as isize, buf);
+}
+
+/// Write all of `bytes` to `fd`; false on failure.
+pub fn write_all(fd: i32, bytes: [u8; &]): bool {
+    return write_file(fd as isize, bytes);
+}
+
+extern "C" {
+    fn poll(fds: *mut i32, n: u64, timeout: i32): i32;
+    fn opendir(path: *u8): *mut u8;
+    fn closedir(dir: *mut u8): i32;
+}
+
+// `readdir` returns a `struct dirent`; its layout differs between systems.
+// On macOS on x86_64 the 64-bit-inode one is `readdir$INODE64`.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+extern "C" {
+    #[link_name = "readdir$INODE64"]
+    fn readdir(dir: *mut u8): *u8;
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+extern "C" {
+    fn readdir(dir: *mut u8): *u8;
+}
+
+/// `d_type` and `d_name` in a `struct dirent`.
+#[cfg(target_os = "macos")]
+const DIRENT_TYPE: isize = 20;
+#[cfg(target_os = "macos")]
+const DIRENT_NAME: isize = 21;
+#[cfg(not(target_os = "macos"))]
+const DIRENT_TYPE: isize = 18;
+#[cfg(not(target_os = "macos"))]
+const DIRENT_NAME: isize = 19;
+
+/// Whether reading `fd` now would not block (`poll` says it is readable,
+/// or closed).
+pub fn input_available(fd: i32): bool {
+    // struct pollfd { int fd; short events; short revents; }, POLLIN = 1.
+    let mut fds: [i32; 2] = [fd, 1];
+    let r = unsafe { poll(fds.as_mut_ptr(), 1, 0) };
+    return r > 0;
+}
+
+/// Whether `path` is a directory that can be listed.
+pub fn is_dir(path: str): bool {
+    let c = c_path(path);
+    let d = unsafe { opendir(c.as_bytes().as_ptr()) };
+    if (d as usize) == 0 {
+        return false;
+    }
+    unsafe {
+        closedir(d);
+    }
+    return true;
+}
+
+/// Whether `path` is a file that can be opened for reading.
+pub fn is_file(path: str): bool {
+    if is_dir(path) {
+        return false;
+    }
+    let h = open_file(path, false);
+    if h < 0 {
+        return false;
+    }
+    close_file(h);
+    return true;
+}
+
+/// The entries of the directory `path` (without `.` and `..`): their names
+/// end to end in `names`, where each ends in `ends`, and which are
+/// directories in `dirs`. False if it cannot be listed.
+pub fn read_dir(path: str, names: &mut +String, ends: &mut +[u32; ..+], dirs: &mut +[bool; ..+]): bool {
+    let c = c_path(path);
+    let d = unsafe { opendir(c.as_bytes().as_ptr()) };
+    if (d as usize) == 0 {
+        return false;
+    }
+    loop {
+        let e = unsafe { readdir(d) };
+        if (e as usize) == 0 {
+            break;
+        }
+        let name_ptr = intrinsics::ptr_offset(e, DIRENT_NAME);
+        let mut n: usize = 0;
+        while unsafe { intrinsics::ptr_read(intrinsics::ptr_offset(name_ptr, n as isize)) } != 0 {
+            n += 1;
+        }
+        let bytes = unsafe { intrinsics::slice_from_raw(name_ptr, n) };
+        let name = match str::from_utf8(bytes) {
+            Some(s) => s,
+            None => continue,
+        };
+        if name == "." || name == ".." {
+            continue;
+        }
+        // DT_DIR = 4; DT_UNKNOWN = 0 (some file systems): look.
+        let t = unsafe { intrinsics::ptr_read(intrinsics::ptr_offset(e, DIRENT_TYPE)) };
+        let dir = if t == 0 {
+            let mut full = String::from(path);
+            full.push('/');
+            full.push_str(name);
+            is_dir(full.as_str())
+        } else {
+            t == 4
+        };
+        names.push_str(name);
+        ends.push(names.len() as u32);
+        dirs.push(dir);
+    }
+    unsafe {
+        closedir(d);
+    }
+    return true;
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn _NSGetExecutablePath(buf: *mut u8, size: *mut u32): i32;
+}
+
+/// The path of the running executable.
+#[cfg(target_os = "macos")]
+pub fn current_exe(): Option::<String> {
+    let mut buf: [u8; 4096] = [0; 4096];
+    let mut size: u32 = 4096;
+    if unsafe { _NSGetExecutablePath(buf.as_mut_ptr(), intrinsics::addr_of_mut(&mut size)) } != 0 {
+        return None;
+    }
+    let mut n: usize = 0;
+    while n < 4096 && buf[n] != 0 {
+        n += 1;
+    }
+    return match str::from_utf8(buf[..n]) {
+        Some(s) => Some(String::from(s)),
+        None => None,
+    };
+}
+
+#[cfg(not(target_os = "macos"))]
+extern "C" {
+    fn readlink(path: *u8, buf: *mut u8, size: usize): isize;
+}
+
+/// The path of the running executable (`/proc/self/exe`).
+#[cfg(not(target_os = "macos"))]
+pub fn current_exe(): Option::<String> {
+    let mut buf: [u8; 4096] = [0; 4096];
+    let n = unsafe { readlink("/proc/self/exe\0".as_bytes().as_ptr(), buf.as_mut_ptr(), 4096) };
+    if n <= 0 || n >= 4096 {
+        return None;
+    }
+    return match str::from_utf8(buf[..n as usize]) {
+        Some(s) => Some(String::from(s)),
+        None => None,
+    };
 }
 
 pub fn exit(code: i32): ! {

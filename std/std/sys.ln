@@ -16,6 +16,12 @@
 //   write_file(h: isize, bytes: [u8; &]): bool
 //   close_file(h: isize)
 //   remove_file(path: str): bool
+//   write_all(fd: i32, bytes: [u8; &]): bool
+//   input_available(fd: i32): bool      (reading would not block)
+//   is_file(path: str): bool, is_dir(path: str): bool
+//   read_dir(path: str, names: &mut +String, ends: &mut +[u32; ..+],
+//            dirs: &mut +[bool; ..+]): bool
+//   current_exe(): Option::<String>
 
 #[cfg(windows)]
 mod windows;

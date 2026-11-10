@@ -232,6 +232,126 @@ fn is_msys_pty(h: *mut u8): bool {
     return (s.contains("msys-") || s.contains("cygwin-")) && s.contains("-pty");
 }
 
+extern "C" {
+    fn PeekNamedPipe(h: *mut u8, buf: *mut u8, size: u32, got: *mut u32, avail: *mut u32, left: *mut u32): i32;
+    fn GetModuleFileNameW(module: *mut u8, buf: *mut u16, size: u32): u32;
+    fn GetFileAttributesW(name: *u16): u32;
+    fn FindFirstFileW(name: *u16, data: *mut u32): *mut u8;
+    fn FindNextFileW(h: *mut u8, data: *mut u32): i32;
+    fn FindClose(h: *mut u8): i32;
+}
+
+/// Write all of `bytes` to `fd`; false on failure.
+pub fn write_all(fd: i32, bytes: [u8; &]): bool {
+    return write_file((handle(fd) as usize) as isize, bytes);
+}
+
+/// Whether reading `fd` now would not block: it is a pipe with bytes
+/// waiting (consoles and files cannot tell, and are false).
+pub fn input_available(fd: i32): bool {
+    let mut avail: u32 = 0;
+    let ok = unsafe {
+        PeekNamedPipe(handle(fd), core::ptr::null_mut(), 0, core::ptr::null_mut(), intrinsics::addr_of_mut(&mut avail), core::ptr::null_mut())
+    };
+    return ok != 0 && avail > 0;
+}
+
+/// `GetFileAttributesW`, or `INVALID_FILE_ATTRIBUTES` (all ones).
+fn attributes(path: str): u32 {
+    let w = wide(path);
+    return unsafe { GetFileAttributesW(w[..].as_ptr()) };
+}
+
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 16;
+
+pub fn is_dir(path: str): bool {
+    let a = attributes(path);
+    return a != 4294967295 && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+pub fn is_file(path: str): bool {
+    let a = attributes(path);
+    return a != 4294967295 && (a & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+/// The entries of the directory `path` (without `.` and `..`): their names
+/// end to end in `names`, where each ends in `ends`, and which are
+/// directories in `dirs`. False if it cannot be listed.
+pub fn read_dir(path: str, names: &mut +String, ends: &mut +[u32; ..+], dirs: &mut +[bool; ..+]): bool {
+    let mut pattern = String::from(path);
+    if !path.ends_with("/") && !path.ends_with("\\") {
+        pattern.push('\\');
+    }
+    pattern.push('*');
+    let w = wide(pattern.as_str());
+    // WIN32_FIND_DATAW (592 bytes): the attributes first, the name (260
+    // UTF-16 units) at byte 44.
+    let mut data: [u32; 150] = [0; 150];
+    let h = unsafe { FindFirstFileW(w[..].as_ptr(), data.as_mut_ptr()) };
+    if (h as usize) == 18446744073709551615 {
+        return false;
+    }
+    loop {
+        let mut units: [u16; -..+] = [];
+        let mut i: usize = 22;
+        while i < 22 + 260 {
+            let word = data[i / 2];
+            let u = if i % 2 == 0 { word & 65535 } else { word >> 16 };
+            if u == 0 {
+                break;
+            }
+            units.push(u as u16);
+            i += 1;
+        }
+        let name = narrow(units[..]);
+        if name.as_str() != "." && name.as_str() != ".." {
+            names.push_str(name.as_str());
+            ends.push(names.len() as u32);
+            dirs.push((data[0] & FILE_ATTRIBUTE_DIRECTORY) != 0);
+        }
+        if unsafe { FindNextFileW(h, data.as_mut_ptr()) } == 0 {
+            break;
+        }
+    }
+    unsafe {
+        FindClose(h);
+    }
+    return true;
+}
+
+/// The path of the running executable.
+pub fn current_exe(): Option::<String> {
+    let mut buf: [u16; 32768] = [0; 32768];
+    let n = unsafe { GetModuleFileNameW(core::ptr::null_mut(), buf.as_mut_ptr(), 32768) };
+    if n == 0 || n >= 32768 {
+        return None;
+    }
+    return Some(narrow(buf[..n as usize]));
+}
+
+/// UTF-16 as UTF-8 (an unpaired surrogate as U+FFFD).
+fn narrow(units: [u16; &]): String {
+    let mut out = String::new();
+    let mut i: usize = 0;
+    while i < units.len() {
+        let u = units[i] as u32;
+        i += 1;
+        let mut cp = u;
+        if u >= 55296 && u <= 56319 {
+            if i < units.len() && units[i] as u32 >= 56320 && units[i] as u32 <= 57343 {
+                cp = 65536 + ((u - 55296) << 10) + (units[i] as u32 - 56320);
+                i += 1;
+            } else {
+                cp = 65533;
+            }
+        } else if u >= 56320 && u <= 57343 {
+            cp = 65533;
+        }
+        out.push(char::from_u32(cp).unwrap());
+    }
+    return out;
+}
+
 pub fn read(fd: i32, buf: [u8; &mut]): isize {
     let h = handle(fd);
     let mut got: u32 = 0;
