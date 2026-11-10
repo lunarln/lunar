@@ -2306,6 +2306,13 @@ impl Moves {
 
     fn read(&mut self, cx: &mut Cx, p: &mut +Program, place: Id::<Expr>, mode: ReadMode, st: &mut MoveState, span: Span) {
         self.place_inner(cx, p, place, st);
+        self.read_evaluated(cx, p, place, mode, st, span);
+    }
+
+    /// `read`, for a place whose inner expressions (indexes, temporaries)
+    /// were already evaluated: a match moving out of its scrutinee must not
+    /// evaluate `take(o)` in `take(o)?` a second time.
+    fn read_evaluated(&mut self, cx: &mut Cx, p: &mut +Program, place: Id::<Expr>, mode: ReadMode, st: &mut MoveState, span: Span) {
         self.check_use(cx, p, place, st, span);
         if mode != ReadMode::Move {
             return;
@@ -2412,7 +2419,8 @@ impl Moves {
 
     fn pat_moves(&mut self, cx: &mut Cx, p: &mut +Program, scrut: Id::<Expr>, pat: Id::<Pat>, st: &mut MoveState) {
         if pat_has_move(&p.thir, pat) {
-            self.read(cx, p, scrut, ReadMode::Move, st, p.thir.pat(pat).span);
+            // The scrutinee was evaluated before the arms.
+            self.read_evaluated(cx, p, scrut, ReadMode::Move, st, p.thir.pat(pat).span);
         }
     }
 

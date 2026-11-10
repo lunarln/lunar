@@ -1472,6 +1472,13 @@ impl Moves<'_, '_, '_> {
 
     fn read(&mut self, place: &Expr, mode: ReadMode, st: &mut MoveState, span: Span) {
         self.place_inner(place, st);
+        self.read_evaluated(place, mode, st, span);
+    }
+
+    /// `read`, for a place whose inner expressions (indexes, temporaries)
+    /// were already evaluated: a match moving out of its scrutinee must not
+    /// evaluate `take(o)` in `take(o)?` a second time.
+    fn read_evaluated(&mut self, place: &Expr, mode: ReadMode, st: &mut MoveState, span: Span) {
         self.check_use(place, st, span);
         if mode != ReadMode::Move {
             return;
@@ -1567,7 +1574,8 @@ impl Moves<'_, '_, '_> {
             }
         });
         if has_move {
-            self.read(scrut, ReadMode::Move, st, pat.span);
+            // The scrutinee was evaluated before the arms.
+            self.read_evaluated(scrut, ReadMode::Move, st, pat.span);
         }
     }
 

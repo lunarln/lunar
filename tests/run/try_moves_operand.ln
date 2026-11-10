@@ -1,0 +1,17 @@
+struct Opts { name: String }
+
+fn take(o: Opts): Result::<i32, String> {
+    return Ok(o.name.len() as i32);
+}
+
+fn outer(o: Opts): Result::<i32, String> {
+    let n = take(o)?;
+    return Ok(n + 1);
+}
+
+fn main() {
+    match outer(Opts { name: String::from("abc") }) {
+        Ok(n) => println("{n}"),
+        Err(e) => println("{e}"),
+    }
+}
