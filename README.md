@@ -1,6 +1,6 @@
 # Lunar
 
-[![CI](https://github.com/lunarc1/lunar/actions/workflows/ci.yml/badge.svg)](https://github.com/lunarc1/lunar/actions/workflows/ci.yml)
+[![CI](https://github.com/lunarln/lunar/actions/workflows/ci.yml/badge.svg)](https://github.com/lunarln/lunar/actions/workflows/ci.yml)
 
 Lunar is a compiled systems language with Rust-like syntax and a
 [Goose](https://github.com/aardappel/goose/wiki)-inspired memory model:
