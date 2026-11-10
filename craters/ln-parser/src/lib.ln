@@ -66,6 +66,7 @@ pub struct Diag {
     pub span: Span,
     pub message: Symbol,
     pub label: Option::<Symbol>,
+    pub help: Option::<Symbol>,
     /// False for the errors of a format hole's sub-parse, which become the
     /// format string's own error instead.
     live: bool,
@@ -447,8 +448,22 @@ impl Parser {
 
     /// Report an error from the grammar.
     fn diag(&mut self, code: Code, span: Span, message: str) {
+        self.diag_with(code, span, message, None, None);
+    }
+
+    /// Report an error from the grammar, with the text under its span
+    /// and a help.
+    fn diag_with(&mut self, code: Code, span: Span, message: str, label: Option::<str>, help: Option::<str>) {
         let m = self.ast.names.intern(message);
-        self.diags.push(Diag { code, span, message: m, label: None, live: true });
+        let label = match label {
+            Some(l) => Some(self.ast.names.intern(l)),
+            None => None,
+        };
+        let help = match help {
+            Some(h) => Some(self.ast.names.intern(h)),
+            None => None,
+        };
+        self.diags.push(Diag { code, span, message: m, label, help, live: true });
     }
 
     /// An error from the cursor: at most one per position, so a failure
@@ -459,7 +474,7 @@ impl Parser {
             return;
         }
         let m = self.ast.names.intern(message);
-        self.cursor_errors.push(Diag { code: Code::UnexpectedToken, span, message: m, label, live: true });
+        self.cursor_errors.push(Diag { code: Code::UnexpectedToken, span, message: m, label, help: None, live: true });
     }
 
     /// Every live error, sorted by position (grammar errors before cursor

@@ -360,6 +360,33 @@ pub fn unescape_byte(raw: str): Result::<u8, String> {
     };
 }
 
+/// The help for a byte literal body that `unescape_byte` rejects, if
+/// there is one.
+pub fn unescape_byte_help(raw: str): Option::<String> {
+    if raw.starts_with("\\x") {
+        return None;
+    }
+    if raw.starts_with("\\u") {
+        return Some(String::from("a byte is a single `\\x00`..`\\xFF` value"));
+    }
+    let s = match unescape(raw) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    let mut chars = s.as_str().chars();
+    let first = chars.next();
+    let second = chars.next();
+    return match first {
+        Some(c) if second.is_none() && (c as u32) >= 128 => {
+            let mut m = String::new();
+            m.write("its UTF-8 encoding is {c.len_utf8()} bytes; write one byte as `\\xNN`, or use the `char` literal `'{c}'`");
+            Some(m)
+        }
+        None => Some(String::from("for the zero byte write `b'\\0'`")),
+        _ => None,
+    };
+}
+
 /// A format hole's expression length and spec.
 struct SpecSplit {
     len: usize,
@@ -594,11 +621,15 @@ impl Parser {
                     Lit::Int { value: 0, high: 0, suffix: Some(u8_suffix) }
                 } else {
                     // A byte literal is a `u8` integer literal.
-                    let value = match unescape_byte(text[2..text.len() - 1]) {
+                    let raw = text[2..text.len() - 1];
+                    let value = match unescape_byte(raw) {
                         Ok(b) => b as u64,
                         Err(m) => {
                             let code = if m.as_str().contains("escape") { Code::BadEscape } else { Code::BadChar };
-                            self.diag(code, sp, m.as_str());
+                            match unescape_byte_help(raw) {
+                                Some(h) => self.diag_with(code, sp, m.as_str(), None, Some(h.as_str())),
+                                None => self.diag(code, sp, m.as_str()),
+                            }
                             0
                         }
                     };
@@ -655,7 +686,20 @@ impl Parser {
                 if n == 1 {
                     Lit::Char(only)
                 } else {
-                    self.diag(Code::BadChar, sp, "character literal must contain exactly one character");
+                    let msg = "character literal must contain exactly one character";
+                    if n == 0 {
+                        self.diag_with(Code::BadChar, sp, msg, Some("this literal is empty"), Some("for a space write `' '`; for the NUL character write `'\\0'`"));
+                    } else {
+                        let mut label = String::new();
+                        label.write("this literal contains {n} characters");
+                        if raw.contains("\"") {
+                            self.diag_with(Code::BadChar, sp, msg, Some(label.as_str()), None);
+                        } else {
+                            let mut help = String::new();
+                            help.write("for text, use a string literal: `\"{raw}\"`");
+                            self.diag_with(Code::BadChar, sp, msg, Some(label.as_str()), Some(help.as_str()));
+                        }
+                    }
                     Lit::Char('\0')
                 }
             }
