@@ -1696,7 +1696,7 @@ fn const_binary(op: BinOp, x: ConstVal, y: ConstVal): Result::<ConstVal, String>
                 BinOp::And | BinOp::Or => return Err(String::from("`&&`/`||` need booleans")),
             };
             return Ok(r);
-        }
+        },
         (ConstVal::Float(a), ConstVal::Float(b)) => {
             return match op {
                 BinOp::Add => Ok(ConstVal::Float(a + b)),
@@ -1705,7 +1705,7 @@ fn const_binary(op: BinOp, x: ConstVal, y: ConstVal): Result::<ConstVal, String>
                 BinOp::Div => Ok(ConstVal::Float(a / b)),
                 _ => Err(String::from("unsupported float operation in constant")),
             };
-        }
+        },
         (ConstVal::Bool(a), ConstVal::Bool(b)) => {
             return match op {
                 BinOp::And => Ok(ConstVal::Bool(a && b)),
