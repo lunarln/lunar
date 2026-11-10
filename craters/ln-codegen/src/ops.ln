@@ -1,0 +1,1202 @@
+// Calls, intrinsics, builtin trait impls, arithmetic, casts, format
+// strings, drop glue and runtime panics: a port of
+// crates/ln-codegen/src/ops.rs.
+
+use core::arena::{Id, List};
+use core::ffi::c_string;
+use ln_ast::{BinOp, FmtSpec, ParamMode, Span, UnOp};
+use ln_sema::defs::DefId;
+use ln_sema::diag::dummy_span;
+use ln_sema::program::Program;
+use ln_sema::thir::*;
+use ln_sema::traits::MethodImpl;
+use ln_sema::ty::{ArrKind, IntTy, Modes, TraitRef, Ty, TyKind, TyList};
+use crater::Cg;
+use crater::llvm::*;
+
+/// Whether an argument expression only borrows an existing place.
+fn is_borrowed(p: &mut +Program, e: Id::<Expr>): bool {
+    return match p.thir.expr(e).kind {
+        ExprKind::Read { mode, .. } => mode != ReadMode::Move,
+        ExprKind::Coerce { expr, kind: Coercion::Weaken } => is_borrowed(p, expr),
+        _ => false,
+    };
+}
+
+/// The place a borrowing argument reads, if it reads one in place.
+fn borrowed_place(p: &mut +Program, e: Id::<Expr>): Option::<Id::<Expr>> {
+    return match p.thir.expr(e).kind {
+        ExprKind::Read { place, mode } => if mode != ReadMode::Move { Some(place) } else { None },
+        // Owner kinds and `[T; &mut]` -> `[T; &]` share a layout.
+        ExprKind::Coerce { expr, kind: Coercion::Weaken } => borrowed_place(p, expr),
+        _ => None,
+    };
+}
+
+/// The binary operator of a builtin operator method.
+fn method_op(method: str): Option::<BinOp> {
+    if method == "add" {
+        return Some(BinOp::Add);
+    }
+    if method == "sub" {
+        return Some(BinOp::Sub);
+    }
+    if method == "mul" {
+        return Some(BinOp::Mul);
+    }
+    if method == "div" {
+        return Some(BinOp::Div);
+    }
+    if method == "rem" {
+        return Some(BinOp::Rem);
+    }
+    if method == "bitand" {
+        return Some(BinOp::BitAnd);
+    }
+    if method == "bitor" {
+        return Some(BinOp::BitOr);
+    }
+    if method == "bitxor" {
+        return Some(BinOp::BitXor);
+    }
+    if method == "shl" {
+        return Some(BinOp::Shl);
+    }
+    if method == "shr" {
+        return Some(BinOp::Shr);
+    }
+    if method == "lt" {
+        return Some(BinOp::Lt);
+    }
+    if method == "le" {
+        return Some(BinOp::Le);
+    }
+    if method == "gt" {
+        return Some(BinOp::Gt);
+    }
+    if method == "ge" {
+        return Some(BinOp::Ge);
+    }
+    return None;
+}
+
+impl Cg {
+    // ===================================================================== calls
+
+    /// The declaration whose signature decides how arguments are passed
+    /// (`None` for calls through function pointers, which take values).
+    fn callee_def(&mut self, p: &mut +Program, callee: Callee): Option::<DefId> {
+        return match callee {
+            Callee::Fn { def, .. } => Some(def),
+            Callee::Intrinsic { def, .. } => Some(def),
+            Callee::Trait { trait_ref, method, .. } => {
+                let td = p.trait_data(trait_ref.trait_id);
+                for m in p.trait_methods.list(td.methods) {
+                    if m.name == method {
+                        return Some(m.def);
+                    }
+                }
+                None
+            }
+            Callee::Indirect(_) | Callee::Value { .. } => None,
+        };
+    }
+
+    /// The parameter modes (and their number) of a callable value of type
+    /// `t` (after instantiation): a closure's own parameters, or a function
+    /// pointer's.
+    fn value_modes(&mut self, p: &mut +Program, t: Ty): Option::<(Modes, usize)> {
+        return match p.types.kind(t) {
+            TyKind::Closure(def, args) => {
+                let sig = p.closure_sig(def, args);
+                match p.types.kind(sig) {
+                    TyKind::FnPtr(ps, modes, _) => Some((modes, ps.len())),
+                    _ => None,
+                }
+            }
+            TyKind::FnPtr(ps, modes, _) => Some((modes, ps.len())),
+            _ => None,
+        };
+    }
+
+    /// The LLVM type of a call through a function pointer of type
+    /// `fn(params): ret`: parameters not taken by value are pointers.
+    fn ptr_fn_ty(&mut self, p: &mut +Program, params: TyList, modes: Modes, ret: Ty): TypeRef {
+        let mut ps: [(Ty, bool); ..+] = [];
+        for i in 0..params.len() {
+            ps.push((p.types.at(params, i), modes.get(i) != ParamMode::Take));
+        }
+        return self.fn_ty(p, ps[..], ret, false);
+    }
+
+    /// Call a closure: its function takes the captures first, each from the
+    /// closure's value at `env` (through the pointer for a borrowed one, in
+    /// place for a held one), then the arguments.
+    fn call_closure(&mut self, p: &mut +Program, def: DefId, targs: TyList, env: ValueRef, vals: [ValueRef; &]): Option::<ValueRef> {
+        let info = p.closures.get(def).unwrap();
+        let cty = p.types.mk(TyKind::Closure(def, targs));
+        let lt = self.llty(p, cty);
+        let fields = p.closure_fields(def, targs);
+        let mut all: [ValueRef; ..+] = [];
+        for i in 0..info.captures.len() {
+            let cap = p.captures.list(info.captures)[i];
+            let fp = self.struct_field(lt, env, i as u32);
+            let at = if cap.by_ref { self.load_ty(self.ptr_ty(), fp, noname()) } else { fp };
+            if p.param_by_ref(def, i) {
+                all.push(at);
+            } else {
+                let t = p.types.subst(cap.ty, targs);
+                let v = self.load(p, at, t);
+                if cap.mode == ParamMode::Take && p.has_owner(t) {
+                    // Taken by the call: the closure no longer owns it.
+                    let ft = self.llty(p, p.types.at(fields, i));
+                    self.store(self.const_null(ft), at);
+                }
+                all.push(v);
+            }
+        }
+        all.extend(vals);
+        let f = self.instance(p, def, targs);
+        return self.call_value(f, all[..]);
+    }
+
+    /// A call expression with result type `ret`.
+    pub fn call_expr(&mut self, p: &mut +Program, callee: Callee, args: List::<Arg>, ret: Ty, span: Span): Option::<ValueRef> {
+        let mut indirect = null();
+        if let Callee::Indirect(f) = callee {
+            indirect = self.value(p, f)?;
+        }
+        let def = self.callee_def(p, callee);
+        // How each argument is passed: from the callee's declaration, or
+        // for a call through a pointer, from the modes in the pointer's
+        // type.
+        let ptr_modes = match callee {
+            Callee::Indirect(f) => {
+                let t = self.ety(p, f);
+                self.value_modes(p, t)
+            }
+            Callee::Value { callee: f, .. } => {
+                let t = self.ety(p, f);
+                self.value_modes(p, t)
+            }
+            _ => None,
+        };
+        // The callable value: a closure's place (or a temporary holding a
+        // consumed one), or a function pointer.
+        let mut value_callee = null();
+        if let Callee::Value { callee: f, .. } = callee {
+            let t = self.ety(p, f);
+            let is_fn_ptr = match p.types.kind(t) {
+                TyKind::FnPtr(..) => true,
+                _ => false,
+            };
+            if is_fn_ptr {
+                value_callee = self.value(p, f)?;
+            } else if p.thir.is_place(f) {
+                value_callee = self.place(p, f)?;
+            } else {
+                // A consumed closure: what it still holds after the call is
+                // dropped with the statement's temporaries.
+                let v = self.value(p, f)?;
+                let tmp = self.alloca_for(p, t, z("closure\0"));
+                self.store(v, tmp);
+                self.register_cleanup(p, tmp, t);
+                value_callee = tmp;
+            }
+        }
+        let n = args.len();
+        let mut by_ref_at: [bool; ..+] = [];
+        let mut taken_at: [bool; ..+] = [];
+        for i in 0..n {
+            match ptr_modes {
+                Some(pm) => {
+                    let (modes, count) = pm;
+                    by_ref_at.push(i < count && modes.get(i) != ParamMode::Take);
+                    taken_at.push(i < count && modes.get(i) == ParamMode::Take);
+                }
+                None => match def {
+                    Some(d) => {
+                        by_ref_at.push(p.param_by_ref(d, i));
+                        let ps = p.fn_data(d).sig.params;
+                        taken_at.push(i < ps.len() && p.params.list(ps)[i].mode == ParamMode::Take);
+                    }
+                    None => {
+                        by_ref_at.push(false);
+                        taken_at.push(false);
+                    }
+                },
+            }
+        }
+        let mut vals: [ValueRef; ..+] = [];
+        // Types of arguments passed by pointer, for built-in
+        // implementations that need the values.
+        let mut by_ref_tys: [Option::<Ty>; ..+] = [];
+        for i in 0..n {
+            let a = p.thir.args.list(args)[i];
+            match a {
+                Arg::Value(e) => {
+                    if by_ref_at[i] {
+                        // A borrowed parameter gets the address of the
+                        // caller's place, or of a temporary that lives until
+                        // the end of the statement.
+                        by_ref_tys.push(Some(self.ety(p, e)));
+                        if let Some(place) = borrowed_place(p, e) {
+                            vals.push(self.place(p, place)?);
+                            continue;
+                        }
+                        let v = self.value(p, e)?;
+                        let ty = self.ety(p, e);
+                        let tmp = self.alloca_for(p, ty, z("argtmp\0"));
+                        self.store(v, tmp);
+                        self.register_cleanup(p, tmp, ty);
+                        vals.push(tmp);
+                        continue;
+                    }
+                    by_ref_tys.push(None);
+                    let v = self.value(p, e)?;
+                    let ty = self.ety(p, e);
+                    if p.has_owner(ty) && !is_borrowed(p, e) && !taken_at[i] {
+                        // An owned temporary lent to a borrowing parameter:
+                        // dropped after the statement. (A parameter that
+                        // takes ownership frees it itself.)
+                        let tmp = self.alloca_for(p, ty, z("argtmp\0"));
+                        self.store(v, tmp);
+                        self.register_cleanup(p, tmp, ty);
+                    }
+                    vals.push(v);
+                }
+                Arg::InOut(x) => {
+                    by_ref_tys.push(None);
+                    vals.push(self.place(p, x)?);
+                }
+            }
+        }
+        let mut result: Option::<ValueRef> = None;
+        match callee {
+            Callee::Fn { def, args: targs } => {
+                let targs = self.t_list(p, targs);
+                let f = self.instance(p, def, targs);
+                result = self.call_value(f, vals[..]);
+            }
+            Callee::Trait { trait_ref, self_ty, method, method_args } => {
+                let tr = TraitRef { trait_id: trait_ref.trait_id, args: self.t_list(p, trait_ref.args) };
+                let st = self.t(p, self_ty);
+                let margs = self.t_list(p, method_args);
+                match p.resolve_method(tr, st, method, margs) {
+                    Some(MethodImpl::Fn { def, args }) => {
+                        let f = self.instance(p, def, args);
+                        result = self.call_value(f, vals[..]);
+                    }
+                    Some(MethodImpl::Builtin { lang, method }) => {
+                        // Built-in implementations work on values.
+                        let mut vs: [ValueRef; ..+] = [];
+                        for i in 0..vals.len() {
+                            match by_ref_tys[i] {
+                                Some(t) => {
+                                    let lt = self.llty(p, t);
+                                    vs.push(self.load_ty(lt, vals[i], noname()));
+                                }
+                                None => vs.push(vals[i]),
+                            }
+                        }
+                        result = Some(self.builtin(p, p.text(lang), p.text(method), vs[..], st, ret, span));
+                    }
+                    None => {
+                        let s = p.ty_str(st);
+                        let tn = p.name(tr.trait_id);
+                        let mn = p.text(method);
+                        let mut msg = String::new();
+                        msg.write("no implementation of `{tn}::{mn}` for `{s}`");
+                        self.ice(p, msg.as_str());
+                        return None;
+                    }
+                }
+            }
+            Callee::Intrinsic { name, args: targs, .. } => {
+                let targs = self.t_list(p, targs);
+                return self.intrinsic(p, p.text(name), targs, vals[..], ret, span);
+            }
+            Callee::Indirect(f) => {
+                let ft = self.ety(p, f);
+                let TyKind::FnPtr(params, modes, r) = p.types.kind(ft) else {
+                    self.ice(p, "indirect call through a non-function");
+                    return None;
+                };
+                let fty = self.ptr_fn_ty(p, params, modes, r);
+                result = self.call_typed(fty, indirect, vals[..]);
+            }
+            Callee::Value { callee: f, .. } => {
+                let ft = self.ety(p, f);
+                match p.types.kind(ft) {
+                    TyKind::Closure(def, targs) => {
+                        result = self.call_closure(p, def, targs, value_callee, vals[..]);
+                    }
+                    TyKind::FnPtr(params, modes, r) => {
+                        let fty = self.ptr_fn_ty(p, params, modes, r);
+                        result = self.call_typed(fty, value_callee, vals[..]);
+                    }
+                    _ => {
+                        let s = p.ty_str(ft);
+                        let mut msg = String::new();
+                        msg.write("call of a value of type `{s}`");
+                        self.ice(p, msg.as_str());
+                        return None;
+                    }
+                }
+            }
+        }
+        if p.types.is_never(ret) {
+            if !self.terminated() {
+                self.unreachable();
+            }
+            return None;
+        }
+        return match result {
+            Some(v) => Some(v),
+            None => Some(self.unit()),
+        };
+    }
+
+    // ===================================================================== intrinsics
+
+    fn intrinsic(&mut self, p: &mut +Program, name: str, targs: TyList, vals: [ValueRef; &], ret: Ty, span: Span): Option::<ValueRef> {
+        let mut v = null();
+        if name == "size_of" {
+            let n = self.size_of(p, p.types.at(targs, 0));
+            v = self.usize(n);
+        } else if name == "align_of" {
+            let n = self.align_of(p, p.types.at(targs, 0));
+            v = self.usize(n as u64);
+        } else if name == "slice_len" || name == "str_len" {
+            v = self.extract(vals[0], 1, z("len\0"));
+        } else if name == "slice_ptr" || name == "slice_mut_ptr" {
+            v = self.extract(vals[0], 0, z("ptr\0"));
+        } else if name == "slice_from_raw" || name == "slice_mut_from_raw" {
+            v = self.make_slice(vals[0], vals[1]);
+        } else if name == "str_bytes" || name == "str_from_bytes" || name == "char_from_u32" {
+            v = vals[0];
+        } else if name == "arr_push" {
+            self.emit_push(p, vals[0], vals[1], p.types.at(targs, 0));
+            v = self.unit();
+        } else if name == "arr_extend" {
+            self.emit_extend(p, vals[0], vals[1], p.types.at(targs, 0));
+            v = self.unit();
+        } else if name == "string_push_str" {
+            let u8t = p.types.int(IntTy::U8);
+            self.emit_extend(p, vals[0], vals[1], u8t);
+            v = self.unit();
+        } else if name == "arr_reserve" {
+            self.ensure_cap(p, vals[0], vals[1], p.types.at(targs, 0));
+            v = self.unit();
+        } else if name == "arr_cap" || name == "string_cap" {
+            let size = if name == "arr_cap" { self.size_of(p, p.types.at(targs, 0)) } else { 1 };
+            self.emit_ds_cap(p, vals[0], self.usize(size), vals[1]);
+            v = self.unit();
+        } else if name == "arr_truncate" || name == "string_truncate" {
+            let ht = self.handle_ty();
+            let lp = self.struct_field(ht, vals[0], 1);
+            let len = self.load_ty(self.usize_ty(), lp, noname());
+            let n = vals[1];
+            let shorter = self.icmp(INT_ULT, n, len, noname());
+            let new = self.select(shorter, n, len, noname());
+            self.store(new, lp);
+            v = self.unit();
+        } else if name == "arr_from_slice" {
+            let ht = self.handle_ty();
+            let slot = self.alloca(ht, z("dyn\0"));
+            self.store(self.const_null(ht), slot);
+            self.emit_extend(p, slot, vals[0], p.types.at(targs, 0));
+            v = self.load_ty(ht, slot, noname());
+        } else if name == "string_new" {
+            v = self.const_null(self.handle_ty());
+        } else if name == "string_as_str" {
+            let data = self.extract(vals[0], 0, noname());
+            let len = self.extract(vals[0], 1, noname());
+            v = self.make_slice(data, len);
+        } else if name == "fmt_write" {
+            let env = self.extract(vals[0], 0, z("env\0"));
+            let thunk_i = self.extract(vals[0], 1, z("thunk\0"));
+            let thunk = unsafe { LLVMBuildIntToPtr(self.b, thunk_i, self.ptr_ty(), noname()) };
+            let ps = [self.ptr_ty(), self.ptr_ty()];
+            let fty = unsafe { LLVMFunctionType(self.void_ty(), ps[..].as_ptr(), 2, 0) };
+            let call_args = [env, vals[1]];
+            self.call_typed(fty, thunk, call_args[..]);
+            v = self.unit();
+        } else if name == "ptr_read" {
+            let lt = self.llty(p, p.types.at(targs, 0));
+            v = self.load_ty(lt, vals[0], noname());
+        } else if name == "ptr_write" {
+            self.store(vals[1], vals[0]);
+            v = self.unit();
+        } else if name == "ptr_offset" || name == "ptr_offset_mut" {
+            let lt = self.llty(p, p.types.at(targs, 0));
+            v = self.gep(lt, vals[0], vals[1], noname());
+        } else if name == "ptr_null" || name == "ptr_null_mut" {
+            v = unsafe { LLVMConstPointerNull(self.ptr_ty()) };
+        } else if name == "addr_of_mut" {
+            v = vals[0];
+        } else if name == "wrapping_add" {
+            v = self.add(vals[0], vals[1], noname());
+        } else if name == "wrapping_sub" {
+            v = self.sub(vals[0], vals[1], noname());
+        } else if name == "wrapping_mul" {
+            v = self.mul(vals[0], vals[1], noname());
+        } else if name == "abort" {
+            let none: [TypeRef; 0] = [];
+            let trap = self.intrinsic_decl("llvm.trap", none[..]);
+            let no_args: [ValueRef; 0] = [];
+            self.call(trap, no_args[..]);
+            self.unreachable();
+            return None;
+        } else if name == "unreachable" {
+            self.unreachable();
+            return None;
+        } else {
+            let mut msg = String::new();
+            msg.write("unknown intrinsic `{name}`");
+            self.ice(p, msg.as_str());
+            return None;
+        }
+        if p.types.is_never(ret) {
+            self.unreachable();
+            return None;
+        }
+        return Some(v);
+    }
+
+    /// Give the empty array behind handle `h` a slot for exactly `count`
+    /// elements of `size` bytes.
+    pub fn emit_ds_cap(&mut self, p: &mut +Program, h: ValueRef, size: ValueRef, count: ValueRef) {
+        match self.lang_fn(p, "ds_cap") {
+            Ok(f) => {
+                let args = [h, size, count];
+                self.call(f, args[..]);
+            }
+            Err(e) => self.ice(p, e.as_str()),
+        }
+    }
+
+    /// Make sure the array behind handle `h` has room for `extra` more
+    /// elements.
+    pub fn ensure_cap(&mut self, p: &mut +Program, h: ValueRef, extra: ValueRef, elem: Ty) {
+        let size = self.size_of(p, elem);
+        if size == 0 {
+            return;
+        }
+        let ht = self.handle_ty();
+        let lp = self.struct_field(ht, h, 1);
+        let cp = self.struct_field(ht, h, 2);
+        let len = self.load_ty(self.usize_ty(), lp, z("len\0"));
+        let cap = self.load_ty(self.usize_ty(), cp, z("cap\0"));
+        // `extra > cap - len` rather than `len + extra > cap`: `extra` may
+        // be user-controlled and the addition could wrap (`len <= cap`
+        // always).
+        let room = self.sub(cap, len, z("room\0"));
+        let full = self.icmp(INT_UGT, extra, room, noname());
+        let grow = self.block_named(z("grow\0"));
+        let done = self.block_named(z("grown\0"));
+        self.cond_br(full, grow, done);
+        self.position(grow);
+        match self.lang_fn(p, "ds_grow") {
+            Ok(f) => {
+                let args = [h, self.usize(size), extra];
+                self.call(f, args[..]);
+            }
+            Err(e) => self.ice(p, e.as_str()),
+        }
+        self.br(done);
+        self.position(done);
+    }
+
+    fn emit_push(&mut self, p: &mut +Program, h: ValueRef, v: ValueRef, elem: Ty) {
+        self.ensure_cap(p, h, self.usize(1), elem);
+        let ht = self.handle_ty();
+        let dp = self.struct_field(ht, h, 0);
+        let lp = self.struct_field(ht, h, 1);
+        let data = self.load_ty(self.ptr_ty(), dp, noname());
+        let len = self.load_ty(self.usize_ty(), lp, noname());
+        let et = self.llty(p, elem);
+        let slot = self.gep(et, data, len, noname());
+        self.store(v, slot);
+        let n = self.add(len, self.usize(1), noname());
+        self.store(n, lp);
+    }
+
+    fn emit_extend(&mut self, p: &mut +Program, h: ValueRef, slice: ValueRef, elem: Ty) {
+        let src = self.extract(slice, 0, noname());
+        let n = self.extract(slice, 1, noname());
+        let nonzero = self.icmp(INT_NE, n, self.usize(0), noname());
+        let copy = self.block_named(z("extend\0"));
+        let done = self.block_named(z("extended\0"));
+        self.cond_br(nonzero, copy, done);
+        self.position(copy);
+        self.ensure_cap(p, h, n, elem);
+        let ht = self.handle_ty();
+        let dp = self.struct_field(ht, h, 0);
+        let lp = self.struct_field(ht, h, 1);
+        let data = self.load_ty(self.ptr_ty(), dp, noname());
+        let len = self.load_ty(self.usize_ty(), lp, noname());
+        let et = self.llty(p, elem);
+        let dst = self.gep(et, data, len, noname());
+        let size = self.size_of(p, elem);
+        let bytes = self.mul(n, self.usize(size), noname());
+        let align = self.align_of(p, elem);
+        unsafe { LLVMBuildMemMove(self.b, dst, align, src, align, bytes) };
+        let new_len = self.add(len, n, noname());
+        self.store(new_len, lp);
+        self.br(done);
+        self.position(done);
+    }
+
+    // ===================================================================== builtin impls
+
+    fn builtin(&mut self, p: &mut +Program, lang: str, method: str, vals: [ValueRef; &], self_ty: Ty, ret: Ty, span: Span): ValueRef {
+        let op = method_op(method);
+        if lang == "neg" {
+            return self.unary(p, UnOp::Neg, vals[0], self_ty, span);
+        }
+        if lang == "not" {
+            return self.unary(p, UnOp::Not, vals[0], self_ty, span);
+        }
+        if lang == "eq" && method == "eq" {
+            return self.values_eq(p, vals[0], vals[1], self_ty);
+        }
+        if lang == "ord" && method == "cmp" {
+            return self.ordering(p, vals[0], vals[1], self_ty);
+        }
+        if lang == "ord" && p.types.kind(self_ty) == TyKind::Str {
+            let o = self.ordering(p, vals[0], vals[1], self_ty);
+            let tag = self.ordering_tag(o);
+            let mut pred = INT_NE;
+            let mut val: u64 = 0;
+            if method == "lt" {
+                pred = INT_EQ;
+                val = 0;
+            } else if method == "gt" {
+                pred = INT_EQ;
+                val = 2;
+            } else if method == "le" {
+                pred = INT_NE;
+                val = 2;
+            }
+            return self.icmp(pred, tag, self.const_int(self.i32_ty(), val), noname());
+        }
+        if lang == "clone" {
+            return vals[0];
+        }
+        if lang == "default" {
+            let lt = self.llty(p, ret);
+            return self.const_null(lt);
+        }
+        return match op {
+            Some(op) => self.binop(p, op, vals[0], vals[1], self_ty, span),
+            None => {
+                let mut msg = String::new();
+                msg.write("unknown builtin `{lang}::{method}`");
+                self.ice(p, msg.as_str());
+                self.unit()
+            }
+        };
+    }
+
+    fn ordering_ty(&mut self, p: &mut +Program): Ty {
+        let Some(o) = p.lang_item("ordering") else {
+            panic("ordering lang item");
+        };
+        return p.types.adt(o, List::empty());
+    }
+
+    fn ordering_tag(&mut self, v: ValueRef): ValueRef {
+        return self.extract(v, 0, noname());
+    }
+
+    /// `a.cmp(b)` for primitives and `str`, as an `Ordering` value.
+    fn ordering(&mut self, p: &mut +Program, a: ValueRef, b: ValueRef, ty: Ty): ValueRef {
+        let i32t = self.i32_ty();
+        let mut lt = null();
+        let mut gt = null();
+        if p.types.kind(ty) == TyKind::Str {
+            let r = self.str_cmp(p, a, b);
+            lt = self.icmp(INT_SLT, r, self.const_int(i32t, 0), noname());
+            gt = self.icmp(INT_SGT, r, self.const_int(i32t, 0), noname());
+        } else {
+            lt = self.binop(p, BinOp::Lt, a, b, ty, dummy_span());
+            gt = self.binop(p, BinOp::Gt, a, b, ty, dummy_span());
+        }
+        let one = self.select(gt, self.const_int(i32t, 2), self.const_int(i32t, 1), noname());
+        let tag = self.select(lt, self.const_int(i32t, 0), one, noname());
+        let ot = self.ordering_ty(p);
+        let st = self.llty(p, ot);
+        return self.insert(self.const_null(st), tag, 0);
+    }
+
+    /// Three-way comparison of two `str`s: negative, zero or positive.
+    fn str_cmp(&mut self, p: &mut +Program, a: ValueRef, b: ValueRef): ValueRef {
+        let (pa, la) = self.split_slice(a);
+        let (pb, lb) = self.split_slice(b);
+        let shorter = self.icmp(INT_ULT, la, lb, noname());
+        let m = self.select(shorter, la, lb, noname());
+        let memcmp = self.libc(p, "memcmp");
+        let args = [pa, pb, m];
+        let r = self.call(memcmp, args[..]);
+        let i32t = self.i32_ty();
+        let is_zero = self.icmp(INT_EQ, r, self.const_int(i32t, 0), noname());
+        let len_lt = self.icmp(INT_ULT, la, lb, noname());
+        let len_gt = self.icmp(INT_UGT, la, lb, noname());
+        let by_len = self.select(len_gt, self.const_int(i32t, 1), self.const_int(i32t, 0), noname());
+        let minus_one = unsafe { LLVMConstInt(i32t, 18446744073709551615, 1) };
+        let by_len = self.select(len_lt, minus_one, by_len, noname());
+        return self.select(is_zero, by_len, r, noname());
+    }
+
+    fn split_slice(&mut self, v: ValueRef): (ValueRef, ValueRef) {
+        let ptr = self.extract(v, 0, noname());
+        let len = self.extract(v, 1, noname());
+        return (ptr, len);
+    }
+
+    /// Equality for primitives and `str`.
+    pub fn values_eq(&mut self, p: &mut +Program, a: ValueRef, b: ValueRef, ty: Ty): ValueRef {
+        if p.types.kind(ty) == TyKind::Str {
+            let (pa, la) = self.split_slice(a);
+            let (pb, lb) = self.split_slice(b);
+            let same_len = self.icmp(INT_EQ, la, lb, noname());
+            let cmp_bb = self.block_named(z("streq\0"));
+            let done = self.block_named(z("streq_done\0"));
+            let start = self.insert_block();
+            self.cond_br(same_len, cmp_bb, done);
+            self.position(cmp_bb);
+            let memcmp = self.libc(p, "memcmp");
+            let args = [pa, pb, la];
+            let r = self.call(memcmp, args[..]);
+            let eq = self.icmp(INT_EQ, r, self.const_int(self.i32_ty(), 0), noname());
+            let cmp_end = self.insert_block();
+            self.br(done);
+            self.position(done);
+            let phi = unsafe { LLVMBuildPhi(self.b, self.bool_ty(), noname()) };
+            let vals = [self.const_int(self.bool_ty(), 0), eq];
+            let blocks = [start, cmp_end];
+            unsafe { LLVMAddIncoming(phi, vals[..].as_ptr(), blocks[..].as_ptr(), 2) };
+            return phi;
+        }
+        if p.types.is_unit(ty) {
+            return self.const_int(self.bool_ty(), 1);
+        }
+        return self.binop(p, BinOp::Eq, a, b, ty, dummy_span());
+    }
+
+    // ===================================================================== arithmetic
+
+    pub fn unary(&mut self, p: &mut +Program, op: UnOp, v: ValueRef, ty: Ty, span: Span): ValueRef {
+        let k = p.types.kind(ty);
+        if op == UnOp::Neg {
+            if let TyKind::Float(_) = k {
+                return unsafe { LLVMBuildFNeg(self.b, v, noname()) };
+            }
+            if let TyKind::Int(_) = k {
+                let zero = self.const_null(unsafe { LLVMTypeOf(v) });
+                return self.binop(p, BinOp::Sub, zero, v, ty, span);
+            }
+        }
+        if op == UnOp::Not {
+            return unsafe { LLVMBuildNot(self.b, v, noname()) };
+        }
+        self.ice(p, "bad unary operand");
+        return v;
+    }
+
+    pub fn binop(&mut self, p: &mut +Program, op: BinOp, a: ValueRef, b: ValueRef, ty: Ty, span: Span): ValueRef {
+        let k = p.types.kind(ty);
+        if let TyKind::Float(_) = k {
+            let bd = self.b;
+            return match op {
+                BinOp::Add => unsafe { LLVMBuildFAdd(bd, a, b, noname()) },
+                BinOp::Sub => unsafe { LLVMBuildFSub(bd, a, b, noname()) },
+                BinOp::Mul => unsafe { LLVMBuildFMul(bd, a, b, noname()) },
+                BinOp::Div => unsafe { LLVMBuildFDiv(bd, a, b, noname()) },
+                BinOp::Rem => unsafe { LLVMBuildFRem(bd, a, b, noname()) },
+                BinOp::Eq => unsafe { LLVMBuildFCmp(bd, REAL_OEQ, a, b, noname()) },
+                BinOp::Ne => unsafe { LLVMBuildFCmp(bd, REAL_UNE, a, b, noname()) },
+                BinOp::Lt => unsafe { LLVMBuildFCmp(bd, REAL_OLT, a, b, noname()) },
+                BinOp::Le => unsafe { LLVMBuildFCmp(bd, REAL_OLE, a, b, noname()) },
+                BinOp::Gt => unsafe { LLVMBuildFCmp(bd, REAL_OGT, a, b, noname()) },
+                BinOp::Ge => unsafe { LLVMBuildFCmp(bd, REAL_OGE, a, b, noname()) },
+                _ => {
+                    self.ice(p, "bad float operator");
+                    a
+                }
+            };
+        }
+        let (is_int, signed) = match k {
+            TyKind::Int(i) => (true, i.signed()),
+            _ => (false, false),
+        };
+        let checked = op == BinOp::Add || op == BinOp::Sub || op == BinOp::Mul;
+        if checked && self.opts.overflow_checks && is_int {
+            let mut name = "llvm.umul.with.overflow";
+            let mut what = "multiply";
+            if op == BinOp::Add {
+                name = if signed { "llvm.sadd.with.overflow" } else { "llvm.uadd.with.overflow" };
+                what = "add";
+            } else if op == BinOp::Sub {
+                name = if signed { "llvm.ssub.with.overflow" } else { "llvm.usub.with.overflow" };
+                what = "subtract";
+            } else if signed {
+                name = "llvm.smul.with.overflow";
+            }
+            let tys = [unsafe { LLVMTypeOf(a) }];
+            let f = self.intrinsic_decl(name, tys[..]);
+            let args = [a, b];
+            let r = self.call(f, args[..]);
+            let val = self.extract(r, 0, noname());
+            let ov = self.extract(r, 1, noname());
+            let bad = self.block_named(z("overflow\0"));
+            let ok = self.block_named(z("no_overflow\0"));
+            self.cond_br(ov, bad, ok);
+            self.position(bad);
+            let mut msg = String::new();
+            msg.write("attempt to {what} with overflow");
+            self.panic_msg(p, msg.as_str(), span);
+            self.position(ok);
+            return val;
+        }
+        let bd = self.b;
+        return match op {
+            BinOp::Add => self.add(a, b, noname()),
+            BinOp::Sub => self.sub(a, b, noname()),
+            BinOp::Mul => self.mul(a, b, noname()),
+            BinOp::Div | BinOp::Rem => {
+                let it = unsafe { LLVMTypeOf(a) };
+                let is_zero = self.icmp(INT_EQ, b, self.const_null(it), noname());
+                let bad = self.block_named(z("div_zero\0"));
+                let ok = self.block_named(z("div_ok\0"));
+                self.cond_br(is_zero, bad, ok);
+                self.position(bad);
+                let what = if op == BinOp::Div { "divide" } else { "calculate the remainder" };
+                let mut msg = String::new();
+                msg.write("attempt to {what} by zero");
+                self.panic_msg(p, msg.as_str(), span);
+                self.position(ok);
+                if signed {
+                    // MIN / -1 overflows.
+                    let bits = unsafe { LLVMGetIntTypeWidth(it) };
+                    let min = self.const_int(it, 1u64 << ((bits - 1) as u64));
+                    let is_min = self.icmp(INT_EQ, a, min, noname());
+                    let neg1 = self.icmp(INT_EQ, b, unsafe { LLVMConstAllOnes(it) }, noname());
+                    let both = self.and(is_min, neg1, noname());
+                    let bad = self.block_named(z("div_overflow\0"));
+                    let ok2 = self.block_named(z("div_ok2\0"));
+                    self.cond_br(both, bad, ok2);
+                    self.position(bad);
+                    let mut msg = String::new();
+                    msg.write("attempt to {what} with overflow");
+                    self.panic_msg(p, msg.as_str(), span);
+                    self.position(ok2);
+                    if op == BinOp::Div {
+                        unsafe { LLVMBuildSDiv(bd, a, b, noname()) }
+                    } else {
+                        unsafe { LLVMBuildSRem(bd, a, b, noname()) }
+                    }
+                } else if op == BinOp::Div {
+                    unsafe { LLVMBuildUDiv(bd, a, b, noname()) }
+                } else {
+                    unsafe { LLVMBuildURem(bd, a, b, noname()) }
+                }
+            }
+            BinOp::BitAnd | BinOp::And => self.and(a, b, noname()),
+            BinOp::BitOr | BinOp::Or => unsafe { LLVMBuildOr(bd, a, b, noname()) },
+            BinOp::BitXor => unsafe { LLVMBuildXor(bd, a, b, noname()) },
+            BinOp::Shl | BinOp::Shr => {
+                let bits = unsafe { LLVMGetIntTypeWidth(LLVMTypeOf(a)) } as u64;
+                let amt = self.and(b, self.const_int(unsafe { LLVMTypeOf(b) }, bits - 1), noname());
+                if op == BinOp::Shl {
+                    unsafe { LLVMBuildShl(bd, a, amt, noname()) }
+                } else if signed {
+                    unsafe { LLVMBuildAShr(bd, a, amt, noname()) }
+                } else {
+                    unsafe { LLVMBuildLShr(bd, a, amt, noname()) }
+                }
+            }
+            BinOp::Eq => self.icmp(INT_EQ, a, b, noname()),
+            BinOp::Ne => self.icmp(INT_NE, a, b, noname()),
+            BinOp::Lt => self.icmp(if signed { INT_SLT } else { INT_ULT }, a, b, noname()),
+            BinOp::Le => self.icmp(if signed { INT_SLE } else { INT_ULE }, a, b, noname()),
+            BinOp::Gt => self.icmp(if signed { INT_SGT } else { INT_UGT }, a, b, noname()),
+            BinOp::Ge => self.icmp(if signed { INT_SGE } else { INT_UGE }, a, b, noname()),
+        };
+    }
+
+    pub fn cast(&mut self, p: &mut +Program, v: ValueRef, from: Ty, to: Ty): ValueRef {
+        if from == to {
+            return v;
+        }
+        let bd = self.b;
+        match (p.types.kind(from), p.types.kind(to)) {
+            (TyKind::Int(fi), TyKind::Int(ti)) => return unsafe { LLVMBuildIntCast2(bd, v, self.int_ty(ti), fi.signed() as i32, noname()) },
+            (TyKind::Bool, TyKind::Int(ti)) => return unsafe { LLVMBuildIntCast2(bd, v, self.int_ty(ti), 0, noname()) },
+            (TyKind::Char, TyKind::Int(ti)) => return unsafe { LLVMBuildIntCast2(bd, v, self.int_ty(ti), 0, noname()) },
+            (TyKind::Int(_), TyKind::Char) => return unsafe { LLVMBuildIntCast2(bd, v, self.i32_ty(), 0, noname()) },
+            (TyKind::Int(fi), TyKind::Float(ft)) => {
+                let t = self.float_ty(ft);
+                if fi.signed() {
+                    return unsafe { LLVMBuildSIToFP(bd, v, t, noname()) };
+                }
+                return unsafe { LLVMBuildUIToFP(bd, v, t, noname()) };
+            },
+            (TyKind::Float(_), TyKind::Int(ti)) => {
+                // Saturating, like Rust.
+                let name = if ti.signed() { "llvm.fptosi.sat" } else { "llvm.fptoui.sat" };
+                let tys = [self.int_ty(ti), unsafe { LLVMTypeOf(v) }];
+                let f = self.intrinsic_decl(name, tys[..]);
+                let args = [v];
+                return self.call(f, args[..]);
+            },
+            (TyKind::Float(_), TyKind::Float(ft)) => return unsafe { LLVMBuildFPCast(bd, v, self.float_ty(ft), noname()) },
+            (TyKind::Ptr(..), TyKind::Int(ti)) => return unsafe { LLVMBuildPtrToInt(bd, v, self.int_ty(ti), noname()) },
+            (TyKind::FnPtr(..), TyKind::Int(ti)) => return unsafe { LLVMBuildPtrToInt(bd, v, self.int_ty(ti), noname()) },
+            (TyKind::Int(_), TyKind::Ptr(..)) => return unsafe { LLVMBuildIntToPtr(bd, v, self.ptr_ty(), noname()) },
+            (TyKind::Ptr(..), TyKind::Ptr(..)) | (TyKind::FnPtr(..), TyKind::Ptr(..)) => return v,
+            _ => {
+                let f = p.ty_str(from);
+                let t = p.ty_str(to);
+                let mut msg = String::new();
+                msg.write("unsupported cast from {f} to {t}");
+                self.ice(p, msg.as_str());
+                return v;
+            }
+        }
+    }
+
+    // ===================================================================== format strings
+
+    /// Build a `FmtArgs` value: an environment holding the interpolated
+    /// values and a generated thunk that writes them into a `String`.
+    pub fn fmt_args(&mut self, p: &mut +Program, pieces: List::<FmtPiece>): Option::<ValueRef> {
+        let mut arg_vals: [ValueRef; ..+] = [];
+        let mut arg_tys: [Ty; ..+] = [];
+        let mut arg_exprs: [Id::<Expr>; ..+] = [];
+        for i in 0..pieces.len() {
+            let piece = p.thir.fmt_pieces.list(pieces)[i];
+            if let FmtPiece::Arg(e, _) = piece {
+                arg_vals.push(self.value(p, e)?);
+                arg_tys.push(self.ety(p, e));
+                arg_exprs.push(e);
+            }
+        }
+        let mut env_fields: [TypeRef; ..+] = [];
+        for t in arg_tys {
+            env_fields.push(self.llty(p, t));
+        }
+        let env_ty = self.struct_ty(env_fields[..]);
+        let env = self.alloca(env_ty, z("fmt_env\0"));
+        for i in 0..arg_vals.len() {
+            let fp = self.struct_field(env_ty, env, i as u32);
+            self.store(arg_vals[i], fp);
+            // An owned value made for the hole (`{name()}`) is a temporary
+            // of the statement; a borrowed place is not ours to free.
+            if !is_borrowed(p, arg_exprs[i]) {
+                self.register_cleanup(p, fp, arg_tys[i]);
+            }
+        }
+        let thunk = match self.fmt_thunk(p, pieces, arg_tys[..], env_ty) {
+            Ok(f) => f,
+            Err(e) => {
+                self.ice(p, e.as_str());
+                return None;
+            }
+        };
+        let thunk_i = unsafe { LLVMBuildPtrToInt(self.b, thunk, self.usize_ty(), noname()) };
+        let a = self.insert(self.undef(self.slice_ty()), env, 0);
+        return Some(self.insert(a, thunk_i, 1));
+    }
+
+    /// The thunk `void(env, out)` writing the pieces into the `String` at
+    /// `out`.
+    fn fmt_thunk(&mut self, p: &mut +Program, pieces: List::<FmtPiece>, arg_tys: [Ty; &], env_ty: TypeRef): Result::<ValueRef, String> {
+        let ptr = self.ptr_ty();
+        let ps = [ptr, ptr];
+        let fty = unsafe { LLVMFunctionType(self.void_ty(), ps[..].as_ptr(), 2, 0) };
+        self.counter += 1;
+        let mut name = String::new();
+        name.write("_LN_fmt{self.counter}");
+        let cname = c_string(name.as_str());
+        let f = unsafe { LLVMAddFunction(self.module, cname.as_ptr(), fty) };
+        unsafe { LLVMSetLinkage(f, INTERNAL_LINKAGE) };
+        let saved = self.insert_block();
+        let entry = self.append_block(f, z("entry\0"));
+        self.position(entry);
+        let env = unsafe { LLVMGetParam(f, 0) };
+        let out = unsafe { LLVMGetParam(f, 1) };
+        let mut ai: usize = 0;
+        for i in 0..pieces.len() {
+            let piece = p.thir.fmt_pieces.list(pieces)[i];
+            match piece {
+                FmtPiece::Text(s) => {
+                    let sv = self.const_str(p, p.text(s));
+                    self.thunk_extend(p, f, out, sv)?;
+                }
+                FmtPiece::Arg(_, spec) => {
+                    let (lang, method, tname) = match spec {
+                        FmtSpec::Show => ("display", "fmt", "Display"),
+                        FmtSpec::Debugged => ("debug", "debug", "Debug"),
+                    };
+                    let Some(trait_id) = p.lang_item(lang) else {
+                        let mut e = String::new();
+                        e.write("missing lang item `{lang}`");
+                        return Err(e);
+                    };
+                    let t = arg_tys[ai];
+                    let fp = self.struct_gep(env_ty, env, ai as u32, noname());
+                    let lt = self.llty(p, t);
+                    let v = self.load_ty(lt, fp, noname());
+                    let tr = TraitRef { trait_id, args: List::empty() };
+                    let msym = p.sym(method);
+                    match p.resolve_method(tr, t, msym, List::empty()) {
+                        Some(MethodImpl::Fn { def, args }) => {
+                            let callee = self.instance(p, def, args);
+                            // `fmt(&self, ..)` takes the value's address.
+                            let recv = if p.param_by_ref(def, 0) { fp } else { v };
+                            let call_args = [recv, out];
+                            self.call(callee, call_args[..]);
+                        }
+                        _ => {
+                            let ts = p.ty_str(t);
+                            let mut e = String::new();
+                            e.write("no `{tname}` implementation for `{ts}`");
+                            return Err(e);
+                        }
+                    }
+                    ai += 1;
+                }
+            }
+        }
+        self.ret_void();
+        if !is_null(saved) {
+            self.position(saved);
+        }
+        return Ok(f);
+    }
+
+    /// Append the `str` value `s` to the `String` behind `out` (inside the
+    /// thunk `f`).
+    fn thunk_extend(&mut self, p: &mut +Program, f: ValueRef, out: ValueRef, s: ValueRef): Result::<(), String> {
+        let src = self.extract(s, 0, noname());
+        let n = self.extract(s, 1, noname());
+        let is_const = !is_null(unsafe { LLVMIsAConstantInt(n) }) && unsafe { LLVMGetIntTypeWidth(LLVMTypeOf(n)) } <= 64;
+        if is_const && unsafe { LLVMConstIntGetZExtValue(n) } == 0 {
+            return Ok(());
+        }
+        let ht = self.handle_ty();
+        let lp = self.struct_gep(ht, out, 1, noname());
+        let cp = self.struct_gep(ht, out, 2, noname());
+        let len = self.load_ty(self.usize_ty(), lp, noname());
+        let cap = self.load_ty(self.usize_ty(), cp, noname());
+        let room = self.sub(cap, len, noname());
+        let full = self.icmp(INT_UGT, n, room, noname());
+        let grow = self.append_block(f, z("grow\0"));
+        let done = self.append_block(f, z("grown\0"));
+        self.cond_br(full, grow, done);
+        self.position(grow);
+        let ds_grow = self.lang_fn(p, "ds_grow")?;
+        let args = [out, self.usize(1), n];
+        self.call(ds_grow, args[..]);
+        self.br(done);
+        self.position(done);
+        let dp = self.struct_gep(ht, out, 0, noname());
+        let data = self.load_ty(self.ptr_ty(), dp, noname());
+        let len = self.load_ty(self.usize_ty(), lp, noname());
+        let dst = self.gep(self.i8_ty(), data, len, noname());
+        unsafe { LLVMBuildMemCpy(self.b, dst, 1, src, 1, n) };
+        let nl = self.add(len, n, noname());
+        self.store(nl, lp);
+        return Ok(());
+    }
+
+    // ===================================================================== drops
+
+    /// Drop the owned contents of the value at `ptr` (no-op for zeroed
+    /// handles).
+    pub fn drop_in_place(&mut self, p: &mut +Program, ptr: ValueRef, t: Ty) {
+        if !p.has_owner(t) {
+            return;
+        }
+        match self.glue_fn(p, t) {
+            Ok(f) => {
+                let args = [ptr];
+                self.call(f, args[..]);
+            }
+            Err(e) => self.ice(p, e.as_str()),
+        }
+    }
+
+    /// The drop glue function for `t`: `void drop(ptr)`.
+    fn glue_fn(&mut self, p: &mut +Program, t: Ty): Result::<ValueRef, String> {
+        if let Some(f) = self.glue.get(t) {
+            return Ok(f);
+        }
+        let ptr = self.ptr_ty();
+        let ps = [ptr];
+        let fty = unsafe { LLVMFunctionType(self.void_ty(), ps[..].as_ptr(), 1, 0) };
+        self.counter += 1;
+        let mut name = String::new();
+        name.write("_LN_drop{self.counter}");
+        let cname = c_string(name.as_str());
+        let f = unsafe { LLVMAddFunction(self.module, cname.as_ptr(), fty) };
+        unsafe { LLVMSetLinkage(f, INTERNAL_LINKAGE) };
+        self.glue.insert(t, f);
+        let saved = self.insert_block();
+        let entry = self.append_block(f, z("entry\0"));
+        self.position(entry);
+        let pp = unsafe { LLVMGetParam(f, 0) };
+        match p.types.kind(t) {
+            TyKind::String | TyKind::Array(_, ArrKind::Dyn) | TyKind::Array(_, ArrKind::Grow) | TyKind::Array(_, ArrKind::Shrink) => {
+                let ht = self.handle_ty();
+                let dp = self.struct_gep(ht, pp, 0, noname());
+                let data = self.load_ty(ptr, dp, noname());
+                let free = self.lang_fn(p, "ds_free")?;
+                let args = [data];
+                self.call(free, args[..]);
+            }
+            TyKind::Grow(inner) => {
+                let g = self.glue_fn(p, inner)?;
+                self.position(entry);
+                let args = [pp];
+                self.call(g, args[..]);
+            }
+            TyKind::Tuple(_) | TyKind::Closure(..) => {
+                let ts = match p.types.kind(t) {
+                    TyKind::Tuple(ts) => ts,
+                    TyKind::Closure(def, args) => p.closure_fields(def, args),
+                    _ => List::empty(),
+                };
+                let lt = self.llty(p, t);
+                for i in 0..ts.len() {
+                    let ft = p.types.at(ts, i);
+                    if p.has_owner(ft) {
+                        let fp = self.struct_gep(lt, pp, i as u32, noname());
+                        let g = self.glue_fn(p, ft)?;
+                        let args = [fp];
+                        self.call(g, args[..]);
+                    }
+                }
+            }
+            TyKind::Adt(d, targs) => {
+                let adt = p.adt(d);
+                let lt = self.llty(p, t);
+                if adt.is_enum {
+                    let tp = self.struct_gep(lt, pp, 0, noname());
+                    let tag = self.load_ty(self.i32_ty(), tp, noname());
+                    let payload = self.struct_gep(lt, pp, 1, noname());
+                    let done = self.append_block(f, z("done\0"));
+                    let mut cases: [(usize, BasicBlockRef); ..+] = [];
+                    for vi in 0..adt.variants.len() {
+                        if !self.variant_owns(p, adt.variants, vi, targs) {
+                            continue;
+                        }
+                        let bb = self.append_block(f, z("variant\0"));
+                        cases.push((vi, bb));
+                    }
+                    let sw = unsafe { LLVMBuildSwitch(self.b, tag, done, cases.len() as u32) };
+                    for c in cases {
+                        let (vi, bb) = c;
+                        unsafe { LLVMAddCase(sw, self.const_int(self.i32_ty(), vi as u64), bb) };
+                    }
+                    for c in cases {
+                        let (vi, bb) = c;
+                        self.position(bb);
+                        let vs = self.variant_struct(p, t, vi);
+                        let v = p.variants.list(adt.variants)[vi];
+                        for fi in 0..v.fields.len() {
+                            let fty = p.fields.list(v.fields)[fi].ty;
+                            let ft = p.types.subst(fty, targs);
+                            if p.has_owner(ft) {
+                                let fp = self.struct_gep(vs, payload, fi as u32, noname());
+                                let g = self.glue_fn(p, ft)?;
+                                self.position(bb);
+                                let args = [fp];
+                                self.call(g, args[..]);
+                            }
+                        }
+                        self.br(done);
+                    }
+                    self.position(done);
+                } else {
+                    let v = p.variants.list(adt.variants)[0];
+                    for i in 0..v.fields.len() {
+                        let fty = p.fields.list(v.fields)[i].ty;
+                        let ft = p.types.subst(fty, targs);
+                        if p.has_owner(ft) {
+                            let cur = self.insert_block();
+                            let fp = self.struct_gep(lt, pp, i as u32, noname());
+                            let g = self.glue_fn(p, ft)?;
+                            self.position(cur);
+                            let args = [fp];
+                            self.call(g, args[..]);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Nested glue generation restores the builder to our current block.
+        let cur = self.insert_block();
+        if !is_null(cur) && is_null(unsafe { LLVMGetBasicBlockTerminator(cur) }) {
+            self.ret_void();
+        }
+        if !is_null(saved) {
+            self.position(saved);
+        }
+        return Ok(f);
+    }
+
+    /// Whether variant `vi` of an enum (instantiated with `targs`) has a
+    /// field that owns data.
+    fn variant_owns(&mut self, p: &mut +Program, variants: List::<ln_sema::defs::VariantDef>, vi: usize, targs: TyList): bool {
+        let v = p.variants.list(variants)[vi];
+        for fi in 0..v.fields.len() {
+            let fty = p.fields.list(v.fields)[fi].ty;
+            let ft = p.types.subst(fty, targs);
+            if p.has_owner(ft) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ===================================================================== panics
+
+    pub fn panic_msg(&mut self, p: &mut +Program, msg: str, span: Span) {
+        let (file, line, col) = self.location(p, span);
+        let f = match self.lang_fn(p, "panic_str") {
+            Ok(f) => f,
+            Err(e) => {
+                self.ice(p, e.as_str());
+                self.unreachable();
+                return;
+            }
+        };
+        let m = self.const_str(p, msg);
+        let fl = self.const_str(p, p.text(file));
+        let i32t = self.i32_ty();
+        let args = [m, fl, self.const_int(i32t, line as u64), self.const_int(i32t, col as u64)];
+        self.call(f, args[..]);
+        self.unreachable();
+    }
+
+    pub fn panic_bounds(&mut self, p: &mut +Program, i: ValueRef, len: ValueRef, span: Span) {
+        let (file, line, col) = self.location(p, span);
+        let f = match self.lang_fn(p, "panic_bounds") {
+            Ok(f) => f,
+            Err(e) => {
+                self.ice(p, e.as_str());
+                self.unreachable();
+                return;
+            }
+        };
+        let fl = self.const_str(p, p.text(file));
+        let i32t = self.i32_ty();
+        let args = [i, len, fl, self.const_int(i32t, line as u64), self.const_int(i32t, col as u64)];
+        self.call(f, args[..]);
+        self.unreachable();
+    }
+}

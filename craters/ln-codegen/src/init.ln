@@ -1,0 +1,32 @@
+// Target initialization: a port of crates/ln-codegen/src/init.rs. The Rust
+// compiler defines llvm-sys's `LLVM_InitializeNative*` wrappers itself; here
+// the per-target functions exported by LLVM-C are called directly, for the
+// targets Lunar supports.
+
+use crater::llvm::*;
+
+/// Initialize the native target for code generation (target info, target,
+/// machine code, assembly printer and parser).
+#[cfg(target_arch = "aarch64")]
+pub fn native() {
+    unsafe {
+        LLVMInitializeAArch64TargetInfo();
+        LLVMInitializeAArch64Target();
+        LLVMInitializeAArch64TargetMC();
+        LLVMInitializeAArch64AsmPrinter();
+        LLVMInitializeAArch64AsmParser();
+    }
+}
+
+/// Initialize the native target for code generation (target info, target,
+/// machine code, assembly printer and parser).
+#[cfg(not(target_arch = "aarch64"))]
+pub fn native() {
+    unsafe {
+        LLVMInitializeX86TargetInfo();
+        LLVMInitializeX86Target();
+        LLVMInitializeX86TargetMC();
+        LLVMInitializeX86AsmPrinter();
+        LLVMInitializeX86AsmParser();
+    }
+}

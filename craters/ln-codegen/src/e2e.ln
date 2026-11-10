@@ -1,0 +1,443 @@
+// An end-to-end test of code generation without a front end: a `Program`
+// is built by hand (definitions and THIR), compiled to an object file,
+// linked with clang against a small C runtime standing in for the
+// standard library's lang items, and run.
+//
+// The program, as Lunar:
+//
+//     enum E { A, B(i32) }
+//     struct S { name: String, n: i32 }
+//     fn add(a: i32, b: &i32): i32 { a + b }
+//     fn main(): i32 {
+//         let mut total = 0;
+//         for i in 0..10 { total += i; }                    // 45
+//         if total > 40 { total = add(total, -3); }         // 42
+//         let mut s = string_new();
+//         string_push_str(&mut s, "hello");
+//         total += str_len(string_as_str(&s)) as i32;       // 47
+//         let e = E::B(5);
+//         total += match e { E::A => 100, E::B(x) => x };   // 52
+//         let v: [i32; ..+] = [7, 8];
+//         total += v[1];                                    // 60
+//         let mut st = S { name: string_new(), n: 3 };
+//         string_push_str(&mut st.name, "ab");
+//         total += st.n;                                    // 63
+//         for y in v { total += y; }                        // 78
+//         while total < 100 && total != 80 { total += 1; }  // 80
+//         loop { if total > 81 { break; } total += 1; }     // 82
+//         total
+//     }
+//     fn t1() {}   // a `#[test]`
+//
+// The C runtime counts data stacks, so a missing drop fails the run.
+
+use core::arena::{Id, List};
+use ln_ast::{BinOp, ParamMode, Span};
+use ln_sema::defs::*;
+use ln_sema::program::Program;
+use ln_sema::thir::*;
+use ln_sema::ty::{ArrKind, IntTy, Ty, TyKind};
+use crater::Options;
+
+const RUNTIME: str = "#include <stdio.h>
+#include <stdlib.h>
+typedef struct { unsigned char *ptr; size_t len, cap; } Arr;
+static int live;
+static void check(void) { if (live != 0) { fprintf(stderr, \"%d data stacks leaked\\n\", live); _Exit(99); } }
+void e2e_rt_init(int argc, size_t argv) { atexit(check); }
+void e2e_ds_grow(Arr *h, size_t size, size_t extra) {
+    size_t cap = h->cap * 2;
+    if (cap < h->len + extra) cap = h->len + extra;
+    if (!h->ptr) live++;
+    h->ptr = realloc(h->ptr, cap * size);
+    h->cap = cap;
+}
+void e2e_ds_cap(Arr *h, size_t size, size_t count) {}
+void e2e_ds_free(unsigned char *p) { if (p) { live--; free(p); } }
+void e2e_panic_str(const char *m, size_t ml, const char *f, size_t fl, unsigned line, unsigned col) {
+    fprintf(stderr, \"panicked at %.*s:%u:%u: %.*s\\n\", (int)fl, f, line, col, (int)ml, m);
+    _Exit(101);
+}
+void e2e_panic_bounds(size_t i, size_t len, const char *f, size_t fl, unsigned line, unsigned col) { _Exit(102); }
+";
+
+fn sp(): Span {
+    return Span::new(0, 4);
+}
+
+fn def(p: &mut Program, name: str, kind: DefKind, attrs: ItemAttrs, data: DefData): DefId {
+    let id = DefId::new(p.defs.len());
+    let n = p.sym(name);
+    p.defs.push(DefInfo { name: n, kind, module: DefId::new(0), parent: None, is_pub: true, span: sp(), attrs, data });
+    return id;
+}
+
+/// A function: `params` are (name, type, mode).
+fn func(p: &mut Program, name: str, params: [(str, Ty, ParamMode); &], ret: Ty, abi: Abi, has_body: bool, attrs: ItemAttrs): DefId {
+    let mut ps: [Param; ..+] = [];
+    for x in params {
+        let (n, ty, mode) = x;
+        let s = p.sym(n);
+        ps.push(Param { name: s, ctx: SyntaxCtx::root(), ty, mode, inout: mode == ParamMode::InOut, mutable: false, is_self: false, kept: false, span: sp() });
+    }
+    let list = p.params.add_list(ps[..]);
+    let fd = FnData {
+        generics: Generics::none(),
+        sig: FnSig { params: list, ret, ret_span: sp() },
+        is_unsafe: false,
+        abi,
+        variadic: false,
+        has_body,
+        owner: None,
+        has_self: false,
+    };
+    return def(p, name, DefKind::Fn, attrs, DefData::Fn(fd));
+}
+
+/// A runtime lang item, implemented in C as `e2e_<name>`.
+fn lang_fn(p: &mut Program, name: str, params: [(str, Ty, ParamMode); &], ret: Ty) {
+    let mut attrs = ItemAttrs::none();
+    let l = p.sym(name);
+    attrs.lang = Some(l);
+    let mut link = String::from("e2e_");
+    link.push_str(name);
+    attrs.link_name = Some(p.sym(link.as_str()));
+    let d = func(p, name, params, ret, Abi::C, false, attrs);
+    p.lang.insert(l, d);
+}
+
+/// An `#[intrinsic]` declaration.
+fn intrinsic(p: &mut Program, name: str, params: [(str, Ty, ParamMode); &], ret: Ty): DefId {
+    let mut attrs = ItemAttrs::none();
+    attrs.intrinsic = true;
+    return func(p, name, params, ret, Abi::Lunar, false, attrs);
+}
+
+fn ex(p: &mut Program, kind: ExprKind, ty: Ty): Id::<Expr> {
+    return p.thir.exprs.add(Expr { kind, ty, span: sp() });
+}
+
+fn int(p: &mut Program, v: i64, ty: Ty): Id::<Expr> {
+    return ex(p, ExprKind::Lit(ConstVal::Int(ConstInt::of_i64(v))), ty);
+}
+
+fn local(p: &mut Program, l: usize, ty: Ty): Id::<Expr> {
+    return ex(p, ExprKind::Local(LocalId::new(l)), ty);
+}
+
+fn read(p: &mut Program, place: Id::<Expr>, mode: ReadMode): Id::<Expr> {
+    let ty = p.thir.expr(place).ty;
+    return ex(p, ExprKind::Read { place, mode }, ty);
+}
+
+fn read_local(p: &mut Program, l: usize, ty: Ty): Id::<Expr> {
+    let x = local(p, l, ty);
+    return read(p, x, ReadMode::Copy);
+}
+
+fn block(p: &mut Program, stmts: [Stmt; &], tail: Option::<Id::<Expr>>): Id::<Block> {
+    let s = p.thir.stmts.add_list(stmts);
+    return p.thir.blocks.add(Block { stmts: s, tail, locals: List::empty(), span: sp() });
+}
+
+fn let_stmt(p: &mut Program, l: usize, ty: Ty, mode: ReadMode, init: Id::<Expr>): Stmt {
+    let pat = p.thir.pats.add(Pat { kind: PatKind::Binding { local: LocalId::new(l), mode, sub: None }, ty, span: sp() });
+    return Stmt::Let { pat, init: Some(init), span: sp() };
+}
+
+fn call(p: &mut Program, callee: Callee, args: [Arg; &], ty: Ty): Id::<Expr> {
+    let a = p.thir.args.add_list(args);
+    return ex(p, ExprKind::Call { callee, args: a }, ty);
+}
+
+fn intrinsic_call(p: &mut Program, def: DefId, args: [Arg; &], ty: Ty): Id::<Expr> {
+    let name = p.defs[def.index()].name;
+    return call(p, Callee::Intrinsic { def, name, args: List::empty() }, args, ty);
+}
+
+/// `total += x`
+fn add_to_total(p: &mut Program, x: Id::<Expr>, i32t: Ty, unit: Ty): Stmt {
+    let total = local(p, 0, i32t);
+    return Stmt::Expr(ex(p, ExprKind::AssignOp { op: BinOp::Add, place: total, value: x }, unit));
+}
+
+fn lt(p: &mut Program, name: str, ty: Ty, kind: LocalKind): Local {
+    let n = p.sym(name);
+    return Local { name: n, ty, mutable: true, kind, span: sp(), depth: 1 };
+}
+
+fn body(p: &mut Program, d: DefId, locals: [Local; &], params: [LocalId; &], b: Id::<Block>) {
+    let ls = p.thir.locals.add_list(locals);
+    let ps = p.thir.local_ids.add_list(params);
+    p.bodies.insert(d, Body { def: d, locals: ls, params: ps, block: b, span: sp() });
+}
+
+fn build_program(): Program {
+    let mut p = Program::new();
+    let file = p.sym("e2e.ln");
+    p.sources.add(file, "fn main(): i32 { 63 }\n", None);
+    let i32t = p.types.int(IntTy::I32);
+    let usize = p.types.usize();
+    let u32t = p.types.int(IntTy::U32);
+    let unit = p.types.unit();
+    let never = p.types.never();
+    let boolt = p.types.bool();
+    let str = p.types.str();
+    let string = p.types.mk(TyKind::String);
+    let grow_string = p.types.mk(TyKind::Grow(string));
+    let u8t = p.types.int(IntTy::U8);
+    let raw = p.types.ptr(u8t, true);
+
+    // The root module.
+    def(&mut p, "e2e", DefKind::Mod, ItemAttrs::none(), DefData::Mod(ModData { parent: None, krate: DefId::new(0), is_block: false, first_glob: 0 }));
+
+    // The runtime.
+    let take = ParamMode::Take;
+    lang_fn(&mut p, "rt_init", [("argc", i32t, take), ("argv", usize, take)][..], unit);
+    lang_fn(&mut p, "ds_grow", [("h", raw, take), ("size", usize, take), ("extra", usize, take)][..], unit);
+    lang_fn(&mut p, "ds_cap", [("h", raw, take), ("size", usize, take), ("count", usize, take)][..], unit);
+    lang_fn(&mut p, "ds_free", [("p", raw, take)][..], unit);
+    lang_fn(&mut p, "panic_str", [("msg", str, take), ("file", str, take), ("line", u32t, take), ("col", u32t, take)][..], never);
+    lang_fn(&mut p, "panic_bounds", [("i", usize, take), ("len", usize, take), ("file", str, take), ("line", u32t, take), ("col", u32t, take)][..], never);
+
+    // Intrinsics.
+    let string_new = intrinsic(&mut p, "string_new", [][..], string);
+    let push_str = intrinsic(&mut p, "string_push_str", [("s", grow_string, ParamMode::InOut), ("t", str, take)][..], unit);
+    let as_str = intrinsic(&mut p, "string_as_str", [("s", string, ParamMode::Borrow)][..], str);
+    let str_len = intrinsic(&mut p, "str_len", [("s", str, take)][..], usize);
+
+    // enum E { A, B(i32) }
+    let e_def = DefId::new(p.defs.len());
+    let f0 = p.sym("0");
+    let b_fields = p.fields.add_list([FieldDef { name: f0, ty: i32t, is_pub: true, span: sp() }][..]);
+    let va = p.sym("A");
+    let vb = p.sym("B");
+    let e_variants = p.variants.add_list([VariantDef { name: va, def: e_def, ctor: CtorKind::Unit, fields: List::empty(), span: sp() }, VariantDef { name: vb, def: e_def, ctor: CtorKind::Tuple, fields: b_fields, span: sp() }][..]);
+    def(&mut p, "E", DefKind::Enum, ItemAttrs::none(), DefData::Adt(AdtData { generics: Generics::none(), variants: e_variants, is_enum: true }));
+    let e_ty = p.types.adt(e_def, List::empty());
+
+    // struct S { name: String, n: i32 }
+    let s_def = DefId::new(p.defs.len());
+    let fname = p.sym("name");
+    let fn_ = p.sym("n");
+    let s_fields = p.fields.add_list([FieldDef { name: fname, ty: string, is_pub: true, span: sp() }, FieldDef { name: fn_, ty: i32t, is_pub: true, span: sp() }][..]);
+    let s_name = p.sym("S");
+    let s_variants = p.variants.add_list([VariantDef { name: s_name, def: s_def, ctor: CtorKind::Named, fields: s_fields, span: sp() }][..]);
+    def(&mut p, "S", DefKind::Struct, ItemAttrs::none(), DefData::Adt(AdtData { generics: Generics::none(), variants: s_variants, is_enum: false }));
+    let s_ty = p.types.adt(s_def, List::empty());
+
+    // fn add(a: i32, b: &i32): i32 { a + b }
+    let add = func(&mut p, "add", [("a", i32t, take), ("b", i32t, ParamMode::Borrow)][..], i32t, Abi::Lunar, true, ItemAttrs::none());
+    let a = read_local(&mut p, 0, i32t);
+    let b = read_local(&mut p, 1, i32t);
+    let sum = ex(&mut p, ExprKind::Binary(BinOp::Add, a, b), i32t);
+    let add_block = block(&mut p, [][..], Some(sum));
+    let la = lt(&mut p, "a", i32t, LocalKind::Param { index: 0, inout: false, grow: false, owned: true });
+    let lb = lt(&mut p, "b", i32t, LocalKind::Param { index: 1, inout: false, grow: false, owned: false });
+    body(&mut p, add, [la, lb][..], [LocalId::new(0), LocalId::new(1)][..], add_block);
+
+    // fn main(): i32
+    let main = func(&mut p, "main", [][..], i32t, Abi::Lunar, true, ItemAttrs::none());
+    let mut stmts: [Stmt; ..+] = [];
+    // let mut total = 0;
+    let zero = int(&mut p, 0, i32t);
+    stmts.push(let_stmt(&mut p, 0, i32t, ReadMode::Copy, zero));
+    // for i in 0..10 { total += i; }
+    let i = read_local(&mut p, 1, i32t);
+    let inc = add_to_total(&mut p, i, i32t, unit);
+    let for_body = block(&mut p, [inc][..], None);
+    let start = int(&mut p, 0, i32t);
+    let end = int(&mut p, 10, i32t);
+    stmts.push(Stmt::Expr(ex(&mut p, ExprKind::ForRange { var: LocalId::new(1), start, end, inclusive: false, body: for_body, id: LoopId { index: 0 } }, unit)));
+    // if total > 40 { total = add(total, -3); }
+    let t = read_local(&mut p, 0, i32t);
+    let forty = int(&mut p, 40, i32t);
+    let cond = ex(&mut p, ExprKind::Binary(BinOp::Gt, t, forty), boolt);
+    let t = read_local(&mut p, 0, i32t);
+    let minus3 = int(&mut p, -3, i32t);
+    let add_call = call(&mut p, Callee::Fn { def: add, args: List::empty() }, [Arg::Value(t), Arg::Value(minus3)][..], i32t);
+    let total = local(&mut p, 0, i32t);
+    let assign = ex(&mut p, ExprKind::Assign { place: total, value: add_call }, unit);
+    let then_block = block(&mut p, [Stmt::Expr(assign)][..], None);
+    let then = ex(&mut p, ExprKind::Block(then_block), unit);
+    stmts.push(Stmt::Expr(ex(&mut p, ExprKind::If { cond, then, else_: None }, unit)));
+    // let mut s = string_new(); string_push_str(&mut s, "hello");
+    let new_s = intrinsic_call(&mut p, string_new, [][..], string);
+    stmts.push(let_stmt(&mut p, 2, string, ReadMode::Move, new_s));
+    let s_place = local(&mut p, 2, string);
+    let hello_sym = p.sym("hello");
+    let hello = ex(&mut p, ExprKind::Lit(ConstVal::Str(hello_sym)), str);
+    stmts.push(Stmt::Expr(intrinsic_call(&mut p, push_str, [Arg::InOut(s_place), Arg::Value(hello)][..], unit)));
+    // total += str_len(string_as_str(&s)) as i32;
+    let s_place = local(&mut p, 2, string);
+    let s_read = read(&mut p, s_place, ReadMode::Borrow);
+    let view = intrinsic_call(&mut p, as_str, [Arg::Value(s_read)][..], str);
+    let len = intrinsic_call(&mut p, str_len, [Arg::Value(view)][..], usize);
+    let len32 = ex(&mut p, ExprKind::Cast(len), i32t);
+    stmts.push(add_to_total(&mut p, len32, i32t, unit));
+    // let e = E::B(5);
+    let five = int(&mut p, 5, i32t);
+    let fe = p.thir.field_exprs.add_list([FieldExpr { field: 0, expr: five }][..]);
+    let e_val = ex(&mut p, ExprKind::Adt { def: e_def, args: List::empty(), variant: 1, fields: fe }, e_ty);
+    stmts.push(let_stmt(&mut p, 3, e_ty, ReadMode::Copy, e_val));
+    // total += match e { E::A => 100, E::B(x) => x };
+    let scrut = local(&mut p, 3, e_ty);
+    let pat_a = p.thir.pats.add(Pat { kind: PatKind::Adt { def: e_def, variant: 0, fields: List::empty() }, ty: e_ty, span: sp() });
+    let x_pat = p.thir.pats.add(Pat { kind: PatKind::Binding { local: LocalId::new(4), mode: ReadMode::Copy, sub: None }, ty: i32t, span: sp() });
+    let fps = p.thir.field_pats.add_list([FieldPat { field: 0, pat: x_pat }][..]);
+    let pat_b = p.thir.pats.add(Pat { kind: PatKind::Adt { def: e_def, variant: 1, fields: fps }, ty: e_ty, span: sp() });
+    let hundred = int(&mut p, 100, i32t);
+    let x = read_local(&mut p, 4, i32t);
+    let arms = p.thir.arms.add_list([Arm { pat: pat_a, guard: None, body: hundred }, Arm { pat: pat_b, guard: None, body: x }][..]);
+    let m = ex(&mut p, ExprKind::Match { scrut, arms }, i32t);
+    stmts.push(add_to_total(&mut p, m, i32t, unit));
+    // let v: [i32; ..+] = [7, 8]; total += v[1];
+    let grow_i32 = p.types.array(i32t, ArrKind::Grow);
+    let seven = int(&mut p, 7, i32t);
+    let eight = int(&mut p, 8, i32t);
+    let items = p.thir.expr_ids.add_list([seven, eight][..]);
+    let arr = ex(&mut p, ExprKind::Array(items), grow_i32);
+    stmts.push(let_stmt(&mut p, 5, grow_i32, ReadMode::Move, arr));
+    let v = local(&mut p, 5, grow_i32);
+    let one = int(&mut p, 1, usize);
+    let elem = ex(&mut p, ExprKind::Index { base: v, index: one }, i32t);
+    let elem = read(&mut p, elem, ReadMode::Copy);
+    stmts.push(add_to_total(&mut p, elem, i32t, unit));
+    // let mut st = S { name: string_new(), n: 3 }; string_push_str(&mut st.name, "ab"); total += st.n;
+    let new_s = intrinsic_call(&mut p, string_new, [][..], string);
+    let three = int(&mut p, 3, i32t);
+    let sfe = p.thir.field_exprs.add_list([FieldExpr { field: 0, expr: new_s }, FieldExpr { field: 1, expr: three }][..]);
+    let s_val = ex(&mut p, ExprKind::Adt { def: s_def, args: List::empty(), variant: 0, fields: sfe }, s_ty);
+    stmts.push(let_stmt(&mut p, 6, s_ty, ReadMode::Move, s_val));
+    let st = local(&mut p, 6, s_ty);
+    let st_name = ex(&mut p, ExprKind::Field { base: st, variant: 0, field: 0 }, string);
+    let ab_sym = p.sym("ab");
+    let ab = ex(&mut p, ExprKind::Lit(ConstVal::Str(ab_sym)), str);
+    stmts.push(Stmt::Expr(intrinsic_call(&mut p, push_str, [Arg::InOut(st_name), Arg::Value(ab)][..], unit)));
+    let st = local(&mut p, 6, s_ty);
+    let st_n = ex(&mut p, ExprKind::Field { base: st, variant: 0, field: 1 }, i32t);
+    let st_n = read(&mut p, st_n, ReadMode::Copy);
+    stmts.push(add_to_total(&mut p, st_n, i32t, unit));
+    // for y in v { total += y; }
+    let y_pat = p.thir.pats.add(Pat { kind: PatKind::Binding { local: LocalId::new(7), mode: ReadMode::Copy, sub: None }, ty: i32t, span: sp() });
+    let y = read_local(&mut p, 7, i32t);
+    let inc = add_to_total(&mut p, y, i32t, unit);
+    let each_body = block(&mut p, [inc][..], None);
+    let v = local(&mut p, 5, grow_i32);
+    stmts.push(Stmt::Expr(ex(&mut p, ExprKind::ForArray { pat: y_pat, array: v, index: LocalId::new(8), body: each_body, id: LoopId { index: 1 } }, unit)));
+    // while total < 100 && total != 80 { total += 1; }
+    let t = read_local(&mut p, 0, i32t);
+    let hundred = int(&mut p, 100, i32t);
+    let lhs = ex(&mut p, ExprKind::Binary(BinOp::Lt, t, hundred), boolt);
+    let t = read_local(&mut p, 0, i32t);
+    let eighty = int(&mut p, 80, i32t);
+    let rhs = ex(&mut p, ExprKind::Binary(BinOp::Ne, t, eighty), boolt);
+    let cond = ex(&mut p, ExprKind::Logical { and: true, lhs, rhs }, boolt);
+    let one = int(&mut p, 1, i32t);
+    let inc = add_to_total(&mut p, one, i32t, unit);
+    let while_body = block(&mut p, [inc][..], None);
+    stmts.push(Stmt::Expr(ex(&mut p, ExprKind::While { cond, body: while_body, id: LoopId { index: 2 } }, unit)));
+    // loop { if total > 81 { break; } total += 1; }
+    let t = read_local(&mut p, 0, i32t);
+    let limit = int(&mut p, 81, i32t);
+    let cond = ex(&mut p, ExprKind::Binary(BinOp::Gt, t, limit), boolt);
+    let brk = ex(&mut p, ExprKind::Break { id: LoopId { index: 3 }, value: None }, never);
+    let brk_block = block(&mut p, [Stmt::Expr(brk)][..], None);
+    let then = ex(&mut p, ExprKind::Block(brk_block), unit);
+    let check = ex(&mut p, ExprKind::If { cond, then, else_: None }, unit);
+    let one = int(&mut p, 1, i32t);
+    let inc = add_to_total(&mut p, one, i32t, unit);
+    let loop_body = block(&mut p, [Stmt::Expr(check), inc][..], None);
+    stmts.push(Stmt::Expr(ex(&mut p, ExprKind::Loop { body: loop_body, id: LoopId { index: 3 } }, unit)));
+    // total
+    let tail = read_local(&mut p, 0, i32t);
+    let main_block = block(&mut p, stmts[..], Some(tail));
+    let main_locals = [
+        lt(&mut p, "total", i32t, LocalKind::Let),
+        lt(&mut p, "i", i32t, LocalKind::Let),
+        lt(&mut p, "s", string, LocalKind::Let),
+        lt(&mut p, "e", e_ty, LocalKind::Let),
+        lt(&mut p, "x", i32t, LocalKind::Let),
+        lt(&mut p, "v", grow_i32, LocalKind::Let),
+        lt(&mut p, "st", s_ty, LocalKind::Let),
+        lt(&mut p, "y", i32t, LocalKind::Let),
+        lt(&mut p, "idx", usize, LocalKind::Temp),
+    ];
+    body(&mut p, main, main_locals[..], [][..], main_block);
+    p.main = Some(main);
+
+    // #[test] fn t1() {}
+    let t1 = func(&mut p, "t1", [][..], unit, Abi::Lunar, true, ItemAttrs::none());
+    let t1_block = block(&mut p, [][..], None);
+    body(&mut p, t1, [][..], [][..], t1_block);
+    p.tests.push(t1);
+    return p;
+}
+
+fn opts(opt_level: u32, test: bool, overflow_checks: bool): Options {
+    return Options { opt_level, test, overflow_checks, emit_llvm: None };
+}
+
+#[test]
+fn emits_ir() {
+    let mut p = build_program();
+    let ir = match crater::emit_ir(&mut p, opts(0, false, true)) {
+        Ok(ir) => ir,
+        Err(e) => panic("emit_ir failed: {e}"),
+    };
+    let text = ir.as_str();
+    assert!(text.contains("define i32 @main(i32 %0, ptr %1)"));
+    assert!(text.contains("define internal i32 @_LN13_e2e__add(i32 %0, ptr %1)"));
+    assert!(text.contains("define internal i32 @_LN14_e2e__main()"));
+    assert!(text.contains("%E = type { i32, [1 x i64] }"));
+    assert!(text.contains("%S = type { { ptr, i64, i64 }, i32 }"));
+    assert!(text.contains("@llvm.sadd.with.overflow.i32"));
+    assert!(text.contains("declare void @e2e_panic_str({ ptr, i64 }, { ptr, i64 }, i32, i32) #1"));
+    assert!(text.contains("attributes #1 = { noreturn }"));
+    assert!(text.contains("call void @e2e_panic_bounds(i64 1, i64 %len15, { ptr, i64 } { ptr @.str.1, i64 6 }, i32 1, i32 1)"));
+    assert!(text.contains("call void @_LN_drop1(ptr %st)"));
+    assert!(text.contains("call void @e2e_ds_free"));
+    assert!(text.contains("c\"hello\""));
+    // The test harness.
+    let ir = match crater::emit_ir(&mut p, opts(0, true, false)) {
+        Ok(ir) => ir,
+        Err(e) => panic("emit_ir failed: {e}"),
+    };
+    assert!(ir.as_str().contains("@atoi"));
+    assert!(ir.as_str().contains("@_LN15_e2e__t1()"));
+}
+
+#[test]
+fn compiles_links_and_runs() {
+    let rt = "ln_codegen_e2e_rt.c";
+    match std::fs::write(rt, RUNTIME.as_bytes()) {
+        Ok(()) => {}
+        Err(e) => panic("could not write {rt}: {e}"),
+    }
+    for level in [0u32, 2] {
+        let mut p = build_program();
+        let mut obj = String::new();
+        obj.write("ln_codegen_e2e{level}.o");
+        let mut exe = String::new();
+        exe.write("ln_codegen_e2e{level}.exe");
+        match crater::compile(&mut p, opts(level, false, level == 0), obj.as_str()) {
+            Ok(()) => {}
+            Err(e) => panic("compile failed: {e}"),
+        }
+        let args = [obj.as_str(), rt, "-o", exe.as_str()];
+        match std::process::run("clang", args[..]) {
+            Ok(code) => assert_eq!(code, 0),
+            Err(e) => panic("could not run clang: {e}"),
+        }
+        let mut run = String::new();
+        run.write("./{exe}");
+        let none: [str; 0] = [];
+        match std::process::run(run.as_str(), none[..]) {
+            Ok(code) => assert_eq!(code, 82),
+            Err(e) => panic("could not run {exe}: {e}"),
+        }
+        std::fs::remove_file(obj.as_str());
+        std::fs::remove_file(exe.as_str());
+    }
+    std::fs::remove_file(rt);
+}

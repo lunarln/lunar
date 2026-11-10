@@ -11,7 +11,7 @@ Rust `lunar`, rebuilds this workspace into an identical compiler.
 | `ln-ast`     | `crates/ln-ast`    | the syntax tree, in arenas (`core::arena`): every `Box` is an `Id`, every `Vec` a `List`, names and strings are interned |
 | `ln-parser`  | `crates/ln-parser` and `crates/ln-parse-kit` | complete for source files; macro expansion parsing (`parse_expansion`, `parse_fragment`) is not ported yet |
 | `ln-sema`    | `crates/ln-sema` and `crates/ln-diag` | data model done (`ty`, `defs`, `thir`, `program`, `diag`, `codes`); passes in progress (see below) |
-| `ln-codegen` | `crates/ln-codegen` | in progress (LLVM through its C API, `#[link(name = "LLVM-C")]`) |
+| `ln-codegen` | `crates/ln-codegen` | ported (LLVM through its C API, `llvm.ln`, `#[link(name = "LLVM-C")]`); tested on hand-built programs (`lunar test` in `ln-codegen`) until the front end exists |
 | `ln-driver`  | (test driver, then `lunarc`) | `ln-driver FILE...` prints tokens, `ln-driver --parse FILE...` the syntax tree and syntax errors |
 
 ## The port of the rest
@@ -22,7 +22,7 @@ Rust `lunar`, rebuilds this workspace into an identical compiler.
 | traits, layout | `traits.rs`, `layout.rs` | `ln-sema/src/{traits,layout}.ln` | done (unit checks in `tests.ln`) |
 | borrow checker | `borrowck.rs` | `ln-sema/src/borrowck.ln` | done (unit checks on hand-built THIR in `tests.ln`) |
 | type checker | `typeck/*.rs` | `ln-sema/src/typeck*.ln` | after the front end |
-| code generation | `crates/ln-codegen` | `ln-codegen/src/*.ln` | in progress |
+| code generation | `crates/ln-codegen` | `ln-codegen/src/{lib,func,ops,init,llvm}.ln` | done; the state of the function being lowered (Rust's `FnCg`) lives in `Cg` |
 | driver | `crates/ln-driver` (build path only) | `ln-driver/src/main.ln` (`lunarc`) | after the passes |
 
 ### Data model

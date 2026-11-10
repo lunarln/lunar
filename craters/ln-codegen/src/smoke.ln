@@ -1,0 +1,133 @@
+// A smoke test of the LLVM bindings, independent of the compiler's data
+// model (which cannot be produced end to end yet): build a module with two
+// functions through the same LLVM-C calls code generation makes, verify
+// it, optimize it, write an object file, link it with clang and run it.
+
+use core::ffi::c_string;
+use crater::llvm::*;
+
+/// Build `add(a, b) = a + b` (with an overflow check through
+/// `llvm.sadd.with.overflow`) and `main() = add(40, 2)`, then write the
+/// module to `obj` (`opt` is the `default<On>` level). Returns the IR.
+fn build(obj: str, opt: u32): Result::<String, String> {
+    crater::init::native();
+    let triple = unsafe { LLVMGetDefaultTargetTriple() };
+    let mut target: TargetRef = null();
+    let mut err: *mut u8 = null();
+    if unsafe { LLVMGetTargetFromTriple(triple as *u8, core::intrinsics::addr_of_mut(&mut target), core::intrinsics::addr_of_mut(&mut err)) } != 0 {
+        return Err(take_message(err));
+    }
+    let tm = unsafe { LLVMCreateTargetMachine(target, triple as *u8, z("generic\0"), z("\0"), CODEGEN_LEVEL_DEFAULT, RELOC_PIC, CODE_MODEL_DEFAULT) };
+    let ctx = unsafe { LLVMContextCreate() };
+    let m = unsafe { LLVMModuleCreateWithNameInContext(z("lunar\0"), ctx) };
+    unsafe { LLVMSetTarget(m, triple as *u8) };
+    let td = unsafe { LLVMCreateTargetDataLayout(tm) };
+    unsafe { LLVMSetModuleDataLayout(m, td) };
+    let b = unsafe { LLVMCreateBuilderInContext(ctx) };
+    let i32t = unsafe { LLVMInt32TypeInContext(ctx) };
+
+    // add
+    let params = [i32t, i32t];
+    let add_ty = unsafe { LLVMFunctionType(i32t, params[..].as_ptr(), 2, 0) };
+    let add = unsafe { LLVMAddFunction(m, z("add\0"), add_ty) };
+    unsafe { LLVMSetLinkage(add, INTERNAL_LINKAGE) };
+    let entry = unsafe { LLVMAppendBasicBlockInContext(ctx, add, z("entry\0")) };
+    unsafe { LLVMPositionBuilderAtEnd(b, entry) };
+    let x = unsafe { LLVMGetParam(add, 0) };
+    let y = unsafe { LLVMGetParam(add, 1) };
+    let name = "llvm.sadd.with.overflow";
+    let id = unsafe { LLVMLookupIntrinsicID(name.as_bytes().as_ptr(), name.len()) };
+    let tys = [i32t];
+    let sadd = unsafe { LLVMGetIntrinsicDeclaration(m, id, tys[..].as_ptr(), 1) };
+    let args = [x, y];
+    let r = unsafe { LLVMBuildCall2(b, LLVMGlobalGetValueType(sadd), sadd, args[..].as_ptr(), 2, noname()) };
+    let sum = unsafe { LLVMBuildExtractValue(b, r, 0, noname()) };
+    let ov = unsafe { LLVMBuildExtractValue(b, r, 1, noname()) };
+    let bad = unsafe { LLVMAppendBasicBlockInContext(ctx, add, z("overflow\0")) };
+    let ok = unsafe { LLVMAppendBasicBlockInContext(ctx, add, z("no_overflow\0")) };
+    unsafe { LLVMBuildCondBr(b, ov, bad, ok) };
+    unsafe { LLVMPositionBuilderAtEnd(b, bad) };
+    let trap_name = "llvm.trap";
+    let trap_id = unsafe { LLVMLookupIntrinsicID(trap_name.as_bytes().as_ptr(), trap_name.len()) };
+    let no_tys: [TypeRef; 0] = [];
+    let trap = unsafe { LLVMGetIntrinsicDeclaration(m, trap_id, no_tys[..].as_ptr(), 0) };
+    let no_args: [ValueRef; 0] = [];
+    unsafe { LLVMBuildCall2(b, LLVMGlobalGetValueType(trap), trap, no_args[..].as_ptr(), 0, noname()) };
+    unsafe { LLVMBuildUnreachable(b) };
+    unsafe { LLVMPositionBuilderAtEnd(b, ok) };
+    unsafe { LLVMBuildRet(b, sum) };
+
+    // main
+    let main_ty = unsafe { LLVMFunctionType(i32t, no_tys[..].as_ptr(), 0, 0) };
+    let main = unsafe { LLVMAddFunction(m, z("main\0"), main_ty) };
+    let entry = unsafe { LLVMAppendBasicBlockInContext(ctx, main, z("entry\0")) };
+    unsafe { LLVMPositionBuilderAtEnd(b, entry) };
+    let call_args = [unsafe { LLVMConstInt(i32t, 40, 0) }, unsafe { LLVMConstInt(i32t, 2, 0) }];
+    let v = unsafe { LLVMBuildCall2(b, add_ty, add, call_args[..].as_ptr(), 2, z("v\0")) };
+    unsafe { LLVMBuildRet(b, v) };
+
+    let mut msg: *mut u8 = null();
+    if unsafe { LLVMVerifyModule(m, RETURN_STATUS_ACTION, core::intrinsics::addr_of_mut(&mut msg)) } != 0 {
+        return Err(take_message(msg));
+    }
+    take_message(msg);
+    let mut pipeline = String::new();
+    pipeline.write("default<O{opt}>");
+    let pc = c_string(pipeline.as_str());
+    let o = unsafe { LLVMCreatePassBuilderOptions() };
+    let e = unsafe { LLVMRunPasses(m, pc.as_ptr(), tm, o) };
+    unsafe { LLVMDisposePassBuilderOptions(o) };
+    if !is_null(e) {
+        return Err(take_error(e));
+    }
+    let ir = take_message(unsafe { LLVMPrintModuleToString(m) });
+    let path = c_string(obj);
+    let mut emsg: *mut u8 = null();
+    if unsafe { LLVMTargetMachineEmitToFile(tm, m, path.as_ptr(), OBJECT_FILE, core::intrinsics::addr_of_mut(&mut emsg)) } != 0 {
+        return Err(take_message(emsg));
+    }
+    unsafe {
+        LLVMDisposeBuilder(b);
+        LLVMDisposeModule(m);
+        LLVMContextDispose(ctx);
+        LLVMDisposeTargetData(td);
+        LLVMDisposeTargetMachine(tm);
+        LLVMDisposeMessage(triple);
+    }
+    return Ok(ir);
+}
+
+#[test]
+fn llvm_builds_links_and_runs() {
+    for opt in [0u32, 2] {
+        let mut obj = String::new();
+        obj.write("ln_codegen_smoke{opt}.o");
+        let mut exe = String::new();
+        exe.write("ln_codegen_smoke{opt}.exe");
+        let ir = match build(obj.as_str(), opt) {
+            Ok(ir) => ir,
+            Err(e) => panic("LLVM failed: {e}"),
+        };
+        if opt == 0 {
+            assert!(ir.as_str().contains("define internal i32 @add(i32 %0, i32 %1)"));
+            assert!(ir.as_str().contains("@llvm.sadd.with.overflow.i32"));
+        } else {
+            // Inlined and folded.
+            assert!(ir.as_str().contains("ret i32 42"));
+        }
+        let args = [obj.as_str(), "-o", exe.as_str()];
+        match std::process::run("clang", args[..]) {
+            Ok(code) => assert_eq!(code, 0),
+            Err(e) => panic("could not run clang: {e}"),
+        }
+        let mut run = String::new();
+        run.write("./{exe}");
+        let none: [str; 0] = [];
+        match std::process::run(run.as_str(), none[..]) {
+            Ok(code) => assert_eq!(code, 42),
+            Err(e) => panic("could not run {exe}: {e}"),
+        }
+        std::fs::remove_file(obj.as_str());
+        std::fs::remove_file(exe.as_str());
+    }
+}
