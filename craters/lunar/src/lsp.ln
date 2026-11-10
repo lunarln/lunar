@@ -543,14 +543,8 @@ fn with_project_error(a: Analysis, e: ProjectError): Analysis {
             span = Span::new(start + lo as u32, start + hi as u32);
         }
     }
-    let mut code = codes::manifest::PARSE();
-    for c in codes::all_codes() {
-        if e.code.as_str().starts_with(c.scope) && e.code.as_str().ends_with(c.name) && e.code.len() == c.scope.len() + 2 + c.name.len() {
-            code = c;
-        }
-    }
     let m = a.s.p.sym(e.message.as_str());
-    a.s.p.diags.error(code, span, m);
+    a.s.p.diags.error(e.code, span, m);
     if e.label.len() > 0 {
         let l = a.s.p.sym(e.label.as_str());
         a.s.p.diags.label(l);
