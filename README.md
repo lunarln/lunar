@@ -181,7 +181,7 @@ code --install-extension lunar-0.1.0.vsix
 | `crates/ln-sema` | Name resolution, type checking, traits, borrow checking → typed IR |
 | `crates/ln-codegen` | Monomorphization and LLVM code generation (inkwell) |
 | `crates/ln-driver` | The `lunar` CLI, linking, the language server, end-to-end tests |
-| `craters/` | The compiler again, written in Lunar: self-hosted, it builds itself into the same executable (see [craters/README.md](craters/README.md)) |
+| `craters/` | The compiler again, written in Lunar: self-hosted, it builds itself into the same executable, `lunar`, a drop-in replacement for the Rust one that reads std from its sysroot (see [craters/README.md](craters/README.md)) |
 | `editors/vscode` | VS Code extension: syntax highlighting, LSP client |
 | `std/core`, `std/std` | The standard library, written in Lunar (embedded in the compiler) |
 | `docs/errors` | One explanation per diagnostic code, shown by `lunar explain` (embedded in the compiler) |

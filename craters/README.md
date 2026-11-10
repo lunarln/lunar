@@ -10,25 +10,57 @@ compiler that compiles it into the very same executable.
 The code generator calls LLVM's C API, so linking needs the directory of
 LLVM's shared library in `$LUNAR_LIB_PATH` (`LLVM-C.lib` on Windows,
 `libLLVM` elsewhere); on Windows `LLVM-C.dll` must also be on `PATH` at run
-time. The compiler reads `core` and `std` from `$LUNAR_STD_DIR`.
+time.
 
 ```sh
 cd craters
 export LUNAR_LIB_PATH="C:/Program Files/LLVM/lib"   # or `llvm-config --libdir`
-export LUNAR_STD_DIR=../std
 lunar build --release                                # stage 1, by the Rust compiler
-target/release/ln-driver build ln-driver -o stage2   # stage 2, by stage 1
-./stage2 build ln-driver -o stage3                   # stage 3, by stage 2
+target/release/lunar build -p lunar -o stage2        # stage 2, by stage 1
+./stage2 build -p lunar -o stage3                    # stage 3, by stage 2
 cmp stage2 stage3                                    # identical
 ```
 
-`ln-driver build [--release] [--test] [-o OUT] [--emit-llvm FILE] [PATH]`
-compiles `PATH`, a `.ln` file or a package directory (default `.`), with
-the libraries its `lunar.toml` names. Diagnostics are drawn by
-`ln-ariadne` exactly as the Rust compiler draws them with ariadne
-(`ln-sema/src/render.ln` is the glue). When stderr is a terminal and
-`NO_COLOR` is not set they are in color, and the quoted code is syntax
-highlighted from `ln-lexer`'s tokens (`ln-sema/src/highlight.ln`).
+The executable, `target/release/lunar`, is a drop-in replacement for the
+Rust `lunar`: the same commands (`new`, `init`, `check`, `build`, `run`,
+`test`, `add`, `remove`, `update`, `clean`, `emit-llvm`, `explain`; `lsp`
+is being ported), options, help and error texts, status lines, exit codes
+and diagnostics. Diagnostics are drawn by `ln-ariadne` exactly as the Rust
+compiler draws them with ariadne (`ln-sema/src/render.ln` is the glue).
+When stderr is a terminal and `NO_COLOR` is not set they are in color, and
+the quoted code is syntax highlighted from `ln-lexer`'s tokens
+(`ln-sema/src/highlight.ln`).
+
+The Rust integration tests run against it with `LUNAR_BIN`:
+
+```sh
+LUNAR_BIN=$PWD/target/release/lunar cargo test -p ln-driver --test lang --test project
+```
+
+### Where it finds the standard library
+
+The Rust compiler embeds `std/` and `docs/errors/`; this one reads them at
+run time, from the first of:
+
+1. `$LUNAR_STD_DIR` (the standard library only: `core/` and `std/`);
+2. an installation: `<prefix>/lib/lunar/std` and
+   `<prefix>/lib/lunar/docs/errors`, for the executable
+   `<prefix>/bin/lunar`;
+3. a source checkout: the nearest directory above the executable with
+   `std/core/lib.ln`, and its `std/` and `docs/errors/`. So
+   `craters/target/release/lunar` uses the repository's.
+
+To install it, copy the files into that layout:
+
+```
+<prefix>/bin/lunar(.exe)
+<prefix>/lib/lunar/std/{core,std}/...       # this repository's std/
+<prefix>/lib/lunar/docs/errors/<scope>/<name>.md
+```
+
+Without a standard library `lunar` reports `err(build::io): could not find
+the standard library`; without `docs/errors`, `lunar explain` says so and
+failed builds show no `lunar explain` hint.
 
 | Crater       | Port of            | State |
 |--------------|--------------------|-------|
@@ -38,7 +70,9 @@ highlighted from `ln-lexer`'s tokens (`ln-sema/src/highlight.ln`).
 | `ln-ariadne` | the `ariadne` crate (0.6) | complete: sources, labels (color, order, priority), reports with notes and helps, the whole `Config` and the layout algorithm, both character sets; ariadne's tests. Beyond ariadne: a `Theme` for every part of a report, and per-byte source styles (`Sources::add_styled`, `add_highlighted` with a `Highlighter`). Character widths approximate `unicode-width` (common wide and zero-width ranges) |
 | `ln-sema`    | `crates/ln-sema` and `crates/ln-diag` | complete (see below) |
 | `ln-codegen` | `crates/ln-codegen` | complete (LLVM through its C API, `llvm.ln`) |
-| `ln-driver`  | `crates/ln-driver` (the build path) | `ln-driver build` (above); also `ln-driver FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--render [--color] FILE...` the diagnostics drawn as `lunar check` draws them, `--craters DIR` the craters a package build loads |
+| `ln-toml`    | the `toml` and `toml_edit` crates | what manifests and lockfiles need: the whole TOML syntax, every key and value with its place in the text; `edit` sets and removes keys in place, keeping comments and layout as `toml_edit` does |
+| `ln-semver`  | the `semver` crate (1.0) | versions, requirements (`^`, `~`, `=`, `<`, `>`, wildcards, several comparators), matching with its pre-release rules, its display and error messages |
+| `lunar`      | `crates/ln-driver` but the language server | the `lunar` command (above): `cli.ln` (clap's parsing, help and errors), `commands.ln` (`main.rs`), `project.ln` and `git.ln` (`project.rs`), `compile.ln` (`lib.rs`), `explain.ln`, `link.ln`, `testing.ln`, `sysroot.ln`. Hidden modes for `selfhost.rs`: `--lex FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--render [--color] FILE...` the diagnostics drawn as `lunar check` draws them, `--craters DIR` the craters a package build loads. `lsp.ln` is a stub until the language server is ported |
 
 ## The passes
 
@@ -49,7 +83,7 @@ highlighted from `ln-lexer`'s tokens (`ln-sema/src/highlight.ln`).
 | borrow checker | `borrowck.rs` | `ln-sema/src/borrowck.ln` | done (unit checks on hand-built THIR in `tests.ln`) |
 | type checker | `typeck/*.rs` | `ln-sema/src/typeck/{mod,expr,call,pat,closure}.ln` | done; Rust's `FnCtx` is the `Sema::fcx` field |
 | code generation | `crates/ln-codegen` | `ln-codegen/src/{lib,func,ops,init,llvm}.ln` | done; the state of the function being lowered (Rust's `FnCg`) lives in `Cg` |
-| driver | `crates/ln-driver` (build path) | `ln-driver/src/{main,project,link}.ln` | done; std is read from disk, not embedded |
+| driver | `crates/ln-driver` (all but `lsp.rs`, `ide.rs`) | `lunar/src/*.ln` | done; std and `docs/errors` are read from the sysroot, not embedded |
 
 ### Data model
 
@@ -85,6 +119,13 @@ highlighted from `ln-lexer`'s tokens (`ln-sema/src/highlight.ln`).
 * A `&mut` method may shrink what it is given, so it ends views into it;
   `&mut +self` methods only grow. Parameters whose views a function stores
   into an in-out argument are `kept`.
+* A returned value whose type can hold views (a struct with a `str` or a
+  `Code` field, such as `Sema`) counts as pointing into every borrowed
+  argument: an error type is easiest kept free of views (`ProjectError`
+  owns its texts), and a function returning a `Sema` should not build it
+  from a local it borrows.
+* Closures that capture a borrowed parameter and return a view of it are
+  rejected; use a free function taking that parameter.
 
 ## Checked against the Rust compiler
 
@@ -108,7 +149,20 @@ every `.ln` file in the repository:
 
 Programs compiled by the Lunar compiler pass every run test
 (`tests/run`, `examples`), and `--check` reports the Rust compiler's
-codes at the same positions on `tests/ui`.
+codes at the same positions on `tests/ui`. With `LUNAR_BIN` set to it,
+the command-line tests (`tests/lang.rs`, `tests/project.rs`) pass but for
+the language server's.
+
+## Differences from the Rust driver
+
+* `std/` and `docs/errors/` come from the sysroot (above), not from the
+  executable.
+* On Windows, linking falls back from `clang` to a `link.exe` on `PATH`;
+  the Rust driver also finds an installed MSVC through the registry.
+* I/O errors are worded by `std` (`not found (os error 2)`), not by the
+  operating system.
+* Manifest errors that Rust's serde reports with its own spans (an unknown
+  key, a value of the wrong type) point at the key or value instead.
 
 ## Differences from the Rust parser
 
