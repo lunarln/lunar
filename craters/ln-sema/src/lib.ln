@@ -13,3 +13,7 @@ pub mod diag;
 pub mod codes;
 pub mod program;
 pub mod traits;
+pub mod layout;
+pub mod borrowck;
+#[cfg(test)]
+mod tests;

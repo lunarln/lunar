@@ -1,0 +1,2697 @@
+// Move and borrow checking on THIR: a port of crates/ln-sema/src/borrowck.rs.
+//
+// * **Moves**: a forward dataflow over "maybe moved" paths reports uses of
+//   moved values and moves out of borrowed parameters.
+// * **Views**: slices, `str` and other pointy non-owning values have *roots*:
+//   the locals whose storage they point into. Roots are computed
+//   flow-insensitively, then checked when a view is stored into a longer
+//   lived local, returned, or written through a parameter.
+// * **Invalidation**: lending an owner in-out (to a `&mut` parameter, or
+//   to a closure that changes what it captured), replacing it, or moving it
+//   *invalidates* its root: the callee may shrink, clear or replace it. A
+//   backward liveness analysis reports any view of that root that is still
+//   used afterwards. A `&mut +T` parameter promises to only grow its
+//   argument, so lending to one invalidates nothing; inside the function,
+//   such a parameter may itself only be grown.
+//
+// The checks are the Rust ones; only the representation differs, because
+// array items and map values must be Light:
+//
+// * A set of roots (`BTreeSet<Root>`) is a `Roots`: an array kept sorted in
+//   the same order (`root_key`).
+// * The roots of every local (`HashMap<LocalId, Roots>`) are one sorted
+//   array of (local, root) pairs, each packed into a `u64`.
+// * A set of live locals (`BTreeSet<LocalId>`) is a bit set (`LiveSet`);
+//   the sets kept per loop live end to end in one array.
+// * A moved path (`(LocalId, Vec<usize>)`) is interned (`MovePath`); the
+//   move states kept per loop live end to end in one array.
+// * The checker's state is owned (`Cx`, `Moves`); the program is passed to
+//   every method (`p: &mut +Program`: interning types and texts only grows
+//   it), and diagnostics go to `p.diags`.
+// * `visit_children(thir, e, out)` pushes the children of `e` onto `out`
+//   (Rust calls a closure on each).
+
+use core::arena::{Id, List};
+use core::collections::HashMap;
+use core::intern::Symbol;
+use crater::codes;
+use crater::defs::{DefId, Param, Pred};
+use crater::diag::{Diags, is_dummy};
+use crater::program::Program;
+use crater::thir::*;
+use crater::ty::{ArrKind, Ty, TyKind, TyList};
+use ln_ast::{ParamMode, Span};
+
+#[derive(Eq, Debug)]
+enum Root {
+    /// The storage a local owns (an owner's elements, a fixed array).
+    Local(LocalId),
+    /// The local variable itself: a closure that borrows a capture points
+    /// at it.
+    Slot(LocalId),
+    /// Whatever the argument of parameter `.0` points into: the caller's
+    /// data, which outlives the call. Tracked so that storing it into an
+    /// in-out argument can be checked against `kept`.
+    Arg(LocalId),
+    /// A statement-scoped temporary.
+    Temp,
+}
+
+/// The order of roots (by variant, then local), as a number below 2^34.
+fn root_key(r: Root): u64 {
+    return match r {
+        Root::Local(l) => l.index as u64,
+        Root::Slot(l) => (1u64 << 32) | l.index as u64,
+        Root::Arg(l) => (2u64 << 32) | l.index as u64,
+        Root::Temp => 3u64 << 32,
+    };
+}
+
+fn root_from_key(k: u64): Root {
+    let l = LocalId { index: (k & 4294967295) as u32 };
+    return match k >> 32 {
+        0 => Root::Local(l),
+        1 => Root::Slot(l),
+        2 => Root::Arg(l),
+        _ => Root::Temp,
+    };
+}
+
+/// The local a root is about, for `Local`, `Slot` and `Arg`.
+fn root_local(r: Root): Option::<LocalId> {
+    return match r {
+        Root::Local(l) => Some(l),
+        Root::Slot(l) => Some(l),
+        Root::Arg(l) => Some(l),
+        Root::Temp => None,
+    };
+}
+
+/// The local of a `Local` or `Arg` root.
+fn local_or_arg(r: Root): Option::<LocalId> {
+    return match r {
+        Root::Local(l) => Some(l),
+        Root::Arg(l) => Some(l),
+        _ => None,
+    };
+}
+
+/// A set of roots, sorted by `root_key`.
+type Roots = [Root; -..+];
+
+/// Add `r` to `rs`; whether it was not there yet.
+fn roots_insert(rs: &mut Roots, r: Root): bool {
+    let k = root_key(r);
+    let mut lo: usize = 0;
+    let mut hi = rs.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let mk = root_key(rs[mid]);
+        if mk == k {
+            return false;
+        }
+        if mk < k {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    rs.insert(lo, r);
+    return true;
+}
+
+fn roots_extend(rs: &mut Roots, src: [Root; &]) {
+    for r in src {
+        roots_insert(rs, r);
+    }
+}
+
+fn roots_contains(rs: [Root; &], r: Root): bool {
+    for x in rs {
+        if x == r {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// A set of locals, one bit each.
+type LiveSet = [u64; -..+];
+
+fn ls_insert(s: &mut LiveSet, l: LocalId) {
+    let w = l.index() / 64;
+    s[w] = s[w] | (1u64 << (l.index % 64) as u64);
+}
+
+fn ls_remove(s: &mut LiveSet, l: LocalId) {
+    let w = l.index() / 64;
+    s[w] = s[w] & !(1u64 << (l.index % 64) as u64);
+}
+
+fn ls_contains(s: [u64; &], l: LocalId): bool {
+    return (s[l.index() / 64] >> (l.index % 64) as u64) & 1 == 1;
+}
+
+/// `a` becomes the union of `a` and `b`.
+fn ls_union(a: &mut LiveSet, b: [u64; &]) {
+    for i in 0..b.len() {
+        a[i] = a[i] | b[i];
+    }
+}
+
+fn ls_subset(a: [u64; &], b: [u64; &]): bool {
+    for i in 0..a.len() {
+        if a[i] & !b[i] != 0 {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The packed (local, root) pair of `Cx::roots`.
+fn pair_key(l: LocalId, r: Root): u64 {
+    return ((l.index as u64) << 34) | root_key(r);
+}
+
+/// Sort `a` and drop repeated values.
+fn sort_dedup(a: &mut [u64; -..+]) {
+    a.sort();
+    let mut w: usize = 0;
+    for i in 0..a.len() {
+        if w == 0 || a[i] != a[w - 1] {
+            a[w] = a[i];
+            w += 1;
+        }
+    }
+    a.truncate(w);
+}
+
+/// The base of a field or index place.
+fn proj_base(k: ExprKind): Option::<Id::<Expr>> {
+    return match k {
+        ExprKind::Field { base, .. } => Some(base),
+        ExprKind::Index { base, .. } => Some(base),
+        _ => None,
+    };
+}
+
+/// An interned diagnostic text.
+fn say(p: &mut +Program, args: FmtArgs): Symbol {
+    let mut s = String::new();
+    s.write(args);
+    return p.sym(s.as_str());
+}
+
+// ========================================================================= lints
+
+/// The local a place is rooted at (through fields and indexes).
+fn lint_root(p: &Program, e: Id::<Expr>): Option::<LocalId> {
+    return match p.thir.expr(e).kind {
+        ExprKind::Local(l) => Some(l),
+        ExprKind::Field { base, .. } => lint_root(p, base),
+        ExprKind::Index { base, .. } => lint_root(p, base),
+        _ => None,
+    };
+}
+
+fn note_mutated(p: &Program, e: Id::<Expr>, mutated: &mut [bool; ..+]) {
+    if let Some(l) = lint_root(p, e) {
+        mutated[l.index()] = true;
+    }
+}
+
+fn lint_walk(p: &Program, e: Id::<Expr>, used: &mut [bool; ..+], mutated: &mut [bool; ..+]) {
+    match p.thir.expr(e).kind {
+        ExprKind::Local(l) => {
+            used[l.index()] = true;
+        }
+        // Assigning to a variable is not a use of it (`x = 2;`,
+        // `x += 1;`), as in Rust: only reads count. Writing into a part
+        // of it (`a[i] = v`, `s.f = v`) does count, as in Rust.
+        ExprKind::Assign { place, value } => {
+            lint_assign(p, place, value, used, mutated);
+            return;
+        }
+        ExprKind::AssignOp { place, value, .. } => {
+            lint_assign(p, place, value, used, mutated);
+            return;
+        }
+        ExprKind::Call { args, callee } => {
+            for a in p.thir.args.list(args) {
+                if let Arg::InOut(x) = a {
+                    note_mutated(p, x, mutated);
+                }
+            }
+            if let Callee::Value { callee: f, kind: ClosureKind::FnMut } = callee {
+                note_mutated(p, f, mutated);
+            }
+        }
+        // A closure that changes a capture changes the variable (if it
+        // borrowed it) or needs it `mut` to change its own copy.
+        ExprKind::Closure { def, captures } => {
+            if let Some(c) = p.closures.get(def) {
+                let caps = p.captures.list(c.captures);
+                let n = if captures.len() < caps.len() { captures.len() } else { caps.len() };
+                for i in 0..n {
+                    let a = p.thir.args.list(captures)[i];
+                    let x = a.expr();
+                    let place = match p.thir.expr(x).kind {
+                        ExprKind::Read { place, .. } => place,
+                        _ => x,
+                    };
+                    if caps[i].mode == ParamMode::InOut {
+                        note_mutated(p, place, mutated);
+                    }
+                }
+            }
+        }
+        ExprKind::Slice { base, mutable: true, .. } => note_mutated(p, base, mutated),
+        ExprKind::Coerce { kind: Coercion::ToSlice { mutable: true }, expr: base } => note_mutated(p, base, mutated),
+        _ => {}
+    }
+    let mut kids: [Id::<Expr>; ..+] = [];
+    visit_children(&p.thir, e, &mut kids);
+    for c in kids {
+        lint_walk(p, c, used, mutated);
+    }
+}
+
+fn lint_assign(p: &Program, place: Id::<Expr>, value: Id::<Expr>, used: &mut [bool; ..+], mutated: &mut [bool; ..+]) {
+    note_mutated(p, place, mutated);
+    let is_local = match p.thir.expr(place).kind {
+        ExprKind::Local(_) => true,
+        _ => false,
+    };
+    if !is_local {
+        lint_walk(p, place, used, mutated);
+    }
+    lint_walk(p, value, used, mutated);
+}
+
+/// Warn about unused variables and needless `mut` (into `out`, whose
+/// texts are interned in `p`; move them over with `Diags::push_from`).
+pub fn lint(p: &mut +Program, body: Body, out: &mut +Diags) {
+    let n = body.locals.len();
+    let mut used: [bool; ..+] = [false; n];
+    let mut mutated: [bool; ..+] = [false; n];
+    let mut top: [Id::<Expr>; ..+] = [];
+    visit_block(&p.thir, body.block, &mut top);
+    for e in top {
+        lint_walk(p, e, &mut used, &mut mutated);
+    }
+    // `mut x: T` is the function's own copy. Changing it without ever reading
+    // it back almost always means the caller's variable was meant to change
+    // (`x: &mut T`, which was spelled `mut x: T` before parameters took
+    // ownership by default).
+    for i in 0..n {
+        let l = p.thir.locals.list(body.locals)[i];
+        let owned = match l.kind {
+            LocalKind::Param { owned, .. } => owned,
+            _ => false,
+        };
+        let name = p.text(l.name);
+        if !owned || !l.mutable || name.starts_with("_") || is_dummy(l.span) {
+            continue;
+        }
+        if mutated[i] && !used[i] {
+            let m = say(p, "parameter `{name}` is changed, but the new value is never used");
+            out.warning(codes::lint::MUT_PARAM_NOT_READ(), l.span, m);
+            out.label(say(p, "this is the function's own copy"));
+            out.note(say(p, "changes to a `mut` parameter do not reach the caller"));
+            out.help(say(p, "to change the caller's variable, take it in-out: `{name}: &mut ...`"));
+            out.finish();
+        } else if !mutated[i] {
+            let m = say(p, "parameter `{name}` does not need to be mutable");
+            out.warning(codes::lint::UNUSED_MUT(), l.span, m);
+            out.label(say(p, "never mutated"));
+            out.help(say(p, "remove the `mut`"));
+            out.finish();
+        }
+    }
+    for i in 0..n {
+        let l = p.thir.locals.list(body.locals)[i];
+        let name = p.text(l.name);
+        if l.kind != LocalKind::Let || name.starts_with("_") || name.starts_with("<") || is_dummy(l.span) {
+            continue;
+        }
+        if !used[i] {
+            if mutated[i] {
+                let m = say(p, "variable `{name}` is assigned to, but never read");
+                out.warning(codes::lint::UNUSED_VARIABLE(), l.span, m);
+                out.label(say(p, "assigned to but never read"));
+            } else {
+                let m = say(p, "unused variable `{name}`");
+                out.warning(codes::lint::UNUSED_VARIABLE(), l.span, m);
+                out.label(say(p, "never used"));
+            }
+            out.help(say(p, "if this is intentional, prefix it with an underscore: `_{name}`"));
+            out.finish();
+        } else if l.mutable && !mutated[i] {
+            let m = say(p, "variable `{name}` does not need to be mutable");
+            out.warning(codes::lint::UNUSED_MUT(), l.span, m);
+            out.label(say(p, "never mutated"));
+            out.help(say(p, "remove the `mut`"));
+            out.finish();
+        }
+    }
+    unreachable_block(p, body.block, out);
+}
+
+/// Whether evaluating `e` never finishes normally (`return`, `break`,
+/// `continue`, a call returning `!`, a `loop` without `break`, or a block,
+/// `if` or `match` all of whose paths do one of those).
+fn diverges(p: &Program, e: Id::<Expr>): bool {
+    let x = p.thir.expr(e);
+    return match x.kind {
+        ExprKind::Coerce { kind: Coercion::NeverToAny, expr } => diverges(p, expr),
+        _ => p.types.is_never(x.ty),
+    };
+}
+
+/// `lint::unreachable`: warn once per block, at the first statement (or the
+/// tail) after one that always diverges. Code after that point is not
+/// searched further, so one mistake gives one warning.
+fn unreachable_block(p: &mut +Program, b: Id::<Block>, out: &mut +Diags) {
+    let blk = p.thir.block(b);
+    let n = blk.stmts.len();
+    for i in 0..n {
+        let e = match p.thir.stmts.list(blk.stmts)[i] {
+            Stmt::Let { init: Some(e), .. } => e,
+            Stmt::Expr(e) => e,
+            Stmt::Let { init: None, .. } => continue,
+        };
+        unreachable_expr(p, e, out);
+        if !diverges(p, e) {
+            continue;
+        }
+        let mut next: Option::<(Span, str)> = None;
+        if i + 1 < n {
+            next = match p.thir.stmts.list(blk.stmts)[i + 1] {
+                Stmt::Let { span, .. } => Some((span, "statement")),
+                Stmt::Expr(x) => Some((p.thir.expr(x).span, "statement")),
+            };
+        } else if let Some(t) = blk.tail {
+            next = Some((p.thir.expr(t).span, "expression"));
+        }
+        let es = p.thir.expr(e).span;
+        if let Some(nx) = next {
+            let (span, what) = nx;
+            if !is_dummy(span) && !is_dummy(es) {
+                let m = say(p, "unreachable {what}");
+                out.warning(codes::lint::UNREACHABLE(), span, m);
+                out.label(say(p, "this {what} can never run"));
+                out.secondary(es, say(p, "any code following this expression is unreachable, because it never finishes"));
+                out.finish();
+            }
+        }
+        return;
+    }
+    if let Some(t) = blk.tail {
+        unreachable_expr(p, t, out);
+    }
+}
+
+fn unreachable_expr(p: &mut +Program, e: Id::<Expr>, out: &mut +Diags) {
+    match p.thir.expr(e).kind {
+        ExprKind::Block(b) => unreachable_block(p, b, out),
+        ExprKind::Loop { body, .. } => unreachable_block(p, body, out),
+        ExprKind::While { cond, body, .. } => {
+            unreachable_expr(p, cond, out);
+            unreachable_block(p, body, out);
+        }
+        ExprKind::ForRange { start, end, body, .. } => {
+            unreachable_expr(p, start, out);
+            unreachable_expr(p, end, out);
+            unreachable_block(p, body, out);
+        }
+        ExprKind::ForArray { array, body, .. } => {
+            unreachable_expr(p, array, out);
+            unreachable_block(p, body, out);
+        }
+        _ => {
+            let mut kids: [Id::<Expr>; ..+] = [];
+            visit_children(&p.thir, e, &mut kids);
+            for c in kids {
+                unreachable_expr(p, c, out);
+            }
+        }
+    }
+}
+
+// ========================================================================= check
+
+/// Check `body`, whose generic parameters have the bounds `env`. Errors go
+/// to `p.diags`.
+pub fn check(p: &mut +Program, body: Body, env: [Pred; &]) {
+    let mut cx = Cx {
+        body,
+        env,
+        roots: [],
+        reported: HashMap::new(),
+        loop_exit: HashMap::new(),
+        loop_head: HashMap::new(),
+        saved_sets: [],
+        words: (body.locals.len() + 63) / 64,
+        held: [],
+    };
+    // A parameter that can hold a view points into its caller's data.
+    for i in 0..body.params.len() {
+        let l = p.thir.local_ids.list(body.params)[i];
+        if cx.has_view(p, cx.local(p, l).ty) {
+            cx.roots.push(pair_key(l, Root::Arg(l)));
+        }
+    }
+    sort_dedup(&mut cx.roots);
+    cx.compute_roots(p);
+    cx.check_views_block(p, body.block);
+    if let Some(t) = p.thir.block(body.block).tail {
+        cx.check_escape(p, t, p.thir.expr(t).span);
+    }
+    let mut mv = Moves { loop_states: HashMap::new(), saved: [], paths: [], proj: [] };
+    let mut st = MoveState { reachable: true, paths: [] };
+    mv.block(&mut cx, p, body.block, &mut st);
+    let after = cx.ls_new();
+    let _ = cx.live_block(p, body.block, after);
+}
+
+struct Cx {
+    body: Body,
+    env: [Pred; &],
+    /// The roots of every local: `pair_key(local, root)`, sorted, without
+    /// repeats.
+    roots: [u64; -..+],
+    reported: HashMap::<(Span, u32), bool>,
+    /// Where the live sets of each loop are in `saved_sets`.
+    loop_exit: HashMap::<LoopId, usize>,
+    loop_head: HashMap::<LoopId, usize>,
+    saved_sets: [u64; ..+],
+    /// The length of a `LiveSet`.
+    words: usize,
+    /// Roots of the other arguments of the call being checked.
+    held: Roots,
+}
+
+impl Cx {
+    fn local(&self, p: &Program, l: LocalId): Local {
+        return p.thir.local(self.body, l);
+    }
+
+    /// Whether this is the first report of kind `k` at `span`.
+    fn report(&mut self, span: Span, k: u32): bool {
+        return self.reported.insert((span, k), true).is_none();
+    }
+
+    /// The roots of local `l`.
+    fn local_roots(&self, l: LocalId): Roots {
+        let base = (l.index as u64) << 34;
+        let mut lo: usize = 0;
+        let mut hi = self.roots.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.roots[mid] < base {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let mut r: Roots = [];
+        while lo < self.roots.len() && (self.roots[lo] >> 34) == l.index as u64 {
+            r.push(root_from_key(self.roots[lo] & 17179869183));
+            lo += 1;
+        }
+        return r;
+    }
+
+    /// Whether local `l` has root `r`.
+    fn local_has_root(&self, l: LocalId, r: Root): bool {
+        let k = pair_key(l, r);
+        let mut lo: usize = 0;
+        let mut hi = self.roots.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let x = self.roots[mid];
+            if x == k {
+                return true;
+            }
+            if x < k {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return false;
+    }
+
+    /// Whether values of `t` point into storage they do not own.
+    fn has_view(&self, p: &mut +Program, t: Ty): bool {
+        return self.has_view_rec(p, t, 0);
+    }
+
+    fn has_view_rec(&self, p: &mut +Program, t: Ty, depth: u32): bool {
+        if depth > 32 {
+            return false;
+        }
+        return match p.types.kind(t) {
+            TyKind::Str | TyKind::FmtArgs => true,
+            TyKind::Array(e, k) => k.is_slice() || self.has_view_rec(p, e, depth + 1),
+            TyKind::Tuple(ts) => self.any_view(p, ts, depth + 1),
+            TyKind::Adt(d, args) => {
+                let fs = p.adt_field_tys(d, args);
+                self.any_view(p, fs, depth + 1)
+            }
+            TyKind::Grow(t) => self.has_view_rec(p, t, depth + 1),
+            TyKind::Closure(d, args) => {
+                let Some(c) = p.closures.get(d) else { return false; };
+                for i in 0..c.captures.len() {
+                    let cap = p.captures.list(c.captures)[i];
+                    if cap.by_ref {
+                        return true;
+                    }
+                    let ct = p.types.subst(cap.ty, args);
+                    if self.has_view_rec(p, ct, depth + 1) {
+                        return true;
+                    }
+                }
+                false
+            }
+            // Generic values may be instantiated with views, and `impl Trait`
+            // may stand for one, unless bounded by `Dull`.
+            TyKind::Param(..) | TyKind::Opaque(..) => !p.is_dull(t, self.env),
+            _ => false,
+        };
+    }
+
+    fn any_view(&self, p: &mut +Program, l: TyList, depth: u32): bool {
+        for i in 0..l.len() {
+            if self.has_view_rec(p, p.types.at(l, i), depth) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Whether a value of `t` has storage a view could point into: an owned
+    /// array or string, or an inline array, anywhere inside it. A value
+    /// without (a number, a `str`, an iterator holding only views) can only
+    /// be pointed *through*.
+    fn has_storage(&self, p: &mut +Program, t: Ty, depth: u32): bool {
+        if depth > 32 {
+            return true;
+        }
+        return match p.types.kind(t) {
+            TyKind::String => true,
+            // Owning and inline arrays are storage; a slice only points.
+            TyKind::Array(_, k) => !k.is_slice(),
+            TyKind::Tuple(ts) => self.any_storage(p, ts, depth + 1),
+            TyKind::Adt(d, args) => {
+                let fs = p.adt_field_tys(d, args);
+                self.any_storage(p, fs, depth + 1)
+            }
+            TyKind::Grow(t) => self.has_storage(p, t, depth + 1),
+            TyKind::Closure(d, args) => {
+                let Some(c) = p.closures.get(d) else { return true; };
+                for i in 0..c.captures.len() {
+                    let cap = p.captures.list(c.captures)[i];
+                    if !cap.by_ref {
+                        let ct = p.types.subst(cap.ty, args);
+                        if self.has_storage(p, ct, depth + 1) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            // `impl Trait`: look at the type behind it once its function is
+            // checked (like an auto trait, this is not part of the bounds).
+            TyKind::Opaque(d, i, args) => {
+                let concrete = match p.opaques.get((d, i)) {
+                    Some(o) => o.concrete,
+                    None => None,
+                };
+                match concrete {
+                    Some(c) => {
+                        let ct = p.types.subst(c, args);
+                        self.has_storage(p, ct, depth + 1)
+                    }
+                    None => !p.is_dull(t, self.env),
+                }
+            }
+            // Dull types hold no arrays; anything else generic might.
+            TyKind::Param(..) | TyKind::Infer(_) => !p.is_dull(t, self.env),
+            _ => false,
+        };
+    }
+
+    fn any_storage(&self, p: &mut +Program, l: TyList, depth: u32): bool {
+        for i in 0..l.len() {
+            if self.has_storage(p, p.types.at(l, i), depth) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Whether a declared type (in a signature) can hold a view by itself,
+    /// not counting the function's generic parameters: their values are
+    /// the caller's, copied in and out.
+    fn has_own_view(&self, p: &mut +Program, t: Ty, depth: u32): bool {
+        if depth > 32 {
+            return true;
+        }
+        return match p.types.kind(t) {
+            TyKind::Str | TyKind::FmtArgs => true,
+            TyKind::Array(e, k) => k.is_slice() || self.has_own_view(p, e, depth + 1),
+            TyKind::Tuple(ts) => self.any_own_view(p, ts, depth + 1),
+            TyKind::Adt(d, args) => {
+                let fs = p.adt_field_tys(d, args);
+                self.any_own_view(p, fs, depth + 1)
+            }
+            TyKind::Grow(t) => self.has_own_view(p, t, depth + 1),
+            TyKind::Param(..) => false,
+            TyKind::Closure(..) | TyKind::Opaque(..) => true,
+            _ => false,
+        };
+    }
+
+    fn any_own_view(&self, p: &mut +Program, l: TyList, depth: u32): bool {
+        for i in 0..l.len() {
+            if self.has_own_view(p, p.types.at(l, i), depth) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ===================================================================== roots
+
+    fn place_root(&self, p: &Program, e: Id::<Expr>): Option::<Root> {
+        return match p.thir.expr(e).kind {
+            ExprKind::Local(l) => Some(Root::Local(l)),
+            ExprKind::Field { base, .. } => self.place_root(p, base),
+            ExprKind::Index { base, .. } => self.place_root(p, base),
+            ExprKind::Temp(_) => Some(Root::Temp),
+            _ => None,
+        };
+    }
+
+    fn is_view_container(&self, p: &Program, t: Ty): bool {
+        let slice = match p.types.kind(p.types.strip_grow(t)) {
+            TyKind::Array(_, k) => k.is_slice(),
+            _ => false,
+        };
+        return slice || p.types.kind(t) == TyKind::Str;
+    }
+
+    /// Roots of a borrow of `place` (slicing it, passing an owner handle).
+    fn borrow_roots(&self, p: &mut +Program, place: Id::<Expr>): Roots {
+        let pe = p.thir.expr(place);
+        // Slicing a view stored in a field (`self.rest[i..]`): the data lives
+        // wherever that view points, not in the struct holding it.
+        if let ExprKind::Field { .. } = pe.kind {
+            if self.is_view_container(p, pe.ty) {
+                return self.value_roots_of_place(p, place);
+            }
+        }
+        let mut r: Roots = [];
+        match pe.kind {
+            ExprKind::Local(l) => {
+                let lt = self.local(p, l).ty;
+                if self.is_view_container(p, lt) {
+                    // Slicing a slice: the data lives wherever the slice points.
+                    return self.local_roots(l);
+                }
+                // The data lives in `l` (unless it has no storage of its
+                // own, like an iterator holding only a `str`); if it
+                // holds views (an array of `str`), the borrow also
+                // reaches what they point into.
+                if self.has_storage(p, lt, 0) {
+                    roots_insert(&mut r, Root::Local(l));
+                }
+                if self.has_view(p, lt) {
+                    let lr = self.local_roots(l);
+                    roots_extend(&mut r, lr[..]);
+                }
+            }
+            ExprKind::Field { base, .. } => return self.borrow_roots_of_base(p, base),
+            ExprKind::Index { base, .. } => return self.borrow_roots_of_base(p, base),
+            ExprKind::Temp(inner) => {
+                r = self.value_roots(p, inner);
+                // Slicing a temporary view (`s.as_bytes()[0..2]`) points
+                // wherever that view points; only a temporary owner or
+                // fixed array holds the data itself.
+                if !self.is_view_container(p, pe.ty) {
+                    roots_insert(&mut r, Root::Temp);
+                }
+            }
+            _ => {}
+        }
+        return r;
+    }
+
+    /// `borrow_roots` of a field or element of `base`.
+    fn borrow_roots_of_base(&self, p: &mut +Program, base: Id::<Expr>): Roots {
+        if self.is_view_container(p, p.thir.expr(base).ty) {
+            return self.value_roots_of_place(p, base);
+        }
+        return self.borrow_roots(p, base);
+    }
+
+    /// Roots of the value currently stored in `place`.
+    fn value_roots_of_place(&self, p: &mut +Program, place: Id::<Expr>): Roots {
+        let mut r: Roots = [];
+        match self.place_root(p, place) {
+            Some(Root::Local(l)) => return self.local_roots(l),
+            Some(Root::Temp) => match p.thir.expr(place).kind {
+                ExprKind::Temp(inner) => return self.value_roots(p, inner),
+                _ => {
+                    r.push(Root::Temp);
+                }
+            },
+            _ => {}
+        }
+        return r;
+    }
+
+    fn value_roots(&self, p: &mut +Program, e: Id::<Expr>): Roots {
+        let ex = p.thir.expr(e);
+        let mut r: Roots = [];
+        if !self.has_view(p, ex.ty) {
+            return r;
+        }
+        match ex.kind {
+            ExprKind::Read { place, .. } => return self.value_roots_of_place(p, place),
+            ExprKind::Slice { base, .. } => return self.borrow_roots(p, base),
+            ExprKind::Coerce { kind: Coercion::ToSlice { .. }, expr } => return self.borrow_roots(p, expr),
+            ExprKind::Coerce { kind: Coercion::StringToStr, expr } => return self.borrow_roots(p, expr),
+            ExprKind::Coerce { expr, .. } => return self.value_roots(p, expr),
+            ExprKind::Call { args, callee } => {
+                // What a closure returns may point at what it captured.
+                if let Callee::Value { callee: f, .. } = callee {
+                    let fr = if p.thir.is_place(f) { self.value_roots_of_place(p, f) } else { self.value_roots(p, f) };
+                    roots_extend(&mut r, fr[..]);
+                }
+                // A plain function whose declared return type has no view of
+                // its own (`pop(&mut self): Option::<T>`) cannot point into
+                // its arguments' storage: it can only hand back copies of
+                // items, which point where the items point. Trait methods
+                // stay conservative: an implementation may return views
+                // into itself.
+                let copies_only = match callee {
+                    Callee::Fn { def, .. } => !self.has_own_view(p, p.fn_data(def).sig.ret, 0),
+                    Callee::Intrinsic { def, .. } => !self.has_own_view(p, p.fn_data(def).sig.ret, 0),
+                    _ => false,
+                };
+                for i in 0..args.len() {
+                    let a = p.thir.args.list(args)[i];
+                    let ar = match a {
+                        Arg::InOut(x) => if copies_only { self.value_roots_of_place(p, x) } else { self.borrow_roots(p, x) },
+                        Arg::Value(v) => match p.thir.expr(v).kind {
+                            ExprKind::Read { place, mode: ReadMode::Borrow } if copies_only => self.value_roots_of_place(p, place),
+                            _ => self.arg_roots(p, v),
+                        },
+                    };
+                    roots_extend(&mut r, ar[..]);
+                }
+            }
+            ExprKind::Tuple(es) => self.list_value_roots(p, es, &mut r),
+            ExprKind::Array(es) => self.list_value_roots(p, es, &mut r),
+            ExprKind::Adt { fields, .. } => {
+                for i in 0..fields.len() {
+                    let f = p.thir.field_exprs.list(fields)[i];
+                    let fr = self.value_roots(p, f.expr);
+                    roots_extend(&mut r, fr[..]);
+                }
+            }
+            // A borrowing closure points at the variables it borrows (and at
+            // whatever they point into); one that took a value holds that
+            // value's roots.
+            ExprKind::Closure { captures, .. } => {
+                for i in 0..captures.len() {
+                    let a = p.thir.args.list(captures)[i];
+                    let x = a.expr();
+                    if p.thir.is_place(x) {
+                        match self.place_root(p, x) {
+                            Some(Root::Local(l)) => {
+                                roots_insert(&mut r, Root::Slot(l));
+                            }
+                            Some(other) => {
+                                roots_insert(&mut r, other);
+                            }
+                            None => {}
+                        }
+                        if self.has_view(p, p.thir.expr(x).ty) {
+                            let xr = self.value_roots_of_place(p, x);
+                            roots_extend(&mut r, xr[..]);
+                        }
+                    } else if let Arg::Value(v) = a {
+                        let vr = self.value_roots(p, v);
+                        roots_extend(&mut r, vr[..]);
+                    }
+                }
+            }
+            ExprKind::Block(b) => {
+                if let Some(t) = p.thir.block(b).tail {
+                    return self.value_roots(p, t);
+                }
+            }
+            ExprKind::If { then, else_, .. } => {
+                r = self.value_roots(p, then);
+                if let Some(x) = else_ {
+                    let xr = self.value_roots(p, x);
+                    roots_extend(&mut r, xr[..]);
+                }
+            }
+            ExprKind::Match { arms, .. } => {
+                for i in 0..arms.len() {
+                    let a = p.thir.arms.list(arms)[i];
+                    let ar = self.value_roots(p, a.body);
+                    roots_extend(&mut r, ar[..]);
+                }
+            }
+            ExprKind::FmtArgs(pieces) => {
+                for i in 0..pieces.len() {
+                    if let FmtPiece::Arg(x, _) = p.thir.fmt_pieces.list(pieces)[i] {
+                        let xr = self.arg_roots(p, x);
+                        roots_extend(&mut r, xr[..]);
+                    }
+                }
+            }
+            _ => {}
+        }
+        return r;
+    }
+
+    /// The union of the `value_roots` of `es`, into `r`.
+    fn list_value_roots(&self, p: &mut +Program, es: List::<Id::<Expr>>, r: &mut Roots) {
+        for i in 0..es.len() {
+            let x = p.thir.expr_ids.list(es)[i];
+            let xr = self.value_roots(p, x);
+            roots_extend(r, xr[..]);
+        }
+    }
+
+    /// Which parameters of what is called are `kept`, when known: its
+    /// parameters.
+    fn callee_kept(&self, p: &Program, c: Callee): Option::<List::<Param>> {
+        let def = match c {
+            Callee::Fn { def, .. } => def,
+            Callee::Intrinsic { def, .. } => def,
+            Callee::Trait { trait_ref, method, .. } => {
+                let Some(m) = trait_method(p, trait_ref.trait_id, method) else { return None; };
+                m
+            }
+            Callee::Indirect(_) => return None,
+            Callee::Value { .. } => return None,
+        };
+        return Some(p.fn_data(def).sig.params);
+    }
+
+    /// The storage a write into `place` changes: the root local, or, for a
+    /// write through a slice (`s[i] = v`), whatever the slice points into
+    /// (an owner `Local`, or a parameter's data `Arg`). A slice variable
+    /// `lent` in-out may be both reassigned and written through.
+    fn write_targets(&self, p: &mut +Program, place: Id::<Expr>, lent: bool): [Root; -..+] {
+        let mut out: [Root; -..+] = [];
+        let Some(Root::Local(l)) = self.place_root(p, place) else { return out; };
+        let mut through: Roots = [];
+        if self.write_through(p, place, &mut through) {
+            out.extend(through[..]);
+        } else {
+            out.push(Root::Local(l));
+        }
+        let is_local = match p.thir.expr(place).kind {
+            ExprKind::Local(_) => true,
+            _ => false,
+        };
+        if lent && is_local && self.is_view_container(p, self.local(p, l).ty) {
+            let lr = self.local_roots(l);
+            out.extend(lr[..]);
+        }
+        let mut kept: [Root; -..+] = [];
+        for r in out {
+            if local_or_arg(r).is_some() {
+                kept.push(r);
+            }
+        }
+        return kept;
+    }
+
+    /// For `write_targets`: the roots a write into `e` changes through a
+    /// slice it goes through (into `out`), if it goes through one.
+    fn write_through(&self, p: &mut +Program, e: Id::<Expr>, out: &mut Roots): bool {
+        let Some(base) = proj_base(p.thir.expr(e).kind) else { return false; };
+        if self.is_view_container(p, p.thir.expr(base).ty) {
+            let br = self.value_roots_of_place(p, base);
+            roots_extend(out, br[..]);
+            return true;
+        }
+        return self.write_through(p, base, out);
+    }
+
+    /// What a call may store where: a view from a `kept` argument may end up
+    /// in any in-out argument that can hold one (`h.set(s)` doing
+    /// `self.rest = s`, or `push` onto an array of views), or be written
+    /// through a mutable slice argument (`s.fill(v)`); a closure may store
+    /// any argument or capture into what it borrowed. Pairs of a target (a
+    /// `Local`, or a parameter's data `Arg`) and a root it may gain, grouped
+    /// by target.
+    fn call_flows(&self, p: &mut +Program, callee: Callee, args: List::<Arg>): [(Root, Root); -..+] {
+        let mut flows: [(Root, Root); -..+] = [];
+        let mut targets: [Root; -..+] = [];
+        for i in 0..args.len() {
+            match p.thir.args.list(args)[i] {
+                Arg::InOut(x) => {
+                    if self.has_view(p, p.thir.expr(x).ty) {
+                        let wt = self.write_targets(p, x, true);
+                        targets.extend(wt[..]);
+                    }
+                }
+                Arg::Value(v) => {
+                    let mutable_views = match p.types.kind(p.thir.expr(v).ty) {
+                        TyKind::Array(el, ArrKind::SliceMut) => self.has_view(p, el),
+                        _ => false,
+                    };
+                    if mutable_views {
+                        for r in self.value_roots(p, v) {
+                            if local_or_arg(r).is_some() {
+                                targets.push(r);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut given: Roots = [];
+        if let Callee::Value { callee: f, .. } = callee {
+            let fr = if p.thir.is_place(f) { self.value_roots_of_place(p, f) } else { self.value_roots(p, f) };
+            for r in fr {
+                match r {
+                    Root::Slot(l) => {
+                        if self.has_view(p, self.local(p, l).ty) {
+                            targets.push(Root::Local(l));
+                        }
+                    }
+                    // A view the closure captured by value.
+                    _ => {
+                        roots_insert(&mut given, r);
+                    }
+                }
+            }
+        }
+        if targets.len() == 0 {
+            return flows;
+        }
+        let kept = self.callee_kept(p, callee);
+        for i in 0..args.len() {
+            if let Some(ps) = kept {
+                if i < ps.len() && !p.params.list(ps)[i].kept {
+                    continue;
+                }
+            }
+            match p.thir.args.list(args)[i] {
+                Arg::Value(v) => {
+                    let vr = self.arg_roots(p, v);
+                    roots_extend(&mut given, vr[..]);
+                }
+                Arg::InOut(x) => {
+                    if self.has_view(p, p.thir.expr(x).ty) {
+                        let xr = self.value_roots_of_place(p, x);
+                        roots_extend(&mut given, xr[..]);
+                    }
+                }
+            }
+        }
+        let mut seen: Roots = [];
+        for t in targets {
+            if !roots_insert(&mut seen, t) {
+                continue;
+            }
+            let Some(l) = local_or_arg(t) else { continue; };
+            for r in given[..] {
+                if root_local(r) != Some(l) {
+                    flows.push((t, r));
+                }
+            }
+        }
+        return flows;
+    }
+
+    /// Check storing a view with `roots` into `target` (from
+    /// `write_targets` or `call_flows`).
+    fn check_store_into(&mut self, p: &mut +Program, target: Root, roots: [Root; &], span: Span) {
+        match target {
+            Root::Local(l) => {
+                let borrowed = match self.local(p, l).kind {
+                    LocalKind::Param { owned, .. } => !owned,
+                    _ => false,
+                };
+                if borrowed {
+                    self.check_store_into_param(p, l, roots, span);
+                } else {
+                    self.check_store(p, l, roots, span);
+                }
+            }
+            Root::Arg(x) => self.check_store_into_param(p, x, roots, span),
+            Root::Slot(_) => {}
+            Root::Temp => {}
+        }
+    }
+
+    /// Whether local `l` is a parameter declared `kept`.
+    fn is_kept_param(&self, p: &Program, l: LocalId): bool {
+        return match self.local(p, l).kind {
+            LocalKind::Param { index, .. } => {
+                let ps = p.fn_params(self.body.def);
+                (index as usize) < ps.len() && ps[index as usize].kept
+            }
+            _ => false,
+        };
+    }
+
+    /// Whether local `l` is a parameter the function does not own.
+    fn is_borrowed_param(&self, p: &Program, l: LocalId): bool {
+        return match self.local(p, l).kind {
+            LocalKind::Param { owned, .. } => !owned,
+            _ => false,
+        };
+    }
+
+    /// Storing a view with `roots` into in-out parameter `dest` hands it to
+    /// the caller: allowed for what `dest` already pointed into and for
+    /// `kept` parameters' data, never for this function's own locals.
+    fn check_store_into_param(&mut self, p: &mut +Program, dest: LocalId, roots: [Root; &], span: Span) {
+        for r in roots {
+            let mut l: Option::<LocalId> = None;
+            let mut of_param = false;
+            match r {
+                Root::Local(x) => {
+                    l = Some(x);
+                    of_param = self.is_borrowed_param(p, x);
+                }
+                Root::Slot(x) => {
+                    l = Some(x);
+                    of_param = self.is_borrowed_param(p, x);
+                }
+                Root::Arg(x) => {
+                    l = Some(x);
+                    of_param = true;
+                }
+                Root::Temp => {}
+            }
+            let fine = match l {
+                Some(x) => x == dest || (of_param && self.is_kept_param(p, x)),
+                None => false,
+            };
+            if fine {
+                continue;
+            }
+            if !self.report(span, 9) {
+                return;
+            }
+            let dn = p.text(self.local(p, dest).name);
+            match l {
+                Some(x) if of_param => {
+                    let lx = self.local(p, x);
+                    let n = p.text(lx.name);
+                    let m = say(p, "a view from parameter `{n}` may be stored into parameter `{dn}`");
+                    p.diags.error(codes::borrow::ESCAPES_VIA_PARAM(), span, m);
+                    p.diags.secondary(lx.span, say(p, "`{n}` is not declared `kept`, so callers do not expect `{dn}` to point into it"));
+                    p.diags.help(say(p, "declare it `kept {n}: ...`"));
+                }
+                _ => {
+                    let m = say(p, "cannot store a view of a local value into parameter `{dn}`");
+                    p.diags.error(codes::borrow::ESCAPES_VIA_PARAM(), span, m);
+                    p.diags.note(say(p, "the caller's data may outlive the value being viewed"));
+                }
+            }
+            p.diags.finish();
+            return;
+        }
+    }
+
+    /// Roots contributed by a by-value argument: a borrowed owner handle (or
+    /// fixed array) points into its owner.
+    fn arg_roots(&self, p: &mut +Program, v: Id::<Expr>): Roots {
+        if let ExprKind::Read { place, mode: ReadMode::Borrow } = p.thir.expr(v).kind {
+            if p.has_owner(p.thir.expr(place).ty) {
+                return self.borrow_roots(p, place);
+            }
+        }
+        return self.value_roots(p, v);
+    }
+
+    fn compute_roots(&mut self, p: &mut +Program) {
+        for _ in 0..16 {
+            let mut assigns: [u64; -..+] = [];
+            self.collect_assigns_block(p, self.body.block, &mut assigns);
+            let before = self.roots.len();
+            self.roots.extend(assigns[..]);
+            sort_dedup(&mut self.roots);
+            if self.roots.len() == before {
+                break;
+            }
+        }
+    }
+
+    fn collect_assigns_block(&self, p: &mut +Program, b: Id::<Block>, out: &mut [u64; -..+]) {
+        let blk = p.thir.block(b);
+        for i in 0..blk.stmts.len() {
+            match p.thir.stmts.list(blk.stmts)[i] {
+                Stmt::Let { pat, init: Some(init), .. } => {
+                    let r = self.value_roots(p, init);
+                    if r.len() > 0 {
+                        let mut binds: [LocalId; ..+] = [];
+                        pat_bindings(&p.thir, pat, &mut binds);
+                        for l in binds {
+                            for x in r[..] {
+                                out.push(pair_key(l, x));
+                            }
+                        }
+                    }
+                    self.collect_assigns(p, init, out);
+                }
+                Stmt::Let { .. } => {}
+                Stmt::Expr(e) => self.collect_assigns(p, e, out),
+            }
+        }
+        if let Some(t) = blk.tail {
+            self.collect_assigns(p, t, out);
+        }
+    }
+
+    fn collect_assigns(&self, p: &mut +Program, e: Id::<Expr>, out: &mut [u64; -..+]) {
+        let kind = p.thir.expr(e).kind;
+        match kind {
+            ExprKind::Assign { place, value } => {
+                let r = self.value_roots(p, value);
+                if r.len() > 0 {
+                    // Into the variable, or through a slice into what it views.
+                    for t in self.write_targets(p, place, false) {
+                        if let Root::Local(l) = t {
+                            for x in r[..] {
+                                if x != Root::Local(l) {
+                                    out.push(pair_key(l, x));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                for f in self.call_flows(p, callee, args) {
+                    let (t, r) = f;
+                    if let Root::Local(l) = t {
+                        out.push(pair_key(l, r));
+                    }
+                }
+            }
+            ExprKind::Match { scrut, arms } => {
+                // Bindings inside arms view whatever the scrutinee views.
+                let r = if self.has_view(p, p.thir.expr(scrut).ty) { self.value_roots_of_place(p, scrut) } else { [] };
+                if r.len() > 0 {
+                    for i in 0..arms.len() {
+                        let a = p.thir.arms.list(arms)[i];
+                        let mut binds: [LocalId; ..+] = [];
+                        pat_bindings(&p.thir, a.pat, &mut binds);
+                        for l in binds {
+                            if self.has_view(p, self.local(p, l).ty) {
+                                for x in r[..] {
+                                    out.push(pair_key(l, x));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        match kind {
+            ExprKind::Block(b) => self.collect_assigns_block(p, b, out),
+            ExprKind::Loop { body, .. } => self.collect_assigns_block(p, body, out),
+            ExprKind::While { body, cond, .. } => {
+                self.collect_assigns(p, cond, out);
+                self.collect_assigns_block(p, body, out);
+            }
+            ExprKind::ForRange { body, .. } => self.collect_assigns_block(p, body, out),
+            ExprKind::ForArray { body, .. } => self.collect_assigns_block(p, body, out),
+            _ => {
+                let mut kids: [Id::<Expr>; ..+] = [];
+                visit_children(&p.thir, e, &mut kids);
+                for c in kids {
+                    self.collect_assigns(p, c, out);
+                }
+            }
+        }
+    }
+
+    // ===================================================================== view checks
+
+    fn root_name(&self, p: &Program, r: Root): String {
+        let mut s = String::new();
+        match r {
+            Root::Local(l) => s.write("`{p.text(self.local(p, l).name)}`"),
+            Root::Slot(l) => s.write("`{p.text(self.local(p, l).name)}`"),
+            Root::Arg(l) => s.write("what `{p.text(self.local(p, l).name)}` points into"),
+            Root::Temp => s.push_str("a temporary value"),
+        }
+        return s;
+    }
+
+    /// Storing a view with `roots` into local `dest`.
+    fn check_store(&mut self, p: &mut +Program, dest: LocalId, roots: [Root; &], span: Span) {
+        let dl = self.local(p, dest);
+        let dd = dl.depth;
+        let dname = p.text(dl.name);
+        for r in roots {
+            match r {
+                Root::Temp => {
+                    if !self.report(span, 4294967295) {
+                        continue;
+                    }
+                    let m = say(p, "`{dname}` would point into a temporary value that is freed at the end of this statement");
+                    p.diags.error(codes::borrow::OUTLIVES_ROOT(), span, m);
+                    p.diags.help(say(p, "bind the value to a variable first so it lives long enough"));
+                    p.diags.finish();
+                }
+                Root::Local(l) => self.check_store_root(p, l, dd, dname, span),
+                Root::Slot(l) => self.check_store_root(p, l, dd, dname, span),
+                // The caller's data outlives every local.
+                Root::Arg(_) => {}
+            }
+        }
+    }
+
+    /// `check_store` of root local `l` into a local at depth `dd` named
+    /// `dname`.
+    fn check_store_root(&mut self, p: &mut +Program, l: LocalId, dd: u32, dname: str, span: Span) {
+        let rl = self.local(p, l);
+        let is_param = match rl.kind {
+            LocalKind::Param { .. } => true,
+            _ => false,
+        };
+        if rl.depth > dd && !is_param {
+            if !self.report(span, l.index) {
+                return;
+            }
+            let rn = p.text(rl.name);
+            let m = say(p, "`{rn}` does not live long enough");
+            p.diags.error(codes::borrow::OUTLIVES_ROOT(), span, m);
+            p.diags.label(say(p, "`{dname}` would keep pointing into `{rn}` after `{rn}` goes out of scope"));
+            p.diags.secondary(rl.span, say(p, "`{rn}` is declared in an inner scope here"));
+            p.diags.finish();
+        }
+    }
+
+    /// A value leaving the function (return / tail).
+    fn check_escape(&mut self, p: &mut +Program, v: Id::<Expr>, span: Span) {
+        let roots = self.value_roots(p, v);
+        for r in roots {
+            let ok = match r {
+                Root::Local(l) => match self.local(p, l).kind {
+                    // A view into a borrowed (or in-out) owner points into the
+                    // caller's value; an owned parameter is freed on return.
+                    LocalKind::Param { owned, .. } => !owned,
+                    _ => false,
+                },
+                Root::Arg(_) => true,
+                Root::Slot(_) => false,
+                Root::Temp => false,
+            };
+            if let Root::Slot(l) = r {
+                if self.report(span, 7) {
+                    let n = p.text(self.local(p, l).name);
+                    let m = say(p, "cannot return a closure that borrows `{n}`, which is freed when the function returns");
+                    p.diags.error(codes::borrow::ESCAPES_FUNCTION(), span, m);
+                    p.diags.help(say(p, "make it a `move` closure, so it takes `{n}` with it"));
+                    p.diags.finish();
+                    continue;
+                }
+            }
+            if !ok && self.report(span, 7) {
+                let n = self.root_name(p, r);
+                let m = say(p, "cannot return a view of {n}, which is freed when the function returns");
+                p.diags.error(codes::borrow::ESCAPES_FUNCTION(), span, m);
+                if let Root::Local(l) = r {
+                    let local = self.local(p, l);
+                    if let LocalKind::Param { owned, .. } = local.kind {
+                        if owned && p.has_owner(local.ty) {
+                            p.diags.note(say(p, "this function takes ownership of {n}, so it is freed when the function returns"));
+                            p.diags.help(say(p, "borrow the parameter instead (`: &T`), or return the owner itself"));
+                        } else {
+                            p.diags.note(say(p, "{n} has a Dull type, so it is passed as a copy owned by this function"));
+                            p.diags.help(say(p, "take a slice parameter or an in-out parameter (`: &mut T`) instead"));
+                        }
+                    }
+                }
+                p.diags.finish();
+            }
+        }
+    }
+
+    fn check_views_block(&mut self, p: &mut +Program, b: Id::<Block>) {
+        let blk = p.thir.block(b);
+        for i in 0..blk.stmts.len() {
+            match p.thir.stmts.list(blk.stmts)[i] {
+                Stmt::Let { pat, init: Some(init), .. } => {
+                    self.check_views(p, init);
+                    let ie = p.thir.expr(init);
+                    if self.has_view(p, ie.ty) {
+                        let roots = self.value_roots(p, init);
+                        let mut binds: [LocalId; ..+] = [];
+                        pat_bindings(&p.thir, pat, &mut binds);
+                        for l in binds {
+                            self.check_store(p, l, roots[..], ie.span);
+                        }
+                    }
+                }
+                Stmt::Let { .. } => {}
+                Stmt::Expr(e) => self.check_views(p, e),
+            }
+        }
+        if let Some(t) = blk.tail {
+            self.check_views(p, t);
+        }
+    }
+
+    fn check_children(&mut self, p: &mut +Program, e: Id::<Expr>) {
+        let mut kids: [Id::<Expr>; ..+] = [];
+        visit_children(&p.thir, e, &mut kids);
+        for c in kids {
+            self.check_views(p, c);
+        }
+    }
+
+    fn check_views(&mut self, p: &mut +Program, e: Id::<Expr>) {
+        let ex = p.thir.expr(e);
+        match ex.kind {
+            ExprKind::Assign { place, value } => {
+                self.check_views(p, place);
+                self.check_views(p, value);
+                let ve = p.thir.expr(value);
+                if self.has_view(p, ve.ty) {
+                    let roots = self.value_roots(p, value);
+                    let is_static = match p.thir.expr(place).kind {
+                        ExprKind::Static(_) => true,
+                        _ => false,
+                    };
+                    if is_static {
+                        if roots.len() > 0 {
+                            let m = say(p, "cannot store a view of a local value into a static");
+                            p.diags.error(codes::borrow::ESCAPES_FUNCTION(), ve.span, m);
+                            p.diags.finish();
+                        }
+                    } else {
+                        for t in self.write_targets(p, place, false) {
+                            let mut r: Roots = [];
+                            for x in roots[..] {
+                                let same = match (local_or_arg(x), local_or_arg(t)) {
+                                    (Some(a), Some(b)) => a == b,
+                                    _ => false,
+                                };
+                                if !same {
+                                    r.push(x);
+                                }
+                            }
+                            self.check_store_into(p, t, r[..], ve.span);
+                        }
+                    }
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                self.check_children(p, e);
+                let flows = self.call_flows(p, callee, args);
+                let mut i: usize = 0;
+                while i < flows.len() {
+                    let (t, _) = flows[i];
+                    let mut roots: Roots = [];
+                    while i < flows.len() && flows[i].0 == t {
+                        roots_insert(&mut roots, flows[i].1);
+                        i += 1;
+                    }
+                    self.check_store_into(p, t, roots[..], ex.span);
+                }
+            }
+            ExprKind::Return(Some(v)) => {
+                self.check_views(p, v);
+                self.check_escape(p, v, p.thir.expr(v).span);
+            }
+            ExprKind::Block(b) => self.check_views_block(p, b),
+            ExprKind::Loop { body, .. } => self.check_views_block(p, body),
+            ExprKind::While { cond, body, .. } => {
+                self.check_views(p, cond);
+                self.check_views_block(p, body);
+            }
+            ExprKind::ForRange { start, end, body, .. } => {
+                self.check_views(p, start);
+                self.check_views(p, end);
+                self.check_views_block(p, body);
+            }
+            ExprKind::ForArray { array, body, .. } => {
+                self.check_views(p, array);
+                self.check_views_block(p, body);
+            }
+            _ => self.check_children(p, e),
+        }
+    }
+
+    fn place_through_view(&self, p: &Program, place: Id::<Expr>): bool {
+        let Some(base) = proj_base(p.thir.expr(place).kind) else { return false; };
+        return self.is_view_container(p, p.thir.expr(base).ty) || self.place_through_view(p, base);
+    }
+
+    // ===================================================================== liveness & invalidation
+
+    /// The empty set of locals.
+    fn ls_new(&self): LiveSet {
+        return [0u64; self.words];
+    }
+
+    /// Keep `s` at `at` in `saved_sets` (or at a new place); where it is.
+    fn store_set(&mut self, at: Option::<usize>, s: [u64; &]): usize {
+        return match at {
+            Some(o) => {
+                for i in 0..self.words {
+                    self.saved_sets[o + i] = s[i];
+                }
+                o
+            }
+            None => {
+                let o = self.saved_sets.len();
+                self.saved_sets.extend(s);
+                o
+            }
+        };
+    }
+
+    /// The set kept at `at`, or the empty set.
+    fn load_set(&self, at: Option::<usize>): LiveSet {
+        return match at {
+            Some(o) => self.saved_sets[o..o + self.words].to_grow(),
+            None => self.ls_new(),
+        };
+    }
+
+    fn set_loop_exit(&mut self, id: LoopId, s: [u64; &]) {
+        let o = self.store_set(self.loop_exit.get(id), s);
+        self.loop_exit.insert(id, o);
+    }
+
+    fn set_loop_head(&mut self, id: LoopId, s: [u64; &]) {
+        let o = self.store_set(self.loop_head.get(id), s);
+        self.loop_head.insert(id, o);
+    }
+
+    fn live_block(&mut self, p: &mut +Program, b: Id::<Block>, after: LiveSet): LiveSet {
+        let blk = p.thir.block(b);
+        let mut live = after;
+        if let Some(t) = blk.tail {
+            live = self.live(p, t, live);
+        }
+        let mut i = blk.stmts.len();
+        while i > 0 {
+            i -= 1;
+            match p.thir.stmts.list(blk.stmts)[i] {
+                Stmt::Let { pat, init, .. } => {
+                    let mut binds: [LocalId; ..+] = [];
+                    pat_bindings(&p.thir, pat, &mut binds);
+                    for l in binds {
+                        ls_remove(&mut live, l);
+                    }
+                    if let Some(x) = init {
+                        live = self.live(p, x, live);
+                    }
+                }
+                Stmt::Expr(e) => {
+                    live = self.live(p, e, live);
+                }
+            }
+        }
+        return live;
+    }
+
+    fn use_place(&mut self, p: &mut +Program, place: Id::<Expr>, live: LiveSet): LiveSet {
+        let mut live = live;
+        return match p.thir.expr(place).kind {
+            ExprKind::Local(l) => {
+                ls_insert(&mut live, l);
+                live
+            }
+            ExprKind::Field { base, .. } => self.use_place(p, base, live),
+            ExprKind::Index { base, index } => {
+                let live = self.live(p, index, live);
+                self.use_place(p, base, live)
+            }
+            ExprKind::Deref(x) => self.live(p, x, live),
+            ExprKind::Temp(inner) => self.live(p, inner, live),
+            _ => live,
+        };
+    }
+
+    /// Report views of `root` that are live after an invalidating event.
+    fn invalidate(&mut self, p: &mut +Program, root: LocalId, live_after: [u64; &], span: Span, what: str) {
+        let rname = p.text(self.local(p, root).name);
+        // A closure borrowing the variable itself only minds it being moved:
+        // replacing or shrinking it changes what the closure sees.
+        let mut violators: [LocalId; ..+] = [];
+        for i in 0..self.body.locals.len() {
+            let x = LocalId::new(i);
+            if x == root || !ls_contains(live_after, x) {
+                continue;
+            }
+            if self.local_has_root(x, Root::Local(root)) || (what == "move" && self.local_has_root(x, Root::Slot(root))) {
+                violators.push(x);
+            }
+        }
+        for v in violators {
+            if !self.report(span, v.index) {
+                continue;
+            }
+            let vl = self.local(p, v);
+            let vn = p.text(vl.name);
+            let help = if what == "shrink" {
+                say(p, "finish using `{vn}` before this point, or take a new slice afterwards; if this call only grows `{rname}`, declare that parameter `&mut +`")
+            } else {
+                say(p, "finish using `{vn}` before this point, or take a new slice afterwards")
+            };
+            let code = if what == "shrink" {
+                codes::borrow::SHRINK_WHILE_BORROWED()
+            } else if what == "move" {
+                codes::borrow::MOVE_WHILE_BORROWED()
+            } else {
+                codes::borrow::ASSIGN_WHILE_BORROWED()
+            };
+            let verb = if what == "shrink" { "may be shrunk or replaced" } else if what == "move" { "is moved" } else { "is replaced" };
+            let m = say(p, "`{rname}` {verb} here while `{vn}` still points into it");
+            p.diags.error(code, span, m);
+            p.diags.secondary(vl.span, say(p, "`{vn}` borrows from `{rname}` and is used later"));
+            p.diags.help(help);
+            p.diags.finish();
+        }
+        let held_conflict = roots_contains(self.held[..], Root::Local(root));
+        if held_conflict && what == "shrink" && self.report(span, 4294967294) {
+            let m = say(p, "`{rname}` may be shrunk or replaced here while another argument of this call points into it");
+            p.diags.error(codes::borrow::SHRINK_WHILE_BORROWED(), span, m);
+            p.diags.finish();
+        }
+    }
+
+    /// `place` (an owner) is about to be lent where it may be shrunk or
+    /// replaced (`what`): its root local, to invalidate. A `&mut +`
+    /// parameter may only grow, so that is an error.
+    fn may_shrink(&mut self, p: &mut +Program, place: Id::<Expr>, span: Span, what: str): Option::<LocalId> {
+        let Some(Root::Local(root)) = self.place_root(p, place) else { return None; };
+        if self.place_through_view(p, place) {
+            return None;
+        }
+        self.check_grow_only(p, root, span, what);
+        return Some(root);
+    }
+
+    /// Report shrinking or replacing (`what`) local `l` if it is a `&mut +`
+    /// parameter.
+    fn check_grow_only(&mut self, p: &mut +Program, l: LocalId, span: Span, what: str) {
+        let local = self.local(p, l);
+        let grow = match local.kind {
+            LocalKind::Param { grow, .. } => grow,
+            _ => false,
+        };
+        if grow && self.report(span, 1u32 << 29) {
+            let n = p.text(local.name);
+            let m = say(p, "`{n}` may only grow, but {what}");
+            p.diags.error(codes::borrow::GROW_ONLY(), span, m);
+            p.diags.secondary(local.span, say(p, "`{n}` is declared `&mut +`, so callers keep their views into it across the call"));
+            p.diags.help(say(p, "only grow `{n}` (with `&mut +` methods such as `push`), or drop the `+` so it may be shrunk"));
+            p.diags.finish();
+        }
+    }
+
+    /// The parameter types of what is called, when known.
+    fn callee_params(&self, p: &mut +Program, c: Callee): Option::<TyList> {
+        return match c {
+            Callee::Fn { def, .. } => Some(param_tys(p, def)),
+            Callee::Intrinsic { def, .. } => Some(param_tys(p, def)),
+            Callee::Trait { trait_ref, method, .. } => match trait_method(p, trait_ref.trait_id, method) {
+                Some(m) => Some(param_tys(p, m)),
+                None => None,
+            },
+            Callee::Indirect(f) => match p.types.kind(p.thir.expr(f).ty) {
+                TyKind::FnPtr(ps, _, _) => Some(ps),
+                _ => None,
+            },
+            Callee::Value { .. } => None,
+        };
+    }
+
+    /// Whether a closure value of type `t` may change what it captured when
+    /// called (conservatively yes, unless it is known to be an `Fn` closure).
+    fn may_change_captures(&self, p: &Program, t: Ty): bool {
+        return match p.types.kind(t) {
+            TyKind::Closure(d, _) => match p.closures.get(d) {
+                Some(c) => c.kind != ClosureKind::Fn,
+                None => true,
+            },
+            _ => true,
+        };
+    }
+
+    /// Calling (or handing on) a closure whose roots are `roots` may shrink
+    /// or replace the owners it borrowed in-out.
+    fn invalidate_captures(&mut self, p: &mut +Program, roots: [Root; &], after: [u64; &], span: Span) {
+        let mut slots: [LocalId; ..+] = [];
+        for r in roots {
+            if let Root::Slot(l) = r {
+                if p.has_owner(self.local(p, l).ty) {
+                    slots.push(l);
+                }
+            }
+        }
+        for l in slots {
+            self.check_grow_only(p, l, span, "a closure that may shrink or replace it is called here");
+            self.invalidate(p, l, after, span, "shrink");
+        }
+    }
+
+    fn live(&mut self, p: &mut +Program, e: Id::<Expr>, after: LiveSet): LiveSet {
+        let ex = p.thir.expr(e);
+        return match ex.kind {
+            ExprKind::Local(_) => self.use_place(p, e, after),
+            ExprKind::Field { .. } => self.use_place(p, e, after),
+            ExprKind::Index { .. } => self.use_place(p, e, after),
+            ExprKind::Deref(_) => self.use_place(p, e, after),
+            ExprKind::Temp(_) => self.use_place(p, e, after),
+            ExprKind::Static(_) => self.use_place(p, e, after),
+            ExprKind::Read { place, mode } => {
+                if mode == ReadMode::Move && p.has_owner(p.thir.expr(place).ty) {
+                    if let Some(Root::Local(r)) = self.place_root(p, place) {
+                        self.invalidate(p, r, after[..], ex.span, "move");
+                    }
+                }
+                self.use_place(p, place, after)
+            }
+            ExprKind::Continue { id } => self.load_set(self.loop_head.get(id)),
+            ExprKind::Lit(_) | ExprKind::FnRef { .. } | ExprKind::Error => after,
+            ExprKind::Call { callee, args } => self.live_call(p, ex, callee, args, after),
+            ExprKind::Closure { captures, .. } => {
+                let mut l = after;
+                let mut i = captures.len();
+                while i > 0 {
+                    i -= 1;
+                    l = match p.thir.args.list(captures)[i] {
+                        Arg::InOut(x) => self.use_place(p, x, l),
+                        Arg::Value(v) => if p.thir.is_place(v) { self.use_place(p, v, l) } else { self.live(p, v, l) },
+                    };
+                }
+                l
+            }
+            ExprKind::Assign { place, value } => {
+                let mut live = after.clone();
+                let pe = p.thir.expr(place);
+                if p.has_owner(pe.ty) {
+                    if let Some(Root::Local(r)) = self.place_root(p, place) {
+                        if !self.place_through_view(p, place) {
+                            self.check_grow_only(p, r, ex.span, "this replaces part of it");
+                            self.invalidate(p, r, after[..], ex.span, "assign");
+                        }
+                    }
+                }
+                if let ExprKind::Local(l) = pe.kind {
+                    ls_remove(&mut live, l);
+                } else {
+                    live = self.use_place(p, place, live);
+                }
+                self.live(p, value, live)
+            }
+            ExprKind::AssignOp { place, value, .. } => {
+                let live = self.use_place(p, place, after);
+                self.live(p, value, live)
+            }
+            ExprKind::Unary(_, x) => self.live(p, x, after),
+            ExprKind::Cast(x) => self.live(p, x, after),
+            ExprKind::Coerce { expr, .. } => self.live(p, expr, after),
+            ExprKind::Binary(_, a, b) => {
+                let l = self.live(p, b, after);
+                self.live(p, a, l)
+            }
+            ExprKind::Logical { lhs, rhs, .. } => {
+                let mut l = self.live(p, rhs, after.clone());
+                ls_union(&mut l, after[..]);
+                self.live(p, lhs, l)
+            }
+            ExprKind::Tuple(es) => self.live_list(p, es, after),
+            ExprKind::Array(es) => self.live_list(p, es, after),
+            ExprKind::Adt { fields, .. } => {
+                let mut l = after;
+                let mut i = fields.len();
+                while i > 0 {
+                    i -= 1;
+                    l = self.live(p, p.thir.field_exprs.list(fields)[i].expr, l);
+                }
+                l
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                let l = self.live(p, count, after);
+                self.live(p, value, l)
+            }
+            ExprKind::Slice { base, start, end, .. } => {
+                let mut l = after;
+                if let Some(x) = end {
+                    l = self.live(p, x, l);
+                }
+                if let Some(x) = start {
+                    l = self.live(p, x, l);
+                }
+                self.use_place(p, base, l)
+            }
+            ExprKind::Block(b) => self.live_block(p, b, after),
+            ExprKind::If { cond, then, else_ } => {
+                let mut l = self.live(p, then, after.clone());
+                match else_ {
+                    Some(x) => {
+                        let xl = self.live(p, x, after);
+                        ls_union(&mut l, xl[..]);
+                    }
+                    None => ls_union(&mut l, after[..]),
+                }
+                self.live(p, cond, l)
+            }
+            ExprKind::Match { scrut, arms } => {
+                let mut l = self.ls_new();
+                for i in 0..arms.len() {
+                    let a = p.thir.arms.list(arms)[i];
+                    let mut x = self.live(p, a.body, after.clone());
+                    if let Some(g) = a.guard {
+                        x = self.live(p, g, x);
+                    }
+                    ls_union(&mut l, x[..]);
+                }
+                self.use_place(p, scrut, l)
+            }
+            ExprKind::Loop { body, id } => {
+                self.set_loop_exit(id, after[..]);
+                let mut head = self.ls_new();
+                for _ in 0..8 {
+                    self.set_loop_head(id, head[..]);
+                    let new = self.live_block(p, body, head.clone());
+                    if ls_subset(new[..], head[..]) {
+                        break;
+                    }
+                    ls_union(&mut head, new[..]);
+                }
+                head
+            }
+            ExprKind::While { cond, body, id } => {
+                self.set_loop_exit(id, after[..]);
+                let mut head = after.clone();
+                for _ in 0..8 {
+                    self.set_loop_head(id, head[..]);
+                    let mut b = self.live_block(p, body, head.clone());
+                    ls_union(&mut b, after[..]);
+                    let new = self.live(p, cond, b);
+                    if ls_subset(new[..], head[..]) {
+                        break;
+                    }
+                    ls_union(&mut head, new[..]);
+                }
+                head
+            }
+            ExprKind::ForRange { start, end, body, id, .. } => {
+                self.set_loop_exit(id, after[..]);
+                let mut head = self.live(p, end, after.clone());
+                for _ in 0..8 {
+                    self.set_loop_head(id, head[..]);
+                    let mut b = self.live_block(p, body, head.clone());
+                    ls_union(&mut b, after[..]);
+                    let new = self.live(p, end, b);
+                    if ls_subset(new[..], head[..]) {
+                        break;
+                    }
+                    ls_union(&mut head, new[..]);
+                }
+                self.live(p, start, head)
+            }
+            ExprKind::ForArray { array, body, id, .. } => {
+                self.set_loop_exit(id, after[..]);
+                let mut head = self.use_place(p, array, after.clone());
+                for _ in 0..8 {
+                    self.set_loop_head(id, head[..]);
+                    let mut b = self.live_block(p, body, head.clone());
+                    ls_union(&mut b, after[..]);
+                    let new = self.use_place(p, array, b);
+                    if ls_subset(new[..], head[..]) {
+                        break;
+                    }
+                    ls_union(&mut head, new[..]);
+                }
+                head
+            }
+            ExprKind::Break { id, value } => {
+                let exit = self.load_set(self.loop_exit.get(id));
+                match value {
+                    Some(v) => self.live(p, v, exit),
+                    None => exit,
+                }
+            }
+            ExprKind::Return(v) => match v {
+                Some(v) => {
+                    let empty = self.ls_new();
+                    self.live(p, v, empty)
+                }
+                None => self.ls_new(),
+            },
+            ExprKind::FmtArgs(pieces) => {
+                let mut l = after;
+                let mut i = pieces.len();
+                while i > 0 {
+                    i -= 1;
+                    if let FmtPiece::Arg(x, _) = p.thir.fmt_pieces.list(pieces)[i] {
+                        l = self.live(p, x, l);
+                    }
+                }
+                l
+            }
+        };
+    }
+
+    /// `live` of the expressions `es`, last first.
+    fn live_list(&mut self, p: &mut +Program, es: List::<Id::<Expr>>, after: LiveSet): LiveSet {
+        let mut l = after;
+        let mut i = es.len();
+        while i > 0 {
+            i -= 1;
+            l = self.live(p, p.thir.expr_ids.list(es)[i], l);
+        }
+        return l;
+    }
+
+    /// `live` of a call `ex`.
+    fn live_call(&mut self, p: &mut +Program, ex: Expr, callee: Callee, args: List::<Arg>, after: LiveSet): LiveSet {
+        let params = self.callee_params(p, callee);
+        // The roots of each argument, tagged with its index.
+        let mut arg_roots: [(u32, Root); -..+] = [];
+        for i in 0..args.len() {
+            let rs = match p.thir.args.list(args)[i] {
+                Arg::InOut(x) => self.borrow_roots(p, x),
+                Arg::Value(v) => self.arg_roots(p, v),
+            };
+            for r in rs {
+                arg_roots.push((i as u32, r));
+            }
+        }
+        for i in 0..args.len() {
+            let a = p.thir.args.list(args)[i];
+            // Lent in-out to a parameter that is not `+`: the callee
+            // may shrink or replace it.
+            let grows = match params {
+                Some(ps) => {
+                    if i < ps.len() {
+                        match p.types.kind(p.types.at(ps, i)) {
+                            TyKind::Grow(_) => true,
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    }
+                }
+                None => false,
+            };
+            if let Arg::InOut(x) = a {
+                let xe = p.thir.expr(x);
+                if !grows && p.has_owner(xe.ty) {
+                    if let Some(root) = self.may_shrink(p, x, xe.span, "this call may shrink or replace it") {
+                        self.held.clear();
+                        for ar in arg_roots[..] {
+                            let (j, r) = ar;
+                            if j as usize != i {
+                                roots_insert(&mut self.held, r);
+                            }
+                        }
+                        self.invalidate(p, root, after[..], xe.span, "shrink");
+                        self.held.clear();
+                    }
+                }
+            }
+            // A closure that changes what it borrowed may be called
+            // by the callee.
+            let ty = p.thir.expr(a.expr()).ty;
+            if self.may_change_captures(p, ty) {
+                let mut roots: Roots = [];
+                for ar in arg_roots[..] {
+                    let (j, r) = ar;
+                    if j as usize == i {
+                        roots_insert(&mut roots, r);
+                    }
+                }
+                self.invalidate_captures(p, roots[..], after[..], ex.span);
+            }
+        }
+        if let Callee::Value { callee: f, kind } = callee {
+            if kind != ClosureKind::Fn {
+                let roots = if p.thir.is_place(f) { self.value_roots_of_place(p, f) } else { self.value_roots(p, f) };
+                self.invalidate_captures(p, roots[..], after[..], ex.span);
+            }
+        }
+        let mut live = after;
+        let mut i = args.len();
+        while i > 0 {
+            i -= 1;
+            live = match p.thir.args.list(args)[i] {
+                Arg::InOut(x) => self.use_place(p, x, live),
+                Arg::Value(v) => self.live(p, v, live),
+            };
+        }
+        match callee {
+            Callee::Indirect(f) => {
+                live = self.live(p, f, live);
+            }
+            Callee::Value { callee: f, .. } => {
+                live = if p.thir.is_place(f) { self.use_place(p, f, live) } else { self.live(p, f, live) };
+            }
+            _ => {}
+        }
+        return live;
+    }
+}
+
+/// The method `method` of trait `trait_id`.
+fn trait_method(p: &Program, trait_id: DefId, method: Symbol): Option::<DefId> {
+    let t = p.trait_data(trait_id);
+    for m in p.trait_methods.list(t.methods) {
+        if m.name == method {
+            return Some(m.def);
+        }
+    }
+    return None;
+}
+
+/// The parameter types of function `def`.
+fn param_tys(p: &mut +Program, def: DefId): TyList {
+    let mut tys: [Ty; ..+] = [];
+    for q in p.fn_params(def) {
+        tys.push(q.ty);
+    }
+    return p.types.mk_list(tys[..]);
+}
+
+/// The locals bound by pattern `pat`, onto `out`.
+pub fn pat_bindings(thir: &Thir, pat: Id::<Pat>, out: &mut +[LocalId; ..+]) {
+    match thir.pat(pat).kind {
+        PatKind::Binding { local, sub, .. } => {
+            out.push(local);
+            if let Some(s) = sub {
+                pat_bindings(thir, s, out);
+            }
+        }
+        PatKind::Tuple(ps) => {
+            for q in thir.pat_ids.list(ps) {
+                pat_bindings(thir, q, out);
+            }
+        }
+        PatKind::Or(ps) => {
+            for q in thir.pat_ids.list(ps) {
+                pat_bindings(thir, q, out);
+            }
+        }
+        PatKind::Adt { fields, .. } => {
+            for f in thir.field_pats.list(fields) {
+                pat_bindings(thir, f.pat, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Push each direct child expression of `e` onto `out`.
+pub fn visit_children(thir: &Thir, e: Id::<Expr>, out: &mut +[Id::<Expr>; ..+]) {
+    match thir.expr(e).kind {
+        ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Lit(_) | ExprKind::FnRef { .. } | ExprKind::Continue { .. } | ExprKind::Error => {}
+        ExprKind::Field { base, .. } => out.push(base),
+        ExprKind::Index { base, index } => {
+            out.push(base);
+            out.push(index);
+        }
+        ExprKind::Deref(x) => out.push(x),
+        ExprKind::Temp(x) => out.push(x),
+        ExprKind::Unary(_, x) => out.push(x),
+        ExprKind::Cast(x) => out.push(x),
+        ExprKind::Coerce { expr, .. } => out.push(expr),
+        ExprKind::Read { place, .. } => out.push(place),
+        ExprKind::Call { callee, args } => {
+            match callee {
+                Callee::Indirect(c) => out.push(c),
+                Callee::Value { callee: c, .. } => out.push(c),
+                _ => {}
+            }
+            for a in thir.args.list(args) {
+                out.push(a.expr());
+            }
+        }
+        ExprKind::Closure { captures, .. } => {
+            for a in thir.args.list(captures) {
+                out.push(a.expr());
+            }
+        }
+        ExprKind::Binary(_, a, b) => {
+            out.push(a);
+            out.push(b);
+        }
+        ExprKind::Logical { lhs, rhs, .. } => {
+            out.push(lhs);
+            out.push(rhs);
+        }
+        ExprKind::Assign { place, value } => {
+            out.push(place);
+            out.push(value);
+        }
+        ExprKind::AssignOp { place, value, .. } => {
+            out.push(place);
+            out.push(value);
+        }
+        ExprKind::Tuple(es) => out.extend(thir.expr_ids.list(es)),
+        ExprKind::Array(es) => out.extend(thir.expr_ids.list(es)),
+        ExprKind::Adt { fields, .. } => {
+            for f in thir.field_exprs.list(fields) {
+                out.push(f.expr);
+            }
+        }
+        ExprKind::ArrayRepeat { value, count } => {
+            out.push(value);
+            out.push(count);
+        }
+        ExprKind::Slice { base, start, end, .. } => {
+            out.push(base);
+            if let Some(x) = start {
+                out.push(x);
+            }
+            if let Some(x) = end {
+                out.push(x);
+            }
+        }
+        ExprKind::Block(b) => visit_block(thir, b, out),
+        ExprKind::Loop { body, .. } => visit_block(thir, body, out),
+        ExprKind::If { cond, then, else_ } => {
+            out.push(cond);
+            out.push(then);
+            if let Some(x) = else_ {
+                out.push(x);
+            }
+        }
+        ExprKind::Match { scrut, arms } => {
+            out.push(scrut);
+            for a in thir.arms.list(arms) {
+                if let Some(g) = a.guard {
+                    out.push(g);
+                }
+                out.push(a.body);
+            }
+        }
+        ExprKind::While { cond, body, .. } => {
+            out.push(cond);
+            visit_block(thir, body, out);
+        }
+        ExprKind::ForRange { start, end, body, .. } => {
+            out.push(start);
+            out.push(end);
+            visit_block(thir, body, out);
+        }
+        ExprKind::ForArray { array, body, .. } => {
+            out.push(array);
+            visit_block(thir, body, out);
+        }
+        ExprKind::Break { value, .. } => {
+            if let Some(x) = value {
+                out.push(x);
+            }
+        }
+        ExprKind::Return(value) => {
+            if let Some(x) = value {
+                out.push(x);
+            }
+        }
+        ExprKind::FmtArgs(pieces) => {
+            for q in thir.fmt_pieces.list(pieces) {
+                if let FmtPiece::Arg(x, _) = q {
+                    out.push(x);
+                }
+            }
+        }
+    }
+}
+
+/// Push the expressions of block `b` (its statements' and its tail) onto
+/// `out`.
+pub fn visit_block(thir: &Thir, b: Id::<Block>, out: &mut +[Id::<Expr>; ..+]) {
+    let blk = thir.block(b);
+    for s in thir.stmts.list(blk.stmts) {
+        match s {
+            Stmt::Let { init: Some(i), .. } => out.push(i),
+            Stmt::Let { .. } => {}
+            Stmt::Expr(e) => out.push(e),
+        }
+    }
+    if let Some(t) = blk.tail {
+        out.push(t);
+    }
+}
+
+// ========================================================================= moves
+
+/// A moved place: a local and its field projections (`variant * 1000 +
+/// field` each), interned in `Moves` so equal paths are equal values.
+#[derive(Eq)]
+struct MovePath {
+    local: LocalId,
+    start: u32,
+    len: u32,
+}
+
+/// The paths that may have been moved at a point; not `reachable` after
+/// `return`, `break` and `continue` (Rust: `None`).
+#[derive(Clone)]
+struct MoveState {
+    reachable: bool,
+    paths: [MovePath; -..+],
+}
+
+fn unreachable_state(): MoveState {
+    return MoveState { reachable: false, paths: [] };
+}
+
+/// A `MoveState` kept in `Moves::saved`.
+struct SavedState {
+    reachable: bool,
+    start: u32,
+    len: u32,
+}
+
+fn unreachable_saved(): SavedState {
+    return SavedState { reachable: false, start: 0, len: 0 };
+}
+
+fn join(a: &mut MoveState, b: &MoveState) {
+    if !b.reachable {
+        return;
+    }
+    if !a.reachable {
+        a.reachable = true;
+        a.paths = b.paths.clone();
+        return;
+    }
+    for x in b.paths[..] {
+        if !a.paths[..].contains(x) {
+            a.paths.push(x);
+        }
+    }
+}
+
+/// What a loop body does, run by `Moves::looped`.
+enum LoopBody {
+    Block(Id::<Block>),
+    /// A `while` loop: its body, then its condition.
+    While(Id::<Block>, Id::<Expr>),
+    /// A `for` loop over an array: bind its pattern, then its body.
+    ForArray(Id::<Pat>, Id::<Block>),
+}
+
+struct Moves {
+    /// Per loop: (state at `continue`s, state at `break`s).
+    loop_states: HashMap::<LoopId, (SavedState, SavedState)>,
+    saved: [MovePath; ..+],
+    /// Every path, interned.
+    paths: [MovePath; ..+],
+    proj: [u32; ..+],
+}
+
+impl Moves {
+    fn intern(&mut self, l: LocalId, projs: [u32; &]): MovePath {
+        for q in self.paths[..] {
+            if q.local == l && q.len as usize == projs.len() {
+                let s = q.start as usize;
+                if self.proj[s..s + projs.len()] == projs {
+                    return q;
+                }
+            }
+        }
+        let q = MovePath { local: l, start: self.proj.len() as u32, len: projs.len() as u32 };
+        self.proj.extend(projs);
+        self.paths.push(q);
+        return q;
+    }
+
+    /// Whether `a` is a prefix of `b`.
+    fn is_prefix(&self, a: MovePath, b: MovePath): bool {
+        if a.local != b.local || a.len > b.len {
+            return false;
+        }
+        let sa = a.start as usize;
+        let sb = b.start as usize;
+        let n = a.len as usize;
+        return self.proj[sa..sa + n] == self.proj[sb..sb + n];
+    }
+
+    fn save(&mut self, s: &MoveState): SavedState {
+        let start = self.saved.len() as u32;
+        self.saved.extend(s.paths[..]);
+        return SavedState { reachable: s.reachable, start, len: s.paths.len() as u32 };
+    }
+
+    fn load(&self, s: SavedState): MoveState {
+        let a = s.start as usize;
+        return MoveState { reachable: s.reachable, paths: self.saved[a..a + s.len as usize].to_grow() };
+    }
+
+    fn path_of(&mut self, p: &Program, e: Id::<Expr>): Option::<MovePath> {
+        let mut projs: [u32; -..+] = [];
+        let mut cur = e;
+        loop {
+            match p.thir.expr(cur).kind {
+                ExprKind::Local(l) => {
+                    projs.reverse();
+                    return Some(self.intern(l, projs[..]));
+                }
+                ExprKind::Field { base, field, variant } => {
+                    projs.push(variant * 1000 + field);
+                    cur = base;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn check_use(&mut self, cx: &mut Cx, p: &mut +Program, place: Id::<Expr>, st: &MoveState, span: Span) {
+        if !st.reachable {
+            return;
+        }
+        let path = match self.path_of(p, place) {
+            Some(x) => x,
+            None => match cx.place_root(p, place) {
+                Some(Root::Local(l)) => self.intern(l, []),
+                _ => return,
+            },
+        };
+        let mut moved = false;
+        for mp in st.paths[..] {
+            if mp.local == path.local && (self.is_prefix(path, mp) || self.is_prefix(mp, path)) {
+                moved = true;
+            }
+        }
+        if moved && cx.report(span, 1u32 << 30) {
+            let n = p.text(cx.local(p, path.local).name);
+            let m = say(p, "use of moved value `{n}`");
+            p.diags.error(codes::borrow::USE_AFTER_MOVE(), span, m);
+            p.diags.note(say(p, "`{n}` owns its data, so binding, assigning, returning or passing it to a parameter that takes ownership moves it"));
+            p.diags.help(say(p, "move it only once, or `.clone()` it before moving"));
+            p.diags.finish();
+        }
+    }
+
+    fn read(&mut self, cx: &mut Cx, p: &mut +Program, place: Id::<Expr>, mode: ReadMode, st: &mut MoveState, span: Span) {
+        self.place_inner(cx, p, place, st);
+        self.check_use(cx, p, place, st, span);
+        if mode != ReadMode::Move {
+            return;
+        }
+        match cx.place_root(p, place) {
+            Some(Root::Local(l)) => {
+                let local = cx.local(p, l);
+                if let LocalKind::Param { owned: false, inout, .. } = local.kind {
+                    let n = p.text(local.name);
+                    let borrow = if inout { "&mut " } else { "&" };
+                    let mut take = String::new();
+                    if n == "self" {
+                        take.write("`self` rather than `{borrow}self`");
+                    } else {
+                        let ty = p.ty_str(p.types.strip_grow(local.ty));
+                        take.write("`{n}: {ty}` rather than `{n}: {borrow}{ty}`");
+                    }
+                    if cx.report(span, 3u32 << 28) {
+                        let m = say(p, "cannot move out of parameter `{n}`");
+                        p.diags.error(codes::borrow::MOVE_OUT_OF_BORROW(), span, m);
+                        p.diags.note(say(p, "this parameter is borrowed from the caller, so its owned data cannot be taken"));
+                        p.diags.help(say(p, "take ownership instead ({take}), or use `.clone()` to make an owned copy"));
+                        p.diags.finish();
+                    }
+                    return;
+                }
+                let is_index = match p.thir.expr(place).kind {
+                    ExprKind::Index { .. } => true,
+                    _ => false,
+                };
+                if cx.place_through_view(p, place) || is_index {
+                    if cx.report(span, 5u32 << 27) {
+                        let m = say(p, "cannot move an owned value out of an array element");
+                        p.diags.error(codes::borrow::MOVE_OUT_OF_BORROW(), span, m);
+                        p.diags.finish();
+                    }
+                } else if st.reachable {
+                    if let Some(q) = self.path_of(p, place) {
+                        if !st.paths[..].contains(q) {
+                            st.paths.push(q);
+                        }
+                    }
+                }
+            }
+            Some(_) => {}
+            None => {
+                if cx.report(span, 6u32 << 27) {
+                    let m = say(p, "cannot move an owned value out of a static or through a pointer");
+                    p.diags.error(codes::borrow::MOVE_OUT_OF_BORROW(), span, m);
+                    p.diags.finish();
+                }
+            }
+        }
+    }
+
+    /// Visit sub-expressions inside a place (index expressions, temps).
+    fn place_inner(&mut self, cx: &mut Cx, p: &mut +Program, place: Id::<Expr>, st: &mut MoveState) {
+        match p.thir.expr(place).kind {
+            ExprKind::Field { base, .. } => self.place_inner(cx, p, base, st),
+            ExprKind::Index { base, index } => {
+                self.place_inner(cx, p, base, st);
+                self.expr(cx, p, index, st);
+            }
+            ExprKind::Deref(x) => self.expr(cx, p, x, st),
+            ExprKind::Temp(inner) => self.expr(cx, p, inner, st),
+            _ => {}
+        }
+    }
+
+    /// Variables bound by `pat` are freshly initialized (in a loop, the
+    /// previous iteration may have moved them).
+    fn bind(&mut self, p: &Program, pat: Id::<Pat>, st: &mut MoveState) {
+        if !st.reachable {
+            return;
+        }
+        let mut binds: [LocalId; ..+] = [];
+        pat_bindings(&p.thir, pat, &mut binds);
+        let mut keep: [MovePath; -..+] = [];
+        for q in st.paths[..] {
+            if !binds[..].contains(q.local) {
+                keep.push(q);
+            }
+        }
+        st.paths = keep;
+    }
+
+    fn block(&mut self, cx: &mut Cx, p: &mut +Program, b: Id::<Block>, st: &mut MoveState) {
+        let blk = p.thir.block(b);
+        for i in 0..blk.stmts.len() {
+            match p.thir.stmts.list(blk.stmts)[i] {
+                Stmt::Let { pat, init, .. } => {
+                    if let Some(x) = init {
+                        self.expr(cx, p, x, st);
+                    }
+                    self.bind(p, pat, st);
+                }
+                Stmt::Expr(e) => self.expr(cx, p, e, st),
+            }
+        }
+        if let Some(t) = blk.tail {
+            self.expr(cx, p, t, st);
+        }
+    }
+
+    fn pat_moves(&mut self, cx: &mut Cx, p: &mut +Program, scrut: Id::<Expr>, pat: Id::<Pat>, st: &mut MoveState) {
+        if pat_has_move(&p.thir, pat) {
+            self.read(cx, p, scrut, ReadMode::Move, st, p.thir.pat(pat).span);
+        }
+    }
+
+    fn exprs(&mut self, cx: &mut Cx, p: &mut +Program, es: List::<Id::<Expr>>, st: &mut MoveState) {
+        for i in 0..es.len() {
+            self.expr(cx, p, p.thir.expr_ids.list(es)[i], st);
+        }
+    }
+
+    fn expr(&mut self, cx: &mut Cx, p: &mut +Program, e: Id::<Expr>, st: &mut MoveState) {
+        let ex = p.thir.expr(e);
+        match ex.kind {
+            ExprKind::Read { place, mode } => self.read(cx, p, place, mode, st, ex.span),
+            ExprKind::Local(_) | ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Deref(_) | ExprKind::Temp(_) | ExprKind::Static(_) => {
+                self.place_inner(cx, p, e, st);
+                self.check_use(cx, p, e, st, ex.span);
+            }
+            ExprKind::Call { callee, args } => {
+                match callee {
+                    Callee::Indirect(f) => self.expr(cx, p, f, st),
+                    Callee::Value { callee: f, .. } => self.expr(cx, p, f, st),
+                    _ => {}
+                }
+                for i in 0..args.len() {
+                    match p.thir.args.list(args)[i] {
+                        Arg::Value(v) => self.expr(cx, p, v, st),
+                        Arg::InOut(x) => {
+                            self.place_inner(cx, p, x, st);
+                            self.check_use(cx, p, x, st, p.thir.expr(x).span);
+                        }
+                    }
+                }
+            }
+            ExprKind::Assign { place, value } => {
+                self.expr(cx, p, value, st);
+                self.place_inner(cx, p, place, st);
+                if let Some(path) = self.path_of(p, place) {
+                    if st.reachable {
+                        let mut keep: [MovePath; -..+] = [];
+                        for q in st.paths[..] {
+                            if !self.is_prefix(path, q) {
+                                keep.push(q);
+                            }
+                        }
+                        st.paths = keep;
+                    }
+                }
+            }
+            ExprKind::AssignOp { place, value, .. } => {
+                self.expr(cx, p, value, st);
+                self.place_inner(cx, p, place, st);
+                self.check_use(cx, p, place, st, p.thir.expr(place).span);
+            }
+            ExprKind::Slice { base, start, end, .. } => {
+                self.place_inner(cx, p, base, st);
+                self.check_use(cx, p, base, st, ex.span);
+                if let Some(x) = start {
+                    self.expr(cx, p, x, st);
+                }
+                if let Some(x) = end {
+                    self.expr(cx, p, x, st);
+                }
+            }
+            ExprKind::Coerce { kind: Coercion::ToSlice { .. }, expr } => {
+                self.place_inner(cx, p, expr, st);
+                self.check_use(cx, p, expr, st, ex.span);
+            }
+            ExprKind::Coerce { kind: Coercion::StringToStr, expr } => {
+                self.place_inner(cx, p, expr, st);
+                self.check_use(cx, p, expr, st, ex.span);
+            }
+            ExprKind::Coerce { expr, .. } => self.expr(cx, p, expr, st),
+            ExprKind::Unary(_, x) => self.expr(cx, p, x, st),
+            ExprKind::Cast(x) => self.expr(cx, p, x, st),
+            ExprKind::Binary(_, a, b) => {
+                self.expr(cx, p, a, st);
+                self.expr(cx, p, b, st);
+            }
+            ExprKind::Logical { lhs, rhs, .. } => {
+                self.expr(cx, p, lhs, st);
+                let mut s2 = st.clone();
+                self.expr(cx, p, rhs, &mut s2);
+                join(st, &s2);
+            }
+            ExprKind::Tuple(es) => self.exprs(cx, p, es, st),
+            ExprKind::Array(es) => self.exprs(cx, p, es, st),
+            ExprKind::Adt { fields, .. } => {
+                for i in 0..fields.len() {
+                    self.expr(cx, p, p.thir.field_exprs.list(fields)[i].expr, st);
+                }
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                self.expr(cx, p, value, st);
+                self.expr(cx, p, count, st);
+            }
+            ExprKind::FmtArgs(pieces) => {
+                for i in 0..pieces.len() {
+                    if let FmtPiece::Arg(x, _) = p.thir.fmt_pieces.list(pieces)[i] {
+                        self.expr(cx, p, x, st);
+                    }
+                }
+            }
+            ExprKind::If { cond, then, else_ } => {
+                self.expr(cx, p, cond, st);
+                let mut a = st.clone();
+                self.expr(cx, p, then, &mut a);
+                let mut b = st.clone();
+                if let Some(x) = else_ {
+                    self.expr(cx, p, x, &mut b);
+                }
+                st = a;
+                join(st, &b);
+            }
+            ExprKind::Match { scrut, arms } => {
+                self.place_inner(cx, p, scrut, st);
+                self.check_use(cx, p, scrut, st, p.thir.expr(scrut).span);
+                let mut out = unreachable_state();
+                for i in 0..arms.len() {
+                    let a = p.thir.arms.list(arms)[i];
+                    let mut s = st.clone();
+                    self.pat_moves(cx, p, scrut, a.pat, &mut s);
+                    self.bind(p, a.pat, &mut s);
+                    if let Some(g) = a.guard {
+                        self.expr(cx, p, g, &mut s);
+                    }
+                    self.expr(cx, p, a.body, &mut s);
+                    join(&mut out, &s);
+                }
+                st = out;
+            }
+            ExprKind::Block(b) => self.block(cx, p, b, st),
+            ExprKind::Loop { body, id } => self.looped(cx, p, id, st, LoopBody::Block(body), false),
+            ExprKind::While { cond, body, id } => {
+                self.expr(cx, p, cond, st);
+                self.looped(cx, p, id, st, LoopBody::While(body, cond), true);
+            }
+            ExprKind::ForRange { start, end, body, id, .. } => {
+                self.expr(cx, p, start, st);
+                self.expr(cx, p, end, st);
+                self.looped(cx, p, id, st, LoopBody::Block(body), true);
+            }
+            ExprKind::ForArray { pat, array, body, id, .. } => {
+                self.place_inner(cx, p, array, st);
+                self.check_use(cx, p, array, st, p.thir.expr(array).span);
+                self.looped(cx, p, id, st, LoopBody::ForArray(pat, body), true);
+            }
+            ExprKind::Break { id, value } => {
+                if let Some(v) = value {
+                    self.expr(cx, p, v, st);
+                }
+                let (cont, brk) = match self.loop_states.get(id) {
+                    Some(e) => e,
+                    None => (unreachable_saved(), unreachable_saved()),
+                };
+                let mut b = self.load(brk);
+                join(&mut b, st);
+                let brk = self.save(&b);
+                self.loop_states.insert(id, (cont, brk));
+                st.reachable = false;
+                st.paths.clear();
+            }
+            ExprKind::Continue { id } => {
+                let (cont, brk) = match self.loop_states.get(id) {
+                    Some(e) => e,
+                    None => (unreachable_saved(), unreachable_saved()),
+                };
+                let mut c = self.load(cont);
+                join(&mut c, st);
+                let cont = self.save(&c);
+                self.loop_states.insert(id, (cont, brk));
+                st.reachable = false;
+                st.paths.clear();
+            }
+            ExprKind::Return(v) => {
+                if let Some(v) = v {
+                    self.expr(cx, p, v, st);
+                }
+                st.reachable = false;
+                st.paths.clear();
+            }
+            ExprKind::Closure { captures, .. } => {
+                for i in 0..captures.len() {
+                    let a = p.thir.args.list(captures)[i];
+                    let x = a.expr();
+                    let by_value_expr = match a {
+                        Arg::Value(v) => !p.thir.is_place(v),
+                        Arg::InOut(_) => false,
+                    };
+                    if by_value_expr {
+                        self.expr(cx, p, x, st);
+                    } else {
+                        self.place_inner(cx, p, x, st);
+                        self.check_use(cx, p, x, st, p.thir.expr(x).span);
+                    }
+                }
+            }
+            ExprKind::Lit(_) | ExprKind::FnRef { .. } | ExprKind::Error => {}
+        }
+    }
+
+    fn run_body(&mut self, cx: &mut Cx, p: &mut +Program, body: LoopBody, s: &mut MoveState) {
+        match body {
+            LoopBody::Block(b) => self.block(cx, p, b, s),
+            LoopBody::While(b, cond) => {
+                self.block(cx, p, b, s);
+                self.expr(cx, p, cond, s);
+            }
+            LoopBody::ForArray(pat, b) => {
+                self.bind(p, pat, s);
+                self.block(cx, p, b, s);
+            }
+        }
+    }
+
+    /// Run a loop body twice so moves in one iteration are seen by the next.
+    fn looped(&mut self, cx: &mut Cx, p: &mut +Program, id: LoopId, st: &mut MoveState, body: LoopBody, may_skip: bool) {
+        let mut s = st.clone();
+        self.run_body(cx, p, body, &mut s);
+        let mut head = st.clone();
+        join(&mut head, &s);
+        if let Some(e) = self.loop_states.get(id) {
+            let (cont, _) = e;
+            let c = self.load(cont);
+            join(&mut head, &c);
+        }
+        let mut s2 = head.clone();
+        self.run_body(cx, p, body, &mut s2);
+        let breaks = match self.loop_states.remove(id) {
+            Some(e) => {
+                let (_, b) = e;
+                self.load(b)
+            }
+            None => unreachable_state(),
+        };
+        let mut exit = if may_skip { head } else { unreachable_state() };
+        if may_skip {
+            join(&mut exit, &s2);
+        }
+        join(&mut exit, &breaks);
+        st = exit;
+    }
+}
+
+/// Whether `pat` binds something by move.
+fn pat_has_move(thir: &Thir, pat: Id::<Pat>): bool {
+    return match thir.pat(pat).kind {
+        PatKind::Binding { mode, sub, .. } => {
+            if mode == ReadMode::Move {
+                return true;
+            }
+            match sub {
+                Some(s) => pat_has_move(thir, s),
+                None => false,
+            }
+        }
+        PatKind::Tuple(ps) => {
+            for q in thir.pat_ids.list(ps) {
+                if pat_has_move(thir, q) {
+                    return true;
+                }
+            }
+            false
+        }
+        PatKind::Or(ps) => {
+            for q in thir.pat_ids.list(ps) {
+                if pat_has_move(thir, q) {
+                    return true;
+                }
+            }
+            false
+        }
+        PatKind::Adt { fields, .. } => {
+            for f in thir.field_pats.list(fields) {
+                if pat_has_move(thir, f.pat) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    };
+}

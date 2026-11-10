@@ -1,0 +1,172 @@
+// Sizes and alignments of types: a port of crates/ln-sema/src/layout.rs,
+// mirroring the layouts code generation uses (LLVM's default data layout on
+// 64-bit targets). For editor hovers.
+//
+// * integers, floats, `char` (4 bytes), `bool` (1 byte): natural sizes;
+// * pointers and function pointers: 8 bytes;
+// * slices, `str`, `FmtArgs`: `{ ptr, len }`, 16 bytes;
+// * owning arrays and `String`: `{ ptr, len, cap }`, 24 bytes (the
+//   elements live on the array's data stack, not inline);
+// * `[T; N]`: N elements inline;
+// * tuples and structs: fields in order, each aligned, total rounded up to
+//   the largest alignment;
+// * enums: `{ i32 tag, [W x i64] }` where W covers the largest variant.
+
+use crater::defs::{DefData, DefId, VariantDef};
+use crater::program::Program;
+use crater::ty::{ArrKind, FloatTy, IntTy, Ty, TyKind, TyList};
+
+/// Size and alignment in bytes.
+#[derive(Eq, Debug)]
+pub struct Layout {
+    pub size: u64,
+    pub align: u64,
+}
+
+impl Layout {
+    fn new(size: u64, align: u64): Layout {
+        return Layout { size, align };
+    }
+}
+
+/// `x` rounded up to a multiple of `m`.
+fn next_multiple_of(x: u64, m: u64): u64 {
+    let r = x % m;
+    if r == 0 { x } else { x + (m - r) }
+}
+
+/// The C-style layout of fields in order, with each field's offset.
+pub fn struct_layout(fields: [Layout; &]): (Layout, [u64; ..+]) {
+    let mut offset: u64 = 0;
+    let mut align: u64 = 1;
+    let mut offsets: [u64; ..+] = [];
+    for f in fields {
+        offset = next_multiple_of(offset, f.align);
+        offsets.push(offset);
+        offset += f.size;
+        if f.align > align {
+            align = f.align;
+        }
+    }
+    return (Layout::new(next_multiple_of(offset, align), align), offsets);
+}
+
+impl Program {
+    /// Layout of `t`, or `None` if it depends on generic parameters or
+    /// unresolved inference.
+    pub fn layout_of(&mut +self, t: Ty): Option::<Layout> {
+        return self.layout_depth(t, 0);
+    }
+
+    /// The layouts of the types of `l`, onto `out`; false if one has none.
+    fn layouts_of(&mut +self, l: TyList, depth: u32, out: &mut +[Layout; ..+]): bool {
+        for i in 0..l.len() {
+            match self.layout_depth(self.types.at(l, i), depth) {
+                Some(x) => out.push(x),
+                None => return false,
+            }
+        }
+        return true;
+    }
+
+    /// The layout of a struct of the types of `l`.
+    fn fields_layout(&mut +self, l: TyList, depth: u32): Option::<Layout> {
+        let mut fs: [Layout; ..+] = [];
+        if !self.layouts_of(l, depth, &mut fs) {
+            return None;
+        }
+        let (lay, _) = struct_layout(fs[..]);
+        return Some(lay);
+    }
+
+    /// The field types of variant `v` instantiated with `args`.
+    fn variant_tys(&mut +self, v: VariantDef, args: TyList): TyList {
+        let mut tys: [Ty; ..+] = [];
+        for f in self.fields.list(v.fields) {
+            tys.push(self.types.subst(f.ty, args));
+        }
+        return self.types.mk_list(tys[..]);
+    }
+
+    fn layout_depth(&mut +self, t: Ty, depth: u32): Option::<Layout> {
+        if depth > 64 {
+            return None;
+        }
+        let d1 = depth + 1;
+        return match self.types.kind(t) {
+            TyKind::Int(i) => {
+                let n: u64 = match i {
+                    IntTy::I8 | IntTy::U8 => 1,
+                    IntTy::I16 | IntTy::U16 => 2,
+                    IntTy::I32 | IntTy::U32 => 4,
+                    IntTy::I64 | IntTy::U64 | IntTy::Isize | IntTy::Usize => 8,
+                };
+                Some(Layout::new(n, n))
+            },
+            TyKind::Float(FloatTy::F32) => Some(Layout::new(4, 4)),
+            TyKind::Float(FloatTy::F64) => Some(Layout::new(8, 8)),
+            TyKind::Bool => Some(Layout::new(1, 1)),
+            TyKind::Char => Some(Layout::new(4, 4)),
+            TyKind::Str | TyKind::FmtArgs => Some(Layout::new(16, 8)),
+            TyKind::String => Some(Layout::new(24, 8)),
+            TyKind::Ptr(..) | TyKind::FnPtr(..) => Some(Layout::new(8, 8)),
+            TyKind::Grow(inner) => self.layout_depth(inner, d1),
+            TyKind::Never => Some(Layout::new(0, 1)),
+            TyKind::Tuple(ts) => self.fields_layout(ts, d1),
+            TyKind::Array(e, k) => match k {
+                ArrKind::Fixed(n) => {
+                    let Some(el) = self.layout_depth(e, d1) else { return None; };
+                    Some(Layout::new(el.size * n, el.align))
+                },
+                ArrKind::FixedVar(_) => None,
+                ArrKind::Slice | ArrKind::SliceMut => Some(Layout::new(16, 8)),
+                ArrKind::Dyn | ArrKind::Grow | ArrKind::Shrink => Some(Layout::new(24, 8)),
+            },
+            TyKind::Adt(d, args) => {
+                let DefData::Adt(adt) = self.defs[d.index()].data else { return None; };
+                if adt.is_enum {
+                    let mut max: u64 = 0;
+                    for v in 0..adt.variants.len() {
+                        let vd = self.variants.list(adt.variants)[v];
+                        let tys = self.variant_tys(vd, args);
+                        let Some(vl) = self.fields_layout(tys, d1) else { return None; };
+                        if vl.size > max {
+                            max = vl.size;
+                        }
+                    }
+                    // Even an empty `[0 x i64]` payload aligns the enum to 8.
+                    Some(Layout::new(8 + 8 * ((max + 7) / 8), 8))
+                } else {
+                    let vd = self.variants.list(adt.variants)[0];
+                    let tys = self.variant_tys(vd, args);
+                    self.fields_layout(tys, d1)
+                }
+            },
+            TyKind::Closure(def, args) => {
+                let fs = self.closure_fields(def, args);
+                self.fields_layout(fs, d1)
+            },
+            TyKind::Opaque(..) => {
+                let r = self.reveal(t);
+                if self.types.has_error(r) {
+                    return None;
+                }
+                self.layout_depth(r, d1)
+            },
+            TyKind::Param(..) | TyKind::Infer(_) | TyKind::Error => None,
+        };
+    }
+
+    /// Byte offsets of a struct's fields (non-generic structs only).
+    pub fn field_offsets(&mut +self, adt: DefId, args: TyList): Option::<[u64; ..+]> {
+        let DefData::Adt(a) = self.defs[adt.index()].data else { return None; };
+        let vd = self.variants.list(a.variants)[0];
+        let tys = self.variant_tys(vd, args);
+        let mut fs: [Layout; ..+] = [];
+        if !self.layouts_of(tys, 0, &mut fs) {
+            return None;
+        }
+        let (_, offsets) = struct_layout(fs[..]);
+        return Some(offsets);
+    }
+}
