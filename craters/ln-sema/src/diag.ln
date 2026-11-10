@@ -1,0 +1,161 @@
+// Diagnostics: a port of crates/ln-diag (without ariadne). Every error has a
+// scoped code (`codes.ln`), rendered as `err(scope::name)`.
+
+use core::arena::{Arena, List};
+use core::intern::Symbol;
+use ln_ast::Span;
+
+/// A scoped diagnostic code, such as `type::mismatch`.
+#[derive(Eq, Hash)]
+pub struct Code {
+    pub scope: str,
+    pub name: str,
+}
+
+#[derive(Eq, Hash, Debug)]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+/// A secondary label attached to a diagnostic.
+pub struct Label {
+    pub span: Span,
+    pub message: Symbol,
+}
+
+/// One diagnostic. Texts are interned in the program's names; labels,
+/// notes and helps are lists in `Diags`.
+pub struct Diag {
+    pub severity: Severity,
+    pub code: Code,
+    pub message: Symbol,
+    pub span: Span,
+    /// Text shown under the primary span.
+    pub label: Option::<Symbol>,
+    pub labels: List::<Label>,
+    pub notes: List::<Symbol>,
+    pub helps: List::<Symbol>,
+}
+
+impl Diag {
+    pub fn is_error(self): bool {
+        return self.severity == Severity::Error;
+    }
+}
+
+/// A span that points nowhere (a missing `main`, a link failure).
+pub fn dummy_span(): Span {
+    return Span::new(4294967295, 4294967295);
+}
+
+pub fn is_dummy(s: Span): bool {
+    return s.lo == 4294967295;
+}
+
+/// Diagnostics being built: `start` one, add labels, notes and helps, then
+/// `finish` it. All texts are interned (`Symbol`s) by the caller.
+pub struct Diags {
+    pub list: [Diag; -..+],
+    pub labels: Arena::<Label>,
+    pub texts: Arena::<Symbol>,
+    /// The diagnostic being built.
+    cur: Diag,
+    cur_labels: [Label; -..+],
+    cur_notes: [Symbol; -..+],
+    cur_helps: [Symbol; -..+],
+    errors: usize,
+}
+
+impl Diags {
+    pub fn new(): Diags {
+        let empty = Diag {
+            severity: Severity::Error,
+            code: Code { scope: "", name: "" },
+            message: Symbol::from_index(0),
+            span: dummy_span(),
+            label: None,
+            labels: List::empty(),
+            notes: List::empty(),
+            helps: List::empty(),
+        };
+        return Diags { list: [], labels: Arena::new(), texts: Arena::new(), cur: empty, cur_labels: [], cur_notes: [], cur_helps: [], errors: 0 };
+    }
+
+    /// Start building an error.
+    pub fn error(&mut self, kept code: Code, span: Span, message: Symbol) {
+        self.begin(Severity::Error, code, span, message);
+    }
+
+    /// Start building a warning.
+    pub fn warning(&mut self, kept code: Code, span: Span, message: Symbol) {
+        self.begin(Severity::Warning, code, span, message);
+    }
+
+    fn begin(&mut self, severity: Severity, kept code: Code, span: Span, message: Symbol) {
+        self.cur = Diag { severity, code, message, span, label: None, labels: List::empty(), notes: List::empty(), helps: List::empty() };
+        self.cur_labels.clear();
+        self.cur_notes.clear();
+        self.cur_helps.clear();
+    }
+
+    pub fn label(&mut self, text: Symbol) {
+        self.cur.label = Some(text);
+    }
+
+    pub fn secondary(&mut self, span: Span, text: Symbol) {
+        self.cur_labels.push(Label { span, message: text });
+    }
+
+    pub fn note(&mut self, text: Symbol) {
+        self.cur_notes.push(text);
+    }
+
+    pub fn help(&mut self, text: Symbol) {
+        self.cur_helps.push(text);
+    }
+
+    /// Record the diagnostic being built.
+    pub fn finish(&mut self) {
+        let mut d = self.cur;
+        d.labels = self.labels.add_list(self.cur_labels[..]);
+        d.notes = self.texts.add_list(self.cur_notes[..]);
+        d.helps = self.texts.add_list(self.cur_helps[..]);
+        if d.is_error() {
+            self.errors += 1;
+        }
+        self.list.push(d);
+    }
+
+    /// Record `d` (built elsewhere, with its lists in this `Diags`).
+    pub fn push(&mut self, kept d: Diag) {
+        if d.is_error() {
+            self.errors += 1;
+        }
+        self.list.push(d);
+    }
+
+    pub fn error_count(&self): usize {
+        return self.errors;
+    }
+
+    pub fn has_errors(&self): bool {
+        return self.errors > 0;
+    }
+
+    pub fn len(&self): usize {
+        return self.list.len();
+    }
+
+    /// Drop every diagnostic after the first `n` (for speculative checks).
+    pub fn truncate(&mut self, n: usize) {
+        let mut errors: usize = 0;
+        for i in 0..n {
+            if self.list[i].is_error() {
+                errors += 1;
+            }
+        }
+        self.list.truncate(n);
+        self.errors = errors;
+    }
+}

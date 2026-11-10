@@ -1,0 +1,153 @@
+// Every scoped diagnostic code the compiler can emit: a port of
+// crates/ln-diag/src/codes.rs. Rendered as `err(scope::name)`. Each code
+// is a function (`codes::ty::MISMATCH()`): constants cannot hold structs.
+
+pub mod ty {
+    use crater::diag::Code;
+    fn c(name: str): Code { return Code { scope: "type", name }; }
+    pub fn MISMATCH(): Code { return c("mismatch"); }
+    pub fn ARRAY_OWNER_ITEMS(): Code { return c("array_owner_items"); }
+    pub fn GROW_OUTSIDE_PARAM(): Code { return c("grow_outside_param"); }
+    pub fn GROW_NO_OWNER(): Code { return c("grow_no_owner"); }
+    pub fn GROW_WITHOUT_MUT(): Code { return c("grow_without_mut"); }
+    pub fn FMTARGS_OUTSIDE_PARAM(): Code { return c("fmtargs_outside_param"); }
+    pub fn ANNOTATIONS_NEEDED(): Code { return c("annotations_needed"); }
+    pub fn NOT_CALLABLE(): Code { return c("not_callable"); }
+    pub fn ARG_COUNT(): Code { return c("arg_count"); }
+    pub fn GENERIC_COUNT(): Code { return c("generic_count"); }
+    pub fn NO_FIELD(): Code { return c("no_field"); }
+    pub fn NO_METHOD(): Code { return c("no_method"); }
+    pub fn NOT_INDEXABLE(): Code { return c("not_indexable"); }
+    pub fn BAD_OPERAND(): Code { return c("bad_operand"); }
+    pub fn BAD_CAST(): Code { return c("bad_cast"); }
+    pub fn UNSATISFIED_BOUND(): Code { return c("unsatisfied_bound"); }
+    pub fn INFINITE_SIZE(): Code { return c("infinite_size"); }
+    pub fn ARRAY_LEN(): Code { return c("array_len"); }
+    pub fn NOT_A_PLACE(): Code { return c("not_a_place"); }
+    pub fn IMMUTABLE(): Code { return c("immutable"); }
+    pub fn MISSING_FIELD(): Code { return c("missing_field"); }
+    pub fn DUPLICATE_FIELD(): Code { return c("duplicate_field"); }
+    pub fn NON_EXHAUSTIVE(): Code { return c("non_exhaustive"); }
+    pub fn BAD_PATTERN(): Code { return c("bad_pattern"); }
+    pub fn RETURN_MISSING(): Code { return c("return_missing"); }
+    pub fn BREAK_OUTSIDE_LOOP(): Code { return c("break_outside_loop"); }
+    pub fn LITERAL_RANGE(): Code { return c("literal_range"); }
+    pub fn NOT_ITERABLE(): Code { return c("not_iterable"); }
+    pub fn FFI_TYPE(): Code { return c("ffi_type"); }
+    pub fn BAD_MAIN(): Code { return c("bad_main"); }
+    pub fn BAD_TEST(): Code { return c("bad_test"); }
+    pub fn CONST_EVAL(): Code { return c("const_eval"); }
+    pub fn VARIADIC_NOT_EXTERN(): Code { return c("variadic_not_extern"); }
+    pub fn IMPL_TRAIT_POSITION(): Code { return c("impl_trait_position"); }
+    pub fn OPAQUE_MISMATCH(): Code { return c("opaque_mismatch"); }
+    pub fn LET_ELSE_FALLS_THROUGH(): Code { return c("let_else_falls_through"); }
+}
+
+pub mod syntax {
+    use crater::diag::Code;
+    fn c(name: str): Code { return Code { scope: "syntax", name }; }
+    pub fn UNEXPECTED_TOKEN(): Code { return c("unexpected_token"); }
+    pub fn UNKNOWN_CHAR(): Code { return c("unknown_char"); }
+    pub fn UNTERMINATED(): Code { return c("unterminated"); }
+    pub fn BAD_ESCAPE(): Code { return c("bad_escape"); }
+    pub fn BAD_NUMBER(): Code { return c("bad_number"); }
+    pub fn BAD_FORMAT(): Code { return c("bad_format"); }
+    pub fn MISSING_SEMI(): Code { return c("missing_semi"); }
+    pub fn MISSING_BODY(): Code { return c("missing_body"); }
+    pub fn BAD_CHAR(): Code { return c("bad_char"); }
+    pub fn BAD_ATTRIBUTE(): Code { return c("bad_attribute"); }
+    pub fn CONFLICT_MARKER(): Code { return c("conflict_marker"); }
+}
+
+pub mod name {
+    use crater::diag::Code;
+    fn c(name: str): Code { return Code { scope: "name", name }; }
+    pub fn UNRESOLVED(): Code { return c("unresolved"); }
+    pub fn DUPLICATE(): Code { return c("duplicate"); }
+    pub fn PRIVATE(): Code { return c("private"); }
+    pub fn NOT_A_TYPE(): Code { return c("not_a_type"); }
+    pub fn NOT_A_VALUE(): Code { return c("not_a_value"); }
+    pub fn NOT_A_TRAIT(): Code { return c("not_a_trait"); }
+    pub fn MODULE_FILE(): Code { return c("module_file"); }
+    pub fn BAD_SELF(): Code { return c("bad_self"); }
+}
+
+pub mod trait_ {
+    use crater::diag::Code;
+    fn c(name: str): Code { return Code { scope: "trait", name }; }
+    pub fn DULL_IMPL(): Code { return c("dull_impl"); }
+    pub fn NEGATIVE_IMPL(): Code { return c("negative_impl"); }
+    pub fn MISSING_ITEM(): Code { return c("missing_item"); }
+    pub fn EXTRA_ITEM(): Code { return c("extra_item"); }
+    pub fn SIGNATURE(): Code { return c("signature"); }
+    pub fn CONFLICTING_IMPL(): Code { return c("conflicting_impl"); }
+    pub fn AMBIGUOUS_METHOD(): Code { return c("ambiguous_method"); }
+    pub fn INHERENT_FOREIGN(): Code { return c("inherent_foreign"); }
+}
+
+pub mod borrow {
+    use crater::diag::Code;
+    fn c(name: str): Code { return Code { scope: "borrow", name }; }
+    pub fn USE_AFTER_MOVE(): Code { return c("use_after_move"); }
+    pub fn MOVE_OUT_OF_BORROW(): Code { return c("move_out_of_borrow"); }
+    pub fn GROW_ONLY(): Code { return c("grow_only"); }
+    pub fn SHRINK_WHILE_BORROWED(): Code { return c("shrink_while_borrowed"); }
+    pub fn MOVE_WHILE_BORROWED(): Code { return c("move_while_borrowed"); }
+    pub fn ASSIGN_WHILE_BORROWED(): Code { return c("assign_while_borrowed"); }
+    pub fn OUTLIVES_ROOT(): Code { return c("outlives_root"); }
+    pub fn ESCAPES_FUNCTION(): Code { return c("escapes_function"); }
+    pub fn ESCAPES_VIA_PARAM(): Code { return c("escapes_via_param"); }
+    pub fn MISSING_MARKER(): Code { return c("missing_marker"); }
+    pub fn WRONG_MARKER(): Code { return c("wrong_marker"); }
+    pub fn NOT_AN_ARGUMENT(): Code { return c("not_an_argument"); }
+}
+
+pub mod macro_ {
+    use crater::diag::Code;
+    fn c(name: str): Code { return Code { scope: "macro", name }; }
+    pub fn UNDEFINED(): Code { return c("undefined"); }
+    pub fn NO_MATCH(): Code { return c("no_match"); }
+    pub fn BAD_MATCHER(): Code { return c("bad_matcher"); }
+    pub fn REPETITION(): Code { return c("repetition"); }
+    pub fn RECURSION_LIMIT(): Code { return c("recursion_limit"); }
+    pub fn DERIVE_OUTPUT(): Code { return c("derive_output"); }
+    pub fn NOT_SUPPORTED(): Code { return c("not_supported"); }
+    pub fn ERROR(): Code { return c("error"); }
+}
+
+pub mod unsafe_ {
+    use crater::diag::Code;
+    fn c(name: str): Code { return Code { scope: "unsafe", name }; }
+    pub fn OUTSIDE_UNSAFE(): Code { return c("outside_unsafe"); }
+    pub fn IN_UNSAFE_FN(): Code { return c("in_unsafe_fn"); }
+}
+
+pub mod lint {
+    use crater::diag::Code;
+    fn c(name: str): Code { return Code { scope: "lint", name }; }
+    pub fn NEEDLESS_BORROW(): Code { return c("needless_borrow"); }
+    pub fn MUT_PARAM_NOT_READ(): Code { return c("mut_param_not_read"); }
+    pub fn UNUSED_VARIABLE(): Code { return c("unused_variable"); }
+    pub fn UNREACHABLE(): Code { return c("unreachable"); }
+    pub fn UNUSED_MUT(): Code { return c("unused_mut"); }
+    pub fn UNKNOWN_CFG(): Code { return c("unknown_cfg"); }
+    pub fn IRREFUTABLE_LET_ELSE(): Code { return c("irrefutable_let_else"); }
+}
+
+pub mod build {
+    use crater::diag::Code;
+    fn c(name: str): Code { return Code { scope: "build", name }; }
+    pub fn LINK(): Code { return c("link"); }
+    pub fn LLVM(): Code { return c("llvm"); }
+    pub fn IO(): Code { return c("io"); }
+    pub fn NO_MAIN(): Code { return c("no_main"); }
+    pub fn MISSING_LANG_ITEM(): Code { return c("missing_lang_item"); }
+}
+
+pub mod manifest {
+    use crater::diag::Code;
+    fn c(name: str): Code { return Code { scope: "manifest", name }; }
+    pub fn PARSE(): Code { return c("parse"); }
+    pub fn NOT_FOUND(): Code { return c("not_found"); }
+    pub fn WORKSPACE(): Code { return c("workspace"); }
+}

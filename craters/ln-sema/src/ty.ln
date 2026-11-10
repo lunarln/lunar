@@ -1,0 +1,645 @@
+// Semantic types: a port of crates/ln-sema/src/ty.rs.
+//
+// A type is a `Ty`: a handle into the program's `Types` interner. Equal
+// types are equal handles, so comparing, hashing and copying types is
+// cheap. Lists of types (`TyList`) are interned too, so a list handle also
+// stands for its contents. The interner's tables grow in place (never
+// replaced), so `mk` and `mk_list` are `&mut +self`: views from `list` stay
+// valid across them.
+
+use core::arena::List;
+use core::hash::{Hash, Hasher, hash_of};
+use core::intern::Symbol;
+use crater::defs::DefId;
+use ln_ast::ParamMode;
+
+#[derive(Eq, Hash, Debug)]
+pub enum IntTy {
+    I8,
+    I16,
+    I32,
+    I64,
+    Isize,
+    U8,
+    U16,
+    U32,
+    U64,
+    Usize,
+}
+
+impl IntTy {
+    pub fn name(self): str {
+        return match self {
+            IntTy::I8 => "i8",
+            IntTy::I16 => "i16",
+            IntTy::I32 => "i32",
+            IntTy::I64 => "i64",
+            IntTy::Isize => "isize",
+            IntTy::U8 => "u8",
+            IntTy::U16 => "u16",
+            IntTy::U32 => "u32",
+            IntTy::U64 => "u64",
+            IntTy::Usize => "usize",
+        };
+    }
+
+    pub fn from_name(s: str): Option::<IntTy> {
+        let all = [IntTy::I8, IntTy::I16, IntTy::I32, IntTy::I64, IntTy::Isize, IntTy::U8, IntTy::U16, IntTy::U32, IntTy::U64, IntTy::Usize];
+        for t in all {
+            if t.name() == s {
+                return Some(t);
+            }
+        }
+        return None;
+    }
+
+    pub fn signed(self): bool {
+        return match self {
+            IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::Isize => true,
+            _ => false,
+        };
+    }
+
+    /// Width in bits (pointer-sized types are 64-bit on every target).
+    pub fn bits(self): u32 {
+        return match self {
+            IntTy::I8 | IntTy::U8 => 8,
+            IntTy::I16 | IntTy::U16 => 16,
+            IntTy::I32 | IntTy::U32 => 32,
+            _ => 64,
+        };
+    }
+
+    /// The largest value.
+    pub fn max(self): u64 {
+        let b = self.bits();
+        if self.signed() {
+            return (1u64 << ((b - 1) as u64)) - 1;
+        }
+        if b == 64 {
+            return 18446744073709551615;
+        }
+        return (1u64 << (b as u64)) - 1;
+    }
+
+    /// The magnitude of the smallest value (0 for unsigned types).
+    pub fn min_magnitude(self): u64 {
+        if self.signed() { 1u64 << ((self.bits() - 1) as u64) } else { 0 }
+    }
+}
+
+#[derive(Eq, Hash, Debug)]
+pub enum FloatTy {
+    F32,
+    F64,
+}
+
+impl FloatTy {
+    pub fn name(self): str {
+        return match self {
+            FloatTy::F32 => "f32",
+            FloatTy::F64 => "f64",
+        };
+    }
+}
+
+/// The kind of an array type.
+#[derive(Eq, Hash, Debug)]
+pub enum ArrKind {
+    /// `[T; N]`: inline, fixed length.
+    Fixed(u64),
+    /// `[T; _]` whose length is still being inferred (variable id).
+    FixedVar(u32),
+    /// `[T]`: sized at construction, then frozen. Owns a data stack.
+    Dyn,
+    /// `[T; ..+]`: grow-only. Owns a data stack.
+    Grow,
+    /// `[T; -..+]`: grows and shrinks. Owns a data stack.
+    Shrink,
+    /// `[T; &]`
+    Slice,
+    /// `[T; &mut]`
+    SliceMut,
+}
+
+impl ArrKind {
+    /// Owning arrays live on their own data stack and are move-only.
+    pub fn is_owner(self): bool {
+        return match self {
+            ArrKind::Dyn | ArrKind::Grow | ArrKind::Shrink => true,
+            _ => false,
+        };
+    }
+
+    pub fn is_slice(self): bool {
+        return match self {
+            ArrKind::Slice | ArrKind::SliceMut => true,
+            _ => false,
+        };
+    }
+
+    pub fn is_fixed(self): bool {
+        return match self {
+            ArrKind::Fixed(_) | ArrKind::FixedVar(_) => true,
+            _ => false,
+        };
+    }
+}
+
+/// A type: a handle into `Types`.
+#[derive(Eq, Hash, Debug)]
+pub struct Ty {
+    index: u32,
+}
+
+impl Ty {
+    pub fn index(self): usize {
+        return self.index as usize;
+    }
+}
+
+/// An interned list of types.
+pub type TyList = List::<Ty>;
+
+/// The parameter modes of a function pointer type, two bits per parameter
+/// (`Take` 0, `Borrow` 1, `InOut` 2), first parameter lowest.
+#[derive(Eq, Hash, Debug)]
+pub struct Modes {
+    pub bits: u64,
+}
+
+impl Modes {
+    pub fn of(modes: [ParamMode; &]): Modes {
+        let mut bits: u64 = 0;
+        let mut i: u64 = 0;
+        for m in modes {
+            let v: u64 = match m {
+                ParamMode::Take => 0,
+                ParamMode::Borrow => 1,
+                ParamMode::InOut => 2,
+            };
+            bits = bits | (v << (2 * i));
+            i += 1;
+        }
+        return Modes { bits };
+    }
+
+    pub fn get(self, i: usize): ParamMode {
+        return match (self.bits >> (2 * i as u64)) & 3 {
+            1 => ParamMode::Borrow,
+            2 => ParamMode::InOut,
+            _ => ParamMode::Take,
+        };
+    }
+}
+
+#[derive(Eq, Hash, Debug)]
+pub enum TyKind {
+    Int(IntTy),
+    Float(FloatTy),
+    Bool,
+    Char,
+    /// UTF-8 view (pointer + length).
+    Str,
+    /// Owned UTF-8 text; laid out exactly like `[u8; -..+]`.
+    String,
+    /// Implicitly built from a string literal; parameter-only.
+    FmtArgs,
+    /// `()` is the empty tuple.
+    Tuple(TyList),
+    /// Struct or enum instance.
+    Adt(DefId, TyList),
+    Array(Ty, ArrKind),
+    /// `+T` parameter marker: the argument only grows.
+    Grow(Ty),
+    /// `*T` / `*mut T`.
+    Ptr(Ty, bool),
+    /// `fn(A, &B, &mut C): R`: parameter types, their modes, return type.
+    FnPtr(TyList, Modes, Ty),
+    /// The type of one closure expression (its function definition), with
+    /// the generic arguments of the function it is written in.
+    Closure(DefId, TyList),
+    /// `impl Trait` number `idx` in the return type of function `def`.
+    Opaque(DefId, u32, TyList),
+    /// Generic parameter number `idx` of the enclosing item.
+    Param(u32, Symbol),
+    /// Inference variable.
+    Infer(u32),
+    Never,
+    /// Produced after an error; unifies with anything.
+    Error,
+}
+
+/// A reference to a trait with its generic arguments (excluding `Self`).
+#[derive(Eq, Hash, Debug)]
+pub struct TraitRef {
+    pub trait_id: DefId,
+    pub args: TyList,
+}
+
+/// Rebuilds types bottom-up: `Types::fold` calls `fold_ty` on each node
+/// after folding its children.
+pub trait Folder {
+    fn fold_ty(&mut self, types: &mut +Types, t: Ty): Ty;
+}
+
+/// The type interner.
+pub struct Types {
+    kinds: [TyKind; ..+],
+    kind_hashes: [u64; ..+],
+    /// Open addressing: kind index + 1 per slot (0 = empty).
+    kind_table: [u32; ..+],
+    /// Every interned list's items, end to end.
+    items: [Ty; ..+],
+    lists: [TyList; ..+],
+    list_hashes: [u64; ..+],
+    list_table: [u32; ..+],
+}
+
+impl Types {
+    pub fn new(): Types {
+        return Types { kinds: [], kind_hashes: [], kind_table: [], items: [], lists: [], list_hashes: [], list_table: [] };
+    }
+
+    // ----------------------------------------------------------- interning
+
+    /// The type of kind `k`.
+    pub fn mk(&mut +self, k: TyKind): Ty {
+        let h = hash_of(&k);
+        if self.kind_table.len() > 0 {
+            let mask = self.kind_table.len() - 1;
+            let mut i = (h as usize) & mask;
+            loop {
+                let e = self.kind_table[i];
+                if e == 0 {
+                    break;
+                }
+                let at = (e - 1) as usize;
+                if self.kind_hashes[at] == h && self.kinds[at] == k {
+                    return Ty { index: at as u32 };
+                }
+                i = (i + 1) & mask;
+            }
+        }
+        let index = self.kinds.len() as u32;
+        self.kinds.push(k);
+        self.kind_hashes.push(h);
+        if self.kinds.len() * 4 > self.kind_table.len() * 3 {
+            self.grow_kinds();
+        } else {
+            place(&mut self.kind_table, h, index);
+        }
+        return Ty { index };
+    }
+
+    fn grow_kinds(&mut +self) {
+        let n = self.kind_table.len();
+        let cap = if n == 0 { 64 } else { n * 2 };
+        for i in 0..n {
+            self.kind_table[i] = 0;
+        }
+        while self.kind_table.len() < cap {
+            self.kind_table.push(0);
+        }
+        for i in 0..self.kinds.len() {
+            let h = self.kind_hashes[i];
+            place(&mut self.kind_table, h, i as u32);
+        }
+    }
+
+    /// The interned list of `tys`.
+    pub fn mk_list(&mut +self, tys: [Ty; &]): TyList {
+        if tys.len() == 0 {
+            return List::empty();
+        }
+        let h = hash_of(&tys);
+        if self.list_table.len() > 0 {
+            let mask = self.list_table.len() - 1;
+            let mut i = (h as usize) & mask;
+            loop {
+                let e = self.list_table[i];
+                if e == 0 {
+                    break;
+                }
+                let at = (e - 1) as usize;
+                if self.list_hashes[at] == h && same_tys(self.list(self.lists[at]), tys) {
+                    return self.lists[at];
+                }
+                i = (i + 1) & mask;
+            }
+        }
+        let start = self.items.len();
+        self.items.extend(tys);
+        let l: TyList = List::from_parts(start, tys.len());
+        let index = self.lists.len() as u32;
+        self.lists.push(l);
+        self.list_hashes.push(h);
+        if self.lists.len() * 4 > self.list_table.len() * 3 {
+            self.grow_lists();
+        } else {
+            place(&mut self.list_table, h, index);
+        }
+        return l;
+    }
+
+    fn grow_lists(&mut +self) {
+        let n = self.list_table.len();
+        let cap = if n == 0 { 64 } else { n * 2 };
+        for i in 0..n {
+            self.list_table[i] = 0;
+        }
+        while self.list_table.len() < cap {
+            self.list_table.push(0);
+        }
+        for i in 0..self.lists.len() {
+            let h = self.list_hashes[i];
+            place(&mut self.list_table, h, i as u32);
+        }
+    }
+
+    // ----------------------------------------------------------- reading
+
+    pub fn kind(&self, t: Ty): TyKind {
+        return self.kinds[t.index as usize];
+    }
+
+    /// The types of an interned list.
+    pub fn list(&self, l: TyList): [Ty; &] {
+        let start = l.start();
+        return self.items[start..start + l.len()];
+    }
+
+    pub fn at(&self, l: TyList, i: usize): Ty {
+        return self.list(l)[i];
+    }
+
+    // ----------------------------------------------------------- common types
+
+    pub fn int(&mut +self, i: IntTy): Ty {
+        return self.mk(TyKind::Int(i));
+    }
+
+    pub fn usize(&mut +self): Ty {
+        return self.mk(TyKind::Int(IntTy::Usize));
+    }
+
+    pub fn bool(&mut +self): Ty {
+        return self.mk(TyKind::Bool);
+    }
+
+    pub fn unit(&mut +self): Ty {
+        return self.mk(TyKind::Tuple(List::empty()));
+    }
+
+    pub fn never(&mut +self): Ty {
+        return self.mk(TyKind::Never);
+    }
+
+    pub fn error(&mut +self): Ty {
+        return self.mk(TyKind::Error);
+    }
+
+    pub fn str(&mut +self): Ty {
+        return self.mk(TyKind::Str);
+    }
+
+    pub fn tuple(&mut +self, tys: [Ty; &]): Ty {
+        let l = self.mk_list(tys);
+        return self.mk(TyKind::Tuple(l));
+    }
+
+    pub fn adt(&mut +self, def: DefId, args: TyList): Ty {
+        return self.mk(TyKind::Adt(def, args));
+    }
+
+    pub fn array(&mut +self, elem: Ty, k: ArrKind): Ty {
+        return self.mk(TyKind::Array(elem, k));
+    }
+
+    pub fn ptr(&mut +self, t: Ty, mutable: bool): Ty {
+        return self.mk(TyKind::Ptr(t, mutable));
+    }
+
+    pub fn infer(&mut +self, v: u32): Ty {
+        return self.mk(TyKind::Infer(v));
+    }
+
+    // ----------------------------------------------------------- queries
+
+    pub fn is_unit(&self, t: Ty): bool {
+        return match self.kind(t) {
+            TyKind::Tuple(l) => l.len() == 0,
+            _ => false,
+        };
+    }
+
+    pub fn is_error(&self, t: Ty): bool {
+        return match self.kind(t) {
+            TyKind::Error => true,
+            _ => false,
+        };
+    }
+
+    pub fn is_never(&self, t: Ty): bool {
+        return match self.kind(t) {
+            TyKind::Never => true,
+            _ => false,
+        };
+    }
+
+    pub fn is_integral(&self, t: Ty): bool {
+        return match self.kind(t) {
+            TyKind::Int(_) => true,
+            _ => false,
+        };
+    }
+
+    pub fn is_numeric(&self, t: Ty): bool {
+        return match self.kind(t) {
+            TyKind::Int(_) | TyKind::Float(_) => true,
+            _ => false,
+        };
+    }
+
+    pub fn is_primitive_scalar(&self, t: Ty): bool {
+        return match self.kind(t) {
+            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char => true,
+            _ => false,
+        };
+    }
+
+    /// `T` for `+T`, else `t`.
+    pub fn strip_grow(&self, t: Ty): Ty {
+        return match self.kind(t) {
+            TyKind::Grow(inner) => inner,
+            _ => t,
+        };
+    }
+
+    /// Whether `f` holds for `t` or any type inside it.
+    pub fn any::<F: Fn(TyKind): bool>(&self, t: Ty, f: &F): bool {
+        let k = self.kind(t);
+        if f(k) {
+            return true;
+        }
+        return match k {
+            TyKind::Tuple(l) => self.any_in(l, f),
+            TyKind::Adt(_, l) => self.any_in(l, f),
+            TyKind::Closure(_, l) => self.any_in(l, f),
+            TyKind::Opaque(_, _, l) => self.any_in(l, f),
+            TyKind::Array(e, _) => self.any(e, f),
+            TyKind::Grow(e) => self.any(e, f),
+            TyKind::Ptr(e, _) => self.any(e, f),
+            TyKind::FnPtr(ps, _, r) => self.any_in(ps, f) || self.any(r, f),
+            _ => false,
+        };
+    }
+
+    pub fn any_in::<F: Fn(TyKind): bool>(&self, l: TyList, f: &F): bool {
+        for t in self.list(l) {
+            if self.any(t, f) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn has_params(&self, t: Ty): bool {
+        return self.any(t, &|k| match k {
+            TyKind::Param(..) => true,
+            _ => false,
+        });
+    }
+
+    pub fn has_infer(&self, t: Ty): bool {
+        return self.any(t, &|k| match k {
+            TyKind::Infer(_) | TyKind::Array(_, ArrKind::FixedVar(_)) => true,
+            _ => false,
+        });
+    }
+
+    pub fn has_error(&self, t: Ty): bool {
+        return self.any(t, &|k| match k {
+            TyKind::Error => true,
+            _ => false,
+        });
+    }
+
+    // ----------------------------------------------------------- rebuilding
+
+    /// `t` rebuilt bottom-up by `f` (see `Folder`).
+    pub fn fold::<F: Folder>(&mut +self, t: Ty, f: &mut F): Ty {
+        let rebuilt = match self.kind(t) {
+            TyKind::Tuple(l) => {
+                let l2 = self.fold_list(l, f);
+                if l2 == l { t } else { self.mk(TyKind::Tuple(l2)) }
+            }
+            TyKind::Adt(d, l) => {
+                let l2 = self.fold_list(l, f);
+                if l2 == l { t } else { self.mk(TyKind::Adt(d, l2)) }
+            }
+            TyKind::Closure(d, l) => {
+                let l2 = self.fold_list(l, f);
+                if l2 == l { t } else { self.mk(TyKind::Closure(d, l2)) }
+            }
+            TyKind::Opaque(d, i, l) => {
+                let l2 = self.fold_list(l, f);
+                if l2 == l { t } else { self.mk(TyKind::Opaque(d, i, l2)) }
+            }
+            TyKind::Array(e, k) => {
+                let e2 = self.fold(e, f);
+                if e2 == e { t } else { self.mk(TyKind::Array(e2, k)) }
+            }
+            TyKind::Grow(e) => {
+                let e2 = self.fold(e, f);
+                if e2 == e { t } else { self.mk(TyKind::Grow(e2)) }
+            }
+            TyKind::Ptr(e, m) => {
+                let e2 = self.fold(e, f);
+                if e2 == e { t } else { self.mk(TyKind::Ptr(e2, m)) }
+            }
+            TyKind::FnPtr(ps, modes, r) => {
+                let ps2 = self.fold_list(ps, f);
+                let r2 = self.fold(r, f);
+                if ps2 == ps && r2 == r { t } else { self.mk(TyKind::FnPtr(ps2, modes, r2)) }
+            }
+            _ => t,
+        };
+        return f.fold_ty(self, rebuilt);
+    }
+
+    pub fn fold_list::<F: Folder>(&mut +self, l: TyList, f: &mut F): TyList {
+        if l.len() == 0 {
+            return l;
+        }
+        let mut out: [Ty; ..+] = [];
+        let mut same = true;
+        for i in 0..l.len() {
+            let t = self.at(l, i);
+            let t2 = self.fold(t, f);
+            same = same && t2 == t;
+            out.push(t2);
+        }
+        if same {
+            return l;
+        }
+        return self.mk_list(out[..]);
+    }
+
+    /// `t` with generic parameter `i` replaced by `args[i]`.
+    pub fn subst(&mut +self, t: Ty, args: TyList): Ty {
+        if args.len() == 0 || !self.has_params(t) {
+            return t;
+        }
+        let mut s = Subst { args };
+        return self.fold(t, &mut s);
+    }
+
+    pub fn subst_list(&mut +self, l: TyList, args: TyList): TyList {
+        if args.len() == 0 {
+            return l;
+        }
+        let mut s = Subst { args };
+        return self.fold_list(l, &mut s);
+    }
+
+    pub fn subst_trait_ref(&mut +self, tr: TraitRef, args: TyList): TraitRef {
+        return TraitRef { trait_id: tr.trait_id, args: self.subst_list(tr.args, args) };
+    }
+}
+
+/// Replaces generic parameters by index.
+struct Subst {
+    args: TyList,
+}
+
+impl Folder for Subst {
+    fn fold_ty(&mut self, types: &mut +Types, t: Ty): Ty {
+        return match types.kind(t) {
+            TyKind::Param(i, _) => if (i as usize) < self.args.len() { types.at(self.args, i as usize) } else { t },
+            _ => t,
+        };
+    }
+}
+
+fn same_tys(a: [Ty; &], b: [Ty; &]): bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Put entry `index` (hash `h`) in the first free slot of `table`.
+fn place(table: &mut +[u32; ..+], h: u64, index: u32) {
+    let mask = table.len() - 1;
+    let mut i = (h as usize) & mask;
+    while table[i] != 0 {
+        i = (i + 1) & mask;
+    }
+    table[i] = index + 1;
+}

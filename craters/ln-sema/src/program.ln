@@ -1,0 +1,663 @@
+// The analyzed program handed to code generation: a port of `Program` and
+// friends from crates/ln-sema/src/lib.rs, plus the source map
+// (crates/ln-diag/src/source.rs).
+//
+// Spans are global byte offsets: every file's text sits end to end in
+// `SourceMap::text` (which only grows, so views into it stay valid), and a
+// span's file is the one whose range contains it. Macro expansions are
+// files too.
+
+use core::arena::{Arena, Id, List};
+use core::collections::HashMap;
+use core::intern::Symbol;
+use crater::defs::*;
+use crater::diag::Diags;
+use crater::thir::{Body, ClosureKind, LocalId, Thir};
+use crater::ty::*;
+use ln_ast::{Ast, Ident, ParamMode, Span};
+
+// ===================================================================== sources
+
+pub struct SourceFile {
+    /// The path (or, for an expansion, a description).
+    pub name: Symbol,
+    /// Where its text starts in `SourceMap::text`.
+    pub start: u32,
+    pub len: u32,
+    /// For a macro expansion: where the macro was invoked.
+    pub expansion_site: Option::<Span>,
+}
+
+pub struct SourceMap {
+    pub text: String,
+    pub files: [SourceFile; ..+],
+}
+
+impl SourceMap {
+    pub fn new(): SourceMap {
+        return SourceMap { text: String::new(), files: [] };
+    }
+
+    /// Add a file: its index and the offset of its first byte. A NUL byte
+    /// separates files, so a span's end never touches the next file.
+    pub fn add(&mut +self, name: Symbol, text: str, expansion_site: Option::<Span>): (u32, u32) {
+        let start = self.text.len() as u32;
+        self.text.push_str(text);
+        self.text.push('\0');
+        let index = self.files.len() as u32;
+        self.files.push(SourceFile { name, start, len: text.len() as u32, expansion_site });
+        return (index, start);
+    }
+
+    /// The text of file `i`.
+    pub fn file_text(&self, i: u32): str {
+        let f = self.files[i as usize];
+        return self.text.as_str()[f.start as usize..(f.start + f.len) as usize];
+    }
+
+    /// The file containing offset `pos`.
+    pub fn file_of(&self, pos: u32): u32 {
+        // Binary search over the start offsets.
+        let mut lo: usize = 0;
+        let mut hi = self.files.len();
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if self.files[mid].start <= pos {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo as u32;
+    }
+
+    /// The source text of a span.
+    pub fn snippet(&self, s: Span): str {
+        return self.text.as_str()[s.lo as usize..s.hi as usize];
+    }
+
+    /// 1-based line and column of `pos` in its file.
+    pub fn line_col(&self, pos: u32): (u32, u32) {
+        let f = self.files[self.file_of(pos) as usize];
+        let bytes = self.text.as_bytes();
+        let mut line: u32 = 1;
+        let mut col: u32 = 1;
+        let mut i = f.start as usize;
+        while i < pos as usize {
+            if bytes[i] == b'\n' {
+                line += 1;
+                col = 1;
+            } else if bytes[i] < 128 || bytes[i] >= 192 {
+                col += 1;
+            }
+            i += 1;
+        }
+        return (line, col);
+    }
+}
+
+// ===================================================================== closures and opaques
+
+/// A closure is compiled to a function whose leading parameters are its
+/// captures (in this order), followed by its own parameters. Its value is
+/// a struct of the captures: a pointer for each borrowed one, the value for
+/// each one it took.
+pub struct ClosureInfo {
+    /// The function the closure is written in; the closure has its generics.
+    pub parent: DefId,
+    pub captures: List::<Capture>,
+    pub kind: ClosureKind,
+}
+
+pub struct Capture {
+    pub name: Symbol,
+    /// The captured variable's type (in terms of the parent's generics).
+    pub ty: Ty,
+    /// Kept as a pointer to the variable, rather than moved or copied in.
+    pub by_ref: bool,
+    /// How the body uses it, which is the mode of its parameter: read
+    /// (`Borrow`), changed (`InOut`) or consumed (`Take`).
+    pub mode: ParamMode,
+}
+
+/// An `impl Trait` in a function's return type.
+pub struct OpaqueInfo {
+    /// What callers know about it (in terms of the function's generics).
+    pub bounds: List::<TraitRef>,
+    /// The type the function's body returns there, once checked.
+    pub concrete: Option::<Ty>,
+    pub span: Span,
+}
+
+/// A crater root and the name it is known by.
+pub struct CraterRoot {
+    pub name: Symbol,
+    pub def: DefId,
+}
+
+/// A resolved name occurrence, for editor tooling.
+pub enum RefTarget {
+    Def(DefId),
+    Field { adt: DefId, variant: u32, field: u32 },
+    Local { body: DefId, local: LocalId },
+    TyParam(Span),
+}
+
+pub struct Ref {
+    pub span: Span,
+    pub target: RefTarget,
+}
+
+// ===================================================================== the program
+
+pub struct Program {
+    /// Every file's syntax (and macro expansions'), with the shared name
+    /// interner `ast.names`.
+    pub ast: Ast,
+    pub sources: SourceMap,
+    pub types: Types,
+    pub defs: [DefInfo; ..+],
+    /// Every name bound in a module.
+    pub bindings: HashMap::<BindKey, Binding>,
+    pub globs: [Glob; ..+],
+    /// An impl's methods: (impl, name) to the method.
+    pub impl_methods: HashMap::<(DefId, Symbol), DefId>,
+    pub thir: Thir,
+    pub bodies: HashMap::<DefId, Body>,
+    /// Lang items (`#[lang = "..."]`) by name.
+    pub lang: HashMap::<Symbol, DefId>,
+    pub crate_roots: [CraterRoot; ..+],
+    pub impls: [DefId; ..+],
+    pub main: Option::<DefId>,
+    pub tests: [DefId; ..+],
+    pub refs: [Ref; ..+],
+    pub closures: HashMap::<DefId, ClosureInfo>,
+    pub opaques: HashMap::<(DefId, u32), OpaqueInfo>,
+    /// Native libraries to link (`#[link(name = "...")]`).
+    pub link_libs: [Symbol; ..+],
+    pub diags: Diags,
+
+    // ----- list arenas for the definitions -----
+    pub symbols: Arena::<Symbol>,
+    pub preds: Arena::<Pred>,
+    pub params: Arena::<Param>,
+    pub fields: Arena::<FieldDef>,
+    pub variants: Arena::<VariantDef>,
+    pub trait_refs: Arena::<TraitRef>,
+    pub trait_methods: Arena::<TraitMethod>,
+    pub consts: Arena::<ConstVal>,
+    pub idents: Arena::<Ident>,
+    pub captures: Arena::<Capture>,
+}
+
+impl Program {
+    pub fn new(): Program {
+        return Program {
+            ast: Ast::new(),
+            sources: SourceMap::new(),
+            types: Types::new(),
+            defs: [],
+            bindings: HashMap::new(),
+            globs: [],
+            impl_methods: HashMap::new(),
+            thir: Thir::new(),
+            bodies: HashMap::new(),
+            lang: HashMap::new(),
+            crate_roots: [],
+            impls: [],
+            main: None,
+            tests: [],
+            refs: [],
+            closures: HashMap::new(),
+            opaques: HashMap::new(),
+            link_libs: [],
+            diags: Diags::new(),
+            symbols: Arena::new(),
+            preds: Arena::new(),
+            params: Arena::new(),
+            fields: Arena::new(),
+            variants: Arena::new(),
+            trait_refs: Arena::new(),
+            trait_methods: Arena::new(),
+            consts: Arena::new(),
+            idents: Arena::new(),
+            captures: Arena::new(),
+        };
+    }
+
+    // ----------------------------------------------------------- names
+
+    /// The interned symbol of `s`.
+    pub fn sym(&mut +self, s: str): Symbol {
+        return self.ast.names.intern(s);
+    }
+
+    /// The text of a symbol.
+    pub fn text(&self, s: Symbol): str {
+        return self.ast.names.resolve(s);
+    }
+
+    // ----------------------------------------------------------- definitions
+
+    pub fn def(&self, id: DefId): DefInfo {
+        return self.defs[id.index()];
+    }
+
+    pub fn name(&self, id: DefId): str {
+        return self.text(self.defs[id.index()].name);
+    }
+
+    pub fn fn_data(&self, id: DefId): FnData {
+        return match self.defs[id.index()].data {
+            DefData::Fn(f) => f,
+            _ => panic("not a fn: {self.name(id)}"),
+        };
+    }
+
+    pub fn adt(&self, id: DefId): AdtData {
+        return match self.defs[id.index()].data {
+            DefData::Adt(a) => a,
+            _ => panic("not an adt: {self.name(id)}"),
+        };
+    }
+
+    pub fn trait_data(&self, id: DefId): TraitData {
+        return match self.defs[id.index()].data {
+            DefData::Trait(t) => t,
+            _ => panic("not a trait: {self.name(id)}"),
+        };
+    }
+
+    pub fn impl_data(&self, id: DefId): ImplData {
+        return match self.defs[id.index()].data {
+            DefData::Impl(i) => i,
+            _ => panic("not an impl: {self.name(id)}"),
+        };
+    }
+
+    pub fn mod_data(&self, id: DefId): ModData {
+        return match self.defs[id.index()].data {
+            DefData::Mod(m) => m,
+            _ => panic("not a module: {self.name(id)}"),
+        };
+    }
+
+    pub fn is_enum(&self, id: DefId): bool {
+        return self.defs[id.index()].kind == DefKind::Enum;
+    }
+
+    /// The parameters of function `id`.
+    pub fn fn_params(&self, id: DefId): [Param; &] {
+        return self.params.list(self.fn_data(id).sig.params);
+    }
+
+    pub fn variants_of(&self, adt: AdtData): [VariantDef; &] {
+        return self.variants.list(adt.variants);
+    }
+
+    pub fn fields_of(&self, v: VariantDef): [FieldDef; &] {
+        return self.fields.list(v.fields);
+    }
+
+    /// A struct's fields.
+    pub fn struct_fields(&self, id: DefId): [FieldDef; &] {
+        let a = self.adt(id);
+        return self.fields.list(self.variants.list(a.variants)[0].fields);
+    }
+
+    /// The method `name` of impl `imp`.
+    pub fn impl_method(&self, imp: DefId, name: Symbol): Option::<DefId> {
+        return self.impl_methods.get((imp, name));
+    }
+
+    /// The binding of `name` in namespace `ns` of `module`.
+    pub fn binding(&self, module: DefId, ns: Ns, name: Symbol): Option::<Binding> {
+        return self.bindings.get(BindKey { module, ns, name });
+    }
+
+    /// Whether parameter `index` of function `def` is passed as a pointer
+    /// to the caller's place: in-out (`&mut T`) and borrowed (`&T`)
+    /// parameters of Lunar functions. Intrinsics and `extern` functions
+    /// take values.
+    pub fn param_by_ref(&self, def: DefId, index: usize): bool {
+        let fd = self.fn_data(def);
+        let ps = self.params.list(fd.sig.params);
+        if index >= ps.len() {
+            return false;
+        }
+        let p = ps[index];
+        if p.inout {
+            return true;
+        }
+        return p.mode == ParamMode::Borrow && fd.abi == Abi::Lunar && !self.defs[def.index()].attrs.intrinsic;
+    }
+
+    pub fn lang_item(&self, name: str): Option::<DefId> {
+        return match self.ast.names.get(name) {
+            Some(s) => self.lang.get(s),
+            None => None,
+        };
+    }
+
+    /// The `#[lang]` name of `id`, if it is a lang item.
+    pub fn lang_name(&self, id: DefId): Option::<str> {
+        return match self.defs[id.index()].attrs.lang {
+            Some(s) => Some(self.text(s)),
+            None => None,
+        };
+    }
+
+    pub fn is_lang(&self, id: DefId, name: str): bool {
+        return match self.lang_name(id) {
+            Some(n) => n == name,
+            None => false,
+        };
+    }
+
+    // ----------------------------------------------------------- closures and opaques
+
+    /// The fields of a closure's value, for closure `def` instantiated with
+    /// `args`: a pointer per borrowed capture, the value otherwise.
+    pub fn closure_fields(&mut +self, def: DefId, args: TyList): TyList {
+        let c = match self.closures.get(def) {
+            Some(c) => c,
+            None => return List::empty(),
+        };
+        let mut out: [Ty; ..+] = [];
+        for i in 0..c.captures.len() {
+            let cap = self.captures.list(c.captures)[i];
+            let t = self.types.subst(cap.ty, args);
+            if cap.by_ref {
+                out.push(self.types.ptr(t, cap.mode == ParamMode::InOut));
+            } else {
+                out.push(t);
+            }
+        }
+        return self.types.mk_list(out[..]);
+    }
+
+    /// The signature `fn(params): ret` a closure is called with (without
+    /// its captures), for closure `def` instantiated with `args`.
+    pub fn closure_sig(&mut +self, def: DefId, args: TyList): Ty {
+        let fd = self.fn_data(def);
+        let n = match self.closures.get(def) {
+            Some(c) => c.captures.len(),
+            None => 0,
+        };
+        let mut tys: [Ty; ..+] = [];
+        let mut modes: [ParamMode; ..+] = [];
+        let ps = fd.sig.params;
+        for i in n..ps.len() {
+            let p = self.params.list(ps)[i];
+            tys.push(self.types.subst(p.ty, args));
+            modes.push(p.mode);
+        }
+        let l = self.types.mk_list(tys[..]);
+        let r = self.types.subst(fd.sig.ret, args);
+        return self.types.mk(TyKind::FnPtr(l, Modes::of(modes[..]), r));
+    }
+
+    /// What is known about an `impl Trait` type: its bounds, as predicates
+    /// on it (into `out`).
+    pub fn opaque_preds(&mut +self, def: DefId, idx: u32, args: TyList, out: &mut +[Pred; ..+]) {
+        let o = match self.opaques.get((def, idx)) {
+            Some(o) => o,
+            None => return,
+        };
+        let ty = self.types.mk(TyKind::Opaque(def, idx, args));
+        for i in 0..o.bounds.len() {
+            let b = self.trait_refs.list(o.bounds)[i];
+            let tr = self.types.subst_trait_ref(b, args);
+            out.push(Pred { ty, trait_ref: tr, span: o.span });
+        }
+    }
+
+    /// `t` with every `impl Trait` replaced by the type it stands for (for
+    /// code generation, after the functions returning them are checked).
+    pub fn reveal(&mut +self, t: Ty): Ty {
+        let mut t = t;
+        for _ in 0..32 {
+            let has = self.types.any(t, &|k| match k {
+                TyKind::Opaque(..) => true,
+                _ => false,
+            });
+            if !has {
+                break;
+            }
+            t = self.reveal_once(t);
+        }
+        return t;
+    }
+
+    fn reveal_once(&mut +self, t: Ty): Ty {
+        let mut list: [(DefId, u32, Ty); ..+] = [];
+        for e in self.opaques.iter() {
+            let ((d, i), o) = e;
+            if let Some(c) = o.concrete {
+                list.push((d, i, c));
+            }
+        }
+        let mut f = RevealFolder { concrete: list[..] };
+        return self.types.fold(t, &mut f);
+    }
+
+    // ----------------------------------------------------------- display
+
+    /// `t` as written in source: `[i32; ..+]`, `Option::<str>`.
+    pub fn ty_str(&mut +self, t: Ty): String {
+        let mut out = String::new();
+        self.write_ty(&mut out, t);
+        return out;
+    }
+
+    pub fn write_ty(&mut +self, out: &mut +String, t: Ty) {
+        match self.types.kind(t) {
+            TyKind::Int(i) => out.push_str(i.name()),
+            TyKind::Float(x) => out.push_str(x.name()),
+            TyKind::Bool => out.push_str("bool"),
+            TyKind::Char => out.push_str("char"),
+            TyKind::Str => out.push_str("str"),
+            TyKind::String => out.push_str("String"),
+            TyKind::FmtArgs => out.push_str("FmtArgs"),
+            TyKind::Tuple(l) => {
+                out.push('(');
+                self.write_list(out, l);
+                if l.len() == 1 {
+                    out.push(',');
+                }
+                out.push(')');
+            }
+            TyKind::Adt(id, args) => {
+                out.push_str(self.name(id));
+                if args.len() > 0 {
+                    out.push_str("::<");
+                    self.write_list(out, args);
+                    out.push('>');
+                }
+            }
+            TyKind::Array(e, k) => {
+                out.push('[');
+                self.write_ty(out, e);
+                match k {
+                    ArrKind::Fixed(n) => out.write("; {n}]"),
+                    ArrKind::FixedVar(_) => out.push_str("; _]"),
+                    ArrKind::Dyn => out.push(']'),
+                    ArrKind::Grow => out.push_str("; ..+]"),
+                    ArrKind::Shrink => out.push_str("; -..+]"),
+                    ArrKind::Slice => out.push_str("; &]"),
+                    ArrKind::SliceMut => out.push_str("; &mut]"),
+                }
+            }
+            TyKind::Grow(e) => {
+                out.push('+');
+                self.write_ty(out, e);
+            }
+            TyKind::Ptr(e, m) => {
+                out.push_str(if m { "*mut " } else { "*" });
+                self.write_ty(out, e);
+            }
+            TyKind::FnPtr(ps, modes, r) => {
+                out.push_str("fn(");
+                for i in 0..ps.len() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    match modes.get(i) {
+                        ParamMode::Borrow => out.push('&'),
+                        ParamMode::InOut => out.push_str("&mut "),
+                        ParamMode::Take => {}
+                    }
+                    self.write_ty(out, self.types.at(ps, i));
+                }
+                out.push(')');
+                if !self.types.is_unit(r) {
+                    out.push_str(": ");
+                    self.write_ty(out, r);
+                }
+            }
+            TyKind::Closure(..) => out.push_str("{closure}"),
+            TyKind::Opaque(def, i, args) => {
+                let mut preds: [Pred; ..+] = [];
+                self.opaque_preds(def, i, args, &mut preds);
+                out.push_str("impl ");
+                for j in 0..preds.len() {
+                    if j > 0 {
+                        out.push_str(" + ");
+                    }
+                    self.write_trait_ref(out, preds[j].trait_ref);
+                }
+            }
+            TyKind::Param(_, n) => out.push_str(self.text(n)),
+            TyKind::Infer(_) => out.push('_'),
+            TyKind::Never => out.push('!'),
+            TyKind::Error => out.push_str("{error}"),
+        }
+    }
+
+    fn write_list(&mut +self, out: &mut +String, l: TyList) {
+        for i in 0..l.len() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            self.write_ty(out, self.types.at(l, i));
+        }
+    }
+
+    /// A trait with its arguments, as written in a bound: `Iterator::<i32>`,
+    /// or with the `Fn` sugar, `Fn(i32): bool`.
+    pub fn write_trait_ref(&mut +self, out: &mut +String, tr: TraitRef) {
+        out.push_str(self.name(tr.trait_id));
+        if tr.args.len() == 0 {
+            return;
+        }
+        let fn_like = match self.lang_name(tr.trait_id) {
+            Some(n) => ClosureKind::from_lang(n).is_some(),
+            None => false,
+        };
+        let first = self.types.at(tr.args, 0);
+        if fn_like && tr.args.len() == 1 {
+            if let TyKind::FnPtr(..) = self.types.kind(first) {
+                // `fn(i32): bool` without the `fn`.
+                let s = self.ty_str(first);
+                out.push_str(s.as_str()[2..]);
+                return;
+            }
+        }
+        out.push_str("::<");
+        self.write_list(out, tr.args);
+        out.push('>');
+    }
+
+    pub fn trait_ref_str(&mut +self, tr: TraitRef): String {
+        let mut out = String::new();
+        self.write_trait_ref(&mut out, tr);
+        return out;
+    }
+
+    /// Fully qualified display path of an item, e.g. `std::io::println`.
+    pub fn path_of(&mut +self, id: DefId): String {
+        let d = self.defs[id.index()];
+        let mut out = String::new();
+        match d.kind {
+            DefKind::Mod => {
+                let md = self.mod_data(id);
+                match md.parent {
+                    Some(p) => {
+                        out.push_str(self.path_of(p).as_str());
+                        if !md.is_block {
+                            out.push_str("::");
+                            out.push_str(self.text(d.name));
+                        }
+                    }
+                    None => out.push_str(self.text(d.name)),
+                }
+            }
+            DefKind::Variant => {
+                let p = match d.parent {
+                    Some(p) => p,
+                    None => d.module,
+                };
+                out.push_str(self.path_of(p).as_str());
+                out.push_str("::");
+                out.push_str(self.text(d.name));
+            }
+            DefKind::Fn if d.parent.is_some() => {
+                let parent = match d.parent {
+                    Some(p) => p,
+                    None => d.module,
+                };
+                if self.defs[parent.index()].kind == DefKind::Impl {
+                    let i = self.impl_data(parent);
+                    let s = self.ty_str(i.self_ty);
+                    out.push_str(s.as_str());
+                } else {
+                    out.push_str(self.path_of(parent).as_str());
+                }
+                out.push_str("::");
+                out.push_str(self.text(d.name));
+            }
+            _ => {
+                out.push_str(self.path_of(d.module).as_str());
+                out.push_str("::");
+                out.push_str(self.text(d.name));
+            }
+        }
+        return out;
+    }
+
+    /// Where `span` is in code the user wrote: spans inside macro
+    /// expansions map to the invocation (repeatedly, for nested ones).
+    pub fn source_span(&self, span: Span): Span {
+        let mut s = span;
+        for _ in 0..64 {
+            let f = self.sources.files[self.sources.file_of(s.lo) as usize];
+            match f.expansion_site {
+                Some(site) => s = site,
+                None => return s,
+            }
+        }
+        return s;
+    }
+}
+
+/// Replaces `impl Trait` types by the types behind them.
+struct RevealFolder {
+    concrete: [(DefId, u32, Ty); &],
+}
+
+impl crater::ty::Folder for RevealFolder {
+    fn fold_ty(&mut self, types: &mut +Types, t: Ty): Ty {
+        return match types.kind(t) {
+            TyKind::Opaque(d, i, args) => {
+                for c in self.concrete {
+                    let (cd, ci, ct) = c;
+                    if cd == d && ci == i {
+                        return types.subst(ct, args);
+                    }
+                }
+                types.error()
+            }
+            _ => t,
+        };
+    }
+}

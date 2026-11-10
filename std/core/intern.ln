@@ -13,6 +13,11 @@ impl Symbol {
     pub fn index(self): usize {
         return self.index as usize;
     }
+
+    /// The symbol with index `i` (of whichever interner made it).
+    pub fn from_index(i: usize): Symbol {
+        return Symbol { index: i as u32 };
+    }
 }
 
 impl Eq for Symbol {

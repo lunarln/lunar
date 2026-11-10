@@ -1,0 +1,8 @@
+[package]
+name = "ln-sema"
+version = "0.1.0"
+
+[dependencies]
+ln-ast = { path = "../ln-ast" }
+ln-parser = { path = "../ln-parser" }
+ln-lexer = { path = "../ln-lexer" }

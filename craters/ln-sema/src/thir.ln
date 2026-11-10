@@ -1,0 +1,370 @@
+// Typed intermediate representation produced by type checking: a port of
+// crates/ln-sema/src/thir.rs.
+//
+// Every node lives in an arena of the program's `Thir` (`exprs`, `pats`,
+// `blocks`, ...) and refers to its children by `Id`; lists of children are
+// `List`s of ids. A body's locals are a `List` of `Local`s.
+//
+// Places (locals, fields, indexes, derefs) are explicit and every use of a
+// place as a value goes through `ExprKind::Read`, which records whether the
+// read copies, moves, or merely borrows (passes a handle to a callee).
+
+use core::arena::{Arena, Id, List};
+use core::intern::Symbol;
+use crater::defs::{ConstVal, DefId};
+use crater::ty::{Ty, TyList, TraitRef};
+use ln_ast::{BinOp, UnOp, FmtSpec, Span};
+
+#[derive(Eq, Hash, Debug, Ord)]
+pub struct LocalId {
+    pub index: u32,
+}
+
+impl LocalId {
+    pub fn new(index: usize): LocalId {
+        return LocalId { index: index as u32 };
+    }
+
+    pub fn index(self): usize {
+        return self.index as usize;
+    }
+}
+
+#[derive(Eq, Hash, Debug)]
+pub struct LoopId {
+    pub index: u32,
+}
+
+#[derive(Eq, Hash, Debug)]
+pub enum LocalKind {
+    /// Function parameter number `index`. `owned`: the function took
+    /// ownership (`x: T`). `grow`: declared `&mut +T`.
+    Param { index: u32, inout: bool, grow: bool, owned: bool },
+    /// `let` binding or pattern binding.
+    Let,
+    /// Compiler temporary.
+    Temp,
+}
+
+pub struct Local {
+    pub name: Symbol,
+    pub ty: Ty,
+    pub mutable: bool,
+    pub kind: LocalKind,
+    pub span: Span,
+    /// Lexical block depth (params are 0, the body block is 1).
+    pub depth: u32,
+}
+
+pub struct Body {
+    pub def: DefId,
+    pub locals: List::<Local>,
+    pub params: List::<LocalId>,
+    pub block: Id::<Block>,
+    pub span: Span,
+}
+
+pub struct Block {
+    pub stmts: List::<Stmt>,
+    pub tail: Option::<Id::<Expr>>,
+    /// Locals introduced directly in this block, in declaration order
+    /// (dropped in reverse at block exit).
+    pub locals: List::<LocalId>,
+    pub span: Span,
+}
+
+pub enum Stmt {
+    Let { pat: Id::<Pat>, init: Option::<Id::<Expr>>, span: Span },
+    Expr(Id::<Expr>),
+}
+
+pub struct Expr {
+    pub kind: ExprKind,
+    pub ty: Ty,
+    pub span: Span,
+}
+
+#[derive(Eq, Hash, Debug)]
+pub enum ReadMode {
+    /// Bitwise copy of a Light (or otherwise copyable) value.
+    Copy,
+    /// Ownership transfer; the source becomes invalid.
+    Move,
+    /// Pass an owner's handle to a callee without transferring ownership.
+    Borrow,
+}
+
+/// What calling a closure may do to its captures (`Fn` < `FnMut` <
+/// `FnOnce`).
+#[derive(Eq, Hash, Debug, Ord)]
+pub enum ClosureKind {
+    Fn,
+    FnMut,
+    FnOnce,
+}
+
+impl ClosureKind {
+    pub fn lang(self): str {
+        return match self {
+            ClosureKind::Fn => "fn",
+            ClosureKind::FnMut => "fn_mut",
+            ClosureKind::FnOnce => "fn_once",
+        };
+    }
+
+    pub fn from_lang(name: str): Option::<ClosureKind> {
+        if name == "fn" {
+            return Some(ClosureKind::Fn);
+        }
+        if name == "fn_mut" {
+            return Some(ClosureKind::FnMut);
+        }
+        if name == "fn_once" {
+            return Some(ClosureKind::FnOnce);
+        }
+        return None;
+    }
+}
+
+pub enum Callee {
+    /// A known function instantiated with `args` (all generic params,
+    /// parent first).
+    Fn { def: DefId, args: TyList },
+    /// A trait method resolved at monomorphization time from `self_ty`.
+    Trait { trait_ref: TraitRef, self_ty: Ty, method: Symbol, method_args: TyList },
+    /// A compiler intrinsic (`def` is its `#[intrinsic]` declaration).
+    Intrinsic { def: DefId, name: Symbol, args: TyList },
+    /// Call through a function pointer.
+    Indirect(Id::<Expr>),
+    /// Call a value whose type implements an `Fn` trait. `callee` is a
+    /// place (borrowed for `Fn`, changed for `FnMut`), or for `FnOnce` a
+    /// read that consumes it.
+    Value { callee: Id::<Expr>, kind: ClosureKind },
+}
+
+pub enum Arg {
+    /// By-value (or by-handle for owners) argument.
+    Value(Id::<Expr>),
+    /// In-out: a mutable place passed by reference.
+    InOut(Id::<Expr>),
+}
+
+impl Arg {
+    pub fn expr(self): Id::<Expr> {
+        return match self {
+            Arg::Value(e) => e,
+            Arg::InOut(e) => e,
+        };
+    }
+}
+
+pub enum FmtPiece {
+    Text(Symbol),
+    /// A value, shown with `Display` or (for `{x:?}`) `Debug`.
+    Arg(Id::<Expr>, FmtSpec),
+}
+
+#[derive(Eq, Hash, Debug)]
+pub enum Coercion {
+    /// `!` to any type.
+    NeverToAny,
+    /// Whole array place (fixed or owner) viewed as a slice.
+    ToSlice { mutable: bool },
+    /// `[T; &mut]` to `[T; &]`, `*mut T` to `*T` (no-op at run time).
+    Weaken,
+    /// `String` to `str` view.
+    StringToStr,
+    /// Function item to function pointer.
+    FnToPtr,
+}
+
+pub struct Arm {
+    pub pat: Id::<Pat>,
+    pub guard: Option::<Id::<Expr>>,
+    pub body: Id::<Expr>,
+}
+
+/// A field initializer of an ADT literal, or a field sub-pattern.
+pub struct FieldExpr {
+    pub field: u32,
+    pub expr: Id::<Expr>,
+}
+
+pub struct FieldPat {
+    pub field: u32,
+    pub pat: Id::<Pat>,
+}
+
+pub enum ExprKind {
+    // ----- places -----
+    Local(LocalId),
+    Static(DefId),
+    /// Field of a struct, tuple, or (inside a matched pattern) enum variant.
+    Field { base: Id::<Expr>, variant: u32, field: u32 },
+    /// Bounds-checked element of an array, slice or owner.
+    Index { base: Id::<Expr>, index: Id::<Expr> },
+    /// `*p` on a raw pointer.
+    Deref(Id::<Expr>),
+    /// A value materialized into a temporary so it can be used as a place.
+    Temp(Id::<Expr>),
+
+    // ----- values -----
+    Read { place: Id::<Expr>, mode: ReadMode },
+    Lit(ConstVal),
+    FnRef { def: DefId, args: TyList },
+    Call { callee: Callee, args: List::<Arg> },
+    Unary(UnOp, Id::<Expr>),
+    /// Primitive arithmetic/comparison; operands have the same primitive
+    /// type.
+    Binary(BinOp, Id::<Expr>, Id::<Expr>),
+    /// Short-circuiting `&&` (`and`) / `||`.
+    Logical { and: bool, lhs: Id::<Expr>, rhs: Id::<Expr> },
+    Cast(Id::<Expr>),
+    Assign { place: Id::<Expr>, value: Id::<Expr> },
+    /// Primitive compound assignment.
+    AssignOp { op: BinOp, place: Id::<Expr>, value: Id::<Expr> },
+    Tuple(List::<Id::<Expr>>),
+    Adt { def: DefId, args: TyList, variant: u32, fields: List::<FieldExpr> },
+    /// Array literal; the array kind comes from `ty`.
+    Array(List::<Id::<Expr>>),
+    /// `[value; count]`; `count` is a usize expression.
+    ArrayRepeat { value: Id::<Expr>, count: Id::<Expr> },
+    /// `base[start..end]` producing a slice / str view.
+    Slice { base: Id::<Expr>, start: Option::<Id::<Expr>>, end: Option::<Id::<Expr>>, inclusive: bool, mutable: bool },
+    Block(Id::<Block>),
+    If { cond: Id::<Expr>, then: Id::<Expr>, else_: Option::<Id::<Expr>> },
+    Match { scrut: Id::<Expr>, arms: List::<Arm> },
+    Loop { body: Id::<Block>, id: LoopId },
+    While { cond: Id::<Expr>, body: Id::<Block>, id: LoopId },
+    /// `for var in start..end` over integers.
+    ForRange { var: LocalId, start: Id::<Expr>, end: Id::<Expr>, inclusive: bool, body: Id::<Block>, id: LoopId },
+    /// `for pat in array` (by-value elements of an array place).
+    ForArray { pat: Id::<Pat>, array: Id::<Expr>, index: LocalId, body: Id::<Block>, id: LoopId },
+    Break { id: LoopId, value: Option::<Id::<Expr>> },
+    Continue { id: LoopId },
+    Return(Option::<Id::<Expr>>),
+    Coerce { kind: Coercion, expr: Id::<Expr> },
+    /// A string literal converted to `FmtArgs`.
+    FmtArgs(List::<FmtPiece>),
+    /// A closure value: one entry per capture (see `ClosureInfo`).
+    Closure { def: DefId, captures: List::<Arg> },
+    /// Placeholder for an expression that failed to type-check.
+    Error,
+}
+
+pub struct Pat {
+    pub kind: PatKind,
+    pub ty: Ty,
+    pub span: Span,
+}
+
+pub enum PatKind {
+    Wild,
+    Binding { local: LocalId, mode: ReadMode, sub: Option::<Id::<Pat>> },
+    Lit(ConstVal),
+    Range { lo: ConstVal, hi: ConstVal, inclusive: bool },
+    Tuple(List::<Id::<Pat>>),
+    /// Struct or enum variant with field sub-patterns.
+    Adt { def: DefId, variant: u32, fields: List::<FieldPat> },
+    Or(List::<Id::<Pat>>),
+}
+
+/// The arenas holding every body's typed tree.
+pub struct Thir {
+    pub exprs: Arena::<Expr>,
+    pub expr_ids: Arena::<Id::<Expr>>,
+    pub pats: Arena::<Pat>,
+    pub pat_ids: Arena::<Id::<Pat>>,
+    pub blocks: Arena::<Block>,
+    pub stmts: Arena::<Stmt>,
+    pub locals: Arena::<Local>,
+    pub local_ids: Arena::<LocalId>,
+    pub args: Arena::<Arg>,
+    pub arms: Arena::<Arm>,
+    pub field_exprs: Arena::<FieldExpr>,
+    pub field_pats: Arena::<FieldPat>,
+    pub fmt_pieces: Arena::<FmtPiece>,
+}
+
+impl Thir {
+    pub fn new(): Thir {
+        return Thir {
+            exprs: Arena::new(),
+            expr_ids: Arena::new(),
+            pats: Arena::new(),
+            pat_ids: Arena::new(),
+            blocks: Arena::new(),
+            stmts: Arena::new(),
+            locals: Arena::new(),
+            local_ids: Arena::new(),
+            args: Arena::new(),
+            arms: Arena::new(),
+            field_exprs: Arena::new(),
+            field_pats: Arena::new(),
+            fmt_pieces: Arena::new(),
+        };
+    }
+
+    pub fn expr(&self, id: Id::<Expr>): Expr {
+        return self.exprs.get(id);
+    }
+
+    pub fn pat(&self, id: Id::<Pat>): Pat {
+        return self.pats.get(id);
+    }
+
+    pub fn block(&self, id: Id::<Block>): Block {
+        return self.blocks.get(id);
+    }
+
+    pub fn local(&self, body: Body, l: LocalId): Local {
+        return self.locals.list(body.locals)[l.index()];
+    }
+
+    pub fn is_place(&self, id: Id::<Expr>): bool {
+        return match self.exprs.get(id).kind {
+            ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Deref(_) | ExprKind::Temp(_) => true,
+            _ => false,
+        };
+    }
+
+    /// Whether the pattern matches every value of its type (`is_enum`
+    /// tells enums from structs).
+    pub fn is_irrefutable::<F: Fn(DefId): bool>(&self, p: Id::<Pat>, is_enum: &F): bool {
+        return match self.pats.get(p).kind {
+            PatKind::Wild => true,
+            PatKind::Binding { sub, .. } => match sub {
+                Some(s) => self.is_irrefutable(s, is_enum),
+                None => true,
+            },
+            PatKind::Lit(_) | PatKind::Range { .. } => false,
+            PatKind::Tuple(ps) => {
+                for q in self.pat_ids.list(ps) {
+                    if !self.is_irrefutable(q, is_enum) {
+                        return false;
+                    }
+                }
+                true
+            }
+            PatKind::Adt { def, fields, .. } => {
+                if is_enum(def) {
+                    return false;
+                }
+                for f in self.field_pats.list(fields) {
+                    if !self.is_irrefutable(f.pat, is_enum) {
+                        return false;
+                    }
+                }
+                true
+            }
+            PatKind::Or(ps) => {
+                for q in self.pat_ids.list(ps) {
+                    if self.is_irrefutable(q, is_enum) {
+                        return true;
+                    }
+                }
+                false
+            }
+        };
+    }
+}

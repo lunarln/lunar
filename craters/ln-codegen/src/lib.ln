@@ -1,0 +1,2 @@
+// Code generation for Lunar, written in Lunar: a port of the Rust
+// `ln-codegen` crate (crates/ln-codegen), calling LLVM through its C API.

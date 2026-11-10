@@ -12,6 +12,7 @@ use core::intern::{Interner, Symbol};
 use ln_lexer::Token;
 
 /// A byte range in the source file.
+#[derive(Eq, Hash, Debug)]
 pub struct Span {
     pub lo: u32,
     pub hi: u32,
@@ -40,6 +41,7 @@ pub struct Ident {
 
 // ===================================================================== macros
 
+#[derive(Eq, Hash, Debug)]
 pub enum Delim {
     Paren,
     Bracket,
@@ -134,6 +136,7 @@ pub struct FnDecl {
     pub sig_span: Span,
 }
 
+#[derive(Eq, Hash, Debug)]
 pub enum ParamMode {
     Take,
     Borrow,
@@ -375,6 +378,7 @@ impl BinOp {
     }
 }
 
+#[derive(Eq, Hash, Debug)]
 pub enum UnOp {
     Neg,
     Not,
@@ -485,6 +489,7 @@ pub enum FmtPiece {
     Hole(Id::<Expr>, FmtSpec),
 }
 
+#[derive(Eq, Hash, Debug)]
 pub enum FmtSpec {
     Show,
     Debugged,

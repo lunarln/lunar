@@ -1,0 +1,14 @@
+// Semantic analysis for Lunar, written in Lunar: a port of the Rust
+// `ln-sema` crate (crates/ln-sema). Name resolution, type checking, traits,
+// the `Dull` and `Light` auto traits, unsafe checking, and move/borrow
+// checking, producing a typed IR (`thir`) for code generation.
+//
+// The data model (`ty`, `defs`, `thir`, `program`, `diag`) is shared by the
+// passes; see craters/README.md for the state of the port.
+
+pub mod ty;
+pub mod defs;
+pub mod thir;
+pub mod diag;
+pub mod codes;
+pub mod program;

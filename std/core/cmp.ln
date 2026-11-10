@@ -61,6 +61,18 @@ impl Eq for Ordering {
     }
 }
 
+impl::<A: Eq, B: Eq> Eq for (A, B) {
+    fn eq(&self, other: &(A, B)): bool {
+        return self.0 == other.0 && self.1 == other.1;
+    }
+}
+
+impl::<A: Eq, B: Eq, C: Eq> Eq for (A, B, C) {
+    fn eq(&self, other: &(A, B, C)): bool {
+        return self.0 == other.0 && self.1 == other.1 && self.2 == other.2;
+    }
+}
+
 impl crater::fmt::Display for Ordering {
     fn fmt(&self, out: &mut String) {
         out.push_str(match self {
