@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/WorriedArrow/lunar"
+repository = "https://github.com/lunarc1/lunar"
 
 [workspace.dependencies]
 ln-ast = { path = "./crates/ln-ast" }

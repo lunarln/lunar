@@ -1,6 +1,6 @@
 # Lunar for VS Code
 
-Language support for [Lunar](https://github.com/WorriedArrow/lunar):
+Language support for [Lunar](https://github.com/lunarc1/lunar):
 
 * Syntax highlighting for `.ln` files (and ```` ```lunar ```` blocks in Markdown).
 * Diagnostics as you type, with the scoped codes (`err(borrow::shrink_while_borrowed)`).
