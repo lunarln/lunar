@@ -7,3 +7,4 @@ ln-lexer = { path = "../ln-lexer" }
 ln-ast = { path = "../ln-ast" }
 ln-parser = { path = "../ln-parser" }
 ln-sema = { path = "../ln-sema" }
+ln-codegen = { path = "../ln-codegen" }

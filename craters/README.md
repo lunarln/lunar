@@ -1,29 +1,51 @@
 # The Lunar compiler, in Lunar
 
-A port of the Rust compiler (`crates/`) to Lunar, one stage at a time. It is
-a Lunar workspace, built with `lunar build` from this directory. The goal is
-a fully self-hosted compiler: `lunarc`, built from this workspace by the
-Rust `lunar`, rebuilds this workspace into an identical compiler.
+The Rust compiler (`crates/`) ported to Lunar. It is a Lunar workspace,
+built with `lunar build` from this directory, and it is self-hosted: the
+compiler built from it by the Rust `lunar` compiles it again into a
+compiler that compiles it into the very same executable.
+
+## Building and bootstrapping
+
+The code generator calls LLVM's C API, so linking needs the directory of
+LLVM's shared library in `$LUNAR_LIB_PATH` (`LLVM-C.lib` on Windows,
+`libLLVM` elsewhere); on Windows `LLVM-C.dll` must also be on `PATH` at run
+time. The compiler reads `core` and `std` from `$LUNAR_STD_DIR`.
+
+```sh
+cd craters
+export LUNAR_LIB_PATH="C:/Program Files/LLVM/lib"   # or `llvm-config --libdir`
+export LUNAR_STD_DIR=../std
+lunar build --release                                # stage 1, by the Rust compiler
+target/release/ln-driver build ln-driver -o stage2   # stage 2, by stage 1
+./stage2 build ln-driver -o stage3                   # stage 3, by stage 2
+cmp stage2 stage3                                    # identical
+```
+
+`ln-driver build [--release] [--test] [-o OUT] [--emit-llvm FILE] [PATH]`
+compiles `PATH`, a `.ln` file or a package directory (default `.`), with
+the libraries its `lunar.toml` names. Diagnostics are the Rust compiler's
+codes and messages in a plainer layout (`ln-sema/src/render.ln`).
 
 | Crater       | Port of            | State |
 |--------------|--------------------|-------|
 | `ln-lexer`   | `crates/ln-lexer`  | complete |
 | `ln-ast`     | `crates/ln-ast`    | the syntax tree, in arenas (`core::arena`): every `Box` is an `Id`, every `Vec` a `List`, names and strings are interned |
 | `ln-parser`  | `crates/ln-parser` and `crates/ln-parse-kit` | complete: source files (`parse_file`, and `parse_file_into` a shared `Ast` with global offsets), macro expansions (`parse_expansion`, `parse_fragment`), hygiene contexts on identifiers and tokens |
-| `ln-sema`    | `crates/ln-sema` and `crates/ln-diag` | data model done (`ty`, `defs`, `thir`, `program`, `diag`, `codes`); passes in progress (see below) |
-| `ln-codegen` | `crates/ln-codegen` | ported (LLVM through its C API, `llvm.ln`, `#[link(name = "LLVM-C")]`); tested on hand-built programs (`lunar test` in `ln-codegen`) |
-| `ln-driver`  | (test driver, then `lunarc`) | `ln-driver FILE...` prints tokens, `ln-driver --parse FILE...` the syntax tree and syntax errors, `ln-driver --check FILE` the front end's diagnostics (with `core` and `std` from `$LUNAR_STD_DIR`; `LN_EXPANSIONS=1` also prints every macro expansion) |
+| `ln-sema`    | `crates/ln-sema` and `crates/ln-diag` | complete (see below) |
+| `ln-codegen` | `crates/ln-codegen` | complete (LLVM through its C API, `llvm.ln`) |
+| `ln-driver`  | `crates/ln-driver` (the build path) | `ln-driver build` (above); also `ln-driver FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--craters DIR` the craters a package build loads |
 
-## The port of the rest
+## The passes
 
 | Part | Rust source | Lunar file(s) | State |
 |------|-------------|---------------|-------|
 | front end | `loader.rs`, `expand.rs`, `collect.rs`, `resolve.rs`, `lower.rs`, parser expansion parsing | `ln-sema/src/{sema,loader,expand,collect,resolve,lower}.ln` | done; same diagnostics as Rust on tests/ui, tests/run, examples |
 | traits, layout | `traits.rs`, `layout.rs` | `ln-sema/src/{traits,layout}.ln` | done (unit checks in `tests.ln`) |
 | borrow checker | `borrowck.rs` | `ln-sema/src/borrowck.ln` | done (unit checks on hand-built THIR in `tests.ln`) |
-| type checker | `typeck/*.rs` | `ln-sema/src/typeck/{mod,expr,call,pat,closure}.ln` | ported |
+| type checker | `typeck/*.rs` | `ln-sema/src/typeck/{mod,expr,call,pat,closure}.ln` | done; Rust's `FnCtx` is the `Sema::fcx` field |
 | code generation | `crates/ln-codegen` | `ln-codegen/src/{lib,func,ops,init,llvm}.ln` | done; the state of the function being lowered (Rust's `FnCg`) lives in `Cg` |
-| driver | `crates/ln-driver` (build path only) | `ln-driver/src/main.ln` (`lunarc`) | after the passes |
+| driver | `crates/ln-driver` (build path) | `ln-driver/src/{main,project,link}.ln` | done; std is read from disk, not embedded |
 
 ### Data model
 
@@ -72,7 +94,14 @@ every `.ln` file in the repository:
   span and message);
 * `parser_matches_rust_parser_on_broken_programs`: the same, for every
   program cut off a third and two thirds of the way through, which
-  exercises error recovery.
+  exercises error recovery;
+* `compiler_builds_itself`: the bootstrap above; stages 2 and 3 must have
+  the same LLVM IR and the same bytes (on Windows the link is reproducible
+  through `/Brepro`).
+
+Programs compiled by the Lunar compiler pass every run test
+(`tests/run`, `examples`), and `--check` reports the Rust compiler's
+codes at the same positions on `tests/ui`.
 
 ## Differences from the Rust parser
 

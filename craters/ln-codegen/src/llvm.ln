@@ -67,7 +67,16 @@ pub const GLOBAL_UNNAMED_ADDR: u32 = 2;
 /// `LLVMAttributeFunctionIndex` (`~0U`).
 pub const ATTRIBUTE_FUNCTION_INDEX: u32 = 4294967295;
 
+// The C API is its own library on Windows (`LLVM-C.dll`) and part of
+// `libLLVM` elsewhere. The directory it is in goes in `$LUNAR_LIB_PATH`.
+#[cfg(windows)]
 #[link(name = "LLVM-C")]
+extern "C" {}
+
+#[cfg(unix)]
+#[link(name = "LLVM")]
+extern "C" {}
+
 extern "C" {
     // ----- messages -----
     pub fn LLVMDisposeMessage(msg: *mut u8);

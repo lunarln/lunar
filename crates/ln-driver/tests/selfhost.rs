@@ -1,9 +1,11 @@
 //! The compiler written in Lunar (`craters/`) against the Rust one: built
 //! with `lunar`, run over every `.ln` file in the repository, and compared
 //! stage by stage: the lexer's tokens, then the parser's syntax trees and
-//! syntax errors.
+//! syntax errors. Then the bootstrap: it compiles itself, and the compiler
+//! that makes compiles itself into the same executable.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -38,6 +40,22 @@ fn all_files(root: &Path) -> Vec<String> {
     files
 }
 
+/// Where LLVM's shared library is, for linking `craters/` (whose code
+/// generator calls LLVM's C API): `$LUNAR_LIB_PATH` if set, else the LLVM
+/// the Rust compiler was built with.
+fn llvm_lib_path() -> Option<OsString> {
+    if let Some(p) = std::env::var_os("LUNAR_LIB_PATH") {
+        return Some(p);
+    }
+    if cfg!(windows) {
+        let prefix = std::env::var_os("LLVM_SYS_201_PREFIX").map_or_else(|| PathBuf::from(r"C:\Program Files\LLVM"), PathBuf::from);
+        return Some(prefix.join("lib").into_os_string());
+    }
+    let config = std::env::var("LLVM_CONFIG").unwrap_or_else(|_| "llvm-config".into());
+    let out = Command::new(config).arg("--libdir").output().ok()?;
+    Some(String::from_utf8(out.stdout).ok()?.trim().into())
+}
+
 /// `craters/` built once (with this checkout's `lunar`), for every test.
 fn driver() -> &'static Path {
     static EXE: OnceLock<PathBuf> = OnceLock::new();
@@ -49,6 +67,7 @@ fn driver() -> &'static Path {
             .current_dir(&craters)
             .env("LUNAR_HOME", &home)
             .env_remove("LUNAR_STD_DIR")
+            .envs(llvm_lib_path().map(|p| ("LUNAR_LIB_PATH", p)))
             .output()
             .unwrap();
         assert!(build.status.success(), "building craters/:\n{}{}", String::from_utf8_lossy(&build.stdout), String::from_utf8_lossy(&build.stderr));
@@ -165,5 +184,50 @@ fn parser_matches_rust_parser_on_broken_programs() {
         }
     }
     compare_files(&dir, &files, &["--parse"], "parse", rust_tree);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The standard library's directory, for `$LUNAR_STD_DIR`: without
+/// `canonicalize`'s `\\?\`, under which Windows takes no `/` (and the
+/// driver appends `/core/lib.ln`).
+fn std_dir_of(root: &Path) -> String {
+    root.join("std").to_string_lossy().trim_start_matches(r"\\?\").to_string()
+}
+
+/// The bootstrap. Stage 1 is the Lunar compiler as built by the Rust one;
+/// stage 2 is what stage 1 makes of the compiler's source, and stage 3 what
+/// stage 2 makes of it. Stages 1 and 2 are the same program built by
+/// different compilers, so stages 2 and 3 must be identical: the same LLVM
+/// IR and the same bytes.
+#[test]
+fn compiler_builds_itself() {
+    let root = root();
+    let dir = std::env::temp_dir().join(format!("lunar-bootstrap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let std_dir = std_dir_of(&root);
+    let stage = |compiler: &Path, n: u32| -> (PathBuf, String) {
+        let exe = dir.join(format!("stage{n}{}", std::env::consts::EXE_SUFFIX));
+        let ll = dir.join(format!("stage{n}.ll"));
+        let out = Command::new(compiler)
+            .args(["build", "ln-driver", "-o"])
+            .arg(&exe)
+            .arg("--emit-llvm")
+            .arg(&ll)
+            .current_dir(root.join("craters"))
+            .env("LUNAR_STD_DIR", &std_dir)
+            .envs(llvm_lib_path().map(|p| ("LUNAR_LIB_PATH", p)))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "stage {n}:\n{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        (exe, std::fs::read_to_string(&ll).unwrap())
+    };
+    let (stage2, ir2) = stage(driver(), 2);
+    let (stage3, ir3) = stage(&stage2, 3);
+    if let Some((i, (a, b))) = ir2.lines().zip(ir3.lines()).enumerate().find(|(_, (a, b))| a != b) {
+        panic!("stages 2 and 3 differ at IR line {}:\n  {a}\n  {b}", i + 1);
+    }
+    assert_eq!(ir2.len(), ir3.len(), "stage 3's IR is a prefix of stage 2's, or the other way round");
+    assert!(std::fs::read(&stage2).unwrap() == std::fs::read(&stage3).unwrap(), "stages 2 and 3 have the same IR but link to different bytes");
     let _ = std::fs::remove_dir_all(&dir);
 }

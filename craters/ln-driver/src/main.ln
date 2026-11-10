@@ -11,6 +11,16 @@
 //                                 per line, `err(scope::name) line:col
 //                                 message`, then their labels, notes and
 //                                 helps indented
+//
+// and it is the compiler:
+//
+//     ln-driver build [--release] [--test] [-o OUT] [--emit-llvm FILE] [PATH]
+//                                 compile PATH (a `.ln` file, or a package
+//                                 directory with a `lunar.toml`; default
+//                                 `.`) and the craters it uses into an
+//                                 executable, with `core` and `std` from
+//                                 `$LUNAR_STD_DIR`. OUT defaults to the
+//                                 crater's name in the current directory.
 
 mod project;
 mod link;
@@ -18,11 +28,15 @@ mod link;
 use std::env;
 use std::fs;
 use ln_sema::diag::is_dummy;
-use ln_sema::loader::{Craters, load_crate};
+use ln_sema::loader::{CraterDep, Craters, load_crate};
 use ln_sema::program::Program;
+use ln_sema::render::render;
 use ln_sema::sema::{Options, analyze};
 
 fn main() {
+    if env::arg_count() > 1 && env::arg(1).unwrap() == "build" {
+        std::process::exit(build());
+    }
     if env::arg_count() > 2 && env::arg(1).unwrap() == "--craters" {
         list_craters(env::arg(2).unwrap());
         return;
@@ -58,6 +72,206 @@ fn main() {
         }
         i += 1;
     }
+}
+
+/// `build`: compile a file or a package into an executable. The exit code
+/// is 1 if it has errors, 2 for bad usage.
+fn build(): i32 {
+    let mut release = false;
+    let mut test = false;
+    let mut out: Option::<String> = None;
+    let mut emit_llvm: Option::<String> = None;
+    let mut target = String::from(".");
+    let mut i: usize = 2;
+    while i < env::arg_count() {
+        let a = env::arg(i).unwrap();
+        if a == "--release" {
+            release = true;
+        } else if a == "--test" {
+            test = true;
+        } else if (a == "-o" || a == "--emit-llvm") && i + 1 < env::arg_count() {
+            let v = String::from(env::arg(i + 1).unwrap());
+            if a == "-o" {
+                out = Some(v);
+            } else {
+                emit_llvm = Some(v);
+            }
+            i += 1;
+        } else if a.starts_with("-") {
+            eprintln("ln-driver: unknown option `{a}`");
+            return 2;
+        } else {
+            target = String::from(a);
+        }
+        i += 1;
+    }
+    let std_dir = match env::var("LUNAR_STD_DIR") {
+        Some(d) => d,
+        None => {
+            eprintln("ln-driver: build needs LUNAR_STD_DIR (the std directory)");
+            return 2;
+        }
+    };
+
+    // The craters: the one built first, then the libraries it uses.
+    let mut p = Program::new();
+    let mut cs = Craters::new();
+    let mut name = String::new();
+    if target.as_str().ends_with(".ln") {
+        name = crater_name(target.as_str());
+        match load_crate(&mut p, &mut cs, name.as_str(), target.as_str(), "") {
+            Some(c) => cs.list.push(c),
+            None => {
+                eprintln("err(build::io): could not read `{target}`");
+                return 1;
+            }
+        }
+    } else {
+        let mut proj = project::Project::new();
+        let pkg = proj.load_package(target.as_str());
+        for e in proj.errors {
+            eprintln("err(manifest): {proj.text(e)}");
+        }
+        let pkg = match pkg {
+            Some(k) => k,
+            None => return 1,
+        };
+        proj.craters(pkg, test);
+        if proj.errors.len() > 0 {
+            for e in proj.errors {
+                eprintln("err(manifest): {proj.text(e)}");
+            }
+            return 1;
+        }
+        name = String::from(proj.text(proj.specs[0].name));
+        for s in proj.specs {
+            let root = proj.text(s.root);
+            match load_crate(&mut p, &mut cs, proj.text(s.name), root, "") {
+                Some(c) => {
+                    let mut deps: [CraterDep; ..+] = [];
+                    for d in proj.crater_deps.list(s.deps) {
+                        deps.push(CraterDep { name: p.sym(proj.text(d.alias)), index: d.index });
+                    }
+                    let mut c = c;
+                    c.deps = cs.deps.add_list(deps[..]);
+                    cs.list.push(c);
+                }
+                None => {
+                    eprintln("err(build::io): could not read `{root}`");
+                    return 1;
+                }
+            }
+        }
+    }
+    if !load_std(&mut p, &mut cs, std_dir.as_str()) {
+        return 1;
+    }
+    if p.diags.has_errors() {
+        report(&p);
+        return 1;
+    }
+
+    let mut s = analyze(p, cs, Options::host(test));
+    report(&s.p);
+    if s.p.diags.has_errors() {
+        return 1;
+    }
+    if !test && s.p.main.is_none() {
+        eprintln("err(build::no_main): `{target}` has no `main` function");
+        return 1;
+    }
+
+    let out = match out {
+        Some(o) => o,
+        None => {
+            let mut o = String::from(name.as_str());
+            o.push_str(exe_suffix());
+            o
+        }
+    };
+    let mut obj = String::from(strip_exe(out.as_str()));
+    obj.push_str(obj_suffix());
+    let opts = ln_codegen::Options {
+        opt_level: if release { 2 } else { 0 },
+        test,
+        overflow_checks: !release,
+        emit_llvm,
+    };
+    match ln_codegen::compile(&mut s.p, opts, obj.as_str()) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln("err(build::llvm): {e}");
+            return 1;
+        }
+    }
+    let mut libs: [str; ..+] = [];
+    for l in s.p.link_libs {
+        libs.push(s.p.text(l));
+    }
+    let linked = link::link(obj.as_str(), out.as_str(), libs[..]);
+    let _ = fs::remove_file(obj.as_str());
+    return match linked {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln("err(build::link): {e}");
+            1
+        }
+    };
+}
+
+/// Load `core` and `std` from `std_dir`; false (after reporting it) if
+/// either is missing.
+fn load_std(p: &mut Program, cs: &mut +Craters, std_dir: str): bool {
+    let names = ["core", "std"];
+    for n in names {
+        let mut root = String::new();
+        root.write("{std_dir}/{n}/lib.ln");
+        match load_crate(p, cs, n, root.as_str(), "") {
+            Some(c) => cs.list.push(c),
+            None => {
+                eprintln("err(build::io): standard library crater `{n}` not found at {root}");
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Print the diagnostics to stderr.
+fn report(p: &Program) {
+    let mut out = String::new();
+    for d in p.diags.list {
+        render(p, d, &mut out);
+    }
+    eprint("{out}");
+}
+
+/// `path` without a trailing `.exe`.
+fn strip_exe(path: str): str {
+    if path.ends_with(".exe") {
+        return path[..path.len() - 4];
+    }
+    return path;
+}
+
+#[cfg(windows)]
+fn exe_suffix(): str {
+    return ".exe";
+}
+
+#[cfg(unix)]
+fn exe_suffix(): str {
+    return "";
+}
+
+#[cfg(windows)]
+fn obj_suffix(): str {
+    return ".obj";
+}
+
+#[cfg(unix)]
+fn obj_suffix(): str {
+    return ".o";
 }
 
 /// The craters a build of the package in `dir` analyzes (for checking the

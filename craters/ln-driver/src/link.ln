@@ -45,15 +45,20 @@ pub fn link(obj: str, out: str, libs: [str; &]): Result::<(), String> {
     for l in system_libs() {
         push_arg(&mut owned, &mut ranges, l);
     }
+    let cc = match env::var("LUNAR_CC") {
+        Some(c) => c,
+        None => {
+            for a in default_cc_args() {
+                push_arg(&mut owned, &mut ranges, a);
+            }
+            String::from(if is_windows() { "clang" } else { "cc" })
+        }
+    };
     let text = owned.as_str();
     for r in ranges {
         let (s, e) = r;
         args.push(text[s..e]);
     }
-    let cc = match env::var("LUNAR_CC") {
-        Some(c) => c,
-        None => String::from(if is_windows() { "clang" } else { "cc" }),
-    };
     return match process::run(cc.as_str(), args[..]) {
         Ok(0) => Ok(()),
         Ok(code) => {
@@ -105,6 +110,19 @@ fn path_sep(): str {
 #[cfg(windows)]
 fn system_libs(): [str; 2] {
     return ["-llegacy_stdio_definitions", "-lkernel32"];
+}
+
+/// Arguments for the default linker driver only. On Windows, `/Brepro`:
+/// no link timestamp, so the same program links to the same bytes (the
+/// bootstrap compares the compilers it builds).
+#[cfg(windows)]
+fn default_cc_args(): [str; 1] {
+    return ["-Wl,/Brepro"];
+}
+
+#[cfg(unix)]
+fn default_cc_args(): [str; 0] {
+    return [];
 }
 
 #[cfg(target_os = "linux")]

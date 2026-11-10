@@ -73,7 +73,9 @@ fn link_windows(obj: &Path, out: &Path, libs: &[String], search: &[PathBuf]) -> 
         for l in libs {
             cmd.arg(format!("-l{l}"));
         }
-        return run(cmd.args(["-llegacy_stdio_definitions", "-lkernel32"]));
+        // `/Brepro`: no link timestamp, so the same program links to the
+        // same bytes (the self-hosted compiler's bootstrap compares them).
+        return run(cmd.args(["-llegacy_stdio_definitions", "-lkernel32", "-Wl,/Brepro"]));
     }
     let target = if cfg!(target_arch = "aarch64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" };
     let Some(tool) = cc::windows_registry::find_tool(target, "link.exe") else {
@@ -85,6 +87,7 @@ fn link_windows(obj: &Path, out: &Path, libs: &[String], search: &[PathBuf]) -> 
         "libcmt.lib",
         "kernel32.lib",
         "legacy_stdio_definitions.lib",
+        "/Brepro",
     ]);
     for d in search {
         cmd.arg(format!("/LIBPATH:{}", d.display()));
