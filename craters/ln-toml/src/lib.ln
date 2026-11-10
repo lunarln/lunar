@@ -312,7 +312,7 @@ impl Parser {
         if byte(src, self.pos) != b']' || (array && byte(src, self.pos + 1) != b']') {
             let what = if array { "array of tables" } else { "table" };
             let close = if array { "]]" } else { "]" };
-            return Err(err("unclosed {what}, expected `{close}`", self.pos, self.pos + 1));
+            return Err(err("unclosed {what}, expected `{close}`", self.pos, self.pos));
         }
         self.pos += if array { 2 } else { 1 };
         let close = self.pos;

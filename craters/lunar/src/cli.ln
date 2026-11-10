@@ -451,7 +451,14 @@ pub fn parse(): Result::<Cli, i32> {
             if let Some(v) = inline {
                 let mut m = String::new();
                 m.write("unexpected value '{v}' for '--{o.long}' found; no more were expected");
-                return Err(usage_error(m.as_str(), usage(cmd), ""));
+                // clap's usage names the flag in place of `[OPTIONS]`.
+                let u = usage(cmd);
+                let mut line = String::new();
+                match u.find("[OPTIONS]") {
+                    Some(k) => line.write("{u[..k]}--{o.long}{u[k + 9..]}"),
+                    None => line.push_str(u),
+                }
+                return Err(usage_error(m.as_str(), line.as_str(), ""));
             }
             set_flag(&mut cli, o.long);
             continue;
