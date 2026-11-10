@@ -6,10 +6,17 @@
 //     ln-driver --parse FILE...   the syntax tree and syntax errors
 //                                 (`ln_ast::dump`, `ln_parser::dump_diags`)
 
+mod project;
+mod link;
+
 use std::env;
 use std::fs;
 
 fn main() {
+    if env::arg_count() > 2 && env::arg(1).unwrap() == "--craters" {
+        list_craters(env::arg(2).unwrap());
+        return;
+    }
     let mut i: usize = 1;
     let mut parse = false;
     if env::arg_count() > 1 && env::arg(1).unwrap() == "--parse" {
@@ -37,5 +44,27 @@ fn main() {
             }
         }
         i += 1;
+    }
+}
+
+/// The craters a build of the package in `dir` analyzes (for checking the
+/// project loader).
+fn list_craters(dir: str) {
+    let mut p = project::Project::new();
+    match p.load_package(dir) {
+        Some(pkg) => {
+            p.craters(pkg, false);
+            for s in p.specs {
+                print("{p.text(s.name)} {p.text(s.root)}");
+                for d in p.crater_deps.list(s.deps) {
+                    print(" {p.text(d.alias)}={d.index}");
+                }
+                println("");
+            }
+        }
+        None => {}
+    }
+    for e in p.errors {
+        eprintln("error: {p.text(e)}");
     }
 }

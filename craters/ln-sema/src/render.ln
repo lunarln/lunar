@@ -1,0 +1,102 @@
+// Rendering diagnostics as text (the Rust compiler uses ariadne; this is a
+// plainer layout with the same header):
+//
+//     err(type::mismatch): mismatched types
+//       --> src/main.ln:3:9
+//        |
+//      3 |     let x: i32 = "a";
+//        |                  ^^^ expected `i32`, found `str`
+//        = note: ...
+//        = help: ...
+
+use crater::diag::{Diag, Severity, is_dummy};
+use crater::program::Program;
+use ln_ast::Span;
+
+/// `d` as text, ending in a newline.
+pub fn render(p: &Program, d: Diag, out: &mut +String) {
+    let word = if d.severity == Severity::Error { "err" } else { "warn" };
+    out.write("{word}({d.code.scope}::{d.code.name}): {p.text(d.message)}\n");
+    if !is_dummy(d.span) {
+        let span = p.source_span(d.span);
+        let label = match d.label {
+            Some(l) => p.text(l),
+            None => "",
+        };
+        excerpt(p, span, label, true, out);
+        for l in p.diags.labels.list(d.labels) {
+            if !is_dummy(l.span) {
+                excerpt(p, p.source_span(l.span), p.text(l.message), false, out);
+            }
+        }
+    }
+    for n in p.diags.texts.list(d.notes) {
+        note(out, "note", p.text(n));
+    }
+    for h in p.diags.texts.list(d.helps) {
+        note(out, "help", p.text(h));
+    }
+}
+
+/// A `note:` or `help:` line; later lines of a multi-line text are
+/// indented under it.
+fn note(out: &mut +String, kind: str, text: str) {
+    let mut first = true;
+    for line in text.lines() {
+        if first {
+            out.write("   = {kind}: {line}\n");
+            first = false;
+        } else {
+            out.write("     {line}\n");
+        }
+    }
+}
+
+/// The file position, the source line, and a marker under the span.
+fn excerpt(p: &Program, span: Span, label: str, primary: bool, out: &mut +String) {
+    let file = p.sources.files[p.sources.file_of(span.lo) as usize];
+    let (line, col) = p.sources.line_col(span.lo);
+    out.write("  --> {p.text(file.name)}:{line}:{col}\n");
+    // The text of the line holding the span's start.
+    let text = p.sources.text.as_str();
+    let start = file.start as usize;
+    let end = (file.start + file.len) as usize;
+    let mut ls = span.lo as usize;
+    while ls > start && text.as_bytes()[ls - 1] != b'\n' {
+        ls -= 1;
+    }
+    let mut le = span.lo as usize;
+    while le < end && text.as_bytes()[le] != b'\n' && text.as_bytes()[le] != b'\r' {
+        le += 1;
+    }
+    let mut gutter = String::new();
+    gutter.write("{line}");
+    let pad = gutter.len();
+    spaces(out, pad + 1);
+    out.push_str("|\n");
+    out.write(" {line} | {text[ls..le]}\n");
+    spaces(out, pad + 1);
+    out.push_str("| ");
+    spaces(out, (col - 1) as usize);
+    let hi = if span.hi as usize > le { le } else { span.hi as usize };
+    let mut width: usize = 0;
+    for _ in text[span.lo as usize..if hi > span.lo as usize { hi } else { span.lo as usize }].chars() {
+        width += 1;
+    }
+    if width == 0 {
+        width = 1;
+    }
+    for _ in 0..width {
+        out.push(if primary { '^' } else { '-' });
+    }
+    if label.len() > 0 {
+        out.write(" {label}");
+    }
+    out.push('\n');
+}
+
+fn spaces(out: &mut +String, n: usize) {
+    for _ in 0..n {
+        out.push(' ');
+    }
+}

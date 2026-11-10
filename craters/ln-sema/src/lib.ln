@@ -12,3 +12,4 @@ pub mod thir;
 pub mod diag;
 pub mod codes;
 pub mod program;
+pub mod render;
