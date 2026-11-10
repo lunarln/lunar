@@ -567,7 +567,7 @@ impl Parser {
     /// A literal token (the current token).
     pub fn literal(&mut self): PResult::<Lit> {
         let t = self.bump();
-        let text = tok_text(self.src, t);
+        let text = tok_text(self.src, self.base, t);
         let sp = self.tok_span(t);
         let u8_suffix = self.intern("u8");
         let lit = match t.kind {

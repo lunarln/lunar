@@ -6,6 +6,17 @@ pub fn align_of::<T>(): usize {
     return crater::intrinsics::align_of::<T>();
 }
 
+/// Put `value` in `dest` and return what was there, for taking an owner
+/// out of an in-out place (which cannot be moved out of).
+pub fn replace::<T>(dest: &mut T, value: T): T {
+    unsafe {
+        let p = crater::intrinsics::addr_of_mut(dest);
+        let old = crater::intrinsics::ptr_read(p as *T);
+        crater::intrinsics::ptr_write(p, value);
+        return old;
+    }
+}
+
 /// Swap two Dull values in place.
 pub fn swap::<T: Dull>(a: &mut T, b: &mut T) {
     let t = a;
