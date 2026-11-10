@@ -9,6 +9,9 @@
 //!   on a data stack managed by the runtime (`ds_grow` / `ds_free`).
 //! * slices, `str`: `{ ptr, len }`; `FmtArgs`: `{ env, thunk }`.
 //! * enums: `{ i32 tag, [N x i64] payload }`.
+//!
+//! Aggregates of more than [`MEM_BYTES`] bytes live in memory (see
+//! [`Cg::in_memory`]); everything else is an LLVM value.
 
 mod func;
 mod init;
@@ -106,6 +109,10 @@ fn generate<T>(program: &Program, map: &SourceMap, opts: &Options, finish: impl 
     write_ir(&cg.module)?;
     finish(&cg.module, &tm)
 }
+
+/// Structs, enums, tuples, fixed arrays and closures bigger than this many
+/// bytes live in memory.
+pub(crate) const MEM_BYTES: u64 = 64;
 
 pub(crate) struct Cg<'ctx, 'p> {
     pub ctx: &'ctx Context,
@@ -247,10 +254,53 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         t.is_unit() || matches!(t, Ty::Never)
     }
 
+    /// Whether values of type `t` live in memory instead of being LLVM
+    /// values: structs, enums, tuples, fixed arrays and closures of more
+    /// than [`MEM_BYTES`] bytes. LLVM loads and stores a first-class
+    /// aggregate one element at a time (and its instruction selection
+    /// crashes on big ones), so such a value is always handled through its
+    /// address: the value of an expression is a pointer to memory holding
+    /// it, which its user may take over; copies are `llvm.memcpy`; a Lunar
+    /// function takes one as a pointer to a copy it owns and returns one
+    /// through a pointer to the caller's memory (the first parameter).
+    /// (`extern` functions only take and return scalars.)
+    pub fn in_memory(&mut self, t: &Ty) -> bool {
+        let l = self.llty(t);
+        matches!(l, BasicTypeEnum::StructType(_) | BasicTypeEnum::ArrayType(_)) && self.td.get_abi_size(&l) > MEM_BYTES
+    }
+
+    /// Copy the value of type `t` at `src` to `dst`.
+    pub fn copy_mem(&mut self, dst: PointerValue<'ctx>, src: PointerValue<'ctx>, t: &Ty) {
+        let size = self.size_of(t);
+        let align = self.align_of(t);
+        self.b.build_memcpy(dst, align, src, align, self.usize_ty().const_int(size, false)).unwrap();
+    }
+
+    /// An alloca in the entry block of `f`.
+    pub fn entry_alloca(&self, f: FunctionValue<'ctx>, ty: BasicTypeEnum<'ctx>, name: &str) -> PointerValue<'ctx> {
+        let entry = f.get_first_basic_block().unwrap();
+        let b = self.ctx.create_builder();
+        match entry.get_first_instruction() {
+            Some(i) => b.position_before(&i),
+            None => b.position_at_end(entry),
+        }
+        b.build_alloca(ty, name).unwrap()
+    }
+
     /// LLVM function type for a Lunar signature: `(type, passed by pointer)`.
+    /// Values that live in memory are passed by pointer too, and one
+    /// returned is written through a pointer passed first.
     pub fn fn_ty(&mut self, params: &[(Ty, bool)], ret: &Ty, variadic: bool) -> FunctionType<'ctx> {
-        let ps: Vec<BasicMetadataTypeEnum> = params.iter().map(|(t, by_ref)| if *by_ref { self.ptr_ty().into() } else { self.llty(t).into() }).collect();
-        if Self::is_void(ret) { self.ctx.void_type().fn_type(&ps, variadic) } else { self.llty(ret).fn_type(&ps, variadic) }
+        let sret = self.in_memory(ret);
+        let mut ps: Vec<BasicMetadataTypeEnum> = Vec::new();
+        if sret {
+            ps.push(self.ptr_ty().into());
+        }
+        for (t, by_ref) in params {
+            let pt = if *by_ref || self.in_memory(t) { self.ptr_ty().into() } else { self.llty(t).into() };
+            ps.push(pt);
+        }
+        if Self::is_void(ret) || sret { self.ctx.void_type().fn_type(&ps, variadic) } else { self.llty(ret).fn_type(&ps, variadic) }
     }
 
     // ===================================================================== functions
@@ -372,6 +422,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             (v, t) => return Err(format!("internal compiler error: unsupported constant {v:?} of type {}", self.p.ty_str(t))),
         })
+    }
+
+    /// A private global holding constant `v` of type `t`, for a value that
+    /// lives in memory.
+    pub fn const_global(&mut self, v: &ConstVal, t: &Ty) -> Result<PointerValue<'ctx>, String> {
+        let init = self.const_val(v, t)?;
+        let g = self.module.add_global(init.get_type(), None, ".const");
+        g.set_initializer(&init);
+        g.set_constant(true);
+        g.set_linkage(Linkage::Private);
+        g.set_unnamed_addr(true);
+        Ok(g.as_pointer_value())
     }
 
     pub fn static_ptr(&mut self, def: DefId) -> Result<PointerValue<'ctx>, String> {
