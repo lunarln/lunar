@@ -1,0 +1,76 @@
+// Character classes ariadne takes from Rust and the `unicode-width` crate:
+// Unicode whitespace, and how many terminal columns a character takes.
+
+/// Whether `c` is whitespace (Unicode's `White_Space`, as Rust's
+/// `char::is_whitespace`).
+pub fn is_whitespace(c: char): bool {
+    let cp = c as u32;
+    if cp < 128 {
+        return cp == 32 || (cp >= 9 && cp <= 13);
+    }
+    return cp == 0x85
+        || cp == 0xA0
+        || cp == 0x1680
+        || (cp >= 0x2000 && cp <= 0x200A)
+        || cp == 0x2028
+        || cp == 0x2029
+        || cp == 0x202F
+        || cp == 0x205F
+        || cp == 0x3000;
+}
+
+/// The number of terminal columns `c` takes: 0 for combining marks and
+/// other zero-width characters, 2 for wide (East Asian, emoji)
+/// characters, otherwise 1. `None` for control characters. (An
+/// approximation of `unicode-width`'s tables: the common ranges.)
+pub fn char_width(c: char): Option::<usize> {
+    let cp = c as u32;
+    if cp < 32 || (cp >= 0x7F && cp < 0xA0) {
+        return None;
+    }
+    if cp < 0x300 {
+        return Some(1);
+    }
+    if is_zero_width(cp) {
+        return Some(0);
+    }
+    if is_wide(cp) {
+        return Some(2);
+    }
+    return Some(1);
+}
+
+fn is_zero_width(cp: u32): bool {
+    return (cp >= 0x300 && cp <= 0x36F)
+        || (cp >= 0x483 && cp <= 0x489)
+        || (cp >= 0x591 && cp <= 0x5BD)
+        || (cp >= 0x610 && cp <= 0x61A)
+        || (cp >= 0x64B && cp <= 0x65F)
+        || (cp >= 0x1AB0 && cp <= 0x1AFF)
+        || (cp >= 0x1DC0 && cp <= 0x1DFF)
+        || (cp >= 0x200B && cp <= 0x200F)
+        || (cp >= 0x2060 && cp <= 0x2064)
+        || (cp >= 0x20D0 && cp <= 0x20FF)
+        || (cp >= 0xFE00 && cp <= 0xFE0F)
+        || (cp >= 0xFE20 && cp <= 0xFE2F)
+        || cp == 0xFEFF
+        || (cp >= 0xE0100 && cp <= 0xE01EF);
+}
+
+fn is_wide(cp: u32): bool {
+    return (cp >= 0x1100 && cp <= 0x115F)
+        || (cp >= 0x2E80 && cp <= 0x303E)
+        || (cp >= 0x3041 && cp <= 0x33FF)
+        || (cp >= 0x3400 && cp <= 0x4DBF)
+        || (cp >= 0x4E00 && cp <= 0x9FFF)
+        || (cp >= 0xA000 && cp <= 0xA4CF)
+        || (cp >= 0xAC00 && cp <= 0xD7A3)
+        || (cp >= 0xF900 && cp <= 0xFAFF)
+        || (cp >= 0xFE30 && cp <= 0xFE4F)
+        || (cp >= 0xFF00 && cp <= 0xFF60)
+        || (cp >= 0xFFE0 && cp <= 0xFFE6)
+        || (cp >= 0x1F300 && cp <= 0x1F64F)
+        || (cp >= 0x1F900 && cp <= 0x1F9FF)
+        || (cp >= 0x20000 && cp <= 0x2FFFD)
+        || (cp >= 0x30000 && cp <= 0x3FFFD);
+}

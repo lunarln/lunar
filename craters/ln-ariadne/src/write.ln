@@ -1,0 +1,905 @@
+// Writing a report: ariadne's `write.rs`, the layout algorithm, ported
+// line for line so that it draws exactly what ariadne draws (quirks
+// included: the location shown for a second group in the primary source
+// is the report's, line numbers in the margin ignore the display line
+// offset, a report without labels shows no notes or helps).
+//
+// Ariadne's labels are references, compared by address; here a label is
+// its index in `infos`, the labels of every source group in group order.
+
+use crater::{CharSet, Config, IndexType, Label, LabelAttach, Report, ReportKind};
+use crater::draw::{Characters, Out, Style};
+use crater::source::{Line, Sources, SrcId, decode, trim_end};
+use crater::width::is_whitespace;
+
+/// A label, located: its span in characters, whether it runs over more
+/// than one line, and its last line.
+struct LabelInfo {
+    src: SrcId,
+    multi: bool,
+    start: usize,
+    end: usize,
+    /// The index of the label in the report.
+    label: usize,
+    line: usize,
+}
+
+/// The labels of one source, shown in one frame section: `infos[first..
+/// first + len]`, spanning `start..end` (characters).
+struct Group {
+    src: SrcId,
+    start: usize,
+    end: usize,
+    first: usize,
+    len: usize,
+}
+
+/// A label drawn on one line: the column its arrow leaves from.
+struct LineLabel {
+    col: usize,
+    /// An index into `infos`.
+    label: usize,
+    multi: bool,
+    draw_msg: bool,
+}
+
+/// What drawing a group needs.
+struct Ctx {
+    draw: Characters,
+    config: Config,
+    /// The width of the line numbers.
+    width: usize,
+    src: SrcId,
+    infos: [LabelInfo; &],
+    labels: [Label; &],
+    /// The group's multi-line labels, longest first.
+    multi: [usize; &],
+    /// Those with a message.
+    mlwm: [usize; &],
+}
+
+fn last_offset(l: LabelInfo): usize {
+    let e = if l.end > 0 { l.end - 1 } else { 0 };
+    return if e > l.start { e } else { l.start };
+}
+
+fn span_len(l: LabelInfo): usize {
+    return if l.end > l.start { l.end - l.start } else { 0 };
+}
+
+fn span_contains(l: LabelInfo, x: usize): bool {
+    return l.start <= x && x < l.end;
+}
+
+fn min(a: usize, b: usize): usize {
+    return if a < b { a } else { b };
+}
+
+/// The number of characters in `b` (UTF-8).
+fn count_chars(b: [u8; &]): usize {
+    let mut n: usize = 0;
+    for c in b {
+        if c < 128 || c >= 192 {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// Write `report` onto `out`.
+pub fn write(r: &Report, srcs: &Sources, out: &mut +Out) {
+    let cfg = r.config;
+    let theme = cfg.theme;
+    let draw = if cfg.char_set == CharSet::Unicode { Characters::unicode() } else { Characters::ascii() };
+    let margin = Some(theme.margin);
+
+    // ----- the header -----
+    let kind_style = match r.kind {
+        ReportKind::Error => merge(theme.kind, theme.error),
+        ReportKind::Warning => merge(theme.kind, theme.warning),
+        ReportKind::Advice => merge(theme.kind, theme.advice),
+        ReportKind::Custom(_, c) => theme.kind.with_fg(c),
+    };
+    let mut id = String::new();
+    if let Some(code) = r.code {
+        id.push('[');
+        id.push_str(code);
+        if code.len() < 2 {
+            for _ in code.len()..2 {
+                id.push(' ');
+            }
+        }
+        id.push_str("] ");
+    }
+    id.push_str(r.kind.name());
+    id.push(':');
+    out.paint(Some(kind_style), id.as_str());
+    out.plain(" ");
+    if let Some(m) = r.msg {
+        paint_text(out, Some(theme.message), m);
+    }
+    out.newline();
+
+    let mut infos: [LabelInfo; -..+] = [];
+    let mut groups: [Group; -..+] = [];
+    source_groups(r, srcs, &mut infos, &mut groups);
+
+    // The width of the line numbers: the most digits any group needs.
+    let mut width: usize = 0;
+    for gi in 0..groups.len() {
+        let g = groups[gi];
+        let (_, past) = srcs.get_line_range(g.src, g.start, g.end);
+        let d = digits(past);
+        if d > width {
+            width = d;
+        }
+    }
+
+    // ----- the source sections -----
+    let none: [LineLabel; -..+] = [];
+    for gi in 0..groups.len() {
+        let g = groups[gi];
+        let src = g.src;
+        let (first, past) = srcs.get_line_range(src, g.start, g.end);
+
+        // The file name and position.
+        let location = if src == r.src { r.start } else { infos[g.first].start };
+        let lc: Option::<(usize, usize)> = match cfg.index_type {
+            IndexType::Char => match srcs.get_offset_line(src, location) {
+                Some((_, idx, col)) => Some((idx, col)),
+                None => None,
+            },
+            IndexType::Byte => match srcs.get_byte_line(src, location) {
+                Some((line, idx, col)) => {
+                    let text = srcs.line_text(src, line);
+                    Some((idx, count_chars(text.as_bytes()[..min(col, text.len())])))
+                }
+                None => None,
+            },
+        };
+        let mut line_ref = String::new();
+        line_ref.push_str(srcs.name(src));
+        match lc {
+            Some((idx, col)) => line_ref.write(":{idx + 1 + srcs.display_line_offset(src)}:{col + 1}"),
+            None => line_ref.push_str(":?:?"),
+        }
+        out.repeat(None, ' ', width + 2);
+        out.paint_char(margin, if gi == 0 { draw.ltop } else { draw.lcross });
+        out.paint_char(margin, draw.hbar);
+        out.paint_char(margin, draw.lbox);
+        out.plain(" ");
+        out.paint(Some(theme.location), line_ref.as_str());
+        out.plain(" ");
+        out.paint_char(margin, draw.rbox);
+        out.newline();
+        if !cfg.compact {
+            out.repeat(None, ' ', width + 2);
+            out.paint_char(margin, draw.vbar);
+            out.newline();
+        }
+
+        // The multi-line labels, longest first.
+        let mut multi: [usize; -..+] = [];
+        let mut mlwm: [usize; -..+] = [];
+        for i in g.first..g.first + g.len {
+            if infos[i].multi {
+                multi.push(i);
+                if r.labels[infos[i].label].msg.is_some() {
+                    mlwm.push(i);
+                }
+            }
+        }
+        sort_longest_first(&mut multi, infos[..]);
+        sort_longest_first(&mut mlwm, infos[..]);
+
+        let c = Ctx { draw, config: cfg, width, src, infos: infos[..], labels: r.labels[..], multi: multi[..], mlwm: mlwm[..] };
+
+        let mut is_ellipsis = false;
+        for idx in first..past {
+            let line = match srcs.line(src, idx) {
+                Some(l) => l,
+                None => continue,
+            };
+
+            // The multi-line label drawn in the margin of this line: the
+            // one starting or ending first on it (the longer one on a tie).
+            let mut margin_label: Option::<LineLabel> = None;
+            for k in 0..mlwm.len() {
+                let i = mlwm[k];
+                let info = infos[i];
+                let cand = if line.contains(info.start) {
+                    Some(LineLabel { col: info.start - line.offset, label: i, multi: true, draw_msg: false })
+                } else if line.contains(last_offset(info)) {
+                    Some(LineLabel { col: last_offset(info) - line.offset, label: i, multi: true, draw_msg: true })
+                } else {
+                    None
+                };
+                if let Some(ll) = cand {
+                    margin_label = match margin_label {
+                        Some(m) => if ll.col < m.col || (ll.col == m.col && info.start > infos[m.label].start) { Some(ll) } else { Some(m) },
+                        None => Some(ll),
+                    };
+                }
+            }
+
+            // The labels on this line, with their columns.
+            let mut line_labels: [LineLabel; -..+] = [];
+            for k in 0..mlwm.len() {
+                let i = mlwm[k];
+                let info = infos[i];
+                let is_margin = match margin_label {
+                    Some(m) => m.label == i,
+                    None => false,
+                };
+                if line.contains(info.start) && !is_margin {
+                    line_labels.push(LineLabel { col: info.start - line.offset, label: i, multi: true, draw_msg: false });
+                } else if line.contains(last_offset(info)) {
+                    line_labels.push(LineLabel { col: last_offset(info) - line.offset, label: i, multi: true, draw_msg: true });
+                }
+            }
+            for i in g.first..g.first + g.len {
+                let info = infos[i];
+                if info.start >= line.offset && info.end <= line.end() && !info.multi {
+                    let attach = match cfg.label_attach {
+                        LabelAttach::Start => info.start,
+                        LabelAttach::Middle => (info.start + info.end) / 2,
+                        LabelAttach::End => last_offset(info),
+                    };
+                    let col = (if attach > info.start { attach } else { info.start }) - line.offset;
+                    line_labels.push(LineLabel { col, label: i, multi: false, draw_msg: true });
+                }
+            }
+
+            // Lines without labels: skipped (a gap marks the first), but
+            // the first line inside a multi-line label shows as `┆`.
+            if line_labels.len() == 0 && margin_label.is_none() {
+                let mut within = false;
+                for k in 0..multi.len() {
+                    if span_contains(infos[multi[k]], line.offset) {
+                        within = true;
+                    }
+                }
+                if !is_ellipsis && within {
+                    is_ellipsis = true;
+                } else {
+                    if !cfg.compact && !is_ellipsis {
+                        write_margin(c, srcs, out, idx, false, is_ellipsis, false, None, none[..], None);
+                        out.newline();
+                    }
+                    is_ellipsis = true;
+                    continue;
+                }
+            } else {
+                is_ellipsis = false;
+            }
+
+            sort_line_labels(&mut line_labels, c);
+
+            // Where label messages go.
+            let mut arrow_len: usize = 0;
+            for k in 0..line_labels.len() {
+                let ll = line_labels[k];
+                if ll.multi {
+                    arrow_len = line.len();
+                } else {
+                    let e = infos[ll.label].end;
+                    let v = if e > line.offset { e - line.offset } else { 0 };
+                    if v > arrow_len {
+                        arrow_len = v;
+                    }
+                }
+            }
+            arrow_len += if cfg.compact { 1 } else { 2 };
+
+            // The line itself.
+            write_margin(c, srcs, out, idx, true, is_ellipsis, true, None, line_labels[..], margin_label);
+            let text = trim_end(srcs.line_text(src, line));
+            let tb = text.as_bytes();
+            if !is_ellipsis {
+                let mut pos: usize = 0;
+                let mut col: usize = 0;
+                while pos < tb.len() {
+                    let ch = decode(tb, pos);
+                    let style = match get_highlight(c, line, col, margin_label, line_labels[..]) {
+                        Some(i) => Some(label_text_style(c, i)),
+                        None => match srcs.style_at(src, line.byte_offset + pos) {
+                            Some(s) => Some(s),
+                            None => Some(theme.unimportant),
+                        },
+                    };
+                    let (shown, w) = cfg.char_width(ch, col);
+                    if is_whitespace(shown) {
+                        out.repeat(style, shown, w);
+                    } else {
+                        out.paint_char(style, shown);
+                    }
+                    pos += ch.len_utf8();
+                    col += 1;
+                }
+            }
+            out.newline();
+
+            // The arrows, one row (two without `compact`) per label.
+            for row in 0..line_labels.len() {
+                let ll = line_labels[row];
+                let msg = match r.labels[infos[ll.label].label].msg {
+                    Some(m) => m,
+                    None => continue,
+                };
+                let ll_style = label_style(c, ll.label);
+                if !cfg.compact {
+                    // Underlines, and bars down to the arrows.
+                    write_margin(c, srcs, out, idx, false, is_ellipsis, true, Some((row, false)), line_labels[..], margin_label);
+                    let mut pos: usize = 0;
+                    for col in 0..arrow_len {
+                        let w = next_width(cfg, tb, &mut pos, col);
+                        let vbar = get_vbar(c, col, row, line_labels[..], margin_label);
+                        let underline = if row == 0 { get_underline(c, line, col, line_labels[..]) } else { None };
+                        let mut a = ' ';
+                        let mut tail = ' ';
+                        let mut style: Option::<Style> = None;
+                        if let Some(v) = vbar {
+                            style = label_style(c, v.label);
+                            if underline.is_some() {
+                                a = draw.underbar;
+                                tail = draw.underline;
+                            } else if v.multi && row == 0 && cfg.multiline_arrows {
+                                a = draw.uarrow;
+                            } else {
+                                a = draw.vbar;
+                            }
+                        } else if let Some(u) = underline {
+                            style = label_style(c, u.label);
+                            a = draw.underline;
+                            tail = draw.underline;
+                        }
+                        for i in 0..w {
+                            out.paint_char(style, if i == 0 { a } else { tail });
+                        }
+                    }
+                    out.newline();
+                }
+
+                // The arrow to the message.
+                write_margin(c, srcs, out, idx, false, is_ellipsis, true, Some((row, true)), line_labels[..], margin_label);
+                let is_margin = match margin_label {
+                    Some(m) => m.label == ll.label,
+                    None => false,
+                };
+                let mut pos: usize = 0;
+                for col in 0..arrow_len {
+                    let w = next_width(cfg, tb, &mut pos, col);
+                    let is_hbar = ((col > ll.col) != ll.multi) || (ll.draw_msg && col > ll.col);
+                    let mut a = ' ';
+                    let mut tail = ' ';
+                    let mut a_style: Option::<Style> = None;
+                    let mut tail_style: Option::<Style> = None;
+                    if col == ll.col && !is_margin {
+                        a = if ll.multi {
+                            if ll.draw_msg { draw.mbot } else { draw.rbot }
+                        } else {
+                            draw.lbot
+                        };
+                        tail = draw.hbar;
+                        a_style = ll_style;
+                        tail_style = ll_style;
+                    } else if let Some(v) = get_vbar(c, col, row, line_labels[..], margin_label) {
+                        if !cfg.cross_gap && is_hbar {
+                            a = draw.xbar;
+                            a_style = ll_style;
+                            tail_style = ll_style;
+                        } else if is_hbar {
+                            a = draw.hbar;
+                            tail = draw.hbar;
+                            a_style = ll_style;
+                            tail_style = ll_style;
+                        } else {
+                            a = if v.multi && row == 0 && cfg.compact { draw.uarrow } else { draw.vbar };
+                            a_style = label_style(c, v.label);
+                            tail_style = ll_style;
+                        }
+                    } else if is_hbar {
+                        a = draw.hbar;
+                        tail = draw.hbar;
+                        a_style = ll_style;
+                        tail_style = ll_style;
+                    }
+                    if w > 0 {
+                        out.paint_char(a_style, a);
+                    }
+                    for _ in 1..w {
+                        out.paint_char(tail_style, tail);
+                    }
+                }
+                if ll.draw_msg {
+                    out.plain(" ");
+                    paint_text(out, if theme.color_label_messages { ll_style } else { None }, msg);
+                }
+                out.newline();
+            }
+        }
+
+        let is_final = gi + 1 == groups.len();
+        if is_final {
+            write_extras(c, srcs, out, r.helps[..], "Help", theme.help);
+            write_extras(c, srcs, out, r.notes[..], "Note", theme.note);
+        }
+
+        // The end of the frame, or of this section.
+        if !cfg.compact {
+            if is_final {
+                out.repeat(margin, draw.hbar, width + 2);
+                out.paint_char(margin, draw.rbot);
+            } else {
+                out.repeat(None, ' ', width + 2);
+                out.paint_char(margin, draw.vbar);
+            }
+            out.newline();
+        }
+    }
+}
+
+/// `b`'s color, with `a`'s attributes added.
+fn merge(a: Style, b: Style): Style {
+    let mut s = b;
+    if s.fg.is_none() {
+        s.fg = a.fg;
+    }
+    s.bold = s.bold || a.bold;
+    s.dim = s.dim || a.dim;
+    s.italic = s.italic || a.italic;
+    s.underline = s.underline || a.underline;
+    return s;
+}
+
+/// Write `text` in `style`, ending the style before each line break.
+fn paint_text(out: &mut +Out, style: Option::<Style>, text: str) {
+    let b = text.as_bytes();
+    let mut start: usize = 0;
+    for i in 0..b.len() {
+        if b[i] == b'\n' {
+            out.paint(style, text[start..i]);
+            out.newline();
+            start = i + 1;
+        }
+    }
+    out.paint(style, text[start..]);
+}
+
+/// The number of digits of `n` (1 for 0).
+fn digits(n: usize): usize {
+    let mut d: usize = 1;
+    let mut v = n / 10;
+    while v != 0 {
+        d += 1;
+        v = v / 10;
+    }
+    return d;
+}
+
+/// How many columns the character at `pos` of `text` takes at column
+/// `col` (moving `pos` past it); 1 past the end.
+fn next_width(cfg: Config, text: [u8; &], pos: &mut usize, col: usize): usize {
+    if pos >= text.len() {
+        return 1;
+    }
+    let ch = decode(text, pos);
+    pos += ch.len_utf8();
+    let (_, w) = cfg.char_width(ch, col);
+    return w;
+}
+
+/// The style of label `i` (an index into `infos`): its color.
+fn label_style(c: Ctx, i: usize): Option::<Style> {
+    return match c.labels[c.infos[i].label].color {
+        Some(col) => Some(Style::fg(col)),
+        None => None,
+    };
+}
+
+/// The style of source text inside label `i`.
+fn label_text_style(c: Ctx, i: usize): Style {
+    let s = Style::color(c.labels[c.infos[i].label].color);
+    return if c.config.theme.label_bold { s.bold() } else { s };
+}
+
+fn has_msg(c: Ctx, i: usize): bool {
+    return c.labels[c.infos[i].label].msg.is_some();
+}
+
+/// Whether label `a` wins over `b` where they overlap: a higher
+/// priority, or the same and a shorter span.
+fn wins(c: Ctx, a: usize, b: usize): bool {
+    let pa = c.labels[c.infos[a].label].priority;
+    let pb = c.labels[c.infos[b].label].priority;
+    if pa != pb {
+        return pa > pb;
+    }
+    return span_len(c.infos[a]) < span_len(c.infos[b]);
+}
+
+/// The label whose color the character at `col` of `line` takes.
+fn get_highlight(c: Ctx, line: Line, col: usize, margin_label: Option::<LineLabel>, line_labels: [LineLabel; &]): Option::<usize> {
+    let at = line.offset + col;
+    let mut best: Option::<usize> = None;
+    if let Some(m) = margin_label {
+        if span_contains(c.infos[m.label], at) {
+            best = Some(m.label);
+        }
+    }
+    for k in 0..c.multi.len() {
+        best = better(c, best, c.multi[k], at);
+    }
+    for k in 0..line_labels.len() {
+        best = better(c, best, line_labels[k].label, at);
+    }
+    return best;
+}
+
+/// `best`, or `i` if it covers `at` and wins over `best`.
+fn better(c: Ctx, best: Option::<usize>, i: usize, at: usize): Option::<usize> {
+    if !span_contains(c.infos[i], at) {
+        return best;
+    }
+    return match best {
+        Some(b) => if wins(c, i, b) { Some(i) } else { Some(b) },
+        None => Some(i),
+    };
+}
+
+/// The inline label underlined at `col` of `line`.
+fn get_underline(c: Ctx, line: Line, col: usize, line_labels: [LineLabel; &]): Option::<LineLabel> {
+    if !c.config.underlines {
+        return None;
+    }
+    let at = line.offset + col;
+    let mut best: Option::<LineLabel> = None;
+    for k in 0..line_labels.len() {
+        let ll = line_labels[k];
+        if ll.multi || !span_contains(c.infos[ll.label], at) {
+            continue;
+        }
+        best = match best {
+            Some(b) => if wins(c, ll.label, b.label) { Some(ll) } else { Some(b) },
+            None => Some(ll),
+        };
+    }
+    return best;
+}
+
+/// The label whose arrow runs down through column `col` at arrow row
+/// `row`.
+fn get_vbar(c: Ctx, col: usize, row: usize, line_labels: [LineLabel; &], margin_label: Option::<LineLabel>): Option::<LineLabel> {
+    for j in 0..line_labels.len() {
+        let ll = line_labels[j];
+        if !has_msg(c, ll.label) {
+            continue;
+        }
+        if let Some(m) = margin_label {
+            if m.label == ll.label {
+                continue;
+            }
+        }
+        if ll.col == col && row <= j {
+            return Some(ll);
+        }
+    }
+    return None;
+}
+
+/// The margin of a line: its number (or a bar), then the bars, corners
+/// and arrows of multi-line labels.
+fn write_margin(
+    c: Ctx,
+    srcs: &Sources,
+    out: &mut +Out,
+    idx: usize,
+    is_line: bool,
+    is_ellipsis: bool,
+    draw_labels: bool,
+    report_row: Option::<(usize, bool)>,
+    line_labels: [LineLabel; &],
+    margin_label: Option::<LineLabel>,
+) {
+    let cfg = c.config;
+    let draw = c.draw;
+    out.plain(" ");
+    if is_line && !is_ellipsis {
+        let mut num = String::new();
+        num.write("{idx + 1}");
+        let mut s = String::new();
+        for _ in num.len()..c.width {
+            s.push(' ');
+        }
+        s.push_str(num.as_str());
+        s.push(' ');
+        s.push(draw.vbar);
+        out.paint(Some(cfg.theme.margin), s.as_str());
+    } else {
+        let mut s = String::new();
+        for _ in 0..c.width + 1 {
+            s.push(' ');
+        }
+        s.push(if is_ellipsis { draw.vbar_gap } else { draw.vbar });
+        out.paint(Some(cfg.theme.skipped_margin), s.as_str());
+    }
+    if !cfg.compact {
+        out.plain(" ");
+    }
+    if !draw_labels {
+        return;
+    }
+
+    let n = c.mlwm.len() + if c.mlwm.len() > 0 { 1 } else { 0 };
+    for col in 0..n {
+        let mut corner: Option::<(usize, bool)> = None;
+        let mut hbar: Option::<usize> = None;
+        let mut vbar: Option::<usize> = None;
+        let mut margin_ptr: Option::<(LineLabel, bool)> = None;
+
+        let multi_label: Option::<usize> = if col < c.mlwm.len() { Some(c.mlwm[col]) } else { None };
+        let line = srcs.line(c.src, idx).unwrap();
+        let ls = line.offset;
+        let le = line.end();
+
+        for i in 0..min(col + 1, c.mlwm.len()) {
+            let label = c.mlwm[i];
+            let info = c.infos[label];
+            let margin: Option::<LineLabel> = match margin_label {
+                Some(m) => if m.label == label { Some(m) } else { None },
+                None => None,
+            };
+            if !(info.start <= le && info.end > ls) {
+                continue;
+            }
+            let is_parent = i != col;
+            let is_start = line.contains(info.start);
+            let is_end = line.contains(last_offset(info));
+            if margin.is_some() && is_line {
+                margin_ptr = Some((margin.unwrap(), is_start));
+            } else if !is_start && (!is_end || is_line) {
+                if vbar.is_none() && !is_parent {
+                    vbar = Some(label);
+                }
+            } else if let Some((rrow, is_arrow)) = report_row {
+                let mut label_row: usize = 0;
+                for r in 0..line_labels.len() {
+                    if line_labels[r].label == label {
+                        label_row = r;
+                        break;
+                    }
+                }
+                if rrow == label_row {
+                    if let Some(m) = margin {
+                        vbar = if col == i { Some(m.label) } else { None };
+                        if is_start {
+                            continue;
+                        }
+                    }
+                    if is_arrow {
+                        hbar = Some(label);
+                        if !is_parent {
+                            corner = Some((label, is_start));
+                        }
+                    } else if !is_start {
+                        if vbar.is_none() && !is_parent {
+                            vbar = Some(label);
+                        }
+                    }
+                } else if vbar.is_none() && !is_parent && (is_start != (rrow < label_row)) {
+                    vbar = Some(label);
+                }
+            }
+        }
+
+        if is_line {
+            if let Some((m, _)) = margin_ptr {
+                let is_col = multi_label == Some(m.label);
+                let is_limit = col + 1 == c.mlwm.len();
+                if !is_col && !is_limit && hbar.is_none() {
+                    hbar = Some(m.label);
+                }
+            }
+        }
+
+        if let Some(h) = hbar {
+            let keep = match margin_label {
+                Some(m) => m.label != h,
+                None => true,
+            } || !is_line;
+            if !keep {
+                hbar = None;
+            }
+        }
+
+        let mut a = ' ';
+        let mut b = ' ';
+        let mut a_style: Option::<Style> = None;
+        let mut b_style: Option::<Style> = None;
+        if let Some((l, is_start)) = corner {
+            a = if is_start { draw.ltop } else { draw.lbot };
+            b = draw.hbar;
+            a_style = label_style(c, l);
+            b_style = a_style;
+        } else if hbar.is_some() && vbar.is_some() && !cfg.cross_gap {
+            a = draw.xbar;
+            b = draw.hbar;
+            a_style = label_style(c, hbar.unwrap());
+            b_style = a_style;
+        } else if let Some(h) = hbar {
+            a = draw.hbar;
+            b = draw.hbar;
+            a_style = label_style(c, h);
+            b_style = a_style;
+        } else if let Some(v) = vbar {
+            a = if is_ellipsis { draw.vbar_gap } else { draw.vbar };
+            a_style = label_style(c, v);
+        } else if margin_ptr.is_some() && is_line {
+            let (m, is_start) = margin_ptr.unwrap();
+            let is_col = multi_label == Some(m.label);
+            let is_limit = col == c.mlwm.len();
+            a = if is_limit {
+                draw.rarrow
+            } else if is_col {
+                if is_start { draw.ltop } else { draw.lcross }
+            } else {
+                draw.hbar
+            };
+            b = if !is_limit { draw.hbar } else { ' ' };
+            a_style = label_style(c, m.label);
+            b_style = a_style;
+        }
+        out.paint_char(a_style, a);
+        if !cfg.compact {
+            out.paint_char(b_style, b);
+        }
+    }
+}
+
+/// The helps or notes (`word` is `Help` or `Note`), each after a gap.
+fn write_extras(c: Ctx, srcs: &Sources, out: &mut +Out, items: [str; &], word: str, style: Style) {
+    let none: [LineLabel; -..+] = [];
+    for i in 0..items.len() {
+        if !c.config.compact {
+            write_margin(c, srcs, out, 0, false, false, true, Some((0, false)), none[..], None);
+            out.newline();
+        }
+        let mut prefix = String::new();
+        if items.len() > 1 {
+            prefix.write("{word} {i + 1}");
+        } else {
+            prefix.push_str(word);
+        }
+        let mut first = true;
+        for line in items[i].lines() {
+            write_margin(c, srcs, out, 0, false, false, true, Some((0, false)), none[..], None);
+            if first {
+                out.paint(Some(style), prefix.as_str());
+                out.plain(": ");
+                out.plain(line);
+                first = false;
+            } else {
+                out.repeat(None, ' ', prefix.len() + 2);
+                out.plain(line);
+            }
+            out.newline();
+        }
+    }
+}
+
+/// Locate the report's labels and group them by source, in label order:
+/// labels of the same source stay in one group while their last lines
+/// do not go back up.
+fn source_groups(r: &Report, srcs: &Sources, infos: &mut [LabelInfo; -..+], groups: &mut [Group; -..+]) {
+    let mut located: [LabelInfo; -..+] = [];
+    for li in 0..r.labels.len() {
+        let l = r.labels[li];
+        if !srcs.contains(l.src) {
+            continue;
+        }
+        let mut start = l.start;
+        let mut end = l.end;
+        let mut start_line: usize = 0;
+        let mut end_line: usize = 0;
+        match r.config.index_type {
+            IndexType::Char => {
+                let (_, sidx, _) = match srcs.get_offset_line(l.src, l.start) {
+                    Some(x) => x,
+                    None => continue,
+                };
+                start_line = sidx;
+                end_line = sidx;
+                if l.start < l.end {
+                    let (_, eidx, _) = match srcs.get_offset_line(l.src, l.end - 1) {
+                        Some(x) => x,
+                        None => continue,
+                    };
+                    end_line = eidx;
+                }
+            }
+            IndexType::Byte => {
+                let (sline, sidx, scol) = match srcs.get_byte_line(l.src, l.start) {
+                    Some(x) => x,
+                    None => continue,
+                };
+                let stext = srcs.line_text(l.src, sline);
+                start = sline.offset + count_chars(stext.as_bytes()[..min(scol, stext.len())]);
+                start_line = sidx;
+                if l.start >= l.end {
+                    end = start;
+                    end_line = sidx;
+                } else {
+                    let (eline, eidx, ecol) = match srcs.get_byte_line(l.src, l.end - 1) {
+                        Some(x) => x,
+                        None => continue,
+                    };
+                    let etext = srcs.line_text(l.src, eline);
+                    end = eline.offset + count_chars(etext.as_bytes()[..min(ecol + 1, etext.len())]);
+                    end_line = eidx;
+                }
+            }
+        }
+        located.push(LabelInfo { src: l.src, multi: start_line != end_line, start, end, label: li, line: end_line });
+    }
+
+    // Stable sort by order.
+    for i in 1..located.len() {
+        let mut j = i;
+        while j > 0 && r.labels[located[j].label].order < r.labels[located[j - 1].label].order {
+            located.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+
+    for k in 0..located.len() {
+        let info = located[k];
+        let n = groups.len();
+        if n > 0 && groups[n - 1].src == info.src && infos[infos.len() - 1].line <= info.line {
+            if info.start < groups[n - 1].start {
+                groups[n - 1].start = info.start;
+            }
+            if info.end > groups[n - 1].end {
+                groups[n - 1].end = info.end;
+            }
+            groups[n - 1].len += 1;
+        } else {
+            groups.push(Group { src: info.src, start: info.start, end: info.end, first: infos.len(), len: 1 });
+        }
+        infos.push(info);
+    }
+}
+
+/// Stable sort of labels (indices into `infos`), longest first.
+fn sort_longest_first(a: &mut [usize; -..+], infos: [LabelInfo; &]) {
+    for i in 1..a.len() {
+        let mut j = i;
+        while j > 0 && span_len(infos[a[j]]) > span_len(infos[a[j - 1]]) {
+            a.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+}
+
+/// Stable sort of a line's labels by order, then column, then the later
+/// start first.
+fn sort_line_labels(a: &mut [LineLabel; -..+], c: Ctx) {
+    for i in 1..a.len() {
+        let mut j = i;
+        while j > 0 && line_label_before(c, a[j], a[j - 1]) {
+            a.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+}
+
+fn line_label_before(c: Ctx, x: LineLabel, y: LineLabel): bool {
+    let ox = c.labels[c.infos[x.label].label].order;
+    let oy = c.labels[c.infos[y.label].label].order;
+    if ox != oy {
+        return ox < oy;
+    }
+    if x.col != y.col {
+        return x.col < y.col;
+    }
+    return c.infos[x.label].start > c.infos[y.label].start;
+}
