@@ -58,8 +58,30 @@ pub fn render(map: &SourceMap, diags: &[Diagnostic], color: bool, out: &mut dyn 
         for h in &d.helps {
             report = report.with_help(h);
         }
-        let _ = report.finish().write(&mut cache, &mut *out);
+        // Ariadne colors a custom kind (`err(...)`) even with color off.
+        let mut text = Vec::new();
+        let _ = report.finish().write(&mut cache, &mut text);
+        let _ = out.write_all(&if color { text } else { strip_escapes(&text) });
     }
+}
+
+/// `text` without ANSI escape sequences (`ESC [ ... final-byte`).
+fn strip_escapes(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text[i] == 0x1b && text.get(i + 1) == Some(&b'[') {
+            i += 2;
+            while i < text.len() && !(0x40..=0x7e).contains(&text[i]) {
+                i += 1;
+            }
+            i += 1;
+        } else {
+            out.push(text[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// A diagnostic that is not about a place in the source (a missing `main`,
@@ -84,4 +106,23 @@ pub fn render_to_string(map: &SourceMap, diags: &[Diagnostic]) -> String {
     let mut buf = Vec::new();
     render(map, diags, false, &mut buf);
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Span, codes};
+
+    #[test]
+    fn no_escape_codes_without_color() {
+        let mut map = SourceMap::new();
+        let f = map.add("a.ln", None, "let x: i32 = \"nope\";\n");
+        let d = Diagnostic::error(codes::ty::MISMATCH, Span::new(f, 13, 19), "mismatched types").with_label("expected `i32`");
+        let text = render_to_string(&map, &[d.clone()]);
+        assert!(text.starts_with("err(type::mismatch): mismatched types\n"), "{text:?}");
+        assert!(!text.contains('\x1b'), "{text:?}");
+        let mut colored = Vec::new();
+        render(&map, &[d], true, &mut colored);
+        assert!(String::from_utf8(colored).unwrap().starts_with("\x1b[31merr(type::mismatch):"));
+    }
 }
