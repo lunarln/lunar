@@ -205,11 +205,15 @@ pub struct FnDecl {
     pub generics: Generics,
     pub params: Vec<Param>,
     pub ret: Option<Ty>,
+    /// `from a, b` after the return type: the parameters the result may
+    /// point into (`self` for the receiver, `static` alone for none).
+    /// Empty without the clause.
+    pub ret_from: Vec<Ident>,
     pub body: Option<Block>,
     pub is_unsafe: bool,
     /// C-style variadic (`...` as the last parameter); extern fns only.
     pub variadic: bool,
-    /// Span of the signature (name through return type).
+    /// Span of the signature (name through return type and `from` clause).
     pub sig_span: Span,
 }
 

@@ -264,7 +264,7 @@ pub fn param(a: &Ast, src: str, p: Param): String {
     return out;
 }
 
-/// `unsafe fn name::<T: Ord>(a: T, b: &T): T`, without `pub`.
+/// `unsafe fn name::<T: Ord>(a: T, b: &T): T from b`, without `pub`.
 pub fn fn_sig(a: &Ast, src: str, f: FnDecl): String {
     let mut out = String::new();
     if f.is_unsafe {
@@ -287,6 +287,11 @@ pub fn fn_sig(a: &Ast, src: str, f: FnDecl): String {
     out.push(')');
     if let Some(r) = f.ret {
         out.write(": {ty(a, src, r)}");
+    }
+    let from = a.idents.list(f.ret_from);
+    for i in 0..from.len() {
+        out.push_str(if i == 0 { " from " } else { ", " });
+        out.push_str(a.text(from[i].name));
     }
     return out;
 }

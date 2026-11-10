@@ -189,6 +189,10 @@ pub struct FnDecl {
     pub generics: Generics,
     pub params: List::<Param>,
     pub ret: Option::<Id::<Ty>>,
+    /// `from a, b` after the return type: the parameters the result may
+    /// point into (`self` for the receiver, `static` alone for none).
+    /// Empty without the clause.
+    pub ret_from: List::<Ident>,
     pub body: Option::<Id::<Block>>,
     pub is_unsafe: bool,
     pub variadic: bool,
@@ -867,6 +871,10 @@ fn item_kind(a: &Ast, o: &mut String, d: usize, k: ItemKind) {
                 ind(o, d + 1);
                 o.push_str("ret\n");
                 ty(a, o, d + 2, r);
+            }
+            for i in a.idents.list(f.ret_from) {
+                ind(o, d + 1);
+                o.write("from {ident(a, i)}\n");
             }
             if let Some(b) = f.body {
                 block(a, o, d + 1, b);

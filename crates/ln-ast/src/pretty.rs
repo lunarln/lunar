@@ -138,7 +138,7 @@ pub fn param(p: &Param) -> String {
     }
 }
 
-/// `unsafe fn name::<T: Ord>(a: T, b: &T): T`, without `pub`.
+/// `unsafe fn name::<T: Ord>(a: T, b: &T): T from b`, without `pub`.
 pub fn fn_sig(f: &FnDecl) -> String {
     let mut params: Vec<String> = f.params.iter().map(param).collect();
     if f.variadic {
@@ -146,7 +146,12 @@ pub fn fn_sig(f: &FnDecl) -> String {
     }
     let unsafe_kw = if f.is_unsafe { "unsafe " } else { "" };
     let ret = f.ret.as_ref().map(|r| format!(": {}", ty(r))).unwrap_or_default();
-    format!("{unsafe_kw}fn {}{}({}){ret}", f.name.name, generics(&f.generics), params.join(", "))
+    let from = if f.ret_from.is_empty() {
+        String::new()
+    } else {
+        format!(" from {}", f.ret_from.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", "))
+    };
+    format!("{unsafe_kw}fn {}{}({}){ret}{from}", f.name.name, generics(&f.generics), params.join(", "))
 }
 
 /// A variant as written in its enum: `Some(T)`, `Point { x: i32 }`, `None`.
