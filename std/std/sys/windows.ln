@@ -132,9 +132,13 @@ pub fn remove_file(path: str): bool {
 /// `path` as NUL-terminated UTF-16.
 fn wide(path: str): [u16; -..+] {
     let mut w: [u16; -..+] = [];
+    // In a verbatim path (`\\?\C:\...`) Windows takes no `/` for `\`.
+    let verbatim = path.starts_with("\\\\?\\") || path.starts_with("//?/") || path.starts_with("\\\\?/") || path.starts_with("//?\\");
     for c in path.chars() {
         let cp = c as u32;
-        if cp < 65536 {
+        if verbatim && c == '/' {
+            w.push(92);
+        } else if cp < 65536 {
             w.push(cp as u16);
         } else {
             let v = cp - 65536;

@@ -51,6 +51,12 @@ pub fn link(obj: str, out: str, libs: [str; &]): Result::<(), LinkError> {
     return run("cc", &b);
 }
 
+/// The main thread's stack on Windows, in bytes (reserved, used as
+/// needed). Windows' default, 1 MiB, is less than deeply recursive
+/// programs need, such as this compiler on nested macro expansions (up to
+/// 128 deep); Linux gives 8 MiB by default.
+const MAIN_STACK: usize = 8388608;
+
 fn link_windows(obj: str, out: str, libs: [str; &], search: str): Result::<(), LinkError> {
     let mut b = Args::new();
     if which("clang") {
@@ -63,6 +69,9 @@ fn link_windows(obj: str, out: str, libs: [str; &], search: str): Result::<(), L
         b.add("-llegacy_stdio_definitions");
         b.add("-lkernel32");
         b.add("-Wl,/Brepro");
+        let mut stack = String::new();
+        stack.write("-Wl,/STACK:{MAIN_STACK}");
+        b.add(stack.as_str());
         return run("clang", &b);
     }
     if !which("link") {
@@ -78,6 +87,9 @@ fn link_windows(obj: str, out: str, libs: [str; &], search: str): Result::<(), L
     b.add("kernel32.lib");
     b.add("legacy_stdio_definitions.lib");
     b.add("/Brepro");
+    let mut stack = String::new();
+    stack.write("/STACK:{MAIN_STACK}");
+    b.add(stack.as_str());
     for d in search.split(path_sep()) {
         if d.len() > 0 {
             let mut a = String::from("/LIBPATH:");
