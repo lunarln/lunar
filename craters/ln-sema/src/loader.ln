@@ -53,11 +53,14 @@ pub struct Craters {
     pub children: Arena::<ModChild>,
     pub chains: Arena::<Symbol>,
     pub deps: Arena::<CraterDep>,
+    /// Texts that replace files on disk while loading (unsaved editor
+    /// buffers; Rust's `FileProvider`).
+    pub overlay: Overlay,
 }
 
 impl Craters {
     pub fn new(): Craters {
-        return Craters { list: [], mods: Arena::new(), children: Arena::new(), chains: Arena::new(), deps: Arena::new() };
+        return Craters { list: [], mods: Arena::new(), children: Arena::new(), chains: Arena::new(), deps: Arena::new(), overlay: Overlay::new() };
     }
 
     /// The child of `src` declared by `mod` under `chain` (inline module
@@ -88,6 +91,83 @@ impl Craters {
         return self.mods.add(ModSource { file, items, children: List::empty() });
     }
 }
+
+/// File contents that replace what is on disk, by path (Rust's `Overlay`
+/// in crates/ln-driver): what an editor has open and not saved.
+pub struct Overlay {
+    text: String,
+    files: [OverlayFile; ..+],
+}
+
+/// A file's key (`path_key`) and its text, in `Overlay::text`.
+struct OverlayFile {
+    key_lo: u32,
+    key_hi: u32,
+    lo: u32,
+    hi: u32,
+}
+
+impl Overlay {
+    pub fn new(): Overlay {
+        return Overlay { text: String::new(), files: [] };
+    }
+
+    /// Read `path` as `text` from now on.
+    pub fn add(&mut +self, path: str, text: str) {
+        let key = path_key(path);
+        let key_lo = self.text.len() as u32;
+        self.text.push_str(key.as_str());
+        let lo = self.text.len() as u32;
+        self.text.push_str(text);
+        self.files.push(OverlayFile { key_lo, key_hi: lo, lo, hi: self.text.len() as u32 });
+    }
+
+    /// The text that replaces `path`, if there is one (the latest added).
+    pub fn get(&self, path: str): Option::<str> {
+        let key = path_key(path);
+        let mut i = self.files.len();
+        while i > 0 {
+            i -= 1;
+            let f = self.files[i];
+            if self.text.as_str()[f.key_lo as usize..f.key_hi as usize] == key.as_str() {
+                return Some(self.text.as_str()[f.lo as usize..f.hi as usize]);
+            }
+        }
+        return None;
+    }
+}
+
+/// The text of `path`: the overlay's, else the file's.
+pub fn read_source(cs: &Craters, path: str): Option::<String> {
+    if let Some(t) = cs.overlay.get(path) {
+        return Some(String::from(t));
+    }
+    return match std::fs::read_to_string(path) {
+        Ok(t) => Some(t),
+        Err(_) => None,
+    };
+}
+
+/// What paths are compared by: `\` as `/`, and on Windows in lower case
+/// (Rust's `path_key`).
+pub fn path_key(p: str): String {
+    let mut out = String::new();
+    for c in p.chars() {
+        if c == '\\' {
+            out.push('/');
+        } else if FOLD_CASE && c >= 'A' && c <= 'Z' {
+            out.push(((c as u32) + 32) as u8 as char);
+        } else {
+            out.push(c);
+        }
+    }
+    return out;
+}
+
+#[cfg(windows)]
+const FOLD_CASE: bool = true;
+#[cfg(not(windows))]
+const FOLD_CASE: bool = false;
 
 /// `\` as `/`, so paths print alike on every system.
 pub fn normalize(p: str): String {
@@ -149,9 +229,9 @@ fn join(dir: str, name: str): String {
 /// the root file cannot be read. The caller sets `deps` and adds the
 /// crater to `cs.list`.
 pub fn load_crate(p: &mut Program, cs: &mut +Craters, name: str, root_path: str, display_prefix: str): Option::<CrateSource> {
-    let text = match std::fs::read_to_string(root_path) {
-        Ok(t) => t,
-        Err(_) => return None,
+    let text = match read_source(cs, root_path) {
+        Some(t) => t,
+        None => return None,
     };
     let root = load_mod(p, cs, root_path, text, true, display_prefix);
     let n = p.sym(name);
@@ -190,11 +270,11 @@ fn load_mod(p: &mut Program, cs: &mut +Craters, path: str, text: String, is_dir_
         flat_name.write("{ident_name}.ln");
         let flat = join(dir.as_str(), flat_name.as_str());
         let nested = join(join(dir.as_str(), ident_name.as_str()).as_str(), "mod.ln");
-        let (child_path, child_text, owner) = match std::fs::read_to_string(flat.as_str()) {
-            Ok(t) => (flat, t, false),
-            Err(_) => match std::fs::read_to_string(nested.as_str()) {
-                Ok(t) => (nested, t, true),
-                Err(_) => {
+        let (child_path, child_text, owner) = match read_source(cs, flat.as_str()) {
+            Some(t) => (flat, t, false),
+            None => match read_source(cs, nested.as_str()) {
+                Some(t) => (nested, t, true),
+                None => {
                     let msg = p.sym(core::fmt::format("file not found for module `{ident_name}`").as_str());
                     p.diags.error(codes::name::MODULE_FILE(), d.ident.span, msg);
                     let h = p.sym(core::fmt::format("create `{normalize(flat.as_str())}` or `{normalize(nested.as_str())}`").as_str());
