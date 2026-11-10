@@ -692,16 +692,11 @@ pub fn visit_children(p: &Program, e: Expr, out: &mut +[Id::<Expr>; ..+]) {
             out.push(base);
             out.push(index);
         }
-        ExprKind::Deref(x) => out.push(x),
-        ExprKind::Temp(x) => out.push(x),
-        ExprKind::Unary(_, x) => out.push(x),
-        ExprKind::Cast(x) => out.push(x),
-        ExprKind::Coerce { expr, .. } => out.push(expr),
+        ExprKind::Deref(x) | ExprKind::Temp(x) | ExprKind::Unary(_, x) | ExprKind::Cast(x) | ExprKind::Coerce { expr: x, .. } => out.push(x),
         ExprKind::Read { place, .. } => out.push(place),
         ExprKind::Call { callee, args } => {
             match callee {
-                Callee::Indirect(c) => out.push(c),
-                Callee::Value { callee: c, .. } => out.push(c),
+                Callee::Indirect(c) | Callee::Value { callee: c, .. } => out.push(c),
                 _ => {}
             }
             for a in p.thir.args.list(args) {
@@ -713,24 +708,15 @@ pub fn visit_children(p: &Program, e: Expr, out: &mut +[Id::<Expr>; ..+]) {
                 out.push(a.expr());
             }
         }
-        ExprKind::Binary(_, a, b) => {
+        ExprKind::Binary(_, a, b) | ExprKind::Logical { lhs: a, rhs: b, .. } => {
             out.push(a);
             out.push(b);
         }
-        ExprKind::Logical { lhs, rhs, .. } => {
-            out.push(lhs);
-            out.push(rhs);
-        }
-        ExprKind::Assign { place, value } => {
+        ExprKind::Assign { place, value } | ExprKind::AssignOp { place, value, .. } => {
             out.push(place);
             out.push(value);
         }
-        ExprKind::AssignOp { place, value, .. } => {
-            out.push(place);
-            out.push(value);
-        }
-        ExprKind::Tuple(es) => out.extend(p.thir.expr_ids.list(es)),
-        ExprKind::Array(es) => out.extend(p.thir.expr_ids.list(es)),
+        ExprKind::Tuple(es) | ExprKind::Array(es) => out.extend(p.thir.expr_ids.list(es)),
         ExprKind::Adt { fields, .. } => {
             for f in p.thir.field_exprs.list(fields) {
                 out.push(f.expr);

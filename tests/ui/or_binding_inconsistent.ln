@@ -1,0 +1,19 @@
+// error: name::inconsistent_binding
+// A variable bound by a `|` pattern is `mut` in every alternative or in none.
+enum Pair {
+    Left(i32, i32),
+    Right(i32, i32),
+}
+
+fn bump(p: Pair): i32 {
+    match p {
+        Pair::Left(mut x, _) | Pair::Right(_, x) => {
+            x += 1;
+            x
+        }
+    }
+}
+
+fn main() {
+    println("{bump(Pair::Left(1, 2))}");
+}

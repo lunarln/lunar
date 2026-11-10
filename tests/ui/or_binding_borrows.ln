@@ -1,0 +1,44 @@
+// error: borrow::use_after_move
+// error: borrow::shrink_while_borrowed
+// The borrow checker sees through the bindings of a `|` pattern: whichever
+// alternative matches, the owner moves out of the scrutinee, and a view
+// bound in the pattern views what the scrutinee viewed.
+enum Msg {
+    Text(String),
+    Note(String),
+}
+
+enum Part {
+    Word(str),
+    Number(str),
+}
+
+fn take(s: String): usize {
+    return s.len();
+}
+
+fn moved() {
+    let m = Msg::Note(String::from("hi"));
+    let n = match m {
+        Msg::Text(s) | Msg::Note(s) => take(s),
+    };
+    match m {
+        Msg::Text(s) | Msg::Note(s) => println("{n} {s}"),
+    }
+}
+
+fn viewed() {
+    let mut owner = String::from("abc");
+    let p = Part::Number(owner[0..2]);
+    match p {
+        Part::Word(s) | Part::Number(s) => {
+            owner.clear();
+            println("{s}");
+        }
+    }
+}
+
+fn main() {
+    moved();
+    viewed();
+}

@@ -11,7 +11,7 @@ use crater::codes;
 use crater::defs::*;
 use crater::program::{Program, Ref, RefTarget};
 use crater::sema::Sema;
-use crater::thir::{Arm, ExprKind, FieldPat, LocalKind, Pat, PatKind, ReadMode};
+use crater::thir::{Arm, ExprKind, FieldPat, LocalId, LocalKind, Pat, PatKind, ReadMode};
 use crater::ty::*;
 use crater::typeck::call::ValueRes;
 use crater::typeck::expr::neg_int;
@@ -275,16 +275,39 @@ impl Sema {
                 }
             }
             ast::PatKind::Or(alts) => {
-                let before = self.fcx.locals.len();
+                // The first alternative declares the variables; the others
+                // bind the same ones (see `binding`).
+                let start = self.fcx.or_binds.len();
+                self.fcx.or_frames.push(OrFrame { start, alt: 0 });
                 let mut ps: [Id::<Pat>; ..+] = [];
                 for i in 0..alts.len() {
+                    let top = self.fcx.or_frames.len() - 1;
+                    let mut f = self.fcx.or_frames[top];
+                    f.alt = i;
+                    self.fcx.or_frames[top] = f;
                     let a = self.p.ast.pat_ids.list(alts)[i];
                     ps.push(self.check_pat(a, ty, false));
                 }
-                if self.fcx.locals.len() != before {
-                    self.error_at(codes::ty::BAD_PATTERN(), span, "bindings are not supported inside `|` patterns yet");
-                    self.with_help("use separate match arms");
-                    self.emit();
+                self.fcx.or_frames.pop();
+                self.check_or_binds(alts, start);
+                // The first alternative's variables are the pattern's, for a
+                // `|` pattern around this one.
+                let mut first: [OrBind; ..+] = [];
+                for i in start..self.fcx.or_binds.len() {
+                    let b = self.fcx.or_binds[i];
+                    if b.alt == 0 {
+                        first.push(b);
+                    }
+                }
+                self.fcx.or_binds.truncate(start);
+                let nf = self.fcx.or_frames.len();
+                if nf > 0 {
+                    let alt = self.fcx.or_frames[nf - 1].alt;
+                    for b in first[..] {
+                        let mut c = b;
+                        c.alt = alt;
+                        self.fcx.or_binds.push(c);
+                    }
                 }
                 PatKind::Or(self.p.thir.pat_ids.add_list(ps[..]))
             }
@@ -320,13 +343,156 @@ impl Sema {
     }
 
     fn binding(&mut self, name: Ident, is_mut: bool, ty: Ty, span: Span): PatKind {
-        let depth = self.depth();
-        let l = self.new_local(name.name, ty, is_mut, LocalKind::Let, span, depth);
         let ctx = self.ident_ctx(name);
-        self.bind_name(name.name, ctx, l);
+        let l = match self.or_binding(name.name, ctx) {
+            Some(l) => {
+                self.rebind(l, name.name, is_mut, ty, span);
+                l
+            }
+            None => {
+                let depth = self.depth();
+                let l = self.new_local(name.name, ty, is_mut, LocalKind::Let, span, depth);
+                self.bind_name(name.name, ctx, l);
+                l
+            }
+        };
+        let nf = self.fcx.or_frames.len();
+        if nf > 0 {
+            let alt = self.fcx.or_frames[nf - 1].alt;
+            self.fcx.or_binds.push(OrBind { alt, name: name.name, ctx, local: l, span });
+        }
         let r = self.resolve(ty);
         let mode = if !self.p.types.has_infer(r) && self.p.is_copy(r, self.fcx.env[..]) { ReadMode::Copy } else { ReadMode::Move };
         return PatKind::Binding { local: l, mode, sub: None };
+    }
+
+    /// In a later alternative of a `|` pattern, the variable that the first
+    /// alternative bound under this name (of the innermost such pattern).
+    fn or_binding(&self, name: Symbol, ctx: SyntaxCtx): Option::<LocalId> {
+        let mut k = self.fcx.or_frames.len();
+        while k > 0 {
+            k -= 1;
+            let f = self.fcx.or_frames[k];
+            if f.alt == 0 {
+                continue;
+            }
+            let end = if k + 1 < self.fcx.or_frames.len() { self.fcx.or_frames[k + 1].start } else { self.fcx.or_binds.len() };
+            for i in f.start..end {
+                let b = self.fcx.or_binds[i];
+                if b.alt == 0 && b.name == name && b.ctx == ctx {
+                    return Some(b.local);
+                }
+            }
+        }
+        return None;
+    }
+
+    /// Bind `l` again, in a later alternative of a `|` pattern: it must have
+    /// the same type and mutability there.
+    fn rebind(&mut self, l: LocalId, name: Symbol, is_mut: bool, ty: Ty, span: Span) {
+        self.record_local(span, l);
+        let x = self.fcx.locals[l.index()];
+        let lty = x.ty;
+        let mutable = x.mutable;
+        let first = x.span;
+        if mutable != is_mut {
+            let mut m = String::new();
+            m.write("variable `{self.p.text(name)}` is bound inconsistently across `|` patterns");
+            self.error_at(codes::name::INCONSISTENT_BINDING(), span, m.as_str());
+            self.with_label(if is_mut { "bound with `mut` here" } else { "bound without `mut` here" });
+            self.with_secondary(first, if mutable { "first bound with `mut` here" } else { "first bound without `mut` here" });
+            self.with_help("write `mut` in every alternative or in none");
+            self.emit();
+        }
+        if !self.unify(lty, ty) {
+            let re = self.resolve(lty);
+            let rf = self.resolve(ty);
+            if !self.p.types.has_error(re) && !self.p.types.has_error(rf) {
+                let e = self.p.ty_str(re);
+                let f = self.p.ty_str(rf);
+                let mut m = String::new();
+                m.write("mismatched types: expected `{e}`, found `{f}`");
+                self.error_at(codes::ty::MISMATCH(), span, m.as_str());
+                let mut lb = String::new();
+                lb.write("expected `{e}`");
+                self.with_label(lb.as_str());
+                let mut s = String::new();
+                s.write("first bound here with type `{e}`");
+                self.with_secondary(first, s.as_str());
+                self.with_note("a variable bound by a `|` pattern has the same type in every alternative");
+                self.emit();
+            }
+        }
+    }
+
+    /// Every alternative of a `|` pattern binds the same variables: report
+    /// each variable that an alternative leaves out (`start`: where the
+    /// pattern's bindings begin in `or_binds`).
+    fn check_or_binds(&mut self, alts: List::<Id::<ast::Pat>>, start: usize) {
+        let end = self.fcx.or_binds.len();
+        for i in start..end {
+            let b = self.fcx.or_binds[i];
+            // Each variable once, where it is first bound.
+            let mut seen = false;
+            for j in start..i {
+                let x = self.fcx.or_binds[j];
+                if x.name == b.name && x.ctx == b.ctx {
+                    seen = true;
+                }
+            }
+            if seen {
+                continue;
+            }
+            for k in 0..alts.len() {
+                let mut bound = false;
+                for j in start..end {
+                    let x = self.fcx.or_binds[j];
+                    if x.alt == k && x.name == b.name && x.ctx == b.ctx {
+                        bound = true;
+                    }
+                }
+                if bound {
+                    continue;
+                }
+                let a = self.p.ast.pat_ids.list(alts)[k];
+                let aspan = self.p.ast.pats.get(a).span;
+                let n = self.p.text(b.name).to_string();
+                let mut m = String::new();
+                m.write("variable `{n}` is not bound in all patterns");
+                self.error_at(codes::name::UNBOUND_IN_ALTERNATIVE(), aspan, m.as_str());
+                let mut lb = String::new();
+                lb.write("this alternative does not bind `{n}`");
+                self.with_label(lb.as_str());
+                let mut s = String::new();
+                s.write("`{n}` is bound here");
+                self.with_secondary(b.span, s.as_str());
+                let mut h = String::new();
+                h.write("bind `{n}` in every alternative, or match them in separate arms");
+                self.with_help(h.as_str());
+                self.emit();
+            }
+        }
+    }
+
+    /// Whether `pat` matches every value of `ty`: it is irrefutable, or its
+    /// `|` alternatives cover the type together (`Ok(v) | Err(v)`).
+    pub fn pat_covers(&mut self, pat: Id::<Pat>, ty: Ty): bool {
+        if self.p.thir.is_irrefutable(pat, &|d| self.p.is_enum(d)) {
+            return true;
+        }
+        let t = self.resolve(ty);
+        if self.p.types.has_error(t) {
+            return false;
+        }
+        let mut ex = Exh::new();
+        let l = lite(&self.p, &mut ex, pat);
+        let alts = expand(&mut ex, l);
+        let mut rows: [List::<Id::<Lite>>; ..+] = [];
+        for alt in alts[..] {
+            rows.push(ex.ids.add_list([alt][..]));
+        }
+        let mut w: [Symbol; -..+] = [];
+        return !self.missing(&mut ex, rows[..], [t][..], &mut w);
     }
 
     fn lit_pat(&mut self, l: ast::Lit, neg: bool, ty: Ty, span: Span): PatKind {
@@ -605,6 +771,24 @@ impl Sema {
             _ => false,
         };
     }
+}
+
+/// A `|` pattern being checked.
+pub struct OrFrame {
+    /// Where its bindings begin in `FnCtx::or_binds`.
+    pub start: usize,
+    /// The alternative being checked.
+    pub alt: usize,
+}
+
+/// A variable bound by an alternative of a `|` pattern.
+pub struct OrBind {
+    pub alt: usize,
+    pub name: Symbol,
+    pub ctx: SyntaxCtx,
+    pub local: LocalId,
+    /// The binding (`x`, `mut x`).
+    pub span: Span,
 }
 
 /// A constructor of a type: its id, display name and field types.

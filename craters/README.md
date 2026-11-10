@@ -134,7 +134,6 @@ compares its answers with the Rust server's.
   it lends. Calls through function pointers, trait methods on a generic
   receiver and closures of unknown type still count as pointing into every
   argument.
-* No bindings inside `|` patterns; write separate arms.
 * Constants cannot hold structs.
 * `[T; ..+]` only grows; use `[T; -..+]` to `pop`/`truncate`/`clear`.
 * Keep fixed arrays well under 64K elements: they are copied as one LLVM

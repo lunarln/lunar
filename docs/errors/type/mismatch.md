@@ -15,7 +15,9 @@ The same code is also used for a few related errors:
 * `return;` without a value in a function that declares a return type;
 * `?` used on an `Option` in a function that returns a `Result` (or the other
   way around, or with different error types);
-* passing a slice view as the receiver of a `&mut self` method.
+* passing a slice view as the receiver of a `&mut self` method;
+* a variable bound by a `|` pattern with different types in different
+  alternatives (`Value::Int(x) | Value::Text(x)`).
 
 ## Erroneous example
 

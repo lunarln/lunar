@@ -2612,9 +2612,10 @@ pub fn pat_bindings(thir: &Thir, pat: Id::<Pat>, out: &mut +[LocalId; ..+]) {
                 pat_bindings(thir, q, out);
             }
         }
+        // Every alternative binds the same variables.
         PatKind::Or(ps) => {
-            for q in thir.pat_ids.list(ps) {
-                pat_bindings(thir, q, out);
+            if ps.len() > 0 {
+                pat_bindings(thir, thir.pat_ids.list(ps)[0], out);
             }
         }
         PatKind::Adt { fields, .. } => {

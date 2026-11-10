@@ -383,8 +383,18 @@ while let Some(x) = it.next() { }
 if let Some(v) = maybe { }
 let Some(v) = maybe else { return; };  // `v` is bound for the rest of the block
 let n = text.find("x")?; // `?` on Option and Result
+let size = match shape { Shape::Circle(r) | Shape::Square(r) => r, _ => 0.0 };
 ```
 
+* Patterns go in `match` arms, `if let`, `while let`, `let`, `let .. else`
+  and `for`. A `|` pattern matches if any of its alternatives does, at the
+  top or nested (`Some(A(x) | B(x))`). Its alternatives may bind variables:
+  every alternative binds the same names (`err(name::unbound_in_alternative)`),
+  each with the same type (`err(type::mismatch)`) and the same `mut`
+  (`err(name::inconsistent_binding)`), and the code after the pattern sees
+  one variable, whichever alternative matched. A guard (`if`) sees it too.
+* A `let` takes a pattern that always matches; that includes `|` patterns
+  whose alternatives cover the type together (`let (Ok(v) | Err(v)) = r;`).
 * `let pattern = value else { ... };` takes a pattern that may fail to
   match. When it does not match, the `else` block runs and must leave
   (`return`, `break`, `continue`, or a call returning `!`):

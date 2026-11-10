@@ -75,6 +75,11 @@ pub(crate) struct FnCtx<'s, 'a> {
     /// This function's `impl Trait` return types: the variable standing
     /// for each inside the body (the type it returns there).
     opaque_vars: Vec<(u32, Ty, Span)>,
+    /// The `|` patterns being checked, innermost last.
+    or_frames: Vec<pat::OrFrame>,
+    /// The bindings of the alternatives of `or_frames`, each frame's from
+    /// its `start` on.
+    or_binds: Vec<pat::OrBind>,
 }
 
 impl<'a> Sema<'a> {
@@ -174,6 +179,8 @@ impl<'s, 'a> FnCtx<'s, 'a> {
             reported_annotations: false,
             closures: Vec::new(),
             opaque_vars: Vec::new(),
+            or_frames: Vec::new(),
+            or_binds: Vec::new(),
         };
         // Inside the body, each `impl Trait` it returns is the type it
         // actually returns: a variable to infer.

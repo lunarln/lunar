@@ -1,0 +1,173 @@
+// Bindings inside `|` patterns: every alternative binds the same variables,
+// and the arm sees one variable whichever alternative matched.
+
+enum Shape {
+    Circle(i32),
+    Square(i32),
+    Rect(i32, i32),
+    Named { w: i32, h: i32 },
+}
+
+enum Pair {
+    Left(i32, u8),
+    Right(u8, i32),
+}
+
+enum Msg {
+    Text(String),
+    Note(String),
+    Quit,
+}
+
+enum Part {
+    Word(str),
+    Number(str),
+    Gap,
+}
+
+fn size(s: Shape): i32 {
+    match s {
+        Shape::Circle(x) | Shape::Square(x) => x,
+        // Different payload positions, and a struct pattern.
+        Shape::Rect(w, _) | Shape::Named { w, .. } => w * 10,
+    }
+}
+
+fn pick(p: Pair): i32 {
+    match p {
+        Pair::Left(x, _) | Pair::Right(_, x) => x,
+    }
+}
+
+// Nested in a variant, with a guard.
+fn classify(s: Option::<Shape>): String {
+    match s {
+        Some(Shape::Circle(r) | Shape::Square(r)) if r > 5 => {
+            let mut out = String::from("big ");
+            out.write("{r}");
+            out
+        }
+        Some(Shape::Circle(r) | Shape::Square(r)) => {
+            let mut out = String::from("small ");
+            out.write("{r}");
+            out
+        }
+        Some(_) => String::from("other"),
+        None => String::from("none"),
+    }
+}
+
+// Moved owners: the arm owns the string, whichever variant held it.
+fn text_of(m: Msg): String {
+    match m {
+        Msg::Text(s) | Msg::Note(s) => s,
+        Msg::Quit => String::from("quit"),
+    }
+}
+
+// An owner moved out under a guard that reads it.
+fn long_text(m: Msg): String {
+    match m {
+        Msg::Text(s) | Msg::Note(s) if s.len() > 3 => s,
+        Msg::Text(_) | Msg::Note(_) => String::from("short"),
+        Msg::Quit => String::from("quit"),
+    }
+}
+
+// `mut` bindings.
+fn bump(s: Shape): i32 {
+    match s {
+        Shape::Circle(mut x) | Shape::Square(mut x) => {
+            x += 1;
+            x
+        }
+        _ => 0,
+    }
+}
+
+// `if let`, `let .. else` and an irrefutable `let`.
+fn first_word(p: Part): str {
+    if let Part::Word(w) | Part::Number(w) = p {
+        return w;
+    }
+    return "-";
+}
+
+fn either(r: Result::<i32, i32>): i32 {
+    let (Ok(v) | Err(v)) = r;
+    v
+}
+
+fn digits_or_zero(p: Option::<Pair>): i32 {
+    let Some(Pair::Left(n, _) | Pair::Right(_, n)) = p else {
+        return 0;
+    };
+    n
+}
+
+// Tuples, and alternatives within alternatives.
+fn off_axis(t: (i32, i32)): i32 {
+    match t {
+        (0, y) | (y, 0) => y,
+        (x, _) => -x,
+    }
+}
+
+fn deep(o: Option::<Option::<Shape>>): i32 {
+    match o {
+        Some(Some(Shape::Circle(x) | Shape::Square(x)) | Some(Shape::Rect(x, _))) => x,
+        _ => -1,
+    }
+}
+
+fn main() {
+    println("{size(Shape::Circle(1))} {size(Shape::Square(2))} {size(Shape::Rect(3, 4))} {size(Shape::Named { w: 5, h: 6 })}");
+    println("{pick(Pair::Left(7, 1))} {pick(Pair::Right(1, 8))}");
+    println("{classify(Some(Shape::Circle(9)))}, {classify(Some(Shape::Square(2)))}, {classify(Some(Shape::Rect(1, 1)))}, {classify(None)}");
+    let a = text_of(Msg::Text(String::from("hello")));
+    let b = text_of(Msg::Note(String::from("note")));
+    println("{a} {b} {text_of(Msg::Quit)}");
+    let c = long_text(Msg::Note(String::from("lengthy")));
+    let d = long_text(Msg::Text(String::from("abc")));
+    println("{c} {d}");
+    println("{bump(Shape::Circle(1))} {bump(Shape::Square(10))} {bump(Shape::Rect(1, 2))}");
+
+    // Views: the binding views the string the variant viewed.
+    let owner = String::from("alpha 42");
+    let parts = [Part::Word(owner[0..5]), Part::Number(owner[6..]), Part::Gap];
+    for i in 0..3 {
+        let p = parts[i];
+        match p {
+            Part::Word(s) | Part::Number(s) => println("part {s} ({s.len()})"),
+            Part::Gap => println("gap"),
+        }
+    }
+    println("{first_word(Part::Number(owner[6..]))} {first_word(Part::Gap)}");
+
+    println("{either(Ok(3))} {either(Err(4))}");
+    println("{digits_or_zero(Some(Pair::Right(0, 12)))} {digits_or_zero(None)}");
+    println("{off_axis((0, 5))} {off_axis((6, 0))} {off_axis((2, 3))}");
+    println("{deep(Some(Some(Shape::Square(11))))} {deep(Some(Some(Shape::Rect(12, 0))))} {deep(Some(None))}");
+
+    // `while let`, and owners moved out many times over (a leak or a double
+    // free would show up here).
+    let mut total: usize = 0;
+    for i in 0..100000 {
+        let m = if i % 3 == 0 { Msg::Text(String::from("ab")) } else if i % 3 == 1 { Msg::Note(String::from("cde")) } else { Msg::Quit };
+        match m {
+            Msg::Text(s) | Msg::Note(s) if s.len() > 2 => total += s.len() * 10,
+            Msg::Text(s) | Msg::Note(s) => total += s.len(),
+            Msg::Quit => {}
+        }
+    }
+    println("total {total}");
+    let mut queue: [Result::<i32, i32>; -..+] = [Ok(1), Err(2), Ok(3)];
+    let mut sum = 0;
+    while let Some(Ok(v) | Err(v)) = queue.pop() {
+        sum += v;
+    }
+    println("sum {sum}");
+    for (Ok(v) | Err(v)) in [Ok(5), Err(6)] {
+        println("for {v}");
+    }
+}

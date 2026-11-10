@@ -1,0 +1,19 @@
+// error: type::mismatch
+// once: type::mismatch
+// A variable bound by a `|` pattern has the same type in every alternative.
+enum Value {
+    Int(i32),
+    Text(str),
+    Flag(bool),
+}
+
+fn show(v: Value): i32 {
+    match v {
+        Value::Int(x) | Value::Text(x) => 1,
+        Value::Flag(_) => 0,
+    }
+}
+
+fn main() {
+    println("{show(Value::Int(3))}");
+}

@@ -103,9 +103,7 @@ impl Sema {
                 self.record_def(last, def);
                 self.check_method_privacy(def, last);
             }
-            ValueRes::Const(def) => self.record_def(last, def),
-            ValueRes::Static(def) => self.record_def(last, def),
-            ValueRes::TraitMethod { def, .. } => self.record_def(last, def),
+            ValueRes::Const(def) | ValueRes::Static(def) | ValueRes::TraitMethod { def, .. } => self.record_def(last, def),
             ValueRes::Ctor { adt, variant, .. } => {
                 let v = self.p.variants_of(self.p.adt(adt))[variant as usize].def;
                 self.record_def(last, v);

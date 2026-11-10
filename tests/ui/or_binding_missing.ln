@@ -1,0 +1,39 @@
+// error: name::unbound_in_alternative
+// once: type::mismatch
+// Every alternative of a `|` pattern must bind the same variables: `y` is
+// missing from the second, `z` from the first, and the nested pattern's `w`
+// from `Pair::Right`.
+enum Pair {
+    Left(i32, i32),
+    Right(i32, i32),
+}
+
+fn sum(p: Pair): i32 {
+    match p {
+        Pair::Left(x, y) | Pair::Right(x, _) => x + y,
+    }
+}
+
+fn last(p: Pair): i32 {
+    match p {
+        Pair::Left(_, _) | Pair::Right(_, z) => z,
+    }
+}
+
+fn nested(o: Option::<Pair>): i32 {
+    match o {
+        Some(Pair::Left(w, _) | Pair::Right(_, w)) | None => w,
+    }
+}
+
+// A variable missing from an alternative is still declared: its uses
+// resolve, and a type error in the arm is reported once.
+fn still_typed(p: Pair): bool {
+    match p {
+        Pair::Left(a, _) | Pair::Right(_, _) => a,
+    }
+}
+
+fn main() {
+    println("{sum(Pair::Left(1, 2))} {last(Pair::Right(3, 4))} {nested(None)} {still_typed(Pair::Left(1, 2))}");
+}
