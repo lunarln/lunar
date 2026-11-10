@@ -1,0 +1,185 @@
+// Git dependencies, through the `git` executable. Each repository is
+// mirrored once (bare) in `$LUNAR_HOME/git/db/<slug>` (`~/.lunar` by
+// default), and each commit used is checked out once in
+// `$LUNAR_HOME/git/checkouts/<slug>/<commit prefix>`. A port of the `git`
+// module of crates/ln-driver/src/project.rs.
+
+use std::env;
+use std::fs;
+use std::process;
+use crater::paths::{join, normalize, parent};
+
+/// What a dependency names in its repository.
+#[derive(Eq)]
+pub enum RefKind {
+    Tag,
+    Branch,
+    Rev,
+    DefaultBranch,
+}
+
+/// `$LUNAR_HOME`, or `~/.lunar`.
+pub fn home(): String {
+    if let Some(h) = env::var("LUNAR_HOME") {
+        return normalize(h.as_str());
+    }
+    let user = match env::var("HOME") {
+        Some(h) => h,
+        None => match env::var("USERPROFILE") {
+            Some(h) => h,
+            None => env::temp_dir(),
+        },
+    };
+    return join(user.as_str(), ".lunar");
+}
+
+/// A stable short name for a repository URL: its last part and a hash.
+fn slug(url: str): String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in url.bytes() {
+        h = (h ^ (b as u64)).wrapping_mul(0x100000001b3);
+    }
+    let mut tail = url;
+    while tail.ends_with("/") {
+        tail = tail[..tail.len() - 1];
+    }
+    while tail.ends_with(".git") {
+        tail = tail[..tail.len() - 4];
+    }
+    let b = tail.as_bytes();
+    let mut start = b.len();
+    while start > 0 && b[start - 1] != b'/' {
+        start -= 1;
+    }
+    let mut out = String::new();
+    for c in tail[start..].chars() {
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' {
+            out.push(c);
+        }
+    }
+    out.push('-');
+    let digits = "0123456789abcdef".as_bytes();
+    let mut shift: u64 = 60;
+    loop {
+        out.push(digits[((h >> shift) & 15) as usize] as char);
+        if shift == 0 {
+            break;
+        }
+        shift -= 4;
+    }
+    return out;
+}
+
+/// Run `git args` (in `dir`, if not empty): its trimmed output, or a
+/// message.
+fn run(args: [str; &], dir: str): Result::<String, String> {
+    let mut all: [str; ..+] = [];
+    if dir.len() > 0 {
+        all.push("-C");
+        all.push(dir);
+    }
+    all.extend(args);
+    let o = match process::output("git", all[..]) {
+        Ok(o) => o,
+        Err(e) => {
+            let mut m = String::new();
+            m.write("could not run git: {e} (is git installed?)");
+            return Err(m);
+        }
+    };
+    if !o.status.success() {
+        let mut m = String::from("`git");
+        for a in args {
+            m.push(' ');
+            m.push_str(a);
+        }
+        m.write("` failed: {o.stderr.as_str().trim()}");
+        return Err(m);
+    }
+    return Ok(String::from(o.stdout.as_str().trim()));
+}
+
+/// The local bare mirror of `url`, fetched up to date if `fetch`.
+fn mirror(url: str, fetch: bool): Result::<String, String> {
+    let mut rel = String::from("git/db/");
+    rel.push_str(slug(url).as_str());
+    let db = join(home().as_str(), rel.as_str());
+    let head = join(db.as_str(), "HEAD");
+    if !fs::exists(head.as_str()) {
+        let up = parent(db.as_str()).unwrap();
+        if let Err(e) = fs::create_dir_all(up.as_str()) {
+            let mut m = String::new();
+            m.write("could not create `{up}`: {e}");
+            return Err(m);
+        }
+        let args = ["clone", "--bare", "--quiet", url, db.as_str()];
+        run(args[..], "")?;
+    } else if fetch {
+        let args = ["fetch", "--quiet", "--force", "--tags", "origin", "+refs/heads/*:refs/heads/*"];
+        run(args[..], db.as_str())?;
+    }
+    return Ok(db);
+}
+
+/// The commit a reference names.
+pub fn resolve(url: str, kind: RefKind, name: str): Result::<String, String> {
+    let db = mirror(url, true)?;
+    let mut spec = String::new();
+    match kind {
+        RefKind::Tag => spec.write("refs/tags/{name}^{{commit}}"),
+        RefKind::Branch => spec.write("refs/heads/{name}^{{commit}}"),
+        RefKind::Rev => spec.write("{name}^{{commit}}"),
+        RefKind::DefaultBranch => spec.push_str("HEAD^{commit}"),
+    }
+    let args = ["rev-parse", "--verify", "--quiet", spec.as_str()];
+    return match run(args[..], db.as_str()) {
+        Ok(c) => Ok(c),
+        Err(_) => {
+            let mut m = String::new();
+            match kind {
+                RefKind::Tag => m.write("{url} has no tag `{name}`"),
+                RefKind::Branch => m.write("{url} has no branch `{name}`"),
+                RefKind::Rev => m.write("{url} has no commit `{name}`"),
+                RefKind::DefaultBranch => m.write("{url} has no default branch"),
+            }
+            Err(m)
+        }
+    };
+}
+
+/// A checkout of `commit`, made once and then reused.
+pub fn checkout(url: str, commit: str): Result::<String, String> {
+    let short = if commit.len() > 12 { commit[..12] } else { commit };
+    let mut rel = String::from("git/checkouts/");
+    rel.write("{slug(url)}/{short}");
+    let dir = join(home().as_str(), rel.as_str());
+    if fs::exists(join(dir.as_str(), ".lunar-ok").as_str()) {
+        return Ok(dir);
+    }
+    let db = mirror(url, false)?;
+    let mut probe = String::new();
+    probe.write("{commit}^{{commit}}");
+    let args = ["cat-file", "-e", probe.as_str()];
+    if run(args[..], db.as_str()).is_err() {
+        mirror(url, true)?;
+    }
+    if fs::exists(dir.as_str()) {
+        let _ = fs::remove_dir_all(dir.as_str());
+    }
+    let up = parent(dir.as_str()).unwrap();
+    if let Err(e) = fs::create_dir_all(up.as_str()) {
+        let mut m = String::new();
+        m.write("could not create `{up}`: {e}");
+        return Err(m);
+    }
+    let args = ["clone", "--quiet", "--no-checkout", db.as_str(), dir.as_str()];
+    run(args[..], "")?;
+    let args = ["checkout", "--quiet", commit];
+    run(args[..], dir.as_str())?;
+    if let Err(e) = fs::write(join(dir.as_str(), ".lunar-ok").as_str(), "".as_bytes()) {
+        let mut m = String::new();
+        m.write("{e}");
+        return Err(m);
+    }
+    return Ok(dir);
+}

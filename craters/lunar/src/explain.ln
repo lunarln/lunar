@@ -1,0 +1,277 @@
+// `lunar explain`: the long explanations of diagnostic codes, read from
+// `docs/errors/<scope>/<name>.md` in the sysroot (`sysroot.ln`). A port of
+// crates/ln-driver/src/explain.rs, which embeds them instead.
+
+use std::fs;
+use ln_sema::codes::all_codes;
+use ln_sema::diag::Code;
+use ln_sema::program::Program;
+use crater::sysroot;
+
+/// The Markdown explanation of `code` (`scope::name`), if there is one.
+pub fn lookup(code: str): Option::<String> {
+    // Only real codes name files: no `..` or `/` gets into the path.
+    let mut known = false;
+    for c in all_codes() {
+        if same(c, code) {
+            known = true;
+        }
+    }
+    if !known {
+        return None;
+    }
+    let dir = match sysroot::docs_dir() {
+        Some(d) => d,
+        None => return None,
+    };
+    let sep = code.find("::").unwrap();
+    let mut path = String::new();
+    path.write("{dir}/{code[..sep]}/{code[sep + 2..]}.md");
+    return match fs::read_to_string(path.as_str()) {
+        Ok(md) => Some(md),
+        Err(_) => None,
+    };
+}
+
+/// Whether `c` is `code` (`scope::name`).
+fn same(c: Code, code: str): bool {
+    return code.len() == c.scope.len() + 2 + c.name.len() && code.starts_with(c.scope) && code[c.scope.len()..].starts_with("::") && code.ends_with(c.name);
+}
+
+fn full(c: Code): String {
+    let mut s = String::new();
+    s.write("{c.scope}::{c.name}");
+    return s;
+}
+
+/// The one-line title of an explanation: its first line, without
+/// `# code: `.
+fn title(md: str): String {
+    let first = match md.find("\n") {
+        Some(i) => md[..i],
+        None => md,
+    };
+    let mut t = first;
+    while t.starts_with("#") {
+        t = t[1..];
+    }
+    t = t.trim();
+    return match t.find(": ") {
+        Some(i) => String::from(t[i + 2..]),
+        None => String::from(t),
+    };
+}
+
+/// `scope::name`, also from a pasted `err(scope::name)` or `warn(...)`.
+fn normalize(input: str): String {
+    let mut s = input.trim();
+    while s.starts_with("`") {
+        s = s[1..];
+    }
+    while s.ends_with("`") {
+        s = s[..s.len() - 1];
+    }
+    while s.ends_with(":") {
+        s = s[..s.len() - 1];
+    }
+    let prefixes = ["err(", "warn("];
+    for prefix in prefixes {
+        if s.starts_with(prefix) {
+            s = s[prefix.len()..];
+            if s.ends_with(")") {
+                s = s[..s.len() - 1];
+            }
+        }
+    }
+    return String::from(s.trim());
+}
+
+fn edit_distance(a: str, b: str): usize {
+    let mut bs: [char; ..+] = [];
+    for c in b.chars() {
+        bs.push(c);
+    }
+    let mut prev: [usize; -..+] = [];
+    for j in 0..bs.len() + 1 {
+        prev.push(j);
+    }
+    let mut i: usize = 0;
+    for ca in a.chars() {
+        let mut cur: [usize; -..+] = [];
+        cur.push(i + 1);
+        for j in 0..bs.len() {
+            let sub = prev[j] + if ca != bs[j] { 1 } else { 0 };
+            let mut best = sub;
+            if prev[j + 1] + 1 < best {
+                best = prev[j + 1] + 1;
+            }
+            if cur[j] + 1 < best {
+                best = cur[j] + 1;
+            }
+            cur.push(best);
+        }
+        prev = cur;
+        i += 1;
+    }
+    return prev[bs.len()];
+}
+
+/// The known codes closest to `code`, comparing the full code and just
+/// the name (so a missing or wrong scope still finds them), as text:
+/// up to three, separated by NULs.
+fn suggestions(code: str): [Code; ..+] {
+    let name = match code.find("::") {
+        Some(_) => last_part(code),
+        None => code,
+    };
+    let codes = all_codes();
+    let mut scores: [usize; ..+] = [];
+    let mut best: usize = 18446744073709551615;
+    for c in codes {
+        let f = full(c);
+        let mut d = edit_distance(code, f.as_str());
+        let dn = edit_distance(name, c.name);
+        if dn < d {
+            d = dn;
+        }
+        scores.push(d);
+        if d < best {
+            best = d;
+        }
+    }
+    let mut out: [Code; ..+] = [];
+    let mut limit = name.len() / 3;
+    if limit < 2 {
+        limit = 2;
+    }
+    if best > limit {
+        return out;
+    }
+    for i in 0..codes.len() {
+        if scores[i] == best && out.len() < 3 {
+            out.push(codes[i]);
+        }
+    }
+    return out;
+}
+
+/// The part after the last `::`.
+fn last_part(code: str): str {
+    let mut rest = code;
+    while let Some(i) = rest.find("::") {
+        rest = rest[i + 2..];
+    }
+    return rest;
+}
+
+/// Run `lunar explain [code]`: the exit code.
+pub fn run(code: Option::<str>, list: bool): i32 {
+    let input = match code {
+        Some(c) => c,
+        None => {
+            return print_list();
+        }
+    };
+    if list {
+        return print_list();
+    }
+    let code = normalize(input);
+    if let Some(md) = lookup(code.as_str()) {
+        std::io::write_str(md.as_str());
+        return 0;
+    }
+    if sysroot::docs_dir().is_none() {
+        eprintln("error: the explanations of diagnostic codes (`docs/errors`) were not found");
+        eprintln("help: install them as `<prefix>/lib/lunar/docs/errors` next to `<prefix>/bin/lunar`");
+        return 1;
+    }
+    eprintln("error: no explanation for `{code}`");
+    let s = suggestions(code.as_str());
+    if s.len() == 1 {
+        eprintln("help: did you mean `{full(s[0])}`?");
+    } else if s.len() > 1 {
+        let mut list = String::new();
+        for i in 0..s.len() {
+            if i > 0 {
+                list.push_str(", ");
+            }
+            list.write("`{full(s[i])}`");
+        }
+        eprintln("help: did you mean one of {list}?");
+    }
+    eprintln("note: run `lunar explain --list` to see every code");
+    return 1;
+}
+
+fn print_list(): i32 {
+    let codes = all_codes();
+    let mut width: usize = 0;
+    for c in codes {
+        let n = c.scope.len() + 2 + c.name.len();
+        if n > width {
+            width = n;
+        }
+    }
+    let mut out = String::new();
+    for c in codes {
+        let f = full(c);
+        out.push_str(f.as_str());
+        for _ in f.len()..width {
+            out.push(' ');
+        }
+        out.push_str("  ");
+        match lookup(f.as_str()) {
+            Some(md) => out.push_str(title(md.as_str()).as_str()),
+            None => out.push_str("(no explanation)"),
+        }
+        out.push('\n');
+    }
+    std::io::write_str(out.as_str());
+    return 0;
+}
+
+/// The note printed after the diagnostics of a failed compilation,
+/// pointing at `lunar explain` for the error codes that have an
+/// explanation; empty if none has.
+pub fn hint(p: &Program): String {
+    let mut codes: [Code; ..+] = [];
+    for d in p.diags.list {
+        if !d.is_error() {
+            continue;
+        }
+        let mut seen = false;
+        for c in codes {
+            if c == d.code {
+                seen = true;
+            }
+        }
+        if !seen && lookup(full(d.code).as_str()).is_some() {
+            codes.push(d.code);
+        }
+    }
+    let mut out = String::new();
+    if codes.len() == 0 {
+        return out;
+    }
+    let first = full(codes[0]);
+    if codes.len() == 1 {
+        out.write("For more information about this error, try `lunar explain {first}`.");
+        return out;
+    }
+    let shown: usize = 4;
+    let mut list = String::new();
+    for i in 0..codes.len() {
+        if i == shown {
+            break;
+        }
+        if i > 0 {
+            list.push_str(", ");
+        }
+        list.push_str(full(codes[i]).as_str());
+    }
+    if codes.len() > shown {
+        list.write(" and {codes.len() - shown} more");
+    }
+    out.write("Some errors have detailed explanations: {list}.\nFor more information about an error, try `lunar explain {first}`.");
+    return out;
+}

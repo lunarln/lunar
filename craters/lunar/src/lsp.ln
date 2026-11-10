@@ -1,0 +1,2 @@
+// STUB: replaced by the LSP port
+pub fn serve(): i32 { eprintln("lunar lsp: not yet ported"); return 1; }

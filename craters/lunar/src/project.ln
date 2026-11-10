@@ -1,12 +1,160 @@
-// Packages and workspaces: the part of crates/ln-driver/src/project.rs that
-// building needs. It reads `lunar.toml` manifests (the subset Lunar's own
-// manifests use: tables, strings, arrays of strings, inline tables), follows
-// path dependencies into a package graph, and lists the craters a build
-// analyzes.
+// Projects: `lunar.toml` manifests, workspaces, the package graph,
+// `lunar.lock`, and fetching git dependencies. A port of
+// crates/ln-driver/src/project.rs.
+//
+// A *package* is a directory with a `lunar.toml` that has a `[package]`
+// section. It contains up to two craters: a library (`src/lib.ln`) that
+// other packages can depend on, and a program (`src/main.ln`). Tests live in
+// those craters (`#[test]`) and in `tests/*.ln`, each of which is a crater
+// that can use the library.
+//
+// A *workspace* is a `lunar.toml` with a `[workspace]` section listing member
+// packages. Members share one `lunar.lock` and one `target/` at the
+// workspace root. A package that isn't a member of any workspace is a
+// workspace of its own.
+//
+// Dependencies come from a path or a git repository. Registry dependencies
+// (`json = "1.2"`) are parsed, but the registry does not exist yet.
+//
+// Errors carry a `manifest::` code and, where possible, the position in
+// `lunar.toml` they are about, so they render like compiler diagnostics.
+//
+// Everything is kept in one `Project`: texts are interned in `names`,
+// lists live in its arenas.
 
 use core::arena::{Arena, List};
 use core::intern::{Interner, Symbol};
 use std::fs;
+use ln_sema::codes::{build, manifest};
+use ln_sema::diag::Code;
+use ln_semver::{Version, VersionReq};
+use ln_toml::{Doc, Kind, TableKind, describe, key_of, str_of};
+use crater::git;
+use crater::git::RefKind;
+use crater::paths::{absolute, canonical, display, file_name, join, normalize, parent, relative};
+use crater::ui::status;
+
+pub const MANIFEST: str = "lunar.toml";
+pub const LOCKFILE: str = "lunar.lock";
+
+const NAME_RULE: str = "names use lowercase letters, digits, `-` and `_`, and start with a letter";
+
+// ===================================================================== errors
+
+/// A project error: a `manifest::` code, a message, and the place in a
+/// manifest or lockfile it is about.
+pub struct ProjectError {
+    /// The code, `scope::name` (owned, so that an error never points into
+    /// what it was made from).
+    pub code: String,
+    pub message: String,
+    /// The file it points into (empty if none), and the bytes.
+    pub file: String,
+    pub lo: u32,
+    pub hi: u32,
+    /// Text under the place (empty: none).
+    pub label: String,
+    /// The notes and helps, in order: each a kind byte (`n` or `h`), its
+    /// text and a NUL.
+    pub extra: String,
+}
+
+impl ProjectError {
+    pub fn new(code: Code, message: FmtArgs): ProjectError {
+        let mut m = String::new();
+        m.write(message);
+        let mut c = String::new();
+        c.write("{code.scope}::{code.name}");
+        return ProjectError { code: c, message: m, file: String::new(), lo: 0, hi: 0, label: String::new(), extra: String::new() };
+    }
+
+    pub fn at(mut self, file: str, lo: u32, hi: u32): ProjectError {
+        self.file = String::from(file);
+        self.lo = lo;
+        self.hi = hi;
+        return self;
+    }
+
+    pub fn note(mut self, n: FmtArgs): ProjectError {
+        self.extra.push('n');
+        self.extra.write(n);
+        self.extra.push('\0');
+        return self;
+    }
+
+    pub fn help(mut self, h: FmtArgs): ProjectError {
+        self.extra.push('h');
+        self.extra.write(h);
+        self.extra.push('\0');
+        return self;
+    }
+}
+
+/// An I/O failure while handling `path`.
+fn io_error(path: str, e: std::io::Error): ProjectError {
+    return ProjectError::new(build::IO(), "could not access `{display(path)}`: {e}");
+}
+
+// ===================================================================== the project
+
+/// Where a dependency comes from.
+#[derive(Eq)]
+pub enum DepSource {
+    Registry,
+    Path(Symbol),
+    Git(Symbol, GitRef),
+}
+
+/// What a git dependency names.
+#[derive(Eq)]
+pub enum GitRef {
+    Tag(Symbol),
+    Branch(Symbol),
+    Rev(Symbol),
+    DefaultBranch,
+}
+
+/// A dependency as a manifest declares it.
+pub struct Dependency {
+    /// The name code uses for it (its key in `[dependencies]`).
+    pub alias: Symbol,
+    /// The depended-on package's own name.
+    pub package: Symbol,
+    /// The version requirement's text, if any (it parses).
+    pub req: Option::<Symbol>,
+    pub source: DepSource,
+    /// Where the entry is in the manifest.
+    pub lo: u32,
+    pub hi: u32,
+}
+
+/// Where a package in the graph comes from.
+#[derive(Eq)]
+pub enum SourceId {
+    Path(Symbol),
+    /// The URL, the reference and the commit.
+    Git(Symbol, GitRef, Symbol),
+}
+
+/// A package's manifest, and its place in the graph.
+pub struct Package {
+    pub name: Symbol,
+    /// Its version (it parses).
+    pub version: Symbol,
+    /// The directory containing the manifest.
+    pub dir: Symbol,
+    /// The manifest file.
+    pub manifest: Symbol,
+    pub deps: List::<Dependency>,
+    pub source: SourceId,
+    /// The packages it uses: (name in code, package index).
+    pub resolved: List::<PackageDep>,
+}
+
+pub struct PackageDep {
+    pub alias: Symbol,
+    pub package: u32,
+}
 
 /// A crater to analyze: its name, the path of its root file, and the
 /// craters it may name.
@@ -22,273 +170,1080 @@ pub struct CraterDep {
     pub index: u32,
 }
 
-pub struct Package {
-    pub name: Symbol,
-    /// The package's directory, normalized.
-    pub dir: Symbol,
-    pub has_lib: bool,
-    pub has_main: bool,
-    pub deps: List::<PackageDep>,
+/// What to build from a package.
+#[derive(Eq)]
+pub enum Target {
+    /// `src/main.ln`.
+    Main,
+    /// `src/lib.ln` (for checking and its unit tests).
+    Lib,
+    /// An integration test file `tests/*.ln`.
+    TestFile(Symbol),
 }
 
-pub struct PackageDep {
-    pub alias: Symbol,
-    pub package: u32,
+/// A `members` pattern of a workspace and its place.
+struct Member {
+    pattern: Symbol,
+    lo: u32,
+    hi: u32,
 }
 
+/// A parsed `lunar.toml`: a package, a workspace, or both.
+struct ManifestFile {
+    path: Symbol,
+    package: Option::<Package>,
+    workspace: bool,
+    members: List::<Member>,
+}
+
+/// A line of `lunar.lock`.
+struct Locked {
+    name: Symbol,
+    version: Symbol,
+    source: Symbol,
+}
+
+/// Everything about the projects a command works on: the workspace, the
+/// resolved package graph (members first, in workspace order), and the
+/// craters of the target being built.
 pub struct Project {
     pub names: Interner,
+    /// The workspace's directory: its lockfile and `target/` are there.
+    pub root: Symbol,
+    /// The member package directories (the root's own package first).
+    pub member_dirs: [Symbol; ..+],
+    /// The member the command started in, if any.
+    pub current: Option::<Symbol>,
     pub packages: [Package; ..+],
+    /// How many of `packages` are the workspace's members.
+    pub members: usize,
+    pub deps: Arena::<Dependency>,
     pub package_deps: Arena::<PackageDep>,
+    member_list: Arena::<Member>,
     pub specs: [CraterSpec; -..+],
     pub crater_deps: Arena::<CraterDep>,
-    /// Problems found, as messages.
-    pub errors: [Symbol; ..+],
-}
-
-/// What a manifest says.
-struct Manifest {
-    name: Option::<Symbol>,
-    is_workspace: bool,
-    members: List::<Symbol>,
-    deps: List::<ManifestDep>,
-}
-
-struct ManifestDep {
-    alias: Symbol,
-    path: Symbol,
 }
 
 impl Project {
     pub fn new(): Project {
-        return Project { names: Interner::new(), packages: [], package_deps: Arena::new(), specs: [], crater_deps: Arena::new(), errors: [] };
+        let mut names = Interner::new();
+        let empty = names.intern("");
+        return Project {
+            names,
+            root: empty,
+            member_dirs: [],
+            current: None,
+            packages: [],
+            members: 0,
+            deps: Arena::new(),
+            package_deps: Arena::new(),
+            member_list: Arena::new(),
+            specs: [],
+            crater_deps: Arena::new(),
+        };
     }
 
     pub fn text(&self, s: Symbol): str {
         return self.names.resolve(s);
     }
 
-    fn error(&mut +self, args: FmtArgs) {
+    pub fn sym(&mut +self, s: str): Symbol {
+        return self.names.intern(s);
+    }
+
+    fn symf(&mut +self, args: FmtArgs): Symbol {
         let mut s = String::new();
         s.write(args);
-        let m = self.names.intern(s.as_str());
-        self.errors.push(m);
+        return self.names.intern(s.as_str());
     }
 
-    // ----------------------------------------------------------- packages
+    // ----------------------------------------------------------- manifests
 
-    /// Load the package in `dir` and, through path dependencies, every
-    /// package it needs. Its index, or `None` after an error.
-    pub fn load_package(&mut +self, dir: str): Option::<u32> {
-        let norm = normalize(dir);
-        let d = self.names.intern(norm.as_str());
-        for i in 0..self.packages.len() {
-            if self.packages[i].dir == d {
-                return Some(i as u32);
-            }
-        }
-        let mut symbols: Arena::<Symbol> = Arena::new();
-        let mut deps: Arena::<ManifestDep> = Arena::new();
-        let m = match self.read_manifest(norm.as_str(), &mut symbols, &mut deps) {
-            Some(m) => m,
-            None => return None,
+    /// Read and parse `dir/lunar.toml`.
+    fn load_manifest(&mut +self, dir: str): Result::<ManifestFile, ProjectError> {
+        let path = join(dir, MANIFEST);
+        let text = match fs::read_to_string(path.as_str()) {
+            Ok(t) => t,
+            Err(e) => return Err(io_error(path.as_str(), e)),
         };
-        let name = match m.name {
-            Some(n) => n,
-            None => {
-                self.error("`{norm}/lunar.toml` has no `[package]` with a `name`");
-                return None;
-            }
-        };
-        let index = self.packages.len() as u32;
-        let has_lib = exists(join(norm.as_str(), "src/lib.ln").as_str());
-        let has_main = exists(join(norm.as_str(), "src/main.ln").as_str());
-        self.packages.push(Package { name, dir: d, has_lib, has_main, deps: List::empty() });
-        let mut pdeps: [PackageDep; ..+] = [];
-        for dep in deps.list(m.deps) {
-            let path = join(norm.as_str(), self.text(dep.path));
-            match self.load_package(path.as_str()) {
-                Some(j) => pdeps.push(PackageDep { alias: dep.alias, package: j }),
-                None => return None,
-            }
-        }
-        let l = self.package_deps.add_list(pdeps[..]);
-        self.packages[index as usize].deps = l;
-        return Some(index);
+        return self.parse_manifest(dir, text.as_str());
     }
 
-    /// The directory of the workspace containing `dir` (the nearest
-    /// ancestor whose `lunar.toml` has a `[workspace]`), if any.
-    pub fn find_workspace(&mut +self, dir: str): Option::<String> {
-        let mut d = normalize(dir);
-        loop {
-            let manifest = join(d.as_str(), "lunar.toml");
-            if let Ok(text) = fs::read_to_string(manifest.as_str()) {
-                if text.as_str().contains("[workspace]") {
-                    return Some(d);
+    /// Parse the text of `dir/lunar.toml`.
+    fn parse_manifest(&mut +self, dir: str, text: str): Result::<ManifestFile, ProjectError> {
+        let path = join(dir, MANIFEST);
+        let p = path.as_str();
+        let d = match ln_toml::parse(text) {
+            Ok(d) => d,
+            Err(e) => return Err(ProjectError::new(manifest::PARSE(), "invalid `{MANIFEST}`: {e.message}").at(p, e.lo, e.hi)),
+        };
+        // What serde would reject: unknown keys, values of the wrong type,
+        // missing fields; in document order.
+        let mut package: Option::<u32> = None;
+        let mut workspace: Option::<u32> = None;
+        let mut dependencies: Option::<u32> = None;
+        for e in d.children(0) {
+            let k = key_of(&d, e);
+            let v = d.entries[e as usize].value;
+            if k == "package" {
+                package = Some(v);
+                check_table(&d, v, p, "struct RawPackage")?;
+                check_fields(&d, v, p, "`name`, `version`, `description`, `license`, `authors`")?;
+                for f in d.children(v) {
+                    let fk = key_of(&d, f);
+                    let fv = d.entries[f as usize].value;
+                    if fk == "authors" {
+                        check_kind(&d, fv, p, Kind::Array, "a sequence")?;
+                        for a in d.children(fv) {
+                            check_kind(&d, d.entries[a as usize].value, p, Kind::String, "a string")?;
+                        }
+                    } else {
+                        check_kind(&d, fv, p, Kind::String, "a string")?;
+                    }
+                }
+                for field in ["name", "version"] {
+                    if d.get(v, field).is_none() {
+                        let x = d.values[v as usize];
+                        return Err(ProjectError::new(manifest::PARSE(), "invalid `{MANIFEST}`: missing field `{field}`").at(p, x.lo, x.hi));
+                    }
+                }
+            } else if k == "workspace" {
+                workspace = Some(v);
+                check_table(&d, v, p, "struct RawWorkspace")?;
+                check_fields(&d, v, p, "`members`")?;
+                if let Some(m) = d.get(v, "members") {
+                    let mv = d.entries[m as usize].value;
+                    check_kind(&d, mv, p, Kind::Array, "a sequence")?;
+                    for a in d.children(mv) {
+                        check_kind(&d, d.entries[a as usize].value, p, Kind::String, "a string")?;
+                    }
+                }
+            } else if k == "dependencies" {
+                dependencies = Some(v);
+                check_table(&d, v, p, "a map")?;
+                for dep in d.children(v) {
+                    check_dep(&d, d.entries[dep as usize].value, p)?;
+                }
+            } else {
+                let x = d.entries[e as usize];
+                return Err(ProjectError::new(manifest::PARSE(), "invalid `{MANIFEST}`: unknown field `{k}`, expected one of `package`, `workspace`, `dependencies`").at(p, x.key_lo, x.key_hi));
+            }
+        }
+        if package.is_none() && workspace.is_none() {
+            return Err(ProjectError::new(manifest::PARSE(), "`{display(p)}` has neither a `[package]` nor a `[workspace]` section").help("start it with `[package]`, `name = \"...\"` and `version = \"0.1.0\"`"));
+        }
+        let path_sym = self.sym(p);
+        let mut file = ManifestFile { path: path_sym, package: None, workspace: workspace.is_some(), members: List::empty() };
+        if let Some(w) = workspace {
+            let mut members: [Member; ..+] = [];
+            if let Some(m) = d.get(w, "members") {
+                let mv = d.entries[m as usize].value;
+                for a in d.children(mv) {
+                    let av = d.entries[a as usize].value;
+                    let x = d.values[av as usize];
+                    let s = self.sym(str_of(&d, av));
+                    members.push(Member { pattern: s, lo: x.lo, hi: x.hi });
                 }
             }
-            match parent(d.as_str()) {
-                Some(p) => d = p,
-                None => return None,
+            file.members = self.member_list.add_list(members[..]);
+        }
+        match package {
+            Some(pk) => {
+                file.package = Some(self.package_of(dir, p, &d, pk, dependencies)?);
+            }
+            None => {
+                if let Some(deps) = dependencies {
+                    let keys = sorted_keys(&d, deps);
+                    if keys.len() > 0 {
+                        let x = d.entries[keys[0] as usize];
+                        return Err(ProjectError::new(manifest::PARSE(), "a workspace without a `[package]` cannot have `[dependencies]`").at(p, x.key_lo, x.key_hi).help("declare dependencies in the member packages"));
+                    }
+                }
             }
         }
+        return Ok(file);
     }
 
-    /// The members of the workspace in `dir`.
-    pub fn workspace_members(&mut +self, dir: str, out: &mut +[Symbol; ..+]) {
-        let mut symbols: Arena::<Symbol> = Arena::new();
-        let mut deps: Arena::<ManifestDep> = Arena::new();
-        if let Some(m) = self.read_manifest(dir, &mut symbols, &mut deps) {
-            for s in symbols.list(m.members) {
-                let p = join(dir, self.text(s));
-                out.push(self.names.intern(p.as_str()));
+    /// The package section `pk` (and the dependencies `deps`) of the
+    /// manifest `path`, checked.
+    fn package_of(&mut +self, dir: str, path: str, d: &Doc, pk: u32, deps: Option::<u32>): Result::<Package, ProjectError> {
+        let name_v = d.entries[d.get(pk, "name").unwrap() as usize].value;
+        let version_v = d.entries[d.get(pk, "version").unwrap() as usize].value;
+        let name = str_of(d, name_v);
+        let nx = d.values[name_v as usize];
+        if !valid_name(name) {
+            return Err(ProjectError::new(manifest::BAD_NAME(), "package name `{name}` is not valid").at(path, nx.lo, nx.hi).note("{NAME_RULE}"));
+        }
+        let cn = crater_name(name);
+        if cn.as_str() == "core" || cn.as_str() == "std" || cn.as_str() == "crater" {
+            return Err(ProjectError::new(manifest::BAD_NAME(), "`{name}` cannot be a package name: it is the name of a built-in crater").at(path, nx.lo, nx.hi).help("choose another name"));
+        }
+        let version = str_of(d, version_v);
+        if let Err(e) = Version::parse(version) {
+            let vx = d.values[version_v as usize];
+            return Err(ProjectError::new(manifest::BAD_VERSION(), "package version `{version}` is not a valid version: {e}").at(path, vx.lo, vx.hi).help("versions look like `1.2.3`"));
+        }
+        let mut out: [Dependency; ..+] = [];
+        if let Some(t) = deps {
+            for e in sorted_keys(d, t) {
+                let dep = self.dependency(dir, path, d, e)?;
+                out.push(dep);
             }
         }
+        let name_sym = self.sym(name);
+        let version_sym = self.sym(version);
+        let dir_sym = self.sym(dir);
+        let path_sym = self.sym(path);
+        let list = self.deps.add_list(out[..]);
+        return Ok(Package { name: name_sym, version: version_sym, dir: dir_sym, manifest: path_sym, deps: list, source: SourceId::Path(dir_sym), resolved: List::empty() });
+    }
+
+    /// The dependency entry `e` of a manifest, checked.
+    fn dependency(&mut +self, dir: str, path: str, d: &Doc, e: u32): Result::<Dependency, ProjectError> {
+        let _ = dir;
+        let entry = d.entries[e as usize];
+        let alias = key_of(d, e);
+        let v = entry.value;
+        let lo = entry.key_lo;
+        let hi = d.values[v as usize].hi;
+        if !valid_name(alias) {
+            return Err(ProjectError::new(manifest::BAD_NAME(), "dependency name `{alias}` is not valid").at(path, entry.key_lo, entry.key_hi).note("{NAME_RULE}"));
+        }
+        let cn = crater_name(alias);
+        let c = cn.as_str();
+        if c == "core" || c == "std" || c == "crater" || c == "self" || c == "super" || c == "Self" {
+            return Err(ProjectError::new(manifest::BAD_NAME(), "`{alias}` cannot be a dependency name: it already means something in paths")
+                .at(path, entry.key_lo, entry.key_hi)
+                .help("rename it, keeping the package: `my-{alias} = {{ ..., package = \"{alias}\" }}`"));
+        }
+        let alias_sym = self.sym(alias);
+        if d.values[v as usize].kind == Kind::String {
+            let req = str_of(d, v);
+            check_req(alias, req, path, lo, hi)?;
+            let r = self.sym(req);
+            return Ok(Dependency { alias: alias_sym, package: alias_sym, req: Some(r), source: DepSource::Registry, lo, hi });
+        }
+        let version = field(d, v, "version");
+        let mut req: Option::<Symbol> = None;
+        if let Some(r) = version {
+            check_req(alias, r, path, lo, hi)?;
+            req = Some(self.sym(r));
+        }
+        let package = match field(d, v, "package") {
+            Some(pk) => self.sym(pk),
+            None => alias_sym,
+        };
+        let tag = field(d, v, "tag");
+        let branch = field(d, v, "branch");
+        let rev = field(d, v, "rev");
+        let mut refs: usize = 0;
+        if tag.is_some() {
+            refs += 1;
+        }
+        if branch.is_some() {
+            refs += 1;
+        }
+        if rev.is_some() {
+            refs += 1;
+        }
+        if refs > 1 {
+            return Err(ProjectError::new(manifest::BAD_DEPENDENCY(), "dependency `{alias}` gives more than one of `tag`, `branch` and `rev`").at(path, lo, hi).help("keep one of them"));
+        }
+        let source = match (field(d, v, "path"), field(d, v, "git")) {
+            (Some(_), Some(_)) => {
+                return Err(ProjectError::new(manifest::BAD_DEPENDENCY(), "dependency `{alias}` has both `path` and `git`").at(path, lo, hi).help("keep one of them"));
+            }
+            (Some(pth), None) => {
+                if refs > 0 {
+                    return Err(ProjectError::new(manifest::BAD_DEPENDENCY(), "dependency `{alias}`: `tag`, `branch` and `rev` only apply to `git` dependencies").at(path, lo, hi));
+                }
+                DepSource::Path(self.sym(pth))
+            }
+            (None, Some(url)) => {
+                let reference = if let Some(x) = tag {
+                    GitRef::Tag(self.sym(x))
+                } else if let Some(x) = branch {
+                    GitRef::Branch(self.sym(x))
+                } else if let Some(x) = rev {
+                    GitRef::Rev(self.sym(x))
+                } else {
+                    GitRef::DefaultBranch
+                };
+                DepSource::Git(self.sym(url), reference)
+            }
+            (None, None) => {
+                if req.is_none() {
+                    return Err(ProjectError::new(manifest::BAD_DEPENDENCY(), "dependency `{alias}` does not say where it comes from").at(path, lo, hi).help("give it a `path`, a `git` URL, or a registry `version`"));
+                }
+                DepSource::Registry
+            }
+        };
+        return Ok(Dependency { alias: alias_sym, package, req, source, lo, hi });
+    }
+
+    /// The package manifest in `dir`.
+    pub fn load_package_manifest(&mut +self, dir: str): Result::<Package, ProjectError> {
+        let file = self.load_manifest(dir)?;
+        return match file.package {
+            Some(p) => Ok(p),
+            None => Err(ProjectError::new(manifest::PARSE(), "`{display(self.text(file.path))}` describes a workspace, not a package").help("run the command inside a member package, or pick one with `-p <name>`")),
+        };
+    }
+
+    // ----------------------------------------------------------- workspaces
+
+    /// Find the workspace around `start`: the nearest manifest, and the
+    /// workspace that lists it as a member (or itself).
+    pub fn find_workspace(&mut self, start: str): Result::<(), ProjectError> {
+        let found = match find_project(start) {
+            Some(d) => d,
+            None => {
+                return Err(ProjectError::new(manifest::NOT_FOUND(), "no `{MANIFEST}` in `{display(absolute(start).as_str())}` or any parent directory").help("create a package with `lunar new <name>` or `lunar init`, or pass a .ln file"));
+            }
+        };
+        let dir = match canonical(found.as_str()) {
+            Ok(d) => d,
+            Err(e) => return Err(io_error(found.as_str(), e)),
+        };
+        let file = self.load_manifest(dir.as_str())?;
+        let dir_sym = self.sym(dir.as_str());
+        if file.workspace {
+            let has_package = file.package.is_some();
+            let mut members: [Symbol; ..+] = [];
+            self.expand_members(dir.as_str(), file, &mut members)?;
+            self.root = dir_sym;
+            self.member_dirs = members;
+            if has_package {
+                self.current = Some(dir_sym);
+            }
+            return Ok(());
+        }
+        // A package: look for a workspace above that lists it.
+        let mut up = parent(dir.as_str());
+        while let Some(u) = up {
+            let m = join(u.as_str(), MANIFEST);
+            if fs::is_file(m.as_str()) {
+                if let Ok(f) = self.load_manifest(u.as_str()) {
+                    if f.workspace {
+                        let mut members: [Symbol; ..+] = [];
+                        self.expand_members(u.as_str(), f, &mut members)?;
+                        let mut listed = false;
+                        for i in 0..members.len() {
+                            if members[i] == dir_sym {
+                                listed = true;
+                            }
+                        }
+                        if listed {
+                            self.root = self.sym(u.as_str());
+                            self.member_dirs = members;
+                            self.current = Some(dir_sym);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            up = parent(u.as_str());
+        }
+        self.root = dir_sym;
+        self.member_dirs.push(dir_sym);
+        self.current = Some(dir_sym);
+        return Ok(());
+    }
+
+    /// The member directories of the workspace `file` (at `root`), onto
+    /// `out`.
+    fn expand_members(&mut +self, root: str, file: ManifestFile, out: &mut +[Symbol; ..+]): Result::<(), ProjectError> {
+        let manifest_path = self.text(file.path);
+        if file.package.is_some() {
+            let r = self.sym(root);
+            out.push(r);
+        }
+        for m in self.member_list.list(file.members) {
+            let pat = self.text(m.pattern);
+            if pat.ends_with("/*") {
+                let dir = join(root, pat[..pat.len() - 2]);
+                let entries = match fs::read_dir(dir.as_str()) {
+                    Ok(e) => e,
+                    Err(_) => {
+                        return Err(ProjectError::new(manifest::NOT_FOUND(), "workspace member pattern `{pat}`: `{display(dir.as_str())}` is not a directory").at(manifest_path, m.lo, m.hi));
+                    }
+                };
+                for i in 0..entries.len() {
+                    let child = join(dir.as_str(), entries.name(i));
+                    if fs::is_file(join(child.as_str(), MANIFEST).as_str()) {
+                        let c = match canonical(child.as_str()) {
+                            Ok(c) => c,
+                            Err(e) => return Err(io_error(child.as_str(), e)),
+                        };
+                        let s = self.sym(c.as_str());
+                        push_member(out, s);
+                    }
+                }
+            } else {
+                let dir = join(root, pat);
+                if !fs::is_file(join(dir.as_str(), MANIFEST).as_str()) {
+                    return Err(ProjectError::new(manifest::NOT_FOUND(), "workspace member `{pat}` has no `{MANIFEST}`").at(manifest_path, m.lo, m.hi).help("create it with `lunar new {pat}`, or remove it from `members`"));
+                }
+                let c = match canonical(dir.as_str()) {
+                    Ok(c) => c,
+                    Err(e) => return Err(io_error(dir.as_str(), e)),
+                };
+                let s = self.sym(c.as_str());
+                push_member(out, s);
+            }
+        }
+        return Ok(());
+    }
+
+    /// The member package named `name`.
+    pub fn member(&self, name: str): Option::<usize> {
+        for i in 0..self.members {
+            if self.text(self.packages[i].name) == name {
+                return Some(i);
+            }
+        }
+        return None;
+    }
+
+    /// The member the command started in.
+    pub fn current_member(&self): Option::<usize> {
+        let cur = match self.current {
+            Some(c) => c,
+            None => return None,
+        };
+        for i in 0..self.members {
+            if self.packages[i].dir == cur {
+                return Some(i);
+            }
+        }
+        return None;
+    }
+
+    /// The members' names, `a, b, c`.
+    pub fn member_names(&self): String {
+        let mut s = String::new();
+        for i in 0..self.members {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(self.text(self.packages[i].name));
+        }
+        return s;
+    }
+
+    // ----------------------------------------------------------- resolution
+
+    /// Resolve the dependency graph of the workspace. Locked git commits are
+    /// reused unless `update` is set; the lockfile is rewritten to match.
+    pub fn resolve(&mut +self, update: bool): Result::<(), ProjectError> {
+        let root = String::from(self.text(self.root));
+        let mut lock: [Locked; ..+] = [];
+        if !update {
+            self.load_lock(root.as_str(), &mut lock)?;
+        }
+        for i in 0..self.member_dirs.len() {
+            let dir = String::from(self.text(self.member_dirs[i]));
+            let m = self.load_package_manifest(dir.as_str())?;
+            for j in 0..self.packages.len() {
+                if self.packages[j].name == m.name {
+                    let other = display(self.text(self.packages[j].dir));
+                    return Err(ProjectError::new(manifest::WORKSPACE(), "two workspace members are named `{self.text(m.name)}`")
+                        .note("`{other}` and `{display(dir.as_str())}`")
+                        .help("member package names must be unique"));
+                }
+            }
+            self.packages.push(m);
+        }
+        self.members = self.packages.len();
+        let mut queue: [u32; -..+] = [];
+        for i in 0..self.members {
+            queue.push(i as u32);
+        }
+        while let Some(i) = queue.pop() {
+            let pkg = self.packages[i as usize];
+            let mut resolved: [PackageDep; ..+] = [];
+            for dep in self.deps.list(pkg.deps) {
+                let mpath = String::from(self.text(pkg.manifest));
+                let alias = String::from(self.text(dep.alias));
+                let (id, dir) = match dep.source {
+                    DepSource::Registry => {
+                        return Err(ProjectError::new(manifest::REGISTRY_UNAVAILABLE(), "`{alias}` comes from the package registry, which is not available yet")
+                            .at(mpath.as_str(), dep.lo, dep.hi)
+                            .help("use a `path` or `git` dependency for now"));
+                    }
+                    DepSource::Path(p) => {
+                        let dir = join(self.text(pkg.dir), self.text(p));
+                        if !fs::is_file(join(dir.as_str(), MANIFEST).as_str()) {
+                            return Err(ProjectError::new(manifest::NOT_FOUND(), "dependency `{alias}`: no `{MANIFEST}` in `{display(dir.as_str())}`").at(mpath.as_str(), dep.lo, dep.hi));
+                        }
+                        let c = match canonical(dir.as_str()) {
+                            Ok(c) => c,
+                            Err(e) => return Err(io_error(dir.as_str(), e)),
+                        };
+                        let s = self.sym(c.as_str());
+                        (SourceId::Path(s), c)
+                    }
+                    DepSource::Git(url_sym, reference) => {
+                        let url = String::from(self.text(url_sym));
+                        let commit = match self.locked_commit(&lock, url.as_str(), reference) {
+                            Some(c) => String::from(self.text(c)),
+                            None => {
+                                status("Fetching", url.as_str());
+                                let (kind, name) = self.ref_parts(reference);
+                                match git::resolve(url.as_str(), kind, name.as_str()) {
+                                    Ok(c) => c,
+                                    Err(e) => return Err(ProjectError::new(manifest::GIT(), "dependency `{alias}`: {e}").at(mpath.as_str(), dep.lo, dep.hi)),
+                                }
+                            }
+                        };
+                        let dir = match git::checkout(url.as_str(), commit.as_str()) {
+                            Ok(d) => d,
+                            Err(e) => return Err(ProjectError::new(manifest::GIT(), "dependency `{alias}`: {e}").at(mpath.as_str(), dep.lo, dep.hi)),
+                        };
+                        let c = self.sym(commit.as_str());
+                        (SourceId::Git(url_sym, reference, c), dir)
+                    }
+                };
+                let mut found: Option::<usize> = None;
+                for j in 0..self.packages.len() {
+                    if self.packages[j].source == id {
+                        found = Some(j);
+                    }
+                }
+                let j = match found {
+                    Some(j) => j,
+                    None => {
+                        let mut m = self.load_package_manifest(dir.as_str())?;
+                        m.source = id;
+                        let j = self.packages.len();
+                        self.packages.push(m);
+                        queue.push(j as u32);
+                        j
+                    }
+                };
+                let f = self.packages[j];
+                if f.name != dep.package {
+                    let fname = self.text(f.name);
+                    return Err(ProjectError::new(manifest::WRONG_PACKAGE(), "dependency `{alias}` points at package `{fname}`, expected `{self.text(dep.package)}`")
+                        .at(mpath.as_str(), dep.lo, dep.hi)
+                        .help("if this is intended, keep the name `{alias}` in code with `package = \"{fname}\"`"));
+                }
+                if let Some(r) = dep.req {
+                    let req = VersionReq::parse(self.text(r)).unwrap();
+                    let version = Version::parse(self.text(f.version)).unwrap();
+                    if !req.matches(&version) {
+                        let source = self.describe_source(f.source, root.as_str());
+                        return Err(ProjectError::new(
+                            manifest::VERSION_MISMATCH(),
+                            "`{self.text(pkg.name)}` requires `{self.text(dep.package)}` {req}, but {source} has version {version}",
+                        ).at(mpath.as_str(), dep.lo, dep.hi));
+                    }
+                }
+                let a = self.sym(crater_name(alias.as_str()).as_str());
+                resolved.push(PackageDep { alias: a, package: j as u32 });
+            }
+            let l = self.package_deps.add_list(resolved[..]);
+            self.packages[i as usize].resolved = l;
+        }
+        let mut new_lock: [Locked; ..+] = [];
+        for i in self.members..self.packages.len() {
+            let p = self.packages[i];
+            let s = self.lock_source(p.source, root.as_str());
+            new_lock.push(Locked { name: p.name, version: p.version, source: s });
+        }
+        return self.save_lock(root.as_str(), &new_lock);
+    }
+
+    fn ref_parts(&self, r: GitRef): (RefKind, String) {
+        return match r {
+            GitRef::Tag(t) => (RefKind::Tag, String::from(self.text(t))),
+            GitRef::Branch(b) => (RefKind::Branch, String::from(self.text(b))),
+            GitRef::Rev(v) => (RefKind::Rev, String::from(self.text(v))),
+            GitRef::DefaultBranch => (RefKind::DefaultBranch, String::new()),
+        };
+    }
+
+    /// `?tag=v1`, `?branch=main`, `?rev=abc`, or nothing.
+    fn query(&self, r: GitRef): String {
+        let mut s = String::new();
+        match r {
+            GitRef::Tag(t) => s.write("?tag={self.text(t)}"),
+            GitRef::Branch(b) => s.write("?branch={self.text(b)}"),
+            GitRef::Rev(v) => s.write("?rev={self.text(v)}"),
+            GitRef::DefaultBranch => {}
+        }
+        return s;
+    }
+
+    fn lock_source(&mut +self, id: SourceId, root: str): Symbol {
+        return match id {
+            SourceId::Path(p) => {
+                let dir = String::from(self.text(p));
+                let rel = match relative(dir.as_str(), root) {
+                    Some(r) => r,
+                    None => dir,
+                };
+                self.symf("path+{rel}")
+            }
+            SourceId::Git(url, r, commit) => {
+                let q = self.query(r);
+                let u = String::from(self.text(url));
+                let c = String::from(self.text(commit));
+                self.symf("git+{u}{q}#{c}")
+            }
+        };
+    }
+
+    fn describe_source(&mut +self, id: SourceId, root: str): String {
+        let mut out = String::new();
+        match id {
+            SourceId::Path(_) => {
+                let s = self.lock_source(id, root);
+                out.write("the package at `{self.text(s)[5..]}`");
+            }
+            SourceId::Git(url, _, commit) => {
+                let c = self.text(commit);
+                let short = if c.len() > 12 { c[..12] } else { c };
+                out.write("{self.text(url)} at {short}");
+            }
+        }
+        return out;
+    }
+
+    // ----------------------------------------------------------- lockfile
+
+    /// `lunar.lock` in `root` (nothing if there is none).
+    fn load_lock(&mut +self, root: str, out: &mut +[Locked; ..+]): Result::<(), ProjectError> {
+        let path = join(root, LOCKFILE);
+        let text = match fs::read_to_string(path.as_str()) {
+            Ok(t) => t,
+            Err(_) => return Ok(()),
+        };
+        let p = path.as_str();
+        let d = match ln_toml::parse(text.as_str()) {
+            Ok(d) => d,
+            Err(e) => return Err(lock_error(p, e.message.as_str(), e.lo, e.hi)),
+        };
+        if let Some(v) = d.get(0, "version") {
+            let x = d.values[d.entries[v as usize].value as usize];
+            if x.kind != Kind::Integer || x.int < 0 {
+                return Err(lock_error(p, "invalid type: expected u32", x.lo, x.hi));
+            }
+        }
+        let pkgs = match d.get(0, "package") {
+            Some(e) => d.entries[e as usize].value,
+            None => return Ok(()),
+        };
+        let px = d.values[pkgs as usize];
+        if px.kind != Kind::Array {
+            return Err(lock_error(p, "invalid type: expected a sequence", px.lo, px.hi));
+        }
+        for item in d.children(pkgs) {
+            let t = d.entries[item as usize].value;
+            let tx = d.values[t as usize];
+            if tx.kind != Kind::Table {
+                return Err(lock_error(p, "invalid type: expected struct LockedPackage", tx.lo, tx.hi));
+            }
+            let mut fields: [Symbol; ..+] = [];
+            for f in ["name", "version", "source"] {
+                match d.get(t, f) {
+                    Some(e) => {
+                        let v = d.entries[e as usize].value;
+                        let vx = d.values[v as usize];
+                        if vx.kind != Kind::String {
+                            let mut m = String::new();
+                            m.write("invalid type: {describe(vx.kind)}, expected a string");
+                            return Err(lock_error(p, m.as_str(), vx.lo, vx.hi));
+                        }
+                        fields.push(self.sym(str_of(&d, v)));
+                    }
+                    None => {
+                        let mut m = String::new();
+                        m.write("missing field `{f}`");
+                        return Err(lock_error(p, m.as_str(), tx.lo, tx.hi));
+                    }
+                }
+            }
+            out.push(Locked { name: fields[0], version: fields[1], source: fields[2] });
+        }
+        return Ok(());
+    }
+
+    /// The locked commit of a git dependency.
+    fn locked_commit(&mut +self, lock: &[Locked; ..+], url: str, r: GitRef): Option::<Symbol> {
+        let mut prefix = String::new();
+        prefix.write("git+{url}{self.query(r)}#");
+        for l in lock {
+            let s = self.text(l.source);
+            if s.starts_with(prefix.as_str()) {
+                let c = String::from(s[prefix.len()..]);
+                return Some(self.sym(c.as_str()));
+            }
+        }
+        return None;
+    }
+
+    /// Write the lockfile if its contents changed.
+    fn save_lock(&mut +self, root: str, lock: &[Locked; ..+]): Result::<(), ProjectError> {
+        // Sorted and without repeats, as (name, version, source).
+        let mut rows = String::new();
+        for l in lock {
+            rows.write("{self.text(l.name)}\0{self.text(l.version)}\0{self.text(l.source)}\n");
+        }
+        let mut lines: [str; -..+] = [];
+        for line in rows.as_str().lines() {
+            lines.push(line);
+        }
+        sort_strs(lines[..]);
+        let mut text = String::from("# Generated by lunar. Do not edit by hand.\nversion = 1\n");
+        for i in 0..lines.len() {
+            if i > 0 && lines[i] == lines[i - 1] {
+                continue;
+            }
+            let mut parts = lines[i].split("\0");
+            let name = parts.next().unwrap();
+            let version = parts.next().unwrap();
+            let source = parts.next().unwrap();
+            text.write("\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"{source}\"\n");
+        }
+        let path = join(root, LOCKFILE);
+        if let Ok(old) = fs::read_to_string(path.as_str()) {
+            if old.as_str() == text.as_str() {
+                return Ok(());
+            }
+        }
+        // A workspace without dependencies needs no lockfile.
+        if lock.len() == 0 && !fs::exists(path.as_str()) {
+            return Ok(());
+        }
+        return match fs::write(path.as_str(), text.as_bytes()) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(io_error(path.as_str(), e)),
+        };
     }
 
     // ----------------------------------------------------------- craters
 
-    /// The craters a build of package `pkg` analyzes: its program (or, for
-    /// `lib`, its library) first, then the libraries it uses.
-    pub fn craters(&mut self, pkg: u32, lib: bool) {
+    /// The root file of a package's library (`src/lib.ln`), if it has one.
+    pub fn lib_root(&self, pkg: usize): Option::<String> {
+        let p = join(self.text(self.packages[pkg].dir), "src/lib.ln");
+        if fs::is_file(p.as_str()) {
+            return Some(p);
+        }
+        return None;
+    }
+
+    /// The root file of a package's program (`src/main.ln`), if it has one.
+    pub fn main_root(&self, pkg: usize): Option::<String> {
+        let p = join(self.text(self.packages[pkg].dir), "src/main.ln");
+        if fs::is_file(p.as_str()) {
+            return Some(p);
+        }
+        return None;
+    }
+
+    /// A package's integration tests, `tests/*.ln`, sorted.
+    pub fn test_files(&mut +self, pkg: usize, out: &mut +[Symbol; ..+]) {
+        let dir = join(self.text(self.packages[pkg].dir), "tests");
+        if let Ok(entries) = fs::read_dir(dir.as_str()) {
+            for i in 0..entries.len() {
+                let n = entries.name(i);
+                if n.ends_with(".ln") && n.len() > 3 {
+                    let p = join(dir.as_str(), n);
+                    if fs::is_file(p.as_str()) {
+                        out.push(self.sym(p.as_str()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Set `specs` to the craters to analyze for `target` of package
+    /// `pkg`: the target crater first, then the libraries of every package
+    /// it depends on, directly or not.
+    pub fn craters(&mut self, pkg: usize, target: Target): Result::<(), ProjectError> {
         self.specs.clear();
-        let p = self.packages[pkg as usize];
+        let p = self.packages[pkg];
         let own = crater_name(self.text(p.name));
         let own_sym = self.names.intern(own.as_str());
-        let root = if lib { join(self.text(p.dir), "src/lib.ln") } else { join(self.text(p.dir), "src/main.ln") };
-        let root_sym = self.names.intern(root.as_str());
-        self.specs.push(CraterSpec { name: own_sym, root: root_sym, deps: List::empty() });
+        let has_lib = self.lib_root(pkg).is_some();
+        let (path, uses_own_lib) = match target {
+            Target::Main => match self.main_root(pkg) {
+                Some(m) => (m, true),
+                None => return Err(ProjectError::new(manifest::NO_TARGET(), "package `{self.text(p.name)}` has no program (`src/main.ln`)")),
+            },
+            Target::Lib => match self.lib_root(pkg) {
+                Some(l) => (l, false),
+                None => return Err(ProjectError::new(manifest::NO_TARGET(), "package `{self.text(p.name)}` has no library (`src/lib.ln`)")),
+            },
+            Target::TestFile(f) => (String::from(self.text(f)), true),
+        };
+        let root = self.names.intern(path.as_str());
+        self.specs.push(CraterSpec { name: own_sym, root, deps: List::empty() });
         // Package index -> index of its library crater in `specs`.
         let mut lib_of: [u32; ..+] = [];
         for _ in 0..self.packages.len() {
             lib_of.push(4294967295);
         }
         let mut deps: [CraterDep; ..+] = [];
-        if !lib && p.has_lib {
-            let i = self.lib_crater(pkg, &mut lib_of);
+        if uses_own_lib && has_lib {
+            let i = self.lib_crater(pkg, &mut lib_of)?;
             deps.push(CraterDep { alias: own_sym, index: i });
         }
-        for d in self.package_deps.list(p.deps) {
-            let i = self.lib_crater(d.package, &mut lib_of);
+        for d in self.package_deps.list(p.resolved) {
+            let i = self.lib_crater(d.package as usize, &mut lib_of)?;
             deps.push(CraterDep { alias: d.alias, index: i });
         }
         let l = self.crater_deps.add_list(deps[..]);
         self.specs[0].deps = l;
+        return Ok(());
     }
 
-    fn lib_crater(&mut self, pkg: u32, lib_of: &mut +[u32; ..+]): u32 {
-        if lib_of[pkg as usize] != 4294967295 {
-            return lib_of[pkg as usize];
+    fn lib_crater(&mut +self, pkg: usize, lib_of: &mut +[u32; ..+]): Result::<u32, ProjectError> {
+        if lib_of[pkg] != 4294967295 {
+            return Ok(lib_of[pkg]);
         }
-        let p = self.packages[pkg as usize];
-        if !p.has_lib {
-            self.error("package `{self.text(p.name)}` has no library (`src/lib.ln`) to depend on");
-        }
+        let p = self.packages[pkg];
+        let root = match self.lib_root(pkg) {
+            Some(r) => r,
+            None => return Err(ProjectError::new(manifest::NO_TARGET(), "package `{self.text(p.name)}` has no library (`src/lib.ln`) to depend on")),
+        };
         let name = crater_name(self.text(p.name));
         let name_sym = self.names.intern(name.as_str());
-        let root = join(self.text(p.dir), "src/lib.ln");
         let root_sym = self.names.intern(root.as_str());
         let i = self.specs.len() as u32;
         self.specs.push(CraterSpec { name: name_sym, root: root_sym, deps: List::empty() });
-        lib_of[pkg as usize] = i;
+        lib_of[pkg] = i;
         let mut deps: [CraterDep; ..+] = [];
-        for d in self.package_deps.list(p.deps) {
-            let j = self.lib_crater(d.package, lib_of);
+        for d in self.package_deps.list(p.resolved) {
+            let j = self.lib_crater(d.package as usize, lib_of)?;
             deps.push(CraterDep { alias: d.alias, index: j });
         }
         let l = self.crater_deps.add_list(deps[..]);
         self.specs[i as usize].deps = l;
-        return i;
+        return Ok(i);
     }
 
-    // ----------------------------------------------------------- manifests
+    /// Set `specs` to one crater: the file `path`, named `name`.
+    pub fn single(&mut self, name: str, path: str) {
+        self.specs.clear();
+        let n = self.names.intern(name);
+        let r = self.names.intern(path);
+        self.specs.push(CraterSpec { name: n, root: r, deps: List::empty() });
+    }
 
-    /// Read `dir/lunar.toml`.
-    fn read_manifest(&mut +self, dir: str, symbols: &mut +Arena::<Symbol>, deps: &mut +Arena::<ManifestDep>): Option::<Manifest> {
-        let path = join(dir, "lunar.toml");
+    // ----------------------------------------------------------- editing
+
+    /// Add or replace a dependency in the package manifest in `dir`,
+    /// keeping its formatting and comments.
+    pub fn add_dependency(&mut +self, dir: str, alias: str, spec: &DepSpec): Result::<(), ProjectError> {
+        let path = join(dir, MANIFEST);
+        if !valid_name(alias) {
+            return Err(ProjectError::new(manifest::BAD_NAME(), "`{alias}` is not a valid dependency name").note("{NAME_RULE}"));
+        }
         let text = match fs::read_to_string(path.as_str()) {
             Ok(t) => t,
-            Err(e) => {
-                self.error("cannot read `{path}`: {e}");
-                return None;
-            }
+            Err(e) => return Err(io_error(path.as_str(), e)),
         };
-        let mut m = Manifest { name: None, is_workspace: false, members: List::empty(), deps: List::empty() };
-        let mut table = "";
-        let mut members: [Symbol; ..+] = [];
-        let mut dep_list: [ManifestDep; ..+] = [];
-        let mut lines = text.as_str().lines();
-        let mut line_no: usize = 0;
-        while let Some(raw) = lines.next() {
-            line_no += 1;
-            let line = strip_comment(raw).trim();
-            if line.len() == 0 {
-                continue;
-            }
-            if line.starts_with("[") {
-                table = line;
-                if line == "[workspace]" {
-                    m.is_workspace = true;
-                }
-                continue;
-            }
-            let eq = match line.find("=") {
-                Some(i) => i,
-                None => {
-                    self.error("{path}:{line_no}: expected `key = value`");
-                    return None;
-                }
-            };
-            let key = line[..eq].trim();
-            let mut value = String::from(line[eq + 1..].trim());
-            // An array may continue over several lines.
-            if value.as_str().starts_with("[") {
-                while !value.as_str().contains("]") {
-                    match lines.next() {
-                        Some(more) => {
-                            line_no += 1;
-                            value.push(' ');
-                            value.push_str(strip_comment(more).trim());
-                        }
-                        None => break,
-                    }
-                }
-            }
-            if table == "[package]" && key == "name" {
-                match unquote(value.as_str()) {
-                    Some(s) => m.name = Some(self.names.intern(s)),
-                    None => self.error("{path}:{line_no}: the package name must be a string"),
-                }
-            } else if table == "[workspace]" && key == "members" {
-                for item in value.as_str().trim_matches_array().split(",") {
-                    if let Some(s) = unquote(item.trim()) {
-                        members.push(self.names.intern(s));
-                    }
-                }
-            } else if table == "[dependencies]" {
-                // `alias = { path = "../x" }`
-                let v = value.as_str();
-                match inline_value(v, "path") {
-                    Some(p) => {
-                        // Code names the dependency as a crater: `ln_ast`.
-                        let a = self.names.intern(crater_name(key).as_str());
-                        let ps = self.names.intern(p);
-                        dep_list.push(ManifestDep { alias: a, path: ps });
-                    }
-                    None => self.error("{path}:{line_no}: dependency `{key}` needs a `path` (registry and git dependencies are not supported by this driver)"),
-                }
-            }
+        let value = spec.to_value();
+        let new = match ln_toml::edit::set_key(text.as_str(), "dependencies", alias, value.as_str()) {
+            Ok(n) => n,
+            Err(e) => return Err(ProjectError::new(manifest::PARSE(), "invalid `{MANIFEST}`: {e.message}").at(path.as_str(), e.lo, e.hi)),
+        };
+        // Check before writing.
+        let file = self.parse_manifest(dir, new.as_str())?;
+        if file.package.is_none() {
+            return Err(ProjectError::new(manifest::PARSE(), "`{display(path.as_str())}` describes a workspace, not a package").help("add dependencies to a member package"));
         }
-        m.members = symbols.add_list(members[..]);
-        m.deps = deps.add_list(dep_list[..]);
-        return Some(m);
+        return match fs::write(path.as_str(), new.as_bytes()) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(io_error(path.as_str(), e)),
+        };
+    }
+
+    /// Remove a dependency from the package manifest in `dir`.
+    pub fn remove_dependency(&mut +self, dir: str, alias: str): Result::<(), ProjectError> {
+        let path = join(dir, MANIFEST);
+        let text = match fs::read_to_string(path.as_str()) {
+            Ok(t) => t,
+            Err(e) => return Err(io_error(path.as_str(), e)),
+        };
+        let new = match ln_toml::edit::remove_key(text.as_str(), "dependencies", alias) {
+            Ok(Some(n)) => n,
+            Ok(None) => return Err(ProjectError::new(manifest::NOT_FOUND(), "`{alias}` is not a dependency of this package")),
+            Err(e) => return Err(ProjectError::new(manifest::PARSE(), "invalid `{MANIFEST}`: {e.message}").at(path.as_str(), e.lo, e.hi)),
+        };
+        return match fs::write(path.as_str(), new.as_bytes()) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(io_error(path.as_str(), e)),
+        };
     }
 }
 
-// ===================================================================== paths and text
+/// A dependency as given to `lunar add`.
+pub struct DepSpec {
+    pub version: Option::<str>,
+    pub path: Option::<str>,
+    pub git: Option::<str>,
+    pub tag: Option::<str>,
+    pub branch: Option::<str>,
+    pub rev: Option::<str>,
+    pub package: Option::<str>,
+}
 
-/// `-` becomes `_` in crater names (`ln-ast` is the crater `ln_ast`).
+impl DepSpec {
+    /// The manifest value: `"1.2"`, or an inline table.
+    fn to_value(&self): String {
+        let simple = self.path.is_none() && self.git.is_none() && self.package.is_none();
+        if simple {
+            if let Some(v) = self.version {
+                return ln_toml::edit::quote(v);
+            }
+        }
+        let fields = [("version", self.version), ("path", self.path), ("git", self.git), ("tag", self.tag), ("branch", self.branch), ("rev", self.rev), ("package", self.package)];
+        let mut out = String::from("{");
+        let mut first = true;
+        for f in fields {
+            let (k, v) = f;
+            if let Some(x) = v {
+                out.push_str(if first { " " } else { ", " });
+                out.write("{k} = {ln_toml::edit::quote(x)}");
+                first = false;
+            }
+        }
+        out.push_str(" }");
+        return out;
+    }
+}
+
+// ===================================================================== checks
+
+/// The string field `name` of table `t`, if it has one.
+fn field(d: &Doc, t: u32, name: str): Option::<str> {
+    return match d.get(t, name) {
+        Some(f) => Some(str_of(d, d.entries[f as usize].value)),
+        None => None,
+    };
+}
+
+/// A `manifest::lock` error in `lunar.lock` at `path`.
+fn lock_error(path: str, msg: str, lo: u32, hi: u32): ProjectError {
+    return ProjectError::new(manifest::LOCK(), "`{LOCKFILE}` is invalid: {msg}").help("delete `{LOCKFILE}` and run `lunar update` to regenerate it").at(path, lo, hi);
+}
+
+/// Add a member, unless it repeats the one before (as `Vec::dedup`).
+fn push_member(out: &mut +[Symbol; ..+], s: Symbol) {
+    let n = out.len();
+    if n > 0 && out[n - 1] == s {
+        return;
+    }
+    out.push(s);
+}
+
+/// The key entries of table `t`, sorted by key (as Rust's `BTreeMap`).
+fn sorted_keys(d: &Doc, t: u32): [u32; ..+] {
+    let mut keys: [str; -..+] = [];
+    for e in d.children(t) {
+        keys.push(key_of(d, e));
+    }
+    sort_strs(keys[..]);
+    let mut out: [u32; ..+] = [];
+    for k in keys {
+        out.push(d.get(t, k).unwrap());
+    }
+    return out;
+}
+
+fn sort_strs(v: [str; &mut]) {
+    v.sort();
+}
+
+/// `v` must be a table (else serde's "invalid type").
+fn check_table(d: &Doc, v: u32, path: str, expected: str): Result::<(), ProjectError> {
+    let x = d.values[v as usize];
+    if x.kind != Kind::Table {
+        return Err(ProjectError::new(manifest::PARSE(), "invalid `{MANIFEST}`: invalid type: {describe(x.kind)}, expected {expected}").at(path, x.lo, x.hi));
+    }
+    return Ok(());
+}
+
+fn check_kind(d: &Doc, v: u32, path: str, kind: Kind, expected: str): Result::<(), ProjectError> {
+    let x = d.values[v as usize];
+    if x.kind != kind {
+        return Err(ProjectError::new(manifest::PARSE(), "invalid `{MANIFEST}`: invalid type: {describe(x.kind)}, expected {expected}").at(path, x.lo, x.hi));
+    }
+    return Ok(());
+}
+
+/// Every key of table `t` must be one of `expected` (a list of quoted
+/// names, as serde shows it).
+fn check_fields(d: &Doc, t: u32, path: str, expected: str): Result::<(), ProjectError> {
+    for e in d.children(t) {
+        let k = key_of(d, e);
+        let mut quoted = String::new();
+        quoted.write("`{k}`");
+        let mut known = false;
+        for part in expected.split(", ") {
+            if part == quoted.as_str() {
+                known = true;
+            }
+        }
+        if !known {
+            let x = d.entries[e as usize];
+            let expect = if expected.contains(",") { "expected one of" } else { "expected" };
+            return Err(ProjectError::new(manifest::PARSE(), "invalid `{MANIFEST}`: unknown field `{k}`, {expect} {expected}").at(path, x.key_lo, x.key_hi));
+        }
+    }
+    return Ok(());
+}
+
+/// A dependency is a version string or a table of known string fields
+/// (else serde's message for an untagged enum).
+fn check_dep(d: &Doc, v: u32, path: str): Result::<(), ProjectError> {
+    let x = d.values[v as usize];
+    let mut ok = x.kind == Kind::String;
+    if x.kind == Kind::Table {
+        ok = true;
+        for e in d.children(v) {
+            let k = key_of(d, e);
+            let known = k == "version" || k == "path" || k == "git" || k == "tag" || k == "branch" || k == "rev" || k == "package";
+            if !known || d.values[d.entries[e as usize].value as usize].kind != Kind::String {
+                ok = false;
+            }
+        }
+    }
+    if !ok {
+        return Err(ProjectError::new(manifest::PARSE(), "invalid `{MANIFEST}`: data did not match any variant of untagged enum RawDep").at(path, x.lo, x.hi));
+    }
+    return Ok(());
+}
+
+fn check_req(alias: str, req: str, path: str, lo: u32, hi: u32): Result::<(), ProjectError> {
+    if let Err(e) = VersionReq::parse(req) {
+        return Err(ProjectError::new(manifest::BAD_VERSION(), "dependency `{alias}`: `{req}` is not a valid version requirement: {e}")
+            .at(path, lo, hi)
+            .help("requirements look like `1.2`, `^1.2.3`, `=1.2.4` or `>=1, <3`"));
+    }
+    return Ok(());
+}
+
+/// Package names: lowercase letters, digits, `-` and `_`, starting with a
+/// letter. In code, `-` becomes `_`.
+pub fn valid_name(name: str): bool {
+    let b = name.as_bytes();
+    if b.len() == 0 || b[0] < b'a' || b[0] > b'z' {
+        return false;
+    }
+    for c in b {
+        let ok = (c >= b'a' && c <= b'z') || (c >= b'0' && c <= b'9') || c == b'-' || c == b'_';
+        if !ok {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The name a package's crater has in code: `-` becomes `_`.
 pub fn crater_name(package: str): String {
     let mut s = String::new();
     for c in package.chars() {
@@ -297,135 +1252,76 @@ pub fn crater_name(package: str): String {
     return s;
 }
 
-pub fn exists(path: str): bool {
-    return fs::read(path).is_ok();
-}
-
-/// `dir/rel`, or `rel` if it is absolute.
-pub fn join(dir: str, rel: str): String {
-    if is_absolute(rel) || dir.len() == 0 {
-        return normalize(rel);
-    }
-    let mut s = String::from(dir);
-    if !dir.ends_with("/") {
-        s.push('/');
-    }
-    s.push_str(rel);
-    return normalize(s.as_str());
-}
-
-pub fn is_absolute(p: str): bool {
-    let b = p.as_bytes();
-    return p.starts_with("/") || p.starts_with("\\") || (b.len() >= 2 && b[1] == b':');
-}
-
-/// `p` with `\` as `/`, and `.` and `name/..` segments removed.
-pub fn normalize(p: str): String {
-    let mut parts: [str; -..+] = [];
-    let mut absolute = false;
-    let mut s = String::new();
-    for c in p.chars() {
-        s.push(if c == '\\' { '/' } else { c });
-    }
-    let text = s.as_str();
-    if text.starts_with("/") {
-        absolute = true;
-    }
-    for seg in text.split("/") {
-        if seg.len() == 0 || seg == "." {
-            continue;
+/// The nearest directory at or above `start` that has a `lunar.toml`.
+pub fn find_project(start: str): Option::<String> {
+    let mut d = absolute(start);
+    loop {
+        if fs::is_file(join(d.as_str(), MANIFEST).as_str()) {
+            return Some(d);
         }
-        if seg == ".." && parts.len() > 0 && parts[parts.len() - 1] != ".." {
-            parts.pop();
-            continue;
-        }
-        parts.push(seg);
-    }
-    let mut out = String::new();
-    if absolute {
-        out.push('/');
-    }
-    for i in 0..parts.len() {
-        if i > 0 {
-            out.push('/');
-        }
-        out.push_str(parts[i]);
-    }
-    if out.len() == 0 {
-        out.push('.');
-    }
-    return out;
-}
-
-/// The directory containing `p`, if it has one.
-pub fn parent(p: str): Option::<String> {
-    let b = p.as_bytes();
-    let mut i = b.len();
-    while i > 0 {
-        i -= 1;
-        if b[i] == b'/' {
-            if i == 0 {
-                return None;
-            }
-            // `C:/` has no parent.
-            if i == 2 && b[1] == b':' && b.len() == 3 {
-                return None;
-            }
-            return Some(String::from(p[..i]));
+        match parent(d.as_str()) {
+            Some(p) => d = p,
+            None => return None,
         }
     }
-    return None;
 }
 
-fn strip_comment(line: str): str {
-    // `#` outside a string starts a comment.
-    let b = line.as_bytes();
-    let mut in_str = false;
-    for i in 0..b.len() {
-        if b[i] == b'"' {
-            in_str = !in_str;
-        } else if b[i] == b'#' && !in_str {
-            return line[..i];
+// ===================================================================== scaffolding
+
+/// Create a package in `dir` (which must not contain a manifest yet); its
+/// name.
+pub fn init(dir: str, lib: bool): Result::<String, ProjectError> {
+    let manifest = join(dir, MANIFEST);
+    if fs::exists(manifest.as_str()) {
+        return Err(ProjectError::new(manifest::PARSE(), "`{display(manifest.as_str())}` already exists"));
+    }
+    let mut name = String::new();
+    let abs = absolute(dir);
+    for c in file_name(abs.as_str()).chars() {
+        if c >= 'A' && c <= 'Z' {
+            name.push(((c as u32) + 32) as u8 as char);
+        } else if c == ' ' {
+            name.push('-');
+        } else {
+            name.push(c);
         }
     }
-    return line;
+    if !valid_name(name.as_str()) {
+        return Err(ProjectError::new(manifest::BAD_NAME(), "`{name}` is not a valid package name").note("{NAME_RULE}"));
+    }
+    let src = join(dir, "src");
+    if let Err(e) = fs::create_dir_all(src.as_str()) {
+        return Err(io_error(src.as_str(), e));
+    }
+    let mut toml = String::new();
+    toml.write("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n\n[dependencies]\n");
+    write_new(manifest.as_str(), toml.as_str())?;
+    if lib {
+        let code = "/// Add two numbers.\npub fn add(a: i32, b: i32): i32 {\n    return a + b;\n}\n\n#[test]\nfn adds() {\n    assert_eq(&add(2, 2), &4, \"2 + 2\");\n}\n";
+        write_new(join(src.as_str(), "lib.ln").as_str(), code)?;
+    } else {
+        write_new(join(src.as_str(), "main.ln").as_str(), "fn main() {\n    println(\"Hello, world!\");\n}\n")?;
+    }
+    let ignore = join(dir, ".gitignore");
+    if !fs::exists(ignore.as_str()) {
+        write_new(ignore.as_str(), "/target\n")?;
+    }
+    // Like Cargo: start a repository unless already inside one.
+    let probe = ["-C", dir, "rev-parse", "--is-inside-work-tree"];
+    let in_repo = match std::process::output("git", probe[..]) {
+        Ok(o) => o.status.success(),
+        Err(_) => false,
+    };
+    if !in_repo {
+        let args = ["-C", dir, "init", "--quiet"];
+        let _ = std::process::output("git", args[..]);
+    }
+    return Ok(name);
 }
 
-/// The text of a `"string"`.
-fn unquote(v: str): Option::<str> {
-    if v.len() >= 2 && v.starts_with("\"") && v.ends_with("\"") {
-        return Some(v[1..v.len() - 1]);
-    }
-    return None;
-}
-
-/// The string value of `key` in an inline table `{ key = "value", ... }`.
-fn inline_value(v: str, key: str): Option::<str> {
-    if !v.starts_with("{") || !v.ends_with("}") {
-        return None;
-    }
-    for part in v[1..v.len() - 1].split(",") {
-        let p = part.trim();
-        if let Some(eq) = p.find("=") {
-            if p[..eq].trim() == key {
-                return unquote(p[eq + 1..].trim());
-            }
-        }
-    }
-    return None;
-}
-
-trait ArrayText {
-    fn trim_matches_array(self): str;
-}
-
-impl ArrayText for str {
-    /// The inside of `[ ... ]`.
-    fn trim_matches_array(self): str {
-        let t = self.trim();
-        if t.starts_with("[") && t.ends_with("]") {
-            return t[1..t.len() - 1];
-        }
-        return t;
-    }
+fn write_new(path: str, text: str): Result::<(), ProjectError> {
+    return match fs::write(path, text.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(io_error(path, e)),
+    };
 }

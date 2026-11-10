@@ -1,0 +1,102 @@
+// `lunar test`: build a crater's `#[test]` harness and run each selected
+// test in its own process (the harness runs test `i` when given `i`).
+
+use std::process;
+use ln_sema::sema::Sema;
+use crater::compile::{build_exe, finish_front};
+
+/// The results so far.
+pub struct Tally {
+    pub passed: usize,
+    pub failed: usize,
+    pub filtered: usize,
+    /// Each failed test's `---- name ----` block, with its output.
+    pub failures: String,
+}
+
+impl Tally {
+    pub fn new(): Tally {
+        return Tally { passed: 0, failed: 0, filtered: 0, failures: String::new() };
+    }
+}
+
+/// Build the test harness of `s` as `out` and run the tests whose name
+/// contains `filter`. False if it did not compile.
+pub fn run_tests(s: &mut Sema, label: str, out: str, filter: Option::<str>, release: bool, tally: &mut Tally): bool {
+    if !finish_front(s) {
+        return false;
+    }
+    let mut names = String::new();
+    let mut ends: [usize; ..+] = [];
+    for t in s.p.tests {
+        names.push_str(s.p.name(t));
+        ends.push(names.len());
+    }
+    if !build_exe(s, out, release, true, None) {
+        return false;
+    }
+    let mut selected: [usize; ..+] = [];
+    for i in 0..ends.len() {
+        let name = name_at(names.as_str(), ends[..], i);
+        let keep = match filter {
+            Some(f) => name.contains(f),
+            None => true,
+        };
+        if keep {
+            selected.push(i);
+        }
+    }
+    tally.filtered += ends.len() - selected.len();
+    println("\nrunning {selected.len()} test{if selected.len() == 1 { "" } else { "s" }} ({label})");
+    for i in selected {
+        let name = name_at(names.as_str(), ends[..], i);
+        let mut index = String::new();
+        index.write("{i}");
+        let args = [index.as_str()];
+        match process::output(out, args[..]) {
+            Ok(o) => {
+                if o.status.success() {
+                    println("test {name} ... ok");
+                    tally.passed += 1;
+                } else {
+                    println("test {name} ... FAILED");
+                    let mut text = String::from(o.stderr.as_str());
+                    text.push_str(o.stdout.as_str());
+                    tally.failures.write("\n---- {name} ----\n{trim_end(text.as_str())}\n");
+                    tally.failed += 1;
+                }
+            }
+            Err(e) => {
+                println("test {name} ... FAILED");
+                tally.failures.write("\n---- {name} ----\ncould not run test binary: {e}\n");
+                tally.failed += 1;
+            }
+        }
+    }
+    return true;
+}
+
+fn name_at(names: str, ends: [usize; &], i: usize): str {
+    let start = if i == 0 { 0 } else { ends[i - 1] };
+    return names[start..ends[i]];
+}
+
+fn trim_end(s: str): str {
+    let b = s.as_bytes();
+    let mut end = b.len();
+    while end > 0 && (b[end - 1] == b' ' || b[end - 1] == b'\n' || b[end - 1] == b'\r' || b[end - 1] == b'\t') {
+        end -= 1;
+    }
+    return s[..end];
+}
+
+/// Print the failures and the summary line; the exit code.
+pub fn summary(tally: &Tally, ok: bool): i32 {
+    if tally.failed > 0 {
+        println("\nfailures:");
+        std::io::write_str(tally.failures.as_str());
+    }
+    let good = tally.failed == 0 && ok;
+    println("\ntest result: {if good { "ok" } else { "FAILED" }}. {tally.passed} passed; {tally.failed} failed; {tally.filtered} filtered out\n");
+    return if good { 0 } else { 1 };
+}

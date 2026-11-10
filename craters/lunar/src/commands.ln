@@ -1,0 +1,633 @@
+// The subcommands of `lunar`: a port of crates/ln-driver/src/main.rs.
+//
+// Commands that take a file (`lunar run hello.ln`) work on that file alone.
+// Without one, they work on the project around the current directory: the
+// package there, or, at a workspace root, every member (`-p` picks one).
+// Each returns the process's exit code.
+
+use std::env;
+use std::fs;
+use std::process;
+use ln_ast::Span;
+use ln_sema::codes::{all_codes, build, manifest};
+use ln_sema::diag::dummy_span;
+use ln_sema::program::Program;
+use ln_sema::render::render_all;
+use crater::compile::{analyze_file, analyze_specs, build_exe, check_main, emit_ir, finish_front};
+use crater::explain;
+use crater::paths::{cwd, display, exe_suffix, file_stem, join, parent, with_extension};
+use crater::project::{DepSpec, Project, ProjectError, Target, find_project, init};
+use crater::testing::{Tally, run_tests, summary};
+use crater::ui::{fail, status, use_color};
+
+// ===================================================================== reporting
+
+/// Render a project error like a compiler diagnostic, pointing into
+/// `lunar.toml` when it can, with the `lunar explain` hint.
+pub fn report_project(e: &ProjectError) {
+    let mut p = Program::new();
+    let mut span = dummy_span();
+    if e.file.len() > 0 {
+        if let Ok(text) = fs::read_to_string(e.file.as_str()) {
+            let mut hi = e.hi as usize;
+            if hi > text.len() {
+                hi = text.len();
+            }
+            let mut lo = e.lo as usize;
+            if lo > hi {
+                lo = hi;
+            }
+            let name = p.sym(display(e.file.as_str()).as_str());
+            let (_, start) = p.sources.add(name, text.as_str(), None);
+            span = Span::new(start + lo as u32, start + hi as u32);
+        }
+    }
+    let m = p.sym(e.message.as_str());
+    let mut code = manifest::PARSE();
+    for c in all_codes() {
+        if e.code.as_str().starts_with(c.scope) && e.code.as_str().ends_with(c.name) && e.code.len() == c.scope.len() + 2 + c.name.len() {
+            code = c;
+        }
+    }
+    p.diags.error(code, span, m);
+    if e.label.len() > 0 {
+        let l = p.sym(e.label.as_str());
+        p.diags.label(l);
+    }
+    // Notes and helps, in order: a kind byte, the text, a NUL.
+    let extra = e.extra.as_str();
+    let mut start: usize = 0;
+    let b = extra.as_bytes();
+    for i in 0..b.len() {
+        if b[i] == 0 {
+            let s = p.sym(extra[start + 1..i]);
+            if b[start] == b'n' {
+                p.diags.note(s);
+            } else {
+                p.diags.help(s);
+            }
+            start = i + 1;
+        }
+    }
+    p.diags.finish();
+    let mut out = String::new();
+    render_all(&p, use_color(), &mut out);
+    std::io::ewrite_str(out.as_str());
+    let hint = explain::hint(&p);
+    if hint.len() > 0 {
+        eprintln("\n{hint}");
+    }
+}
+
+fn profile(release: bool): str {
+    return if release { "release" } else { "debug" };
+}
+
+/// The project around the current directory, resolved; `None` after
+/// reporting an error.
+fn load(update: bool): Option::<Project> {
+    let mut proj = Project::new();
+    let here = cwd();
+    if let Err(e) = proj.find_workspace(here.as_str()) {
+        report_project(&e);
+        return None;
+    }
+    if let Err(e) = proj.resolve(update) {
+        report_project(&e);
+        return None;
+    }
+    return Some(proj);
+}
+
+/// The member packages a command works on: `-p <name>`, else the package
+/// the command started in, else (at a workspace root) every member.
+fn select(proj: &Project, package: Option::<str>): Result::<[usize; ..+], ProjectError> {
+    let mut out: [usize; ..+] = [];
+    if let Some(name) = package {
+        return match proj.member(name) {
+            Some(i) => {
+                out.push(i);
+                Ok(out)
+            }
+            None => Err(ProjectError::new(manifest::WORKSPACE(), "no package `{name}` in this workspace").note("its packages are: {proj.member_names()}")),
+        };
+    }
+    match proj.current_member() {
+        Some(i) => out.push(i),
+        None => {
+            for i in 0..proj.members {
+                out.push(i);
+            }
+        }
+    }
+    return Ok(out);
+}
+
+// ===================================================================== new, init
+
+pub fn new_package(path: str, lib: bool): i32 {
+    if fs::is_dir(path) {
+        if let Ok(entries) = fs::read_dir(path) {
+            if entries.len() > 0 {
+                fail(core::fmt::format("`{path}` already exists and is not empty").as_str());
+                return 1;
+            }
+        }
+    }
+    if let Err(e) = fs::create_dir_all(path) {
+        fail(core::fmt::format("could not create `{path}`: {e}").as_str());
+        return 1;
+    }
+    return init_package(path, lib);
+}
+
+pub fn init_package(dir: str, lib: bool): i32 {
+    return match init(dir, lib) {
+        Ok(name) => {
+            status("Created", core::fmt::format("{if lib { "library" } else { "program" }} `{name}` package").as_str());
+            0
+        }
+        Err(e) => {
+            report_project(&e);
+            1
+        }
+    };
+}
+
+pub fn init_here(lib: bool): i32 {
+    let here = cwd();
+    return init_package(here.as_str(), lib);
+}
+
+// ===================================================================== check, build, run
+
+pub fn check_file(file: str, target_os: Option::<str>): i32 {
+    let s = analyze_file(file, false, target_os);
+    return if finish_front(&s) { 0 } else { 1 };
+}
+
+pub fn check_project(package: Option::<str>, target_os: Option::<str>): i32 {
+    let mut proj = match load(false) {
+        Some(p) => p,
+        None => return 1,
+    };
+    let pkgs = match select(&proj, package) {
+        Ok(p) => p,
+        Err(e) => {
+            report_project(&e);
+            return 1;
+        }
+    };
+    let mut ok = true;
+    for pkg in pkgs {
+        let what = core::fmt::format("{proj.text(proj.packages[pkg].name)} v{proj.text(proj.packages[pkg].version)}");
+        status("Checking", what.as_str());
+        let mut targets: [Target; ..+] = [];
+        if proj.lib_root(pkg).is_some() {
+            targets.push(Target::Lib);
+        }
+        if proj.main_root(pkg).is_some() {
+            targets.push(Target::Main);
+        }
+        for t in targets {
+            if let Err(e) = proj.craters(pkg, t) {
+                report_project(&e);
+                return 1;
+            }
+            let s = analyze_specs(&proj, false, target_os);
+            if !finish_front(&s) {
+                ok = false;
+            }
+        }
+    }
+    if ok {
+        status("Finished", "checking");
+        return 0;
+    }
+    return 1;
+}
+
+/// Where `lunar build FILE` puts the executable: the file without its
+/// extension (on Windows, with `.exe`).
+fn default_exe(file: str): String {
+    let stem = with_extension(file, "");
+    if exe_suffix().len() > 0 {
+        return with_extension(stem.as_str(), "exe");
+    }
+    return stem;
+}
+
+/// A temporary executable for `run` and `test` on a file.
+fn temp_exe(file: str, tag: str): String {
+    let mut stem = file_stem(file);
+    if stem.is_empty() {
+        stem = "a";
+    }
+    let mut name = String::new();
+    name.write("lunar-{tag}-{stem}-{process::id()}{exe_suffix()}");
+    return join(env::temp_dir().as_str(), name.as_str());
+}
+
+/// Build the file `file` into `out`; false after reporting a failure.
+fn compile_file(file: str, out: str, release: bool, emit_llvm: Option::<str>): bool {
+    let mut s = analyze_file(file, false, None);
+    check_main(&mut s, file, false);
+    if !finish_front(&s) {
+        return false;
+    }
+    return build_exe(&mut s, out, release, false, emit_llvm);
+}
+
+pub fn build_file(file: str, output: Option::<str>, release: bool, emit_llvm: Option::<str>): i32 {
+    let out = match output {
+        Some(o) => String::from(o),
+        None => default_exe(file),
+    };
+    return if compile_file(file, out.as_str(), release, emit_llvm) { 0 } else { 1 };
+}
+
+/// Build the selected packages' programs (and check library-only
+/// packages): the last executable built, or `None` after a failure.
+fn build_selected(package: Option::<str>, output: Option::<str>, release: bool, emit_llvm: Option::<str>): Option::<String> {
+    let mut proj = match load(false) {
+        Some(p) => p,
+        None => return None,
+    };
+    let pkgs = match select(&proj, package) {
+        Ok(p) => p,
+        Err(e) => {
+            report_project(&e);
+            return None;
+        }
+    };
+    let mut programs: usize = 0;
+    for pkg in pkgs {
+        if proj.main_root(pkg).is_some() {
+            programs += 1;
+        }
+    }
+    if output.is_some() && programs > 1 {
+        fail("`-o` names one file, but this builds several programs; pick one with `-p <package>`");
+        return None;
+    }
+    let mut built = String::new();
+    for pkg in pkgs {
+        let name = String::from(proj.text(proj.packages[pkg].name));
+        let version = String::from(proj.text(proj.packages[pkg].version));
+        let main = match proj.main_root(pkg) {
+            Some(m) => m,
+            None => {
+                // A library on its own has no executable: type-check it.
+                status("Checking", core::fmt::format("{name} v{version} (library)").as_str());
+                if let Err(e) = proj.craters(pkg, Target::Lib) {
+                    report_project(&e);
+                    return None;
+                }
+                let s = analyze_specs(&proj, false, None);
+                if !finish_front(&s) {
+                    return None;
+                }
+                continue;
+            }
+        };
+        let dir = display(proj.text(proj.packages[pkg].dir));
+        status("Compiling", core::fmt::format("{name} v{version} ({dir})").as_str());
+        let out = match output {
+            Some(o) => String::from(o),
+            None => {
+                let mut rel = String::new();
+                rel.write("target/{profile(release)}/{name}{exe_suffix()}");
+                display(join(proj.text(proj.root), rel.as_str()).as_str())
+            }
+        };
+        if let Some(d) = parent(out.as_str()) {
+            if let Err(e) = fs::create_dir_all(d.as_str()) {
+                fail(core::fmt::format("could not create `{display(d.as_str())}`: {e}").as_str());
+                return None;
+            }
+        }
+        if let Err(e) = proj.craters(pkg, Target::Main) {
+            report_project(&e);
+            return None;
+        }
+        let mut s = analyze_specs(&proj, false, None);
+        check_main(&mut s, display(main.as_str()).as_str(), false);
+        if !finish_front(&s) {
+            return None;
+        }
+        if !build_exe(&mut s, out.as_str(), release, false, emit_llvm) {
+            return None;
+        }
+        built = out;
+    }
+    status("Finished", core::fmt::format("`{profile(release)}` profile").as_str());
+    return Some(built);
+}
+
+pub fn build_project(package: Option::<str>, output: Option::<str>, release: bool, emit_llvm: Option::<str>): i32 {
+    return match build_selected(package, output, release, emit_llvm) {
+        Some(_) => 0,
+        None => 1,
+    };
+}
+
+pub fn run_file(file: str, release: bool, args: [str; &]): i32 {
+    let out = temp_exe(file, "run");
+    if !compile_file(file, out.as_str(), release, None) {
+        return 1;
+    }
+    let code = run_program(out.as_str(), args);
+    let _ = fs::remove_file(out.as_str());
+    return code;
+}
+
+pub fn run_project(package: Option::<str>, release: bool, args: [str; &]): i32 {
+    let proj = match load(false) {
+        Some(p) => p,
+        None => return 1,
+    };
+    let pkgs = match select(&proj, package) {
+        Ok(p) => p,
+        Err(e) => {
+            report_project(&e);
+            return 1;
+        }
+    };
+    let mut programs: [usize; ..+] = [];
+    for pkg in pkgs {
+        if proj.main_root(pkg).is_some() {
+            programs.push(pkg);
+        }
+    }
+    if programs.len() == 0 {
+        let named = match package {
+            Some(n) => Some(n),
+            None => match proj.current_member() {
+                Some(i) => Some(proj.text(proj.packages[i].name)),
+                None => None,
+            },
+        };
+        let e = match named {
+            Some(n) => ProjectError::new(manifest::NO_TARGET(), "package `{n}` has no program (`src/main.ln`) to run"),
+            None => ProjectError::new(manifest::NO_TARGET(), "no package in this workspace has a program (`src/main.ln`) to run"),
+        };
+        report_project(&e);
+        return 1;
+    }
+    if programs.len() > 1 {
+        let mut names = String::new();
+        for i in 0..programs.len() {
+            if i > 0 {
+                names.push_str(", ");
+            }
+            names.push_str(proj.text(proj.packages[programs[i]].name));
+        }
+        let first = proj.text(proj.packages[programs[0]].name);
+        let e = ProjectError::new(manifest::WORKSPACE(), "this workspace has several programs; pick one to run").note("programs: {names}").help("`lunar run -p {first}`");
+        report_project(&e);
+        return 1;
+    }
+    let name = String::from(proj.text(proj.packages[programs[0]].name));
+    let exe = match build_selected(Some(name.as_str()), None, release, None) {
+        Some(e) => e,
+        None => return 1,
+    };
+    status("Running", exe.as_str());
+    return run_program(exe.as_str(), args);
+}
+
+/// Run a program, forwarding its exit status. A crash (a signal on Unix,
+/// an NTSTATUS such as `0xC0000005` on Windows) is never success.
+fn run_program(exe: str, args: [str; &]): i32 {
+    let s = match process::status(exe, args) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln("error: could not run program: {e}");
+            return 1;
+        }
+    };
+    return match s.code() {
+        Some(c) => {
+            if c >= 0 && c <= 255 {
+                c
+            } else {
+                eprintln("error: program crashed with status {hex(c as u32)}");
+                101
+            }
+        }
+        None => {
+            eprintln("error: program was terminated: {s}");
+            101
+        }
+    };
+}
+
+/// `0xC0000005`: `{:#010X}`.
+fn hex(n: u32): String {
+    let digits = "0123456789ABCDEF".as_bytes();
+    let mut s = String::from("0x");
+    let mut shift: u32 = 28;
+    loop {
+        s.push(digits[((n >> shift) & 15) as usize] as char);
+        if shift == 0 {
+            return s;
+        }
+        shift -= 4;
+    }
+}
+
+// ===================================================================== test
+
+/// `lunar test file.ln [filter]` or, in a project, `lunar test [filter]`.
+pub fn test(args: [str; &], package: Option::<str>, release: bool): i32 {
+    let file_mode = args.len() > 0 && args[0].ends_with(".ln");
+    let mut tally = Tally::new();
+    let mut ok = true;
+    if file_mode {
+        let file = args[0];
+        let mut s = analyze_file(file, true, None);
+        let out = temp_exe(file, "test");
+        let filter = if args.len() > 1 { Some(args[1]) } else { None };
+        ok = run_tests(&mut s, file, out.as_str(), filter, release, &mut tally);
+        let _ = fs::remove_file(out.as_str());
+    } else {
+        let filter = if args.len() > 0 { Some(args[0]) } else { None };
+        match test_project(package, filter, release, &mut tally) {
+            Some(r) => ok = r,
+            None => return 1,
+        }
+    }
+    return summary(&tally, ok);
+}
+
+/// Run the tests of each selected package's library, program and
+/// `tests/*.ln`; `None` after a project error.
+fn test_project(package: Option::<str>, filter: Option::<str>, release: bool, tally: &mut Tally): Option::<bool> {
+    let mut proj = match load(false) {
+        Some(p) => p,
+        None => return None,
+    };
+    let pkgs = match select(&proj, package) {
+        Ok(p) => p,
+        Err(e) => {
+            report_project(&e);
+            return None;
+        }
+    };
+    let mut rel = String::new();
+    rel.write("target/{profile(release)}/tests");
+    let dir = join(proj.text(proj.root), rel.as_str());
+    if let Err(e) = fs::create_dir_all(dir.as_str()) {
+        fail(core::fmt::format("could not create `{display(dir.as_str())}`: {e}").as_str());
+        return None;
+    }
+    let mut ok = true;
+    for pkg in pkgs {
+        let name = String::from(proj.text(proj.packages[pkg].name));
+        status("Testing", core::fmt::format("{name} v{proj.text(proj.packages[pkg].version)}").as_str());
+        let mut files: [core::intern::Symbol; ..+] = [];
+        proj.test_files(pkg, &mut files);
+        // (target, label, executable suffix) for each crater with tests.
+        let mut n: usize = 0;
+        let has_lib = proj.lib_root(pkg).is_some();
+        let has_main = proj.main_root(pkg).is_some();
+        let total = files.len() + 2;
+        while n < total {
+            let k = n;
+            n += 1;
+            let mut label = String::new();
+            let mut exe = String::new();
+            let target = if k == 0 {
+                if !has_lib {
+                    continue;
+                }
+                label.write("{name}: src/lib.ln");
+                exe.push_str("lib");
+                Target::Lib
+            } else if k == 1 {
+                if !has_main {
+                    continue;
+                }
+                label.write("{name}: src/main.ln");
+                exe.push_str("main");
+                Target::Main
+            } else {
+                let f = files[k - 2];
+                let stem = file_stem(proj.text(f));
+                label.write("{name}: tests/{stem}.ln");
+                exe.write("test-{stem}");
+                Target::TestFile(f)
+            };
+            if let Err(e) = proj.craters(pkg, target) {
+                report_project(&e);
+                return None;
+            }
+            let mut s = analyze_specs(&proj, true, None);
+            let mut file = String::new();
+            file.write("{name}-{exe}{exe_suffix()}");
+            let out = display(join(dir.as_str(), file.as_str()).as_str());
+            if !run_tests(&mut s, label.as_str(), out.as_str(), filter, release, tally) {
+                ok = false;
+            }
+        }
+    }
+    return Some(ok);
+}
+
+// ===================================================================== dependencies
+
+pub fn add(name_arg: str, spec: DepSpec): i32 {
+    let mut name = name_arg;
+    let mut spec = spec;
+    if let Some(at) = name_arg.find("@") {
+        name = name_arg[..at];
+        spec.version = Some(name_arg[at + 1..]);
+    }
+    if spec.path.is_none() && spec.git.is_none() && spec.version.is_none() {
+        fail(core::fmt::format("say where `{name}` comes from: `--path <dir>`, `--git <url>`, or a registry version (`{name}@1.0`)").as_str());
+        return 1;
+    }
+    let here = cwd();
+    let pkg = match find_project(here.as_str()) {
+        Some(p) => p,
+        None => String::from(here.as_str()),
+    };
+    let mut proj = Project::new();
+    if let Err(e) = proj.add_dependency(pkg.as_str(), name, &spec) {
+        report_project(&e);
+        return 1;
+    }
+    status("Added", name);
+    return match load(false) {
+        Some(_) => 0,
+        None => 1,
+    };
+}
+
+pub fn remove(name: str): i32 {
+    let here = cwd();
+    let pkg = match find_project(here.as_str()) {
+        Some(p) => p,
+        None => String::from(here.as_str()),
+    };
+    let mut proj = Project::new();
+    if let Err(e) = proj.remove_dependency(pkg.as_str(), name) {
+        report_project(&e);
+        return 1;
+    }
+    status("Removed", name);
+    return match load(false) {
+        Some(_) => 0,
+        None => 1,
+    };
+}
+
+pub fn update(): i32 {
+    return match load(true) {
+        Some(_) => 0,
+        None => 1,
+    };
+}
+
+pub fn clean(): i32 {
+    let mut proj = Project::new();
+    let here = cwd();
+    if let Err(e) = proj.find_workspace(here.as_str()) {
+        report_project(&e);
+        return 1;
+    }
+    let target = join(proj.text(proj.root), "target");
+    if fs::exists(target.as_str()) {
+        if let Err(e) = fs::remove_dir_all(target.as_str()) {
+            let err = ProjectError::new(build::IO(), "could not remove `{display(target.as_str())}`: {e}");
+            report_project(&err);
+            return 1;
+        }
+    }
+    status("Removed", display(target.as_str()).as_str());
+    return 0;
+}
+
+// ===================================================================== emit-llvm
+
+pub fn emit_llvm(file: str, output: Option::<str>, release: bool, test: bool): i32 {
+    let mut s = analyze_file(file, test, None);
+    check_main(&mut s, file, test);
+    if !finish_front(&s) {
+        return 1;
+    }
+    let ir = match emit_ir(&mut s, release, test) {
+        Some(ir) => ir,
+        None => return 1,
+    };
+    match output {
+        Some(p) => {
+            if let Err(e) = fs::write(p, ir.as_bytes()) {
+                fail(core::fmt::format("could not write `{p}`: {e}").as_str());
+                return 1;
+            }
+        }
+        None => std::io::write_str(ir.as_str()),
+    }
+    return 0;
+}

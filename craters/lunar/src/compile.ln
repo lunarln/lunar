@@ -1,0 +1,269 @@
+// The compiler pipeline: load the craters with `core` and `std`, analyze
+// them, report the diagnostics, generate code and link. A port of
+// crates/ln-driver/src/lib.rs (and the reporting parts of main.rs).
+
+use std::fs;
+use ln_sema::codes::build;
+use ln_sema::diag::{Code, Severity, dummy_span};
+use ln_sema::loader::{Craters, load_crate};
+use ln_sema::program::Program;
+use ln_sema::render::{plain_message, render_all};
+use ln_sema::sema::{Options, Sema, analyze};
+use crater::explain;
+use crater::link;
+use crater::paths::{obj_extension, with_extension};
+use crater::project::Project;
+use crater::sysroot;
+use crater::ui::use_color;
+
+/// Load the craters `proj.specs` (the first is the one built), then `core`
+/// and `std`, and analyze them for the host (or `target_os`). If a file
+/// cannot be read, the result is not analyzed and has the errors.
+pub fn analyze_specs(proj: &Project, test: bool, target_os: Option::<str>): Sema {
+    let opts = options(test, target_os);
+    let mut p = Program::new();
+    let mut cs = Craters::new();
+    for s in proj.specs {
+        let root = proj.text(s.root);
+        match load_crate(&mut p, &mut cs, proj.text(s.name), root, "") {
+            Some(c) => {
+                let mut deps: [ln_sema::loader::CraterDep; ..+] = [];
+                for d in proj.crater_deps.list(s.deps) {
+                    deps.push(ln_sema::loader::CraterDep { name: p.sym(proj.text(d.alias)), index: d.index });
+                }
+                let mut c = c;
+                c.deps = cs.deps.add_list(deps[..]);
+                cs.list.push(c);
+            }
+            None => {
+                let mut m = String::new();
+                m.write("could not read `{root}`");
+                error(&mut p, build::IO(), m.as_str(), "");
+                return Sema::new(p, cs, opts);
+            }
+        }
+    }
+    return with_std(p, cs, opts);
+}
+
+/// The analysis options for the host (or `target_os`).
+fn options(test: bool, target_os: Option::<str>): Options {
+    let mut opts = Options::host(test);
+    if let Some(os) = target_os {
+        opts.target_os = String::from(os);
+        opts.target_family = String::from(if os == "windows" { "windows" } else { "unix" });
+    }
+    return opts;
+}
+
+/// Load `core` and `std` after the user's craters, and analyze them all
+/// (unless something could not be loaded).
+fn with_std(p: Program, cs: Craters, opts: Options): Sema {
+    let mut p = p;
+    let mut cs = cs;
+    let std_dir = match sysroot::std_dir() {
+        Some(d) => d,
+        None => {
+            error(&mut p, build::IO(), "could not find the standard library", sysroot::std_help());
+            return Sema::new(p, cs, opts);
+        }
+    };
+    let names = ["core", "std"];
+    for n in names {
+        let mut root = String::new();
+        root.write("{std_dir}/{n}/lib.ln");
+        match load_crate(&mut p, &mut cs, n, root.as_str(), "") {
+            Some(c) => cs.list.push(c),
+            None => {
+                let mut m = String::new();
+                m.write("standard library crater `{n}` not found at {root}");
+                error(&mut p, build::IO(), m.as_str(), "");
+                return Sema::new(p, cs, opts);
+            }
+        }
+    }
+    if p.diags.has_errors() {
+        return Sema::new(p, cs, opts);
+    }
+    return analyze(p, cs, opts);
+}
+
+/// Analyze the file `path` alone (with `core` and `std`), as a crater
+/// named after it.
+pub fn analyze_file(path: str, test: bool, target_os: Option::<str>): Sema {
+    let opts = options(test, target_os);
+    let mut p = Program::new();
+    let mut cs = Craters::new();
+    let name = crater_name(path);
+    match load_crate(&mut p, &mut cs, name.as_str(), path, "") {
+        Some(c) => cs.list.push(c),
+        None => {
+            let mut m = String::new();
+            m.write("could not read `{path}`");
+            error(&mut p, build::IO(), m.as_str(), "");
+            return Sema::new(p, cs, opts);
+        }
+    }
+    return with_std(p, cs, opts);
+}
+
+/// Record an error without a place in the source.
+fn error(p: &mut Program, kept code: Code, msg: str, help: str) {
+    let m = p.sym(msg);
+    p.diags.error(code, dummy_span(), m);
+    if help.len() > 0 {
+        let h = p.sym(help);
+        p.diags.help(h);
+    }
+    p.diags.finish();
+}
+
+/// `build::no_main`, ahead of the other diagnostics, if a program built
+/// as an executable (not a test harness) has no `main` function.
+pub fn check_main(s: &mut Sema, file: str, test: bool) {
+    if test || s.p.diags.has_errors() || s.p.main.is_some() {
+        return;
+    }
+    let mut m = String::new();
+    m.write("`{file}` has no `main` function");
+    error(&mut s.p, build::NO_MAIN(), m.as_str(), "add `fn main() { ... }` to the file; to run its `#[test]` functions instead, use `lunar test`");
+    let d = s.p.diags.list.pop().unwrap();
+    s.p.diags.list.insert(0, d);
+}
+
+/// Report the front end's diagnostics; false if there were errors (after
+/// the summary line and the `lunar explain` hint).
+pub fn finish_front(s: &Sema): bool {
+    let mut out = String::new();
+    render_all(&s.p, use_color(), &mut out);
+    std::io::ewrite_str(out.as_str());
+    let errors = s.p.diags.error_count();
+    if errors > 0 {
+        eprintln("error: could not compile due to {errors} previous error{if errors == 1 { "" } else { "s" }}");
+        let hint = explain::hint(&s.p);
+        if hint.len() > 0 {
+            eprintln("\n{hint}");
+        }
+        return false;
+    }
+    return true;
+}
+
+/// Report an error from after the front end (code generation, linking):
+/// without a place, with its note and help, then the `lunar explain` hint.
+pub fn report_plain(code: Code, msg: str, note: str, help: str) {
+    let mut notes: [str; ..+] = [];
+    if note.len() > 0 {
+        notes.push(note);
+    }
+    let mut helps: [str; ..+] = [];
+    if help.len() > 0 {
+        helps.push(help);
+    }
+    let mut full = String::new();
+    full.write("{code.scope}::{code.name}");
+    let mut out = String::new();
+    plain_message(Severity::Error, full.as_str(), msg, notes[..], helps[..], use_color(), &mut out);
+    std::io::ewrite_str(out.as_str());
+    if explain::lookup(full.as_str()).is_some() {
+        eprintln("\nFor more information about this error, try `lunar explain {full}`.");
+    }
+}
+
+/// A code generation failure as `build::llvm`: the first line of `msg` is
+/// the message, the other lines (the LLVM verifier's output) a note.
+fn codegen_error(msg: str) {
+    match msg.find("\n") {
+        Some(i) => {
+            let mut first = msg[..i];
+            while first.ends_with(":") {
+                first = first[..first.len() - 1];
+            }
+            let rest = trim_end(msg[i + 1..]);
+            if rest.trim().len() > 0 {
+                report_plain(build::LLVM(), first, rest, "");
+            } else {
+                report_plain(build::LLVM(), first, "", "");
+            }
+        }
+        None => {
+            let mut m = msg;
+            while m.ends_with(":") {
+                m = m[..m.len() - 1];
+            }
+            report_plain(build::LLVM(), m, "", "");
+        }
+    }
+}
+
+fn trim_end(s: str): str {
+    let b = s.as_bytes();
+    let mut end = b.len();
+    while end > 0 && (b[end - 1] == b' ' || b[end - 1] == b'\n' || b[end - 1] == b'\r' || b[end - 1] == b'\t') {
+        end -= 1;
+    }
+    return s[..end];
+}
+
+fn codegen_options(release: bool, test: bool, emit_llvm: Option::<str>): ln_codegen::Options {
+    let ir = match emit_llvm {
+        Some(e) => Some(String::from(e)),
+        None => None,
+    };
+    return ln_codegen::Options { opt_level: if release { 2 } else { 0 }, test, overflow_checks: !release, emit_llvm: ir };
+}
+
+/// Generate code for an analyzed program and link it into the executable
+/// `out`; false after reporting a failure.
+pub fn build_exe(s: &mut Sema, out: str, release: bool, test: bool, emit_llvm: Option::<str>): bool {
+    let obj = with_extension(out, obj_extension());
+    match ln_codegen::compile(&mut s.p, codegen_options(release, test, emit_llvm), obj.as_str()) {
+        Ok(()) => {}
+        Err(e) => {
+            codegen_error(e.as_str());
+            return false;
+        }
+    }
+    let mut libs: [str; ..+] = [];
+    for l in s.p.link_libs {
+        libs.push(s.p.text(l));
+    }
+    let linked = link::link(obj.as_str(), out, libs[..]);
+    let _ = fs::remove_file(obj.as_str());
+    return match linked {
+        Ok(()) => true,
+        Err(e) => {
+            report_plain(build::LINK(), e.message.as_str(), e.note.as_str(), e.help.as_str());
+            false
+        }
+    };
+}
+
+/// The optimized LLVM IR of an analyzed program, or `None` after
+/// reporting a failure.
+pub fn emit_ir(s: &mut Sema, release: bool, test: bool): Option::<String> {
+    return match ln_codegen::emit_ir(&mut s.p, codegen_options(release, test, None)) {
+        Ok(ir) => Some(ir),
+        Err(e) => {
+            codegen_error(e.as_str());
+            None
+        }
+    };
+}
+
+/// A crater name from a file name: letters, digits and `_` (as the Rust
+/// driver's `sanitize`).
+pub fn crater_name(path: str): String {
+    let stem = crater::paths::file_stem(path);
+    let mut out = String::new();
+    for c in stem.chars() {
+        let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+        out.push(if ok { c } else { '_' });
+    }
+    if out.len() == 0 || (out.as_bytes()[0] >= b'0' && out.as_bytes()[0] <= b'9') {
+        let mut s = String::from("_");
+        s.push_str(out.as_str());
+        return s;
+    }
+    return out;
+}

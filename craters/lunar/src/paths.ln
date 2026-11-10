@@ -1,0 +1,251 @@
+// Paths as text. Inside the driver every path uses `/`; `display` gives
+// the system's form for messages (on Windows, with `\`, as Rust's
+// `Path::display` shows the paths it got from the system).
+
+use std::env;
+use std::fs;
+
+/// `p` with `\` as `/`, and `.` and `name/..` segments removed.
+pub fn normalize(p: str): String {
+    let mut s = String::new();
+    for c in p.chars() {
+        s.push(if c == '\\' { '/' } else { c });
+    }
+    let text = s.as_str();
+    let mut parts: [str; -..+] = [];
+    let absolute = text.starts_with("/");
+    // `//server/share`: keep the second `/`.
+    let unc = text.starts_with("//");
+    for seg in text.split("/") {
+        if seg.len() == 0 || seg == "." {
+            continue;
+        }
+        if seg == ".." && parts.len() > 0 && parts[parts.len() - 1] != ".." && !is_drive(parts[parts.len() - 1]) {
+            parts.pop();
+            continue;
+        }
+        parts.push(seg);
+    }
+    let mut out = String::new();
+    if unc {
+        out.push('/');
+    }
+    if absolute {
+        out.push('/');
+    }
+    for i in 0..parts.len() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(parts[i]);
+        // `C:` alone is the current directory of drive C; `C:/` its root.
+        if i == 0 && parts.len() == 1 && is_drive(parts[0]) {
+            out.push('/');
+        }
+    }
+    if out.len() == 0 {
+        out.push('.');
+    }
+    return out;
+}
+
+fn is_drive(seg: str): bool {
+    let b = seg.as_bytes();
+    return b.len() == 2 && b[1] == b':';
+}
+
+pub fn is_absolute(p: str): bool {
+    let b = p.as_bytes();
+    return p.starts_with("/") || p.starts_with("\\") || (b.len() >= 2 && b[1] == b':');
+}
+
+/// `dir/rel`, or `rel` if it is absolute.
+pub fn join(dir: str, rel: str): String {
+    if is_absolute(rel) || dir.len() == 0 {
+        return normalize(rel);
+    }
+    let mut s = String::from(dir);
+    if !dir.ends_with("/") && !dir.ends_with("\\") {
+        s.push('/');
+    }
+    s.push_str(rel);
+    return normalize(s.as_str());
+}
+
+/// The directory containing `p` (normalized), if it has one.
+pub fn parent(p: str): Option::<String> {
+    let n = normalize(p);
+    let s = n.as_str();
+    let b = s.as_bytes();
+    if s == "/" || s == "." || (b.len() == 3 && b[1] == b':' && b[2] == b'/') {
+        return None;
+    }
+    let mut i = b.len();
+    while i > 0 {
+        i -= 1;
+        if b[i] == b'/' {
+            if i == 0 {
+                return Some(String::from("/"));
+            }
+            if i == 2 && b[1] == b':' {
+                return Some(String::from(s[..3]));
+            }
+            return Some(String::from(s[..i]));
+        }
+    }
+    return None;
+}
+
+/// The last part of `p` (empty for a root).
+pub fn file_name(p: str): str {
+    let b = p.as_bytes();
+    let mut end = b.len();
+    while end > 0 && (b[end - 1] == b'/' || b[end - 1] == b'\\') {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && b[start - 1] != b'/' && b[start - 1] != b'\\' {
+        start -= 1;
+    }
+    let name = p[start..end];
+    if name == "." || name == ".." || (name.len() == 2 && name.as_bytes()[1] == b':') {
+        return "";
+    }
+    return name;
+}
+
+/// The file name without its extension.
+pub fn file_stem(p: str): str {
+    let name = file_name(p);
+    let b = name.as_bytes();
+    let mut dot = b.len();
+    while dot > 0 {
+        dot -= 1;
+        if b[dot] == b'.' {
+            if dot == 0 {
+                return name;
+            }
+            return name[..dot];
+        }
+    }
+    return name;
+}
+
+/// `p` with the extension of its file name replaced by `ext` (removed if
+/// `ext` is empty), as Rust's `Path::with_extension`.
+pub fn with_extension(p: str, ext: str): String {
+    let name = file_name(p);
+    let stem = file_stem(p);
+    let b = p.as_bytes();
+    let mut end = b.len();
+    while end > 0 && (b[end - 1] == b'/' || b[end - 1] == b'\\') {
+        end -= 1;
+    }
+    let name_start = end - name.len();
+    let mut out = String::from(p[..name_start]);
+    out.push_str(stem);
+    if ext.len() > 0 {
+        out.push('.');
+        out.push_str(ext);
+    }
+    return out;
+}
+
+/// `p` as the system writes it: on Windows, with `\`.
+#[cfg(windows)]
+pub fn display(p: str): String {
+    let mut s = String::new();
+    for c in p.chars() {
+        s.push(if c == '/' { '\\' } else { c });
+    }
+    return s;
+}
+
+#[cfg(unix)]
+pub fn display(p: str): String {
+    return String::from(p);
+}
+
+/// The current directory, normalized (`.` if it cannot be read).
+pub fn cwd(): String {
+    return match env::current_dir() {
+        Ok(d) => normalize(d.as_str()),
+        Err(_) => String::from("."),
+    };
+}
+
+/// `p` made absolute against the current directory (without resolving
+/// links), normalized.
+pub fn absolute(p: str): String {
+    if is_absolute(p) {
+        return normalize(p);
+    }
+    return join(cwd().as_str(), p);
+}
+
+/// The real path of `p` (links resolved), normalized.
+pub fn canonical(p: str): Result::<String, std::io::Error> {
+    let c = fs::canonicalize(p)?;
+    return Ok(normalize(c.as_str()));
+}
+
+/// `path` relative to `base`, if `path` is reachable from it with `..`
+/// (both normalized and absolute).
+pub fn relative(path: str, base: str): Option::<String> {
+    let mut p: [str; -..+] = [];
+    for s in path.split("/") {
+        if s.len() > 0 {
+            p.push(s);
+        }
+    }
+    let mut b: [str; -..+] = [];
+    for s in base.split("/") {
+        if s.len() > 0 {
+            b.push(s);
+        }
+    }
+    let mut common: usize = 0;
+    while common < p.len() && common < b.len() && p[common] == b[common] {
+        common += 1;
+    }
+    if common == 0 && !(path.starts_with("/") && base.starts_with("/")) {
+        return None;
+    }
+    let mut out = String::new();
+    for _ in common..b.len() {
+        if out.len() > 0 {
+            out.push('/');
+        }
+        out.push_str("..");
+    }
+    for i in common..p.len() {
+        if out.len() > 0 {
+            out.push('/');
+        }
+        out.push_str(p[i]);
+    }
+    if out.len() == 0 {
+        out.push('.');
+    }
+    return Some(out);
+}
+
+#[cfg(windows)]
+pub fn exe_suffix(): str {
+    return ".exe";
+}
+
+#[cfg(unix)]
+pub fn exe_suffix(): str {
+    return "";
+}
+
+#[cfg(windows)]
+pub fn obj_extension(): str {
+    return "obj";
+}
+
+#[cfg(unix)]
+pub fn obj_extension(): str {
+    return "o";
+}

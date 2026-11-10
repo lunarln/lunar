@@ -1,83 +1,203 @@
 // Linking object files into executables: a port of
 // crates/ln-driver/src/link.rs.
 //
-// * Windows: `clang` (on `PATH`).
+// * Windows: `clang` (on `PATH`), else MSVC's `link.exe` if it is on
+//   `PATH` (as in a developer prompt). (The Rust driver also finds an
+//   installed MSVC through the registry.)
 // * Linux / macOS: the system C compiler driver (`cc`).
 //
 // `$LUNAR_CC` overrides the linker driver on every platform (it is invoked
 // like a C compiler: `$LUNAR_CC file.o -o out`). Native libraries named by
-// `#[link(name = "...")]` are passed on as `-lname`, searched for in the
-// directories in `$LUNAR_LIB_PATH` (separated like `PATH`) as well as the
-// linker's defaults.
+// `#[link(name = "...")]` are passed on as `-lname` (`name.lib` for
+// `link.exe`), searched for in the directories in `$LUNAR_LIB_PATH`
+// (separated like `PATH`) as well as the linker's defaults.
 
 use std::env;
+use std::fs;
 use std::process;
 
+/// A failed link, as a `build::link` diagnostic: its message, a note
+/// (the linker's output) and a help, each possibly empty.
+pub struct LinkError {
+    pub message: String,
+    pub note: String,
+    pub help: String,
+}
+
 /// Link `obj` and the native libraries `libs` into the executable `out`.
-/// An error message on failure.
-pub fn link(obj: str, out: str, libs: [str; &]): Result::<(), String> {
+pub fn link(obj: str, out: str, libs: [str; &]): Result::<(), LinkError> {
     let search = lib_path();
-    let mut args: [str; ..+] = [];
-    let mut owned = String::new();
-    // Every argument's text, end to end in `owned` (which never moves),
-    // then views into it.
-    let mut ranges: [(usize, usize); ..+] = [];
-    push_arg(&mut owned, &mut ranges, obj);
-    push_arg(&mut owned, &mut ranges, "-o");
-    push_arg(&mut owned, &mut ranges, out);
-    for d in search.as_str().split(path_sep()) {
+    let mut b = Args::new();
+    if let Some(cc) = env::var("LUNAR_CC") {
+        b.add(obj);
+        b.add("-o");
+        b.add(out);
+        gnu_args(&mut b, search.as_str(), libs, false);
+        for l in system_libs() {
+            b.add(l);
+        }
+        return run(cc.as_str(), &b);
+    }
+    if is_windows() {
+        return link_windows(obj, out, libs, search.as_str());
+    }
+    b.add(obj);
+    b.add("-o");
+    b.add(out);
+    gnu_args(&mut b, search.as_str(), libs, true);
+    for l in system_libs() {
+        b.add(l);
+    }
+    return run("cc", &b);
+}
+
+fn link_windows(obj: str, out: str, libs: [str; &], search: str): Result::<(), LinkError> {
+    let mut b = Args::new();
+    if which("clang") {
+        b.add(obj);
+        b.add("-o");
+        b.add(out);
+        gnu_args(&mut b, search, libs, false);
+        // `/Brepro`: no link timestamp, so the same program links to the
+        // same bytes (the bootstrap compares the compilers it builds).
+        b.add("-llegacy_stdio_definitions");
+        b.add("-lkernel32");
+        b.add("-Wl,/Brepro");
+        return run("clang", &b);
+    }
+    if !which("link") {
+        return Err(LinkError { message: String::from("no linker found"), note: String::new(), help: String::from("install the MSVC build tools or LLVM `clang`, or set `LUNAR_CC`") });
+    }
+    b.add("/NOLOGO");
+    let mut o = String::from("/OUT:");
+    o.push_str(out);
+    b.add(o.as_str());
+    b.add(obj);
+    b.add("/SUBSYSTEM:CONSOLE");
+    b.add("libcmt.lib");
+    b.add("kernel32.lib");
+    b.add("legacy_stdio_definitions.lib");
+    b.add("/Brepro");
+    for d in search.split(path_sep()) {
+        if d.len() > 0 {
+            let mut a = String::from("/LIBPATH:");
+            a.push_str(d);
+            b.add(a.as_str());
+        }
+    }
+    for l in libs {
+        let mut a = String::from(l);
+        a.push_str(".lib");
+        b.add(a.as_str());
+    }
+    return run("link", &b);
+}
+
+/// `-L` for each search directory, `-l` for each library, and with
+/// `rpath`, `-rpath` for each search directory.
+fn gnu_args(b: &mut +Args, search: str, libs: [str; &], rpath: bool) {
+    for d in search.split(path_sep()) {
         if d.len() > 0 {
             let mut a = String::from("-L");
             a.push_str(d);
-            push_arg(&mut owned, &mut ranges, a.as_str());
-            if !is_windows() {
-                let mut r = String::from("-Wl,-rpath,");
-                r.push_str(d);
-                push_arg(&mut owned, &mut ranges, r.as_str());
-            }
+            b.add(a.as_str());
         }
     }
     for l in libs {
         let mut a = String::from("-l");
         a.push_str(l);
-        push_arg(&mut owned, &mut ranges, a.as_str());
+        b.add(a.as_str());
     }
-    for l in system_libs() {
-        push_arg(&mut owned, &mut ranges, l);
-    }
-    let cc = match env::var("LUNAR_CC") {
-        Some(c) => c,
-        None => {
-            for a in default_cc_args() {
-                push_arg(&mut owned, &mut ranges, a);
+    if rpath {
+        for d in search.split(path_sep()) {
+            if d.len() > 0 {
+                // Shared libraries are found through the search path at run
+                // time too.
+                let mut r = String::from("-Wl,-rpath,");
+                r.push_str(d);
+                b.add(r.as_str());
             }
-            String::from(if is_windows() { "clang" } else { "cc" })
         }
-    };
-    let text = owned.as_str();
-    for r in ranges {
+    }
+}
+
+/// Arguments, end to end in one string that only grows.
+struct Args {
+    text: String,
+    ranges: [(usize, usize); ..+],
+}
+
+impl Args {
+    fn new(): Args {
+        return Args { text: String::new(), ranges: [] };
+    }
+
+    fn add(&mut +self, a: str) {
+        let s = self.text.len();
+        self.text.push_str(a);
+        self.ranges.push((s, self.text.len()));
+    }
+}
+
+fn run(program: str, b: &Args): Result::<(), LinkError> {
+    let text = b.text.as_str();
+    let mut args: [str; ..+] = [];
+    for r in b.ranges {
         let (s, e) = r;
         args.push(text[s..e]);
     }
-    return match process::run(cc.as_str(), args[..]) {
-        Ok(0) => Ok(()),
-        Ok(code) => {
-            let mut m = String::new();
-            m.write("linking with `{cc}` failed: exit code {code}");
-            Err(m)
-        }
+    let o = match process::output(program, args[..]) {
+        Ok(o) => o,
         Err(e) => {
             let mut m = String::new();
-            m.write("could not run the linker `{cc}`: {e}; install a linker, or point `LUNAR_CC` at one");
-            Err(m)
+            m.write("could not run the linker `{program}`: {e}");
+            return Err(LinkError { message: m, note: String::new(), help: String::from("install a linker, or point `LUNAR_CC` at one") });
         }
     };
+    if o.status.success() {
+        return Ok(());
+    }
+    let mut m = String::new();
+    m.write("linking with `{program}` failed: {o.status}");
+    let mut all = String::from(o.stdout.as_str());
+    all.push_str(o.stderr.as_str());
+    let mut note = String::new();
+    if all.as_str().trim().len() > 0 {
+        note.write("linker output:\n{trim_end(all.as_str())}");
+    }
+    return Err(LinkError { message: m, note, help: String::new() });
 }
 
-fn push_arg(owned: &mut +String, ranges: &mut +[(usize, usize); ..+], a: str) {
-    let s = owned.len();
-    owned.push_str(a);
-    ranges.push((s, owned.len()));
+fn trim_end(s: str): str {
+    let b = s.as_bytes();
+    let mut end = b.len();
+    while end > 0 && (b[end - 1] == b' ' || b[end - 1] == b'\n' || b[end - 1] == b'\r' || b[end - 1] == b'\t') {
+        end -= 1;
+    }
+    return s[..end];
+}
+
+/// Whether `name` (with `.exe`, `.cmd` or `.bat` on Windows) is on `PATH`.
+fn which(name: str): bool {
+    let path = match env::var("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+    for dir in path.as_str().split(path_sep()) {
+        if dir.len() == 0 {
+            continue;
+        }
+        for ext in exe_exts() {
+            let mut p = String::from(dir);
+            p.push('/');
+            p.push_str(name);
+            p.push_str(ext);
+            if fs::is_file(p.as_str()) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 fn lib_path(): String {
@@ -85,6 +205,16 @@ fn lib_path(): String {
         Some(p) => p,
         None => String::new(),
     };
+}
+
+#[cfg(windows)]
+fn exe_exts(): [str; 4] {
+    return [".exe", ".cmd", ".bat", ""];
+}
+
+#[cfg(unix)]
+fn exe_exts(): [str; 1] {
+    return [""];
 }
 
 #[cfg(windows)]
@@ -110,19 +240,6 @@ fn path_sep(): str {
 #[cfg(windows)]
 fn system_libs(): [str; 2] {
     return ["-llegacy_stdio_definitions", "-lkernel32"];
-}
-
-/// Arguments for the default linker driver only. On Windows, `/Brepro`:
-/// no link timestamp, so the same program links to the same bytes (the
-/// bootstrap compares the compilers it builds).
-#[cfg(windows)]
-fn default_cc_args(): [str; 1] {
-    return ["-Wl,/Brepro"];
-}
-
-#[cfg(unix)]
-fn default_cc_args(): [str; 0] {
-    return [];
 }
 
 #[cfg(target_os = "linux")]

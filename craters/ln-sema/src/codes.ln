@@ -148,6 +148,40 @@ pub mod manifest {
     use crater::diag::Code;
     fn c(name: str): Code { return Code { scope: "manifest", name }; }
     pub fn PARSE(): Code { return c("parse"); }
+    pub fn BAD_NAME(): Code { return c("bad_name"); }
+    pub fn BAD_VERSION(): Code { return c("bad_version"); }
+    pub fn BAD_DEPENDENCY(): Code { return c("bad_dependency"); }
     pub fn NOT_FOUND(): Code { return c("not_found"); }
+    pub fn WRONG_PACKAGE(): Code { return c("wrong_package"); }
+    pub fn VERSION_MISMATCH(): Code { return c("version_mismatch"); }
+    pub fn REGISTRY_UNAVAILABLE(): Code { return c("registry_unavailable"); }
+    pub fn GIT(): Code { return c("git"); }
+    pub fn NO_TARGET(): Code { return c("no_target"); }
     pub fn WORKSPACE(): Code { return c("workspace"); }
+    pub fn LOCK(): Code { return c("lock"); }
+}
+
+/// Every code, in the order of `ALL_CODES` in crates/ln-diag (for `lunar
+/// explain --list`).
+pub fn all_codes(): [crater::diag::Code; ..+] {
+    let scopes = [
+        ("type", "mismatch array_owner_items grow_outside_param grow_no_owner grow_without_mut fmtargs_outside_param annotations_needed not_callable arg_count generic_count no_field no_method not_indexable bad_operand bad_cast unsatisfied_bound infinite_size array_len not_a_place immutable missing_field duplicate_field non_exhaustive bad_pattern return_missing break_outside_loop literal_range not_iterable ffi_type bad_main bad_test const_eval variadic_not_extern impl_trait_position opaque_mismatch let_else_falls_through"),
+        ("syntax", "unexpected_token unknown_char unterminated bad_escape bad_number bad_format missing_semi missing_body bad_char bad_attribute conflict_marker"),
+        ("name", "unresolved duplicate private not_a_type not_a_value not_a_trait module_file bad_self"),
+        ("trait", "dull_impl negative_impl missing_item extra_item signature conflicting_impl ambiguous_method inherent_foreign"),
+        ("borrow", "use_after_move move_out_of_borrow grow_only shrink_while_borrowed move_while_borrowed assign_while_borrowed outlives_root escapes_function escapes_via_param missing_marker wrong_marker not_an_argument"),
+        ("macro", "undefined no_match bad_matcher repetition recursion_limit derive_output not_supported error"),
+        ("unsafe", "outside_unsafe in_unsafe_fn"),
+        ("lint", "needless_borrow mut_param_not_read unused_variable unreachable unused_mut unknown_cfg irrefutable_let_else"),
+        ("build", "link llvm io no_main missing_lang_item"),
+        ("manifest", "parse bad_name bad_version bad_dependency not_found wrong_package version_mismatch registry_unavailable git no_target workspace lock"),
+    ];
+    let mut out: [crater::diag::Code; ..+] = [];
+    for s in scopes {
+        let (scope, names) = s;
+        for name in names.split(" ") {
+            out.push(crater::diag::Code { scope, name });
+        }
+    }
+    return out;
 }
