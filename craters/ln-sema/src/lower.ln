@@ -1,0 +1,80 @@
+// STUB: replaced at merge.
+//
+// The parts of crates/ln-sema/src/lower.rs that the type checker uses.
+
+use core::arena::{Id, List};
+use core::intern::Symbol;
+use crater::defs::{ConstVal, DefId, Generics, Pred};
+use crater::sema::Sema;
+use crater::ty::Ty;
+use ln_ast::Span;
+
+/// A check that needs complete ADT information.
+pub struct Deferred {
+    pub kind: DeferKind,
+    pub ty: Ty,
+    pub env: List::<Pred>,
+    pub span: Span,
+    /// Span of the generic parameter list, for "add Dull to T's bounds" help.
+    pub generics_span: Span,
+}
+
+pub enum DeferKind {
+    ArrayElem,
+    Grow,
+    /// `x: &T` where `T` might be Dull (a pointless borrow).
+    NeedlessBorrow,
+}
+
+/// Where a type appears.
+#[derive(Eq)]
+pub enum TyPos {
+    /// Directly a function parameter type: `+T` and `FmtArgs` allowed.
+    Param,
+    Other,
+}
+
+/// Context for lowering types inside one item.
+pub struct LowerCx {
+    pub module: DefId,
+    /// Generic parameter names in scope, parents first (in `Program::symbols`).
+    pub generic_names: List::<Symbol>,
+    pub self_ty: Option::<Ty>,
+    /// Bounds in scope (in `Program::preds`).
+    pub env: List::<Pred>,
+    pub allow_infer: bool,
+    pub generics_span: Span,
+    /// Lowering this function's return type, where `impl Trait` is allowed.
+    pub opaque_owner: Option::<DefId>,
+}
+
+impl Sema {
+    pub fn lower_cx(&mut self, id: DefId): LowerCx {
+        panic("stub")
+    }
+
+    /// Predicates in scope for an item (own and parents').
+    pub fn env_of(&mut self, id: DefId): [Pred; ..+] {
+        panic("stub")
+    }
+
+    pub fn generics(&self, id: DefId): Option::<Generics> {
+        panic("stub")
+    }
+
+    /// Lower a type; `_` becomes `Infer(u32::MAX)` and `[T; _]` becomes
+    /// `FixedVar(u32::MAX)` where `cx.allow_infer`.
+    pub fn lower_ty(&mut self, cx: LowerCx, t: Id::<ln_ast::Ty>, pos: TyPos): Ty {
+        panic("stub")
+    }
+
+    /// Report the `err(type::array_owner_items)` diagnostic.
+    pub fn pointy_diag(&mut self, elem: Ty, span: Span, generics_span: Span) {
+        panic("stub")
+    }
+
+    /// Evaluate a constant expression of (expected) type `ty`.
+    pub fn eval_const(&mut self, module: DefId, e: Id::<ln_ast::Expr>, ty: Ty): Option::<ConstVal> {
+        panic("stub")
+    }
+}

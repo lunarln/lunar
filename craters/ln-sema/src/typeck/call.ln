@@ -1,0 +1,1733 @@
+// Value paths, calls, method resolution and struct literals: a port of
+// crates/ln-sema/src/typeck/call.rs.
+
+use core::arena::{Id, List};
+use core::intern::Symbol;
+use crater::codes;
+use crater::defs::*;
+use crater::program::Program;
+use crater::resolve::ModRes;
+use crater::sema::Sema;
+use crater::thir::{Arg, Callee, Coercion, Expr, ExprKind, FieldExpr, LocalId, LocalKind, ReadMode};
+use crater::ty::*;
+use ln_ast as ast;
+use ln_ast::{Ident, ParamMode, Span};
+
+/// What a value path refers to.
+pub enum ValueRes {
+    Local(LocalId),
+    Fn { def: DefId, args: TyList },
+    Const(DefId),
+    Static(DefId),
+    Ctor { adt: DefId, variant: u32, args: TyList },
+    TraitMethod { trait_ref: TraitRef, self_ty: Ty, def: DefId, method_args: TyList },
+}
+
+/// A resolved method candidate.
+struct MethodPick {
+    /// The method's definition.
+    def: DefId,
+    /// All generic args for the method (parent args first).
+    args: TyList,
+    /// Trait call info when the method comes from a trait.
+    trait_call: Option::<(TraitRef, Ty)>,
+}
+
+impl Sema {
+    // ===================================================================== generic args
+
+    /// Fresh variables or explicit arguments for an item's own generics.
+    fn own_args(&mut self, def: DefId, explicit: Option::<List::<Id::<ast::Ty>>>, span: Span): TyList {
+        let n = match self.generics(def) {
+            Some(g) => g.own_count(),
+            None => 0,
+        };
+        let mut out: [Ty; ..+] = [];
+        match explicit {
+            Some(ts) => {
+                if ts.len() != n {
+                    let mut m = String::new();
+                    m.write("`{self.p.name(def)}` takes {n} generic argument(s) but {ts.len()} were supplied");
+                    self.error_at(codes::ty::GENERIC_COUNT(), span, m.as_str());
+                    self.emit();
+                    for _ in 0..n {
+                        out.push(self.p.types.error());
+                    }
+                } else {
+                    for i in 0..ts.len() {
+                        let t = self.p.ast.ty_ids.list(ts)[i];
+                        out.push(self.lower_local_ty(t));
+                    }
+                }
+            }
+            None => {
+                for _ in 0..n {
+                    out.push(self.new_var(span));
+                }
+            }
+        }
+        return self.p.types.mk_list(out[..]);
+    }
+
+    /// Instantiate a definition's predicates with `args` and record them.
+    fn oblige_preds(&mut self, def: DefId, args: TyList, span: Span) {
+        let mut cur = Some(def);
+        while let Some(d) = cur {
+            if let Some(g) = self.generics(d) {
+                for i in 0..g.preds.len() {
+                    let p = self.p.preds.list(g.preds)[i];
+                    let ty = self.p.types.subst(p.ty, args);
+                    let tr = self.p.types.subst_trait_ref(p.trait_ref, args);
+                    self.oblige(ty, tr, span);
+                }
+            }
+            let info = self.p.def(d);
+            cur = match info.kind {
+                DefKind::Fn => match info.parent {
+                    Some(p) => if self.p.def(p).kind == DefKind::Impl { Some(p) } else { None },
+                    None => None,
+                },
+                _ => None,
+            };
+        }
+    }
+
+    // ===================================================================== value paths
+
+    pub fn resolve_value_path(&mut self, p: ast::Path, span: Span): Option::<ValueRes> {
+        let r = self.resolve_value_path_inner(p, span)?;
+        let last = self.p.ast.last_segment(p).ident.span;
+        match r {
+            ValueRes::Local(l) => self.record_local(last, l),
+            ValueRes::Fn { def, .. } => {
+                self.record_def(last, def);
+                self.check_method_privacy(def, last);
+            }
+            ValueRes::Const(def) => self.record_def(last, def),
+            ValueRes::Static(def) => self.record_def(last, def),
+            ValueRes::TraitMethod { def, .. } => self.record_def(last, def),
+            ValueRes::Ctor { adt, variant, .. } => {
+                let v = self.p.variants_of(self.p.adt(adt))[variant as usize].def;
+                self.record_def(last, v);
+            }
+        }
+        return Some(r);
+    }
+
+    /// Inherent methods and associated functions are private to the impl's
+    /// module (and its children) unless marked `pub`. Trait methods are as
+    /// visible as their trait.
+    fn check_method_privacy(&mut self, def: DefId, span: Span) {
+        let d = self.p.def(def);
+        let parent = match d.parent {
+            Some(p) => p,
+            None => return,
+        };
+        if d.is_pub || self.p.def(parent).kind != DefKind::Impl || self.p.impl_data(parent).trait_ref.is_some() {
+            return;
+        }
+        let here = self.module();
+        if self.is_ancestor_or_self(d.module, here) {
+            return;
+        }
+        let what = if self.p.fn_data(def).has_self { "method" } else { "associated function" };
+        let mut m = String::new();
+        m.write("{what} `{self.p.text(d.name)}` is private");
+        self.error_at(codes::name::PRIVATE(), span, m.as_str());
+        self.with_secondary(d.span, "defined here");
+        self.with_help("mark it `pub` to use it from other modules");
+        self.emit();
+    }
+
+    /// Report `name::not_a_value` for a path (`shown`) that names `def`, an
+    /// item that exists but is not a value (a module, a type, a trait, ...).
+    fn not_a_value(&mut self, def: DefId, shown: str, span: Span) {
+        let kind = self.p.def(def).kind;
+        let mut m = String::new();
+        m.write("expected a value, found {kind.describe()} `{shown}`");
+        self.error_at(codes::name::NOT_A_VALUE(), span, m.as_str());
+        if kind == DefKind::Struct {
+            let mut h = String::new();
+            h.write("build a value with a struct literal: `{shown} {{ ... }}`");
+            self.with_help(h.as_str());
+        }
+        self.emit();
+    }
+
+    fn resolve_value_path_inner(&mut self, p: ast::Path, span: Span): Option::<ValueRes> {
+        let nsegs = p.segments.len();
+        if self.p.ast.is_single(p) {
+            let id = self.segment(p, 0).ident;
+            let ctx = self.ident_ctx(id);
+            if let Some(l) = self.lookup_local(id.name, ctx) {
+                return Some(ValueRes::Local(l));
+            }
+        }
+        // `Self::f`, `T::f`
+        if nsegs == 2 {
+            let first = self.segment(p, 0).ident.name;
+            let is_self = self.p.text(first) == "Self";
+            let ty = if is_self {
+                self.fcx.cx.self_ty
+            } else {
+                let names = self.fcx.cx.generic_names;
+                let mut found: Option::<Ty> = None;
+                let mut i = names.len();
+                while i > 0 {
+                    i -= 1;
+                    if self.p.symbols.list(names)[i] == first {
+                        found = Some(self.p.types.mk(TyKind::Param(i as u32, first)));
+                        break;
+                    }
+                }
+                found
+            };
+            if let Some(ty) = ty {
+                let seg1 = self.segment(p, 1);
+                if is_self {
+                    if let TyKind::Adt(d, args) = self.p.types.kind(ty) {
+                        if self.p.is_enum(d) {
+                            if let Some(vi) = self.p.variant_index(d, self.p.text(seg1.ident.name)) {
+                                return Some(ValueRes::Ctor { adt: d, variant: vi as u32, args });
+                            }
+                        }
+                    }
+                }
+                return self.assoc_fn(ty, seg1, span);
+            }
+        }
+        let idents = self.path_idents(p);
+        let module = self.module();
+        let res = self.resolve_prefix(module, idents[..], Ns::Value);
+        let (res, used) = match res {
+            Some(r) => r,
+            None => {
+                if idents.len() == 1 {
+                    // Maybe it names a type, e.g. a named-field struct used as a value.
+                    match self.lookup_ident(module, idents[0], Ns::Type) {
+                        Some(ModRes::Def(def)) => {
+                            let shown = self.p.text(idents[0].name).to_string();
+                            self.not_a_value(def, shown.as_str(), span);
+                        }
+                        Some(ModRes::Prim(_)) => {
+                            let mut m = String::new();
+                            m.write("expected a value, found builtin type `{self.p.text(idents[0].name)}`");
+                            self.error_at(codes::name::NOT_A_VALUE(), span, m.as_str());
+                            self.emit();
+                        }
+                        None => self.unresolved_diag(module, idents[0], Ns::Value),
+                    }
+                }
+                return None;
+            }
+        };
+        if used == idents.len() {
+            let def = match res {
+                ModRes::Def(d) => d,
+                ModRes::Prim(_) => {
+                    let mut m = String::new();
+                    m.write("expected a value, found type `{self.path_str(p)}`");
+                    self.error_at(codes::name::NOT_A_VALUE(), span, m.as_str());
+                    self.emit();
+                    return None;
+                }
+            };
+            let d = self.p.def(def);
+            let last_args = self.p.ast.last_segment(p).args;
+            return match d.kind {
+                DefKind::Fn => {
+                    if d.parent.is_some() {
+                        // Methods are not module items, so module paths never
+                        // reach them; report rather than fail silently.
+                        let mut m = String::new();
+                        m.write("`{self.path_str(p)}` is a method; call it through its type, e.g. `Type::{self.p.text(d.name)}`");
+                        self.error_at(codes::name::NOT_A_VALUE(), span, m.as_str());
+                        self.emit();
+                        return None;
+                    }
+                    let args = self.own_args(def, last_args, span);
+                    Some(ValueRes::Fn { def, args })
+                }
+                DefKind::Const => Some(ValueRes::Const(def)),
+                DefKind::Static => Some(ValueRes::Static(def)),
+                DefKind::Struct => {
+                    if self.p.variants_of(self.p.adt(def))[0].ctor == CtorKind::Named {
+                        // Reached through the type namespace: a named-field
+                        // struct is not a value.
+                        let shown = self.path_str(p);
+                        self.not_a_value(def, shown.as_str(), span);
+                        return None;
+                    }
+                    let args = self.own_args(def, last_args, span);
+                    Some(ValueRes::Ctor { adt: def, variant: 0, args })
+                }
+                DefKind::Variant => {
+                    let (enum_id, index) = match d.data {
+                        DefData::Variant { enum_id, index } => (enum_id, index),
+                        _ => panic("variant without data"),
+                    };
+                    // Generic args may sit on the enum segment: `Option::<i32>::None`.
+                    let explicit = if nsegs >= 2 { self.segment(p, nsegs - 2).args } else { None };
+                    let explicit = match explicit {
+                        Some(x) => Some(x),
+                        None => last_args,
+                    };
+                    let args = self.own_args(enum_id, explicit, span);
+                    Some(ValueRes::Ctor { adt: enum_id, variant: index, args })
+                }
+                _ => {
+                    let shown = self.path_str(p);
+                    self.not_a_value(def, shown.as_str(), span);
+                    None
+                }
+            };
+        }
+        // Type-relative: `Type::assoc` or `Trait::method`.
+        if used + 1 != idents.len() {
+            let mut m = String::new();
+            m.write("cannot find `{self.p.text(idents[used].name)}`");
+            self.error_at(codes::name::UNRESOLVED(), idents[used].span, m.as_str());
+            self.emit();
+            return None;
+        }
+        let last = self.segment(p, used);
+        if let ModRes::Def(tid) = res {
+            if self.p.def(tid).kind == DefKind::Trait {
+                let td = self.p.trait_data(tid);
+                let mut mdef: Option::<DefId> = None;
+                for m in self.p.trait_methods.list(td.methods) {
+                    if m.name == last.ident.name {
+                        mdef = Some(m.def);
+                        break;
+                    }
+                }
+                let mdef = match mdef {
+                    Some(m) => m,
+                    None => {
+                        let mut m = String::new();
+                        m.write("trait `{self.p.name(tid)}` has no method `{self.p.text(last.ident.name)}`");
+                        self.error_at(codes::ty::NO_METHOD(), last.ident.span, m.as_str());
+                        self.emit();
+                        return None;
+                    }
+                };
+                let targs = self.own_args(tid, self.segment(p, used - 1).args, span);
+                let self_ty = self.new_var(span);
+                let method_args = self.own_args(mdef, last.args, span);
+                let tr = TraitRef { trait_id: tid, args: targs };
+                self.oblige(self_ty, tr, span);
+                return Some(ValueRes::TraitMethod { trait_ref: tr, self_ty, def: mdef, method_args });
+            }
+        }
+        let ty = self.ty_prefix(res, p, used, span)?;
+        return self.assoc_fn(ty, last, span);
+    }
+
+    /// The type the first `upto` segments of `p` (resolved to `res`) name,
+    /// before an associated item.
+    fn ty_prefix(&mut self, res: ModRes, p: ast::Path, upto: usize, span: Span): Option::<Ty> {
+        return match res {
+            ModRes::Prim(t) => Some(t),
+            ModRes::Def(d) => match self.p.def(d).kind {
+                DefKind::Struct | DefKind::Enum => {
+                    let args = self.own_args(d, self.segment(p, upto - 1).args, span);
+                    Some(self.p.types.adt(d, args))
+                }
+                DefKind::TypeAlias => {
+                    let prefix = ast::Path { segments: List::from_parts(p.segments.start(), upto), span: p.span };
+                    let t = self.p.ast.tys.add(ast::Ty { kind: ast::TyKind::Path(prefix), span: p.span });
+                    Some(self.lower_local_ty(t))
+                }
+                k => {
+                    let mut prefix = String::new();
+                    for i in 0..upto {
+                        if i > 0 {
+                            prefix.push_str("::");
+                        }
+                        prefix.push_str(self.p.text(self.segment(p, i).ident.name));
+                    }
+                    let sp = self.segment(p, upto - 1).ident.span;
+                    let mut m = String::new();
+                    m.write("expected a type, trait or module before `::{self.p.text(self.segment(p, upto).ident.name)}`, found {k.describe()} `{prefix}`");
+                    self.error_at(codes::name::NOT_A_TYPE(), sp, m.as_str());
+                    self.emit();
+                    None
+                }
+            },
+        };
+    }
+
+    /// `Type::name` lookup: inherent impls, then traits.
+    fn assoc_fn(&mut self, ty: Ty, seg: ast::PathSegment, span: Span): Option::<ValueRes> {
+        let name = seg.ident.name;
+        // Enum variants through an alias or `Self`.
+        let st = self.shallow(ty);
+        if let TyKind::Adt(d, args) = self.p.types.kind(st) {
+            if self.p.is_enum(d) {
+                if let Some(vi) = self.p.variant_index(d, self.p.text(name)) {
+                    return Some(ValueRes::Ctor { adt: d, variant: vi as u32, args });
+                }
+            }
+        }
+        if let Some(found) = self.inherent_method(ty, name, false) {
+            let (def, parent_args) = found;
+            let own = self.own_args(def, seg.args, span);
+            let mut all: [Ty; ..+] = [];
+            all.extend(self.p.types.list(parent_args));
+            all.extend(self.p.types.list(own));
+            let args = self.p.types.mk_list(all[..]);
+            return Some(ValueRes::Fn { def, args });
+        }
+        return match self.trait_method(ty, name, false, span) {
+            Some(found) => {
+                let (tr, mdef) = found;
+                let method_args = self.own_args(mdef, seg.args, span);
+                Some(ValueRes::TraitMethod { trait_ref: tr, self_ty: ty, def: mdef, method_args })
+            }
+            None => {
+                let t = self.ty_str(ty);
+                let mut m = String::new();
+                m.write("no function or associated item named `{self.p.text(name)}` found for `{t}`");
+                self.error_at(codes::ty::NO_METHOD(), seg.ident.span, m.as_str());
+                self.emit();
+                None
+            }
+        };
+    }
+
+    /// Find an inherent method on `ty`. Returns the method and the impl's args.
+    fn inherent_method(&mut self, ty: Ty, name: Symbol, need_self: bool): Option::<(DefId, TyList)> {
+        for k in 0..self.p.impls.len() {
+            let imp = self.p.impls[k];
+            let d = match self.p.def(imp).data {
+                DefData::Impl(d) => d,
+                _ => continue,
+            };
+            if d.trait_ref.is_some() {
+                continue;
+            }
+            let m = match self.p.impl_method(imp, name) {
+                Some(m) => m,
+                None => continue,
+            };
+            if need_self && !self.p.fn_data(m).has_self {
+                continue;
+            }
+            if let Some(args) = self.match_impl(imp, ty) {
+                return Some((m, args));
+            }
+        }
+        return None;
+    }
+
+    /// Unify an impl's self type (with fresh variables for its generics)
+    /// against `ty`; commits and returns the impl args on success.
+    fn match_impl(&mut self, imp: DefId, ty: Ty): Option::<TyList> {
+        let d = self.p.impl_data(imp);
+        let snap = self.snapshot();
+        let args = self.fresh_vars(d.generics.count());
+        let self_ty = self.p.types.subst(d.self_ty, args);
+        if self.unify(self_ty, ty) {
+            // Impl bounds must hold (checked later as obligations).
+            for i in 0..d.generics.preds.len() {
+                let p = self.p.preds.list(d.generics.preds)[i];
+                let pt = self.p.types.subst(p.ty, args);
+                let pty = self.resolve(pt);
+                let ptr = self.p.types.subst_trait_ref(p.trait_ref, args);
+                let rtr = self.resolve_trait_ref(ptr);
+                if !self.p.types.has_infer(pty) && !self.p.implements(pty, rtr, self.fcx.env[..]) {
+                    self.rollback(snap);
+                    return None;
+                }
+            }
+            return Some(args);
+        }
+        self.rollback(snap);
+        return None;
+    }
+
+    /// Find a trait method `name` applicable to `ty`. Returns the trait ref and method def.
+    fn trait_method(&mut self, ty: Ty, name: Symbol, need_self: bool, span: Span): Option::<(TraitRef, DefId)> {
+        let ty = self.resolve(ty);
+        let mut found: [(TraitRef, DefId); ..+] = [];
+        // Bounds in scope (generic params and `Self`), and what an
+        // `impl Trait` promises.
+        let known = self.known_preds(ty);
+        for i in 0..self.p.defs.len() {
+            if self.p.defs[i].kind != DefKind::Trait {
+                continue;
+            }
+            let tid = DefId::new(i);
+            let td = self.p.trait_data(tid);
+            let mut mdef: Option::<DefId> = None;
+            for m in self.p.trait_methods.list(td.methods) {
+                if m.name == name {
+                    mdef = Some(m.def);
+                    break;
+                }
+            }
+            let mdef = match mdef {
+                Some(m) => m,
+                None => continue,
+            };
+            if need_self && !self.p.fn_data(mdef).has_self {
+                continue;
+            }
+            let mut from_bound: Option::<TraitRef> = None;
+            for p in known[..] {
+                if p.ty == ty && p.trait_ref.trait_id == tid {
+                    from_bound = Some(p.trait_ref);
+                    break;
+                }
+            }
+            if let Some(tr) = from_bound {
+                found.push((tr, mdef));
+                continue;
+            }
+            if self.p.types.has_infer(ty) {
+                continue;
+            }
+            let own = td.generics.names.len();
+            if own == 0 {
+                let tr = TraitRef { trait_id: tid, args: List::empty() };
+                if self.p.implements(ty, tr, self.fcx.env[..]) {
+                    found.push((tr, mdef));
+                }
+                continue;
+            }
+            // Generic trait: take the args from a matching impl.
+            for k in 0..self.p.impls.len() {
+                let imp = self.p.impls[k];
+                let d = match self.p.def(imp).data {
+                    DefData::Impl(d) => d,
+                    _ => continue,
+                };
+                let itr = match d.trait_ref {
+                    Some(t) => t,
+                    None => continue,
+                };
+                if itr.trait_id != tid {
+                    continue;
+                }
+                if let Some(args) = self.match_impl(imp, ty) {
+                    let tr = self.p.types.subst_trait_ref(itr, args);
+                    found.push((tr, mdef));
+                    break;
+                }
+            }
+        }
+        if found.len() > 1 {
+            let mut names = String::new();
+            for i in 0..found.len() {
+                if i > 0 {
+                    names.push_str(", ");
+                }
+                let (t, _) = found[i];
+                names.write("`{self.p.name(t.trait_id)}`");
+            }
+            let mut m = String::new();
+            m.write("multiple traits provide a method named `{self.p.text(name)}`: {names}");
+            self.error_at(codes::trait_::AMBIGUOUS_METHOD(), span, m.as_str());
+            self.with_help("call it through the trait: `Trait::method(value, ...)`");
+            self.emit();
+        }
+        if found.len() == 0 {
+            return None;
+        }
+        return Some(found[0]);
+    }
+
+    // ===================================================================== path expressions
+
+    pub fn check_path_value(&mut self, p: ast::Path, expect: Option::<Ty>, span: Span): Expr {
+        let r = match self.resolve_value_path(p, span) {
+            Some(r) => r,
+            None => return self.error_expr(span),
+        };
+        return match r {
+            ValueRes::Local(l) => {
+                let ty = self.fcx.locals[l.index()].ty;
+                let place = self.mk(ExprKind::Local(l), ty, span);
+                self.read(place, ReadMode::Move)
+            }
+            ValueRes::Const(def) => match self.p.def(def).data {
+                DefData::Const(c) => match c.value {
+                    Some(v) => self.mk(ExprKind::Lit(v), c.ty, span),
+                    None => self.error_expr(span),
+                },
+                _ => panic("constant without data"),
+            },
+            ValueRes::Static(def) => {
+                let ty = match self.p.def(def).data {
+                    DefData::Static(s) => s.ty,
+                    _ => self.p.types.error(),
+                };
+                let place = self.mk(ExprKind::Static(def), ty, span);
+                self.read(place, ReadMode::Copy)
+            }
+            ValueRes::Ctor { adt, variant, args } => {
+                let v = self.p.variants_of(self.p.adt(adt))[variant as usize];
+                match v.ctor {
+                    CtorKind::Unit => {
+                        let ty = self.p.types.adt(adt, args);
+                        if let Some(e) = expect {
+                            self.unify(ty, e);
+                        }
+                        self.mk(ExprKind::Adt { def: adt, args, variant, fields: List::empty() }, ty, span)
+                    }
+                    _ => {
+                        let n = self.p.text(v.name).to_string();
+                        let mut m = String::new();
+                        m.write("`{n}` must be called with its fields");
+                        self.error_at(codes::name::NOT_A_VALUE(), span, m.as_str());
+                        let mut h = String::new();
+                        h.write("write `{n}(...)` or `{n} {{ ... }}`");
+                        self.with_help(h.as_str());
+                        self.emit();
+                        self.error_expr(span)
+                    }
+                }
+            }
+            ValueRes::Fn { def, args } => {
+                let fd = self.p.fn_data(def);
+                // The pointer type records each parameter's mode, so calls
+                // through it pass arguments exactly as a direct call would.
+                let mut tys: [Ty; ..+] = [];
+                let mut modes: [ParamMode; ..+] = [];
+                let mut any_lent = false;
+                for i in 0..fd.sig.params.len() {
+                    let prm = self.p.params.list(fd.sig.params)[i];
+                    tys.push(self.p.types.subst(prm.ty, args));
+                    modes.push(prm.mode);
+                    if prm.mode != ParamMode::Take {
+                        any_lent = true;
+                    }
+                }
+                let ret = self.p.types.subst(fd.sig.ret, args);
+                if self.p.defs[def.index()].attrs.intrinsic {
+                    self.error_at(codes::ty::NOT_CALLABLE(), span, "intrinsics cannot be used as function pointers; wrap the call in a function");
+                    self.emit();
+                } else if fd.abi == Abi::C && any_lent {
+                    // `extern` functions take every argument by value.
+                    self.error_at(codes::ty::NOT_CALLABLE(), span, "an `extern` function with `&` or `&mut` parameters cannot be used as a function pointer");
+                    self.emit();
+                }
+                self.oblige_preds(def, args, span);
+                let pl = self.p.types.mk_list(tys[..]);
+                let ty = self.p.types.mk(TyKind::FnPtr(pl, Modes::of(modes[..]), ret));
+                self.mk(ExprKind::FnRef { def, args }, ty, span)
+            }
+            ValueRes::TraitMethod { .. } => {
+                self.error_at(codes::ty::NOT_CALLABLE(), span, "trait methods cannot be used as function pointers; call them instead");
+                self.emit();
+                self.error_expr(span)
+            }
+        };
+    }
+
+    // ===================================================================== calls
+
+    pub fn check_call(&mut self, f: Id::<ast::Expr>, args: List::<Id::<ast::Expr>>, expect: Option::<Ty>, span: Span): Expr {
+        let fe = self.p.ast.exprs.get(f);
+        if let ast::ExprKind::Path(p) = fe.kind {
+            let mut local_fnptr = false;
+            if self.p.ast.is_single(p) {
+                let id = self.segment(p, 0).ident;
+                let ctx = self.ident_ctx(id);
+                local_fnptr = self.lookup_local(id.name, ctx).is_some();
+            }
+            if !local_fnptr {
+                let r = match self.resolve_value_path(p, fe.span) {
+                    Some(r) => r,
+                    None => {
+                        for i in 0..args.len() {
+                            let a = self.p.ast.expr_ids.list(args)[i];
+                            self.check_expr(a, None);
+                        }
+                        return self.error_expr(span);
+                    }
+                };
+                return self.call_resolved(r, args, expect, fe.span, span);
+            }
+        }
+        // Call a value: a function pointer, a closure or a generic `F: Fn(..)`.
+        return self.check_value_call(f, args, span);
+    }
+
+    /// Unify `ty` with the expected type, keeping inference unchanged when
+    /// they do not fit (help inference flow from the expected result).
+    fn unify_expected(&mut self, ty: Ty, expect: Option::<Ty>) {
+        if let Some(e) = expect {
+            let snap = self.snapshot();
+            if !self.unify(ty, e) {
+                self.rollback(snap);
+            }
+        }
+    }
+
+    /// The parameter types of `def` with `args` substituted, and their modes.
+    fn sig_of(&mut self, def: DefId, args: TyList, out: &mut +[(Ty, ParamMode); ..+]) {
+        let fd = self.p.fn_data(def);
+        for i in 0..fd.sig.params.len() {
+            let prm = self.p.params.list(fd.sig.params)[i];
+            out.push((self.p.types.subst(prm.ty, args), prm.mode));
+        }
+    }
+
+    fn call_resolved(&mut self, r: ValueRes, args: List::<Id::<ast::Expr>>, expect: Option::<Ty>, fspan: Span, span: Span): Expr {
+        return match r {
+            ValueRes::Fn { def, args: gargs } => {
+                let fd = self.p.fn_data(def);
+                let mut sig: [(Ty, ParamMode); ..+] = [];
+                self.sig_of(def, gargs, &mut sig);
+                let ret = self.p.types.subst(fd.sig.ret, gargs);
+                // Help inference flow from the expected result.
+                self.unify_expected(ret, expect);
+                if fd.is_unsafe {
+                    let n = self.p.path_of(def);
+                    let mut what = String::new();
+                    if fd.abi == Abi::C {
+                        what.write("calling extern function `{n}`");
+                    } else {
+                        what.write("calling unsafe function `{n}`");
+                    }
+                    self.require_unsafe(fspan, what.as_str());
+                }
+                // Bounds first: a closure argument learns its parameter
+                // types from them (`F: Fn(i32): i32`).
+                self.oblige_preds(def, gargs, fspan);
+                let a = self.check_args(sig[..], fd.variadic, args, span);
+                let callee = if self.p.defs[def.index()].attrs.intrinsic {
+                    Callee::Intrinsic { def, name: self.p.defs[def.index()].name, args: gargs }
+                } else {
+                    Callee::Fn { def, args: gargs }
+                };
+                self.mk(ExprKind::Call { callee, args: a }, ret, span)
+            }
+            ValueRes::TraitMethod { trait_ref, self_ty, def, method_args } => {
+                let mut all: [Ty; ..+] = [self_ty];
+                all.extend(self.p.types.list(trait_ref.args));
+                all.extend(self.p.types.list(method_args));
+                let all = self.p.types.mk_list(all[..]);
+                let fd = self.p.fn_data(def);
+                let mut sig: [(Ty, ParamMode); ..+] = [];
+                self.sig_of(def, all, &mut sig);
+                let ret = self.p.types.subst(fd.sig.ret, all);
+                let a = self.check_args(sig[..], false, args, span);
+                self.oblige_preds(def, all, fspan);
+                let callee = Callee::Trait { trait_ref, self_ty, method: self.p.defs[def.index()].name, method_args };
+                self.mk(ExprKind::Call { callee, args: a }, ret, span)
+            }
+            ValueRes::Ctor { adt, variant, args: gargs } => {
+                let v = self.p.variants_of(self.p.adt(adt))[variant as usize];
+                // Constructing a tuple struct names every field.
+                if v.ctor == CtorKind::Tuple {
+                    for i in 0..v.fields.len() {
+                        self.check_field_privacy(adt, i, fspan);
+                    }
+                }
+                let ty = self.p.types.adt(adt, gargs);
+                self.unify_expected(ty, expect);
+                if v.ctor != CtorKind::Tuple {
+                    let n = self.p.text(v.name).to_string();
+                    let mut m = String::new();
+                    if v.ctor == CtorKind::Unit {
+                        m.write("`{n}` takes no fields");
+                    } else {
+                        m.write("`{n}` has named fields; use `{n} {{ ... }}`");
+                    }
+                    self.error_at(codes::ty::NOT_CALLABLE(), fspan, m.as_str());
+                    self.emit();
+                    return self.error_expr(span);
+                }
+                if v.fields.len() != args.len() {
+                    let mut m = String::new();
+                    m.write("`{self.p.text(v.name)}` has {v.fields.len()} field(s) but {args.len()} were supplied");
+                    self.error_at(codes::ty::ARG_COUNT(), span, m.as_str());
+                    self.emit();
+                }
+                let mut fields: [FieldExpr; ..+] = [];
+                let n = if v.fields.len() < args.len() { v.fields.len() } else { args.len() };
+                for i in 0..n {
+                    let f = self.p.fields.list(v.fields)[i];
+                    let a = self.p.ast.expr_ids.list(args)[i];
+                    let ft = self.p.types.subst(f.ty, gargs);
+                    let x = self.check_expr(a, Some(ft));
+                    let asp = self.ast_span(a);
+                    let x = self.coerce(x, ft, asp);
+                    let xn = self.node(x);
+                    fields.push(FieldExpr { field: i as u32, expr: xn });
+                }
+                let fl = self.p.thir.field_exprs.add_list(fields[..]);
+                self.mk(ExprKind::Adt { def: adt, args: gargs, variant, fields: fl }, ty, span)
+            }
+            _ => {
+                self.error_at(codes::ty::NOT_CALLABLE(), fspan, "this value is not callable");
+                self.emit();
+                self.error_expr(span)
+            }
+        };
+    }
+
+    /// Check call arguments against parameter types and modes.
+    pub fn check_args(&mut self, sig: [(Ty, ParamMode); &], variadic: bool, args: List::<Id::<ast::Expr>>, span: Span): List::<Arg> {
+        let mut out: [Arg; ..+] = [];
+        self.check_args_into(sig, variadic, args, span, &mut out);
+        return self.p.thir.args.add_list(out[..]);
+    }
+
+    fn check_args_into(&mut self, sig: [(Ty, ParamMode); &], variadic: bool, args: List::<Id::<ast::Expr>>, span: Span, out: &mut +[Arg; ..+]) {
+        if args.len() < sig.len() || (!variadic && args.len() > sig.len()) {
+            let mut m = String::new();
+            m.write("this function takes {sig.len()} argument(s) but {args.len()} were supplied");
+            self.error_at(codes::ty::ARG_COUNT(), span, m.as_str());
+            self.emit();
+        }
+        for i in 0..args.len() {
+            let a0 = self.p.ast.expr_ids.list(args)[i];
+            let ae = self.p.ast.exprs.get(a0);
+            // `&x` / `&mut x` say how the argument is lent; check the marker,
+            // then check what it lends.
+            let (marker, a) = match ae.kind {
+                ast::ExprKind::Borrow { mutable, expr } => (Some(mutable), expr),
+                _ => (None, a0),
+            };
+            let mode = if i < sig.len() {
+                let (_, m) = sig[i];
+                Some(m)
+            } else {
+                None
+            };
+            self.check_marker(marker, mode, a, ae.span);
+            let asp = self.ast_span(a);
+            if i < sig.len() {
+                let (pt, m) = sig[i];
+                match m {
+                    ParamMode::InOut => out.push(self.check_inout_arg(a, pt)),
+                    ParamMode::Borrow => {
+                        let expect = self.p.types.strip_grow(pt);
+                        let v = self.check_expr_borrow(a, Some(expect));
+                        let v = self.coerce_arg(v, expect, asp);
+                        out.push(Arg::Value(self.node(v)));
+                    }
+                    ParamMode::Take => {
+                        // The value moves into the call (or is copied, if Dull).
+                        let expect = self.p.types.strip_grow(pt);
+                        let v = self.check_expr(a, Some(expect));
+                        let v = self.coerce_arg(v, expect, asp);
+                        out.push(Arg::Value(self.node(v)));
+                    }
+                }
+            } else {
+                let v = self.check_expr(a, None);
+                self.default_var(v.ty);
+                out.push(Arg::Value(self.node(v)));
+            }
+        }
+    }
+
+    /// Borrows are written at the call site: `&x` for a `&T` parameter,
+    /// `&mut x` for a `&mut T` one, nothing for one that takes ownership. A
+    /// parameter that already is a borrow is passed on without a marker
+    /// (an in-out one also where only a borrow is needed).
+    fn check_marker(&mut self, marker: Option::<bool>, mode: Option::<ParamMode>, arg: Id::<ast::Expr>, span: Span) {
+        let lent = self.lent_param(arg);
+        let in_out = mode == Some(ParamMode::InOut);
+        let borrow = mode == Some(ParamMode::Borrow);
+        let takes = !in_out && !borrow;
+        match marker {
+            Some(true) => {
+                if in_out {
+                    return;
+                }
+            }
+            Some(false) => {
+                if borrow {
+                    return;
+                }
+            }
+            None => {
+                if takes || (in_out && lent == Some(ParamMode::InOut)) || (borrow && lent.is_some()) {
+                    return;
+                }
+            }
+        }
+        let mut shown = String::new();
+        pretty_expr(&self.p, arg, &mut shown);
+        let mut h = String::new();
+        if in_out && marker.is_none() {
+            self.error_at(codes::borrow::MISSING_MARKER(), span, "this argument is passed in-out, but the call does not say so");
+            self.with_label("the parameter is `&mut`");
+            h.write("write `&mut {shown}`");
+        } else if borrow && marker.is_none() {
+            self.error_at(codes::borrow::MISSING_MARKER(), span, "this argument is borrowed, but the call does not say so");
+            self.with_label("the parameter is `&`");
+            h.write("write `&{shown}`");
+        } else if in_out {
+            self.error_at(codes::borrow::WRONG_MARKER(), span, "`&` lends read-only, but this parameter is in-out");
+            self.with_label("the parameter is `&mut`");
+            h.write("write `&mut {shown}`");
+        } else if borrow {
+            self.error_at(codes::borrow::WRONG_MARKER(), span, "`&mut` lends for changing, but this parameter only borrows");
+            self.with_label("the parameter is `&`");
+            h.write("write `&{shown}`");
+        } else {
+            let lend = if marker == Some(true) { "&mut" } else { "&" };
+            let mut m = String::new();
+            m.write("this parameter takes ownership, so the argument is not lent with `{lend}`");
+            self.error_at(codes::borrow::WRONG_MARKER(), span, m.as_str());
+            self.with_label("the parameter takes ownership");
+            h.write("pass `{shown}` itself (it is moved, or copied if it is Dull)");
+        }
+        self.with_help(h.as_str());
+        self.emit();
+    }
+
+    /// The mode of the parameter `e` names, if `e` is just a borrowed or
+    /// in-out parameter of the current function.
+    fn lent_param(&self, e: Id::<ast::Expr>): Option::<ParamMode> {
+        let p = match self.p.ast.exprs.get(e).kind {
+            ast::ExprKind::Path(p) => p,
+            _ => return None,
+        };
+        if !self.p.ast.is_single(p) {
+            return None;
+        }
+        let id = self.segment(p, 0).ident;
+        let l = self.lookup_local(id.name, self.ident_ctx(id))?;
+        return match self.local_kind(l) {
+            LocalKind::Param { inout: true, .. } => Some(ParamMode::InOut),
+            LocalKind::Param { owned: false, .. } => Some(ParamMode::Borrow),
+            _ => None,
+        };
+    }
+
+    /// An argument for an in-out (`&mut`) parameter: a mutable place.
+    pub fn check_inout_arg(&mut self, a: Id::<ast::Expr>, pt: Ty): Arg {
+        let asp = self.ast_span(a);
+        let place = match self.check_place(a) {
+            Some(p) => p,
+            None => {
+                let v = self.check_expr(a, Some(pt));
+                self.error_at(codes::ty::NOT_A_PLACE(), asp, "this argument is passed in-out (`&mut` parameter) and must be a variable or field");
+                self.with_help("bind the value with `let mut` first");
+                self.emit();
+                let p = self.expr_as_place(v);
+                return Arg::InOut(self.node(p));
+            }
+        };
+        if let ExprKind::Static(d) = place.kind {
+            if let DefData::Static(s) = self.p.def(d).data {
+                if s.mutable {
+                    self.require_unsafe(asp, "accessing a `static mut`");
+                }
+            }
+        }
+        if !self.is_mutable_place(place) && !self.p.types.is_error(place.ty) {
+            self.immutable_err(place, asp, "pass this as a `&mut` argument");
+        }
+        let w0 = self.p.types.strip_grow(pt);
+        let want = self.shallow(w0);
+        let h0 = self.p.types.strip_grow(place.ty);
+        let have = self.shallow(h0);
+        // Owner kinds subsume: a `[T; -..+]` may be passed where `[T; ..+]` or `[T]` is expected.
+        if let TyKind::Array(we, wk) = self.p.types.kind(want) {
+            if let TyKind::Array(he, hk) = self.p.types.kind(have) {
+                if wk.is_owner() && hk.is_owner() && kind_rank(hk) >= kind_rank(wk) {
+                    if !self.unify(we, he) {
+                        self.mismatch(want, have, asp);
+                    }
+                    return Arg::InOut(self.node(place));
+                }
+            }
+        }
+        if !self.unify(want, have) {
+            self.mismatch(want, have, asp);
+        }
+        return Arg::InOut(self.node(place));
+    }
+
+    // ===================================================================== method calls
+
+    /// Receiver types to try, in order (autoslicing through array kinds).
+    fn method_steps(&mut self, t: Ty): [Ty; ..+] {
+        let mut out: [Ty; ..+] = [t];
+        match self.p.types.kind(t) {
+            TyKind::Array(e, k) => {
+                let chain: [ArrKind; ..+] = match k {
+                    ArrKind::Shrink => [ArrKind::Grow, ArrKind::Dyn, ArrKind::SliceMut, ArrKind::Slice],
+                    ArrKind::Grow => [ArrKind::Dyn, ArrKind::SliceMut, ArrKind::Slice],
+                    ArrKind::Dyn | ArrKind::Fixed(_) | ArrKind::FixedVar(_) => [ArrKind::SliceMut, ArrKind::Slice],
+                    ArrKind::SliceMut => [ArrKind::Slice],
+                    ArrKind::Slice => [],
+                };
+                for k2 in chain[..] {
+                    out.push(self.p.types.array(e, k2));
+                }
+            }
+            TyKind::String => out.push(self.p.types.str()),
+            _ => {}
+        }
+        return out;
+    }
+
+    fn pick_method(&mut self, step: Ty, name: Symbol, span: Span): Option::<MethodPick> {
+        if let Some(found) = self.inherent_method(step, name, true) {
+            let (def, args) = found;
+            return Some(MethodPick { def, args, trait_call: None });
+        }
+        let (tr, mdef) = self.trait_method(step, name, true, span)?;
+        let mut args: [Ty; ..+] = [step];
+        args.extend(self.p.types.list(tr.args));
+        let args = self.p.types.mk_list(args[..]);
+        return Some(MethodPick { def: mdef, args, trait_call: Some((tr, step)) });
+    }
+
+    pub fn check_method_call(
+        &mut self,
+        recv: Id::<ast::Expr>,
+        name: Ident,
+        generics: Option::<List::<Id::<ast::Ty>>>,
+        args: List::<Id::<ast::Expr>>,
+        expect: Option::<Ty>,
+        span: Span,
+    ): Expr {
+        let rspan = self.ast_span(recv);
+        // `[].capped(n)`: an empty array literal has no type of its own; take
+        // the one the call is expected to produce (the method returns `Self`).
+        let mut empty_array_expected = false;
+        if let ast::ExprKind::Array(elems) = self.p.ast.exprs.get(recv).kind {
+            if let Some(e) = expect {
+                let s = self.shallow(e);
+                if let TyKind::Array(..) = self.p.types.kind(s) {
+                    empty_array_expected = elems.len() == 0;
+                }
+            }
+        }
+        let r = if empty_array_expected {
+            let v = self.check_expr(recv, expect);
+            self.expr_as_place(v)
+        } else {
+            self.check_place_or_temp(recv)
+        };
+        if let ExprKind::Static(d) = r.kind {
+            if let DefData::Static(s) = self.p.def(d).data {
+                if s.mutable {
+                    self.require_unsafe(rspan, "accessing a `static mut`");
+                }
+            }
+        }
+        if self.is_unbound_var(r.ty) {
+            // Perhaps a bound says what it is.
+            self.infer_from_bounds();
+        }
+        let rt0 = self.default_var(r.ty);
+        let rt1 = self.p.types.strip_grow(rt0);
+        let rt = self.resolve(rt1);
+        if self.p.types.is_error(rt) {
+            for i in 0..args.len() {
+                let a = self.p.ast.expr_ids.list(args)[i];
+                self.check_expr(a, None);
+            }
+            return self.error_expr(span);
+        }
+        if self.is_unbound_var(rt) {
+            self.annotations_needed(rspan);
+            return self.error_expr(span);
+        }
+        let steps = self.method_steps(rt);
+        let mut picked: Option::<(usize, Ty, MethodPick)> = None;
+        for i in 0..steps.len() {
+            let st = steps[i];
+            if let Some(p) = self.pick_method(st, name.name, name.span) {
+                picked = Some((i, st, p));
+                break;
+            }
+        }
+        let (step_idx, step_ty, pick) = match picked {
+            Some(p) => p,
+            None => {
+                let t = self.ty_str(rt);
+                let mut m = String::new();
+                m.write("no method named `{self.p.text(name.name)}` found for `{t}`");
+                self.error_at(codes::ty::NO_METHOD(), name.span, m.as_str());
+                match self.p.types.kind(rt) {
+                    TyKind::Adt(id, _) => {
+                        if !self.p.is_enum(id) {
+                            let mut is_field = false;
+                            for f in self.p.struct_fields(id) {
+                                if f.name == name.name {
+                                    is_field = true;
+                                }
+                            }
+                            if is_field {
+                                let mut n = String::new();
+                                n.write("`{self.p.text(name.name)}` is a field, not a method");
+                                self.with_note(n.as_str());
+                            }
+                        }
+                    }
+                    TyKind::Param(..) => self.with_help("add a trait bound that provides this method"),
+                    TyKind::Opaque(..) => {
+                        let mut n = String::new();
+                        n.write("`{t}` only offers what its bounds provide; the type behind it is private to the function returning it");
+                        self.with_note(n.as_str());
+                    }
+                    _ => {}
+                }
+                self.emit();
+                for i in 0..args.len() {
+                    let a = self.p.ast.expr_ids.list(args)[i];
+                    self.check_expr(a, None);
+                }
+                return self.error_expr(span);
+            }
+        };
+        self.record_def(name.span, pick.def);
+        self.check_method_privacy(pick.def, name.span);
+        let fd = self.p.fn_data(pick.def);
+        let own = self.own_args(pick.def, generics, name.span);
+        let mut all: [Ty; ..+] = [];
+        all.extend(self.p.types.list(pick.args));
+        all.extend(self.p.types.list(own));
+        let all = self.p.types.mk_list(all[..]);
+        let mut params: [(Ty, ParamMode); ..+] = [];
+        self.sig_of(pick.def, all, &mut params);
+        let ret = self.p.types.subst(fd.sig.ret, all);
+        if fd.is_unsafe {
+            let n = self.p.path_of(pick.def);
+            let mut what = String::new();
+            what.write("calling unsafe method `{n}`");
+            self.require_unsafe(name.span, what.as_str());
+        }
+        // Receiver adjustment.
+        let (self_ty, self_mode) = params[0];
+        let recv_arg = self.adjust_receiver(r, rt, step_ty, step_idx, self_ty, self_mode, rspan);
+        let mut out: [Arg; ..+] = [recv_arg];
+        self.oblige_preds(pick.def, all, name.span);
+        self.check_args_into(params[1..], false, args, span, &mut out);
+        let callee = match pick.trait_call {
+            Some(tc) => {
+                let (tr, st) = tc;
+                Callee::Trait { trait_ref: tr, self_ty: st, method: name.name, method_args: own }
+            }
+            None => {
+                if self.p.defs[pick.def.index()].attrs.intrinsic {
+                    Callee::Intrinsic { def: pick.def, name: self.p.defs[pick.def.index()].name, args: all }
+                } else {
+                    Callee::Fn { def: pick.def, args: all }
+                }
+            }
+        };
+        let al = self.p.thir.args.add_list(out[..]);
+        return self.mk(ExprKind::Call { callee, args: al }, ret, span);
+    }
+
+    fn adjust_receiver(&mut self, r: Expr, rt: Ty, step: Ty, step_idx: usize, self_ty: Ty, mode: ParamMode, span: Span): Arg {
+        let w0 = self.p.types.strip_grow(self_ty);
+        let want = self.shallow(w0);
+        let step_slice = match self.p.types.kind(step) {
+            TyKind::Array(_, k) => k.is_slice(),
+            _ => false,
+        };
+        if mode == ParamMode::InOut {
+            if !self.is_mutable_place(r) && !self.p.types.is_error(r.ty) {
+                self.immutable_err(r, span, "call a method taking `&mut self` on this value");
+            }
+            if step_idx > 0 && step_slice {
+                self.error_at(codes::ty::MISMATCH(), span, "cannot pass a slice view as `&mut self`");
+                self.emit();
+            }
+            self.unify(want, step);
+            return Arg::InOut(self.node(r));
+        }
+        self.unify(want, step);
+        // A `self` receiver takes the value: it moves (or is copied, if Dull).
+        let read_mode = if mode == ParamMode::Take { ReadMode::Move } else { ReadMode::Borrow };
+        if step_idx == 0 {
+            let v = self.read(r, read_mode);
+            return Arg::Value(self.node(v));
+        }
+        match (self.p.types.kind(rt), self.p.types.kind(step)) {
+            (TyKind::Array(_, k), TyKind::Array(_, sk)) => {
+                if sk.is_slice() && !k.is_slice() {
+                    let mutable = sk == ArrKind::SliceMut;
+                    if mutable && !self.is_mutable_place(r) {
+                        self.immutable_err(r, span, "borrow this array as `[T; &mut]`");
+                    }
+                    let rn = self.node(r);
+                    let c = self.mk(ExprKind::Coerce { kind: Coercion::ToSlice { mutable }, expr: rn }, step, span);
+                    return Arg::Value(self.node(c));
+                }
+            }
+            (TyKind::String, TyKind::Str) => {
+                let rn = self.node(r);
+                let st = self.p.types.str();
+                let c = self.mk(ExprKind::Coerce { kind: Coercion::StringToStr, expr: rn }, st, span);
+                return Arg::Value(self.node(c));
+            }
+            _ => {}
+        }
+        // Owner-to-owner kinds and `&mut` -> `&` share a layout.
+        let v = self.read(r, read_mode);
+        let vn = self.node(v);
+        let c = self.mk(ExprKind::Coerce { kind: Coercion::Weaken, expr: vn }, step, span);
+        return Arg::Value(self.node(c));
+    }
+
+    // ===================================================================== struct literals
+
+    pub fn check_struct_lit(&mut self, path: ast::Path, fields: List::<ast::FieldInit>, expect: Option::<Ty>, span: Span): Expr {
+        let (adt, variant, args) = match self.resolve_struct_path(path, span) {
+            Some(r) => r,
+            None => {
+                for i in 0..fields.len() {
+                    let f = self.p.ast.field_inits.list(fields)[i];
+                    if let Some(v) = f.value {
+                        self.check_expr(v, None);
+                    }
+                }
+                return self.error_expr(span);
+            }
+        };
+        let ty = self.p.types.adt(adt, args);
+        self.unify_expected(ty, expect);
+        let v = self.p.variants_of(self.p.adt(adt))[variant as usize];
+        let owner_mod = self.p.def(adt).module;
+        let mut out: [FieldExpr; -..+] = [];
+        for k in 0..fields.len() {
+            let f = self.p.ast.field_inits.list(fields)[k];
+            let mut idx: Option::<usize> = None;
+            for i in 0..v.fields.len() {
+                if self.p.fields.list(v.fields)[i].name == f.name.name {
+                    idx = Some(i);
+                    break;
+                }
+            }
+            let idx = match idx {
+                Some(i) => i,
+                None => {
+                    let mut m = String::new();
+                    m.write("`{self.p.text(v.name)}` has no field named `{self.p.text(f.name.name)}`");
+                    self.error_at(codes::ty::NO_FIELD(), f.name.span, m.as_str());
+                    self.emit();
+                    continue;
+                }
+            };
+            let mut dup = false;
+            for x in out[..] {
+                if x.field as usize == idx {
+                    dup = true;
+                }
+            }
+            if dup {
+                let mut m = String::new();
+                m.write("field `{self.p.text(f.name.name)}` specified more than once");
+                self.error_at(codes::ty::DUPLICATE_FIELD(), f.name.span, m.as_str());
+                self.emit();
+                continue;
+            }
+            let fd = self.p.fields.list(v.fields)[idx];
+            let here = self.module();
+            if !fd.is_pub && !self.p.is_enum(adt) && !self.is_ancestor_or_self(owner_mod, here) {
+                let mut m = String::new();
+                m.write("field `{self.p.text(f.name.name)}` of `{self.p.text(v.name)}` is private");
+                self.error_at(codes::name::PRIVATE(), f.name.span, m.as_str());
+                self.emit();
+            }
+            let ft = self.p.types.subst(fd.ty, args);
+            let x = match f.value {
+                Some(e) => self.check_expr(e, Some(ft)),
+                None => {
+                    let seg = self.p.ast.segments.add_list([ast::PathSegment { ident: f.name, args: None }][..]);
+                    let p = ast::Path { segments: seg, span: f.name.span };
+                    self.check_path_value(p, Some(ft), f.name.span)
+                }
+            };
+            let x = self.coerce(x, ft, f.span);
+            let xn = self.node(x);
+            out.push(FieldExpr { field: idx as u32, expr: xn });
+        }
+        let mut missing = String::new();
+        let mut any_missing = false;
+        for i in 0..v.fields.len() {
+            let mut given = false;
+            for x in out[..] {
+                if x.field as usize == i {
+                    given = true;
+                }
+            }
+            if !given {
+                if any_missing {
+                    missing.push_str(", ");
+                }
+                any_missing = true;
+                missing.write("`{self.p.text(self.p.fields.list(v.fields)[i].name)}`");
+            }
+        }
+        if any_missing {
+            let mut m = String::new();
+            m.write("missing field(s) {missing} in initializer of `{self.p.text(v.name)}`");
+            self.error_at(codes::ty::MISSING_FIELD(), path.span, m.as_str());
+            self.emit();
+        }
+        // Sort by field index.
+        let mut i: usize = 1;
+        while i < out.len() {
+            let mut j = i;
+            while j > 0 && out[j - 1].field > out[j].field {
+                let t = out[j];
+                out[j] = out[j - 1];
+                out[j - 1] = t;
+                j -= 1;
+            }
+            i += 1;
+        }
+        let fl = self.p.thir.field_exprs.add_list(out[..]);
+        return self.mk(ExprKind::Adt { def: adt, args, variant, fields: fl }, ty, span);
+    }
+
+    /// Resolve the path of a struct literal or struct pattern: (adt, variant, generic args).
+    pub fn resolve_struct_path(&mut self, path: ast::Path, span: Span): Option::<(DefId, u32, TyList)> {
+        let r = self.resolve_struct_path_inner(path, span)?;
+        let (adt, variant, _) = r;
+        let v = self.p.variants_of(self.p.adt(adt))[variant as usize].def;
+        let last = self.p.ast.last_segment(path).ident.span;
+        self.record_def(last, v);
+        return Some(r);
+    }
+
+    fn resolve_struct_path_inner(&mut self, path: ast::Path, span: Span): Option::<(DefId, u32, TyList)> {
+        let nsegs = path.segments.len();
+        let first = self.segment(path, 0).ident.name;
+        let first_is_self = self.p.text(first) == "Self";
+        if self.p.ast.is_single(path) && first_is_self {
+            if let Some(t) = self.fcx.cx.self_ty {
+                if let TyKind::Adt(d, args) = self.p.types.kind(t) {
+                    if !self.p.is_enum(d) {
+                        return Some((d, 0, args));
+                    }
+                }
+            }
+            self.error_at(codes::name::NOT_A_TYPE(), span, "`Self` is not a struct here");
+            self.emit();
+            return None;
+        }
+        if nsegs == 2 && first_is_self {
+            if let Some(t) = self.fcx.cx.self_ty {
+                if let TyKind::Adt(d, args) = self.p.types.kind(t) {
+                    if self.p.is_enum(d) {
+                        let n = self.segment(path, 1).ident.name;
+                        if let Some(vi) = self.p.variant_index(d, self.p.text(n)) {
+                            return Some((d, vi as u32, args));
+                        }
+                    }
+                }
+            }
+        }
+        let idents = self.path_idents(path);
+        let module = self.module();
+        let (res, used) = match self.resolve_prefix(module, idents[..], Ns::Type) {
+            Some(r) => r,
+            None => {
+                if idents.len() == 1 {
+                    self.unresolved_diag(module, idents[0], Ns::Type);
+                }
+                return None;
+            }
+        };
+        let def = match res {
+            ModRes::Def(d) => d,
+            _ => {
+                self.error_at(codes::name::NOT_A_TYPE(), span, "expected a struct");
+                self.emit();
+                return None;
+            }
+        };
+        if used != idents.len() {
+            let mut m = String::new();
+            m.write("cannot find struct `{self.path_str(path)}`");
+            self.error_at(codes::name::UNRESOLVED(), span, m.as_str());
+            self.emit();
+            return None;
+        }
+        let d = self.p.def(def);
+        return match d.kind {
+            DefKind::Struct => {
+                let args = self.own_args(def, self.p.ast.last_segment(path).args, span);
+                Some((def, 0, args))
+            }
+            DefKind::Variant => {
+                let (enum_id, index) = match d.data {
+                    DefData::Variant { enum_id, index } => (enum_id, index),
+                    _ => panic("variant without data"),
+                };
+                let explicit = if nsegs >= 2 { self.segment(path, nsegs - 2).args } else { None };
+                let args = self.own_args(enum_id, explicit, span);
+                Some((enum_id, index, args))
+            }
+            DefKind::TypeAlias => {
+                let t = self.p.ast.tys.add(ast::Ty { kind: ast::TyKind::Path(path), span });
+                let lt = self.lower_local_ty(t);
+                match self.p.types.kind(lt) {
+                    TyKind::Adt(ad, args) if !self.p.is_enum(ad) => Some((ad, 0, args)),
+                    _ => {
+                        self.error_at(codes::name::NOT_A_TYPE(), span, "this alias does not name a struct");
+                        self.emit();
+                        None
+                    }
+                }
+            }
+            k => {
+                let mut m = String::new();
+                m.write("expected a struct or enum variant, found {k.describe()} `{self.p.text(d.name)}`");
+                self.error_at(codes::name::NOT_A_TYPE(), span, m.as_str());
+                self.emit();
+                None
+            }
+        };
+    }
+}
+
+/// Capability rank of owner kinds: a higher rank can stand in for a lower one.
+fn kind_rank(k: ArrKind): u8 {
+    return match k {
+        ArrKind::Dyn => 0,
+        ArrKind::Grow => 1,
+        ArrKind::Shrink => 2,
+        _ => 0,
+    };
+}
+
+// ===================================================================== printing
+
+// Expressions printed back as source for help messages: the part of
+// `ln_ast::pretty` (crates/ln-ast/src/pretty.rs) that `check_marker` uses.
+// Float literals print as written (Lunar keeps their text).
+
+/// `a::b::<T, U>::c`
+fn pretty_path(p: &Program, path: ast::Path, out: &mut +String) {
+    let segs = p.ast.segments.list(path.segments);
+    for i in 0..segs.len() {
+        if i > 0 {
+            out.push_str("::");
+        }
+        out.push_str(p.text(segs[i].ident.name));
+        if let Some(args) = segs[i].args {
+            out.push_str("::<");
+            pretty_ty_list(p, args, out);
+            out.push('>');
+        }
+    }
+}
+
+fn pretty_ty_list(p: &Program, l: List::<Id::<ast::Ty>>, out: &mut +String) {
+    let ts = p.ast.ty_ids.list(l);
+    for i in 0..ts.len() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        pretty_ty(p, ts[i], out);
+    }
+}
+
+fn pretty_ty(p: &Program, id: Id::<ast::Ty>, out: &mut +String) {
+    let t = p.ast.tys.get(id);
+    match t.kind {
+        ast::TyKind::Path(path) => pretty_path(p, path, out),
+        ast::TyKind::Array(elem, size) => {
+            out.push('[');
+            pretty_ty(p, elem, out);
+            out.push_str("; ");
+            match size {
+                ast::ArraySize::Fixed(e) => pretty_expr(p, e, out),
+                ast::ArraySize::Inferred => out.push('_'),
+                ast::ArraySize::Grow => out.push_str("..+"),
+                ast::ArraySize::GrowShrink => out.push_str("-..+"),
+                ast::ArraySize::Slice => out.push('&'),
+                ast::ArraySize::SliceMut => out.push_str("&mut"),
+            }
+            out.push(']');
+        }
+        ast::TyKind::DynArray(elem) => {
+            out.push('[');
+            pretty_ty(p, elem, out);
+            out.push(']');
+        }
+        ast::TyKind::Grow(inner) => {
+            out.push('+');
+            pretty_ty(p, inner, out);
+        }
+        ast::TyKind::Ptr { is_mut, inner } => {
+            out.push_str(if is_mut { "*mut " } else { "*" });
+            pretty_ty(p, inner, out);
+        }
+        ast::TyKind::Tuple(items) => {
+            out.push('(');
+            pretty_ty_list(p, items, out);
+            if items.len() == 1 {
+                out.push(',');
+            }
+            out.push(')');
+        }
+        ast::TyKind::Fn { params, ret } => {
+            out.push_str("fn(");
+            pretty_fn_params(p, params, out);
+            out.push(')');
+            if let Some(r) = ret {
+                out.push_str(": ");
+                pretty_ty(p, r, out);
+            }
+        }
+        ast::TyKind::Never => out.push('!'),
+        ast::TyKind::Infer => out.push('_'),
+        ast::TyKind::MacCall(m) => pretty_mac_call(p, m, out),
+        ast::TyKind::ImplTrait(bounds) => {
+            out.push_str("impl ");
+            let bs = p.ast.paths.list(bounds);
+            for i in 0..bs.len() {
+                if i > 0 {
+                    out.push_str(" + ");
+                }
+                pretty_bound(p, bs[i], out);
+            }
+        }
+    }
+}
+
+fn pretty_fn_params(p: &Program, params: List::<ast::FnTyParam>, out: &mut +String) {
+    let ps = p.ast.fn_ty_params.list(params);
+    for i in 0..ps.len() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        match ps[i].mode {
+            ParamMode::Take => {}
+            ParamMode::Borrow => out.push('&'),
+            ParamMode::InOut => out.push_str("&mut "),
+        }
+        pretty_ty(p, ps[i].ty, out);
+    }
+}
+
+/// A trait in a bound, with the `Fn(A): R` sugar where it was written so.
+fn pretty_bound(p: &Program, path: ast::Path, out: &mut +String) {
+    let n = path.segments.len();
+    if n > 0 {
+        let last = p.ast.segments.list(path.segments)[n - 1];
+        if let Some(args) = last.args {
+            if args.len() == 1 {
+                let sig = p.ast.ty_ids.list(args)[0];
+                if let ast::TyKind::Fn { params, ret } = p.ast.tys.get(sig).kind {
+                    let segs = p.ast.segments.list(path.segments);
+                    for i in 0..n {
+                        if i > 0 {
+                            out.push_str("::");
+                        }
+                        out.push_str(p.text(segs[i].ident.name));
+                        if i + 1 < n {
+                            if let Some(a) = segs[i].args {
+                                out.push_str("::<");
+                                pretty_ty_list(p, a, out);
+                                out.push('>');
+                            }
+                        }
+                    }
+                    out.push('(');
+                    pretty_fn_params(p, params, out);
+                    out.push(')');
+                    if let Some(r) = ret {
+                        out.push_str(": ");
+                        pretty_ty(p, r, out);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    pretty_path(p, path, out);
+}
+
+fn delim_open(d: ast::Delim): char {
+    return match d {
+        ast::Delim::Paren => '(',
+        ast::Delim::Bracket => '[',
+        ast::Delim::Brace => '{',
+    };
+}
+
+fn delim_close(d: ast::Delim): char {
+    return match d {
+        ast::Delim::Paren => ')',
+        ast::Delim::Bracket => ']',
+        ast::Delim::Brace => '}',
+    };
+}
+
+/// `path!(tokens)`.
+fn pretty_mac_call(p: &Program, m: ast::MacCall, out: &mut +String) {
+    pretty_path(p, m.path, out);
+    out.push('!');
+    out.push(delim_open(m.delim));
+    pretty_tokens(p, m.tokens, out);
+    out.push(delim_close(m.delim));
+}
+
+/// Token trees as source text, one space between tokens except where that
+/// would look odd (`a::b`, `f(x)`, `x.y`, `$x`).
+fn pretty_tokens(p: &Program, trees: List::<ast::TokenTree>, out: &mut +String) {
+    let start = out.len();
+    let mut prev_glues = true;
+    let ts = p.ast.tokens.list(trees);
+    for i in 0..ts.len() {
+        match ts[i] {
+            ast::TokenTree::Token(tok) => {
+                let text = p.sources.snippet(tok.span);
+                let glue_before = text == "::" || text == "." || text == "," || text == ";" || text == ":" || text == "?" || text == "!";
+                if out.len() > start && !prev_glues && !glue_before {
+                    out.push(' ');
+                }
+                out.push_str(text);
+                prev_glues = text == "::" || text == "." || text == "$" || text == "&" || text == "#";
+            }
+            ast::TokenTree::Group { delim, trees: inner, .. } => {
+                let glue_before = match delim {
+                    ast::Delim::Brace => false,
+                    _ => true,
+                };
+                if out.len() > start && !prev_glues && !glue_before {
+                    out.push(' ');
+                }
+                out.push(delim_open(delim));
+                pretty_tokens(p, inner, out);
+                out.push(delim_close(delim));
+                prev_glues = false;
+            }
+        }
+    }
+}
+
+/// A constant expression (array sizes, `const` values). Anything more
+/// involved than literals, paths and operators prints as `...`.
+pub fn pretty_expr(p: &Program, id: Id::<ast::Expr>, out: &mut +String) {
+    let e = p.ast.exprs.get(id);
+    match e.kind {
+        ast::ExprKind::Lit(l) => pretty_lit(p, l, e.span, out),
+        ast::ExprKind::Path(path) => pretty_path(p, path, out),
+        ast::ExprKind::Unary(op, x) => {
+            out.push_str(match op {
+                ast::UnOp::Neg => "-",
+                ast::UnOp::Not => "!",
+                ast::UnOp::Deref => "*",
+            });
+            pretty_expr(p, x, out);
+        }
+        ast::ExprKind::Borrow { mutable, expr } => {
+            out.push_str(if mutable { "&mut " } else { "&" });
+            pretty_expr(p, expr, out);
+        }
+        ast::ExprKind::Binary(op, a, b) => {
+            pretty_expr(p, a, out);
+            out.push(' ');
+            out.push_str(op.as_str());
+            out.push(' ');
+            pretty_expr(p, b, out);
+        }
+        ast::ExprKind::Paren(x) => {
+            out.push('(');
+            pretty_expr(p, x, out);
+            out.push(')');
+        }
+        ast::ExprKind::Cast(x, t) => {
+            pretty_expr(p, x, out);
+            out.push_str(" as ");
+            pretty_ty(p, t, out);
+        }
+        ast::ExprKind::Tuple(xs) => {
+            out.push('(');
+            pretty_exprs(p, xs, out);
+            out.push(')');
+        }
+        ast::ExprKind::Array(xs) => {
+            if xs.len() <= 8 {
+                out.push('[');
+                pretty_exprs(p, xs, out);
+                out.push(']');
+            } else {
+                out.push_str("...");
+            }
+        }
+        ast::ExprKind::ArrayRepeat(x, n) => {
+            out.push('[');
+            pretty_expr(p, x, out);
+            out.push_str("; ");
+            pretty_expr(p, n, out);
+            out.push(']');
+        }
+        ast::ExprKind::StructLit { path, fields } => {
+            if fields.len() == 0 {
+                pretty_path(p, path, out);
+                out.push_str(" {}");
+            } else {
+                out.push_str("...");
+            }
+        }
+        _ => out.push_str("..."),
+    }
+}
+
+fn pretty_exprs(p: &Program, xs: List::<Id::<ast::Expr>>, out: &mut +String) {
+    let es = p.ast.expr_ids.list(xs);
+    for i in 0..es.len() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        pretty_expr(p, es[i], out);
+    }
+}
+
+fn pretty_lit(p: &Program, l: ast::Lit, span: Span, out: &mut +String) {
+    match l {
+        ast::Lit::Int { value, high, suffix } => {
+            out.push_str(ast::u128_decimal(high, value).as_str());
+            if let Some(s) = suffix {
+                out.push_str(p.text(s));
+            }
+        }
+        ast::Lit::Float { .. } => out.push_str(p.sources.snippet(span)),
+        ast::Lit::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+        ast::Lit::Char(c) => {
+            out.push('\'');
+            let mut s = String::new();
+            s.push(c);
+            pretty_escape(s.as_str(), '\'', out);
+            out.push('\'');
+        }
+        ast::Lit::Str { value, .. } => {
+            out.push('"');
+            pretty_escape(p.text(value), '"', out);
+            out.push('"');
+        }
+    }
+}
+
+fn pretty_escape(s: str, quote: char, out: &mut +String) {
+    for c in s.chars() {
+        if c == '\n' {
+            out.push_str("\\n");
+        } else if c == '\t' {
+            out.push_str("\\t");
+        } else if c == '\r' {
+            out.push_str("\\r");
+        } else if c == '\0' {
+            out.push_str("\\0");
+        } else if c == '\\' {
+            out.push_str("\\\\");
+        } else if c == quote {
+            out.push('\\');
+            out.push(c);
+        } else {
+            out.push(c);
+        }
+    }
+}

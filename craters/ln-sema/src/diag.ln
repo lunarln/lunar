@@ -147,6 +147,21 @@ impl Diags {
         return self.list.len();
     }
 
+    /// Of the diagnostics after the first `n`, keep those whose entry in
+    /// `keep` (one per diagnostic, in order) is true.
+    pub fn retain_after(&mut self, n: usize, keep: [bool; &]) {
+        let mut w = n;
+        for i in n..self.list.len() {
+            if keep[i - n] {
+                self.list[w] = self.list[i];
+                w += 1;
+            } else if self.list[i].is_error() {
+                self.errors -= 1;
+            }
+        }
+        self.list.truncate(w);
+    }
+
     /// Drop every diagnostic after the first `n` (for speculative checks).
     pub fn truncate(&mut self, n: usize) {
         let mut errors: usize = 0;

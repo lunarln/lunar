@@ -13,3 +13,12 @@ pub mod diag;
 pub mod codes;
 pub mod program;
 pub mod render;
+// The passes. `sema`, `lower`, `resolve`, `expand`, `traits` and
+// `borrowck` are stubs here (replaced by their ports at merge).
+pub mod sema;
+mod lower;
+mod resolve;
+mod expand;
+pub mod traits;
+pub mod borrowck;
+pub mod typeck;

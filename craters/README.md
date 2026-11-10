@@ -21,7 +21,7 @@ Rust `lunar`, rebuilds this workspace into an identical compiler.
 | front end | `loader.rs`, `expand.rs`, `collect.rs`, `resolve.rs`, `lower.rs`, parser expansion parsing | `ln-sema/src/{sema,loader,expand,collect,resolve,lower}.ln` | in progress |
 | traits, layout | `traits.rs`, `layout.rs` | `ln-sema/src/{traits,layout}.ln` | in progress |
 | borrow checker | `borrowck.rs` | `ln-sema/src/borrowck.ln` | in progress |
-| type checker | `typeck/*.rs` | `ln-sema/src/typeck*.ln` | after the front end |
+| type checker | `typeck/*.rs` | `ln-sema/src/typeck/{mod,expr,call,pat,closure}.ln` | ported, against stubs of the front end, traits and borrow checker (`sema.ln`, `lower.ln`, `resolve.ln`, `expand.ln`, `traits.ln`, `borrowck.ln`) |
 | code generation | `crates/ln-codegen` | `ln-codegen/src/*.ln` | in progress |
 | driver | `crates/ln-driver` (build path only) | `ln-driver/src/main.ln` (`lunarc`) | after the passes |
 

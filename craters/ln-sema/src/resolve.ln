@@ -1,0 +1,48 @@
+// STUB: replaced at merge.
+//
+// The parts of crates/ln-sema/src/resolve.rs that the type checker uses.
+
+use crater::defs::{DefId, Ns};
+use crater::sema::Sema;
+use crater::ty::{Ty, Types};
+use ln_ast::{Ident, Span};
+
+/// What a module-level path resolves to.
+pub enum ModRes {
+    Def(DefId),
+    Prim(Ty),
+}
+
+/// The primitive type named `name`, if it is one.
+pub fn prim_type(types: &mut +Types, name: str): Option::<Ty> {
+    panic("stub")
+}
+
+impl Sema {
+    /// Whether code in module `from` may see private items of module `owner`.
+    pub fn is_ancestor_or_self(&self, owner: DefId, from: DefId): bool {
+        panic("stub")
+    }
+
+    /// Unqualified lookup of an identifier, with hygiene. Reports nothing.
+    pub fn lookup_ident(&mut self, from: DefId, id: Ident, ns: Ns): Option::<ModRes> {
+        panic("stub")
+    }
+
+    /// Resolve the longest module-level prefix of `segs`. Returns the result
+    /// and how many segments were consumed. Reports errors.
+    pub fn resolve_prefix(&mut self, from: DefId, segs: [Ident; &], last_ns: Ns): Option::<(ModRes, usize)> {
+        panic("stub")
+    }
+
+    /// Remember that the identifier at `span` names `def` (editor tooling).
+    pub fn record(&mut self, span: Span, def: DefId) {
+        panic("stub")
+    }
+
+    /// Report `err(name::unresolved)` for `id` (`unresolved_diag` returns the
+    /// diagnostic in Rust).
+    pub fn unresolved_diag(&mut self, from: DefId, id: Ident, ns: Ns) {
+        panic("stub")
+    }
+}

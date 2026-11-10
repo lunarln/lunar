@@ -1,0 +1,71 @@
+// STUB: replaced at merge.
+//
+// The parts of the front end's `Sema` (crates/ln-sema/src/lib.rs and
+// collect.rs) that the type checker uses, with the Rust names. The real
+// front end is ported separately; only the fields and method signatures here
+// are relied on, and `fcx` (the type checker's per-function state) must be
+// kept as a field of the real `Sema`.
+
+use core::arena::Id;
+use core::collections::HashMap;
+use core::intern::Symbol;
+use crater::defs::{DefId, DefKind, ModData, SyntaxCtx};
+use crater::lower::Deferred;
+use crater::program::Program;
+use crater::typeck::FnCtx;
+use ln_ast::{Ident, Span};
+
+/// Compilation options (`Options` in Rust); only what the passes read.
+pub struct Options {
+    pub test: bool,
+    pub keep_going: bool,
+}
+
+/// AST node backing a definition (only during analysis). The bool marks
+/// functions declared in `extern` blocks.
+pub enum AstRef {
+    None,
+    Fn(ln_ast::FnDecl, bool),
+    Struct(ln_ast::StructDecl),
+    Enum(ln_ast::EnumDecl),
+    Variant(ln_ast::VariantDecl),
+    Trait(ln_ast::TraitDecl),
+    Impl(ln_ast::ImplDecl),
+    Const(ln_ast::ConstDecl),
+    Static(ln_ast::StaticDecl),
+    Alias(ln_ast::TypeAlias),
+    Macro(ln_ast::MacroDef),
+}
+
+pub struct Sema {
+    pub p: Program,
+    pub asts: [AstRef; ..+],
+    pub opts: Options,
+    /// The anonymous module of each block that declares items.
+    pub block_scopes: HashMap::<Id::<ln_ast::Block>, DefId>,
+    /// Array element / `+T` checks deferred until all ADT fields are known.
+    pub deferred: [Deferred; -..+],
+    /// The function body being type checked (`typeck`).
+    pub fcx: FnCtx,
+}
+
+impl Sema {
+    /// The AST node of a definition.
+    pub fn ast(&self, id: DefId): AstRef {
+        panic("stub")
+    }
+
+    /// A new definition named `name` (its own module if `module` is `None`).
+    pub fn new_def(&mut self, name: Symbol, kind: DefKind, module: Option::<DefId>, span: Span, ast: AstRef): DefId {
+        panic("stub")
+    }
+
+    pub fn mod_data(&self, m: DefId): ModData {
+        panic("stub")
+    }
+
+    /// The hygiene context of an identifier (`ast::Ident::ctx` in Rust).
+    pub fn ident_ctx(&self, id: Ident): SyntaxCtx {
+        panic("stub")
+    }
+}

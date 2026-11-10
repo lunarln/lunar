@@ -1,0 +1,18 @@
+// STUB: replaced at merge.
+//
+// The borrow checker (crates/ln-sema/src/borrowck.rs), as the type checker
+// calls it.
+
+use crater::defs::Pred;
+use crater::program::Program;
+use crater::thir::Body;
+
+/// Check moves and borrows in a body (errors into `p.diags`).
+pub fn check(p: &mut +Program, body: Body, env: [Pred; &]) {
+    panic("stub")
+}
+
+/// The lints on a body (warnings into `p.diags`).
+pub fn lint(p: &mut +Program, body: Body) {
+    panic("stub")
+}

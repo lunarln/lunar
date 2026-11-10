@@ -1,0 +1,20 @@
+// STUB: replaced at merge.
+//
+// The parts of crates/ln-sema/src/expand.rs that the type checker uses.
+
+use core::arena::Id;
+use crater::defs::DefId;
+use crater::sema::Sema;
+use ln_ast::MacCall;
+
+impl Sema {
+    /// Expand a macro in expression or statement position.
+    pub fn expand_expr(&mut self, module: DefId, call: MacCall): Option::<Id::<ln_ast::Expr>> {
+        panic("stub")
+    }
+
+    /// Expand a macro in pattern position.
+    pub fn expand_pat(&mut self, module: DefId, call: MacCall): Option::<Id::<ln_ast::Pat>> {
+        panic("stub")
+    }
+}

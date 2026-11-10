@@ -1,0 +1,61 @@
+// STUB: replaced at merge.
+//
+// Trait solving (crates/ln-sema/src/traits.rs), as the type checker uses it.
+
+use core::intern::Symbol;
+use crater::defs::{DefId, Pred};
+use crater::program::Program;
+use crater::ty::{TraitRef, Ty, TyList};
+
+/// What a trait method call resolves to at monomorphization time.
+pub enum MethodImpl {
+    Fn { def: DefId, args: TyList },
+    Builtin { lang: Symbol, method: Symbol },
+}
+
+impl Program {
+    /// `env` with every supertrait bound added (into `out`).
+    pub fn elaborate(&mut +self, env: [Pred; &], out: &mut +[Pred; ..+]) {
+        panic("stub")
+    }
+
+    pub fn is_dull(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        panic("stub")
+    }
+
+    pub fn is_light(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        panic("stub")
+    }
+
+    pub fn has_owner(&mut +self, ty: Ty): bool {
+        panic("stub")
+    }
+
+    pub fn could_own(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        panic("stub")
+    }
+
+    pub fn is_copy(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        panic("stub")
+    }
+
+    pub fn builtin_impl(&mut +self, ty: Ty, trait_id: DefId, env: [Pred; &]): bool {
+        panic("stub")
+    }
+
+    pub fn find_impl(&mut +self, ty: Ty, tr: TraitRef, env: [Pred; &]): Option::<(DefId, TyList)> {
+        panic("stub")
+    }
+
+    pub fn implements(&mut +self, ty: Ty, tr: TraitRef, env: [Pred; &]): bool {
+        panic("stub")
+    }
+
+    pub fn resolve_method(&mut +self, tr: TraitRef, self_ty: Ty, method: Symbol, method_args: TyList): Option::<MethodImpl> {
+        panic("stub")
+    }
+
+    pub fn crater_of(&self, d: DefId): DefId {
+        panic("stub")
+    }
+}
