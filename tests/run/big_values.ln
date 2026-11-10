@@ -1,0 +1,289 @@
+// Big values: fixed arrays, and the structs, tuples, enums and closures
+// holding them, are copied, passed, returned, assigned and bound through
+// memory. (Copied as one LLVM value, a 64 KiB array used to crash LLVM.)
+
+struct Buf {
+    len: usize,
+    data: [u8; 65536],
+}
+
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+enum Slot {
+    Empty,
+    Full(Buf),
+}
+
+// Owns a `String`, and lives in memory: moves must still free it once.
+struct Named {
+    name: String,
+    nums: [u32; 32],
+}
+
+#[derive(Clone, Debug)]
+struct Stats {
+    count: u64,
+    min: u64,
+    max: u64,
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    e: u64,
+    f: u64,
+}
+
+/// 65536 bytes that depend on `seed`.
+fn bytes(seed: u8): [u8; 65536] {
+    let mut a: [u8; 65536] = [0; 65536];
+    let n: usize = 65536;
+    for i in 0..n {
+        a[i] = (i as u8) ^ seed;
+    }
+    return a;
+}
+
+/// A checksum that also sees the order of the bytes.
+fn check(a: &[u8; 65536]): u64 {
+    let mut s: u64 = 0;
+    let n: usize = 65536;
+    for i in 0..n {
+        s += (a[i] as u64) * ((i as u64) % 7 + 1);
+    }
+    return s;
+}
+
+/// Takes its own copy, changes it, and gives its checksum.
+fn check_owned(mut a: [u8; 65536]): u64 {
+    a[0] = 255;
+    return check(&a);
+}
+
+fn twin(seed: u8): ([u8; 65536], u64) {
+    let a = bytes(seed);
+    let c = check(&a);
+    return (a, c);
+}
+
+fn make_buf(seed: u8, len: usize): Buf {
+    return Buf { len, data: bytes(seed) };
+}
+
+fn buf_sum(b: Buf): u64 {
+    return check(&b.data) + b.len as u64;
+}
+
+fn maybe_buf(full: bool): Slot {
+    if full {
+        return Slot::Full(make_buf(7, 3));
+    }
+    return Slot::Empty;
+}
+
+fn id::<T>(x: T): T {
+    return x;
+}
+
+fn pick(flag: bool, a: [u8; 65536], b: [u8; 65536]): [u8; 65536] {
+    if flag { a } else { b }
+}
+
+fn longs(seed: u64): [u64; 100000] {
+    let mut a: [u64; 100000] = [0; 100000];
+    let n: usize = 100000;
+    for i in 0..n {
+        a[i] = (i as u64) * seed;
+    }
+    return a;
+}
+
+fn long_sum(a: &[u64; 100000]): u64 {
+    let mut s: u64 = 0;
+    let n: usize = 100000;
+    for i in 0..n {
+        s += a[i] % 1000;
+    }
+    return s;
+}
+
+/// Takes its own copy.
+fn long_sum_owned(mut a: [u64; 100000]): u64 {
+    a[0] = 999;
+    return long_sum(&a);
+}
+
+/// 800 KB arrays, in a function of their own: unoptimized code gives each
+/// copy its own stack slot.
+fn big_longs() {
+    let a = longs(3);
+    let mut b = a;
+    b[1] = 1000;
+    println("longs: {long_sum(&a)} {long_sum(&b)} {long_sum_owned(a)} {a[0]} {a[99999]} {b[1]}");
+    let mut c: [u64; 100000] = [5; 100000];
+    println("repeat: {long_sum(&c)} {c[0]} {c[99999]}");
+    c = b;
+    println("assigned: {long_sum(&c)} {c[1]}");
+}
+
+fn points(): [Point; 1000] {
+    let mut ps: [Point; 1000] = [Point { x: 1, y: -1 }; 1000];
+    let n: usize = 1000;
+    for i in 0..n {
+        ps[i].x = i as i64;
+    }
+    return ps;
+}
+
+fn span(ps: [Point; 1000]): i64 {
+    let mut s: i64 = 0;
+    let n: usize = 1000;
+    for i in 0..n {
+        s += ps[i].x * ps[i].y;
+    }
+    return s;
+}
+
+fn named(name: str, k: u32): Named {
+    let mut nums: [u32; 32] = [0; 32];
+    let n: usize = 32;
+    for i in 0..n {
+        nums[i] = (i as u32) * k;
+    }
+    return Named { name: String::from(name), nums };
+}
+
+fn total(n: &Named): u32 {
+    let mut s: u32 = 0;
+    let m: usize = 32;
+    for i in 0..m {
+        s += n.nums[i];
+    }
+    return s;
+}
+
+fn arrays() {
+    // Returned, copied, passed by value and by reference.
+    let a = bytes(1);
+    let mut b = a;
+    b[0] = 200;
+    println("bytes: {check(&a)} {check(&b)} {a[0]} {b[0]} {a[65535]}");
+    println("owned: {check_owned(a)} {check(&a)} {a[0]}");
+
+    // Assigned over, and from `if` and `match`.
+    let mut c = bytes(2);
+    println("before: {c[3]}");
+    c = a;
+    println("after: {c[3]} {check(&c)}");
+    let d = if c[3] == 2 { bytes(9) } else { c };
+    let e = match d[0] {
+        1 => bytes(10),
+        _ => d,
+    };
+    println("chosen: {d[0]} {e[0]} {pick(true, a, b)[0]} {pick(false, a, b)[0]}");
+
+    // Repeats: of a byte, of zero.
+    let sevens: [u8; 65536] = [7; 65536];
+    let zeros: [u8; 65536] = [0; 65536];
+    println("repeat: {check(&sevens)} {check(&zeros)}");
+
+    // Tuples and pattern bindings.
+    let (x, cx) = twin(4);
+    println("twin: {x[1]} {cx == check(&x)}");
+    let pair = (a, x);
+    let (p, q) = pair;
+    println("pair: {p[2]} {q[2]} {pair.0[2]}");
+
+    // A generic function's instance.
+    let same = id(a);
+    println("id: {check(&same) == check(&a)}");
+
+    // A closure holding a big array.
+    let held = bytes(3);
+    let f = move || check(&held);
+    println("closure: {f() == check(&bytes(3))}");
+    let mk = |s: u8| bytes(s);
+    println("closure result: {mk(3)[5]}");
+
+    // Through function pointers.
+    let fp: fn([u8; 65536]): u64 = check_owned;
+    let gp: fn(u8): [u8; 65536] = bytes;
+    println("fn ptr: {fp(gp(1)) == check_owned(a)} {gp(2)[7]}");
+}
+
+fn structs() {
+    // A struct holding a big array.
+    let buf = make_buf(5, 10);
+    let mut buf2 = buf;
+    buf2.data[0] = 99;
+    println("buf: {buf.data[0]} {buf2.data[0]} {buf_sum(buf)} {buf2.len}");
+    let Buf { len, data } = buf2;
+    println("fields: {len} {data[0]} {data[1]}");
+    let copied = buf.data;
+    println("field copy: {check(&copied) == check(&buf.data)}");
+
+    // An enum with a big payload.
+    match maybe_buf(true) {
+        Slot::Full(got) => println("full: {got.len} {got.data[0]}"),
+        Slot::Empty => println("empty"),
+    }
+    if let Slot::Empty = maybe_buf(false) {
+        println("empty");
+    }
+    let opt: Option::<Buf> = Some(make_buf(6, 1));
+    let inner = opt.unwrap();
+    println("unwrapped: {inner.data[1]}");
+
+    // In a growable array: pushed, read back by index and by `for`.
+    let mut bufs: [Buf; ..+] = [];
+    for i in 0..3 {
+        bufs.push(make_buf(i as u8, i as usize));
+    }
+    let one = bufs[1];
+    let mut lens: usize = 0;
+    for b in bufs {
+        lens += b.len;
+    }
+    println("bufs: {one.data[0]} {one.len} {lens}");
+}
+
+fn others() {
+    // An array of structs.
+    let ps = points();
+    let ps2 = ps;
+    println("points: {span(ps)} {ps2[999].x} {ps2[999].y}");
+
+    // Owners that live in memory: moved around, freed once.
+    for i in 0..1000 {
+        let n1 = named("one", i);
+        let n2 = n1;
+        let mut slot = Some(n2);
+        let got = match slot {
+            Some(n) => n,
+            None => named("none", 0),
+        };
+        if i == 999 {
+            println("named: {got.name} {total(&got)}");
+        }
+        slot = Some(named("two", 3));
+        if let Some(m) = slot {
+            if i == 999 {
+                println("moved: {m.name} {m.nums[31]}");
+            }
+        }
+    }
+
+    // Derived impls on a struct that lives in memory.
+    let s = Stats { count: 3, min: 1, max: 9, a: 1, b: 2, c: 3, d: 4, e: 5, f: 6 };
+    let t = s.clone();
+    println("stats: {t:?}");
+}
+
+fn main() {
+    arrays();
+    structs();
+    others();
+    big_longs();
+}

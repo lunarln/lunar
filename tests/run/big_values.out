@@ -1,0 +1,26 @@
+bytes: 33422591 33422790 1 200 254
+owned: 33422845 33422591 1
+before: 1
+after: 2 33422591
+chosen: 9 9 1 200
+repeat: 1834973 0
+twin: 5 true
+pair: 3 6 3
+id: true
+closure: true
+closure result: 6
+fn ptr: true 5
+buf: 5 99 33422557 10
+fields: 10 99 4
+field copy: true
+full: 3 7
+empty
+unwrapped: 7
+bufs: 1 1 3
+points: -499500 999 -1
+named: one 495504
+moved: two 93
+stats: Stats { count: 3, min: 1, max: 9, a: 1, b: 2, c: 3, d: 4, e: 5, f: 6 }
+longs: 49950000 49949997 49950999 0 299997 1000
+repeat: 500000 5 5
+assigned: 49949997 1000
