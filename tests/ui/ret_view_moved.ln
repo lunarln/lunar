@@ -1,0 +1,25 @@
+// error: borrow::move_while_borrowed
+// once: borrow::move_while_borrowed
+// A struct result holding a view into the argument it was built from.
+struct Span {
+    text: str,
+    len: usize,
+}
+
+fn span_of(text: &String, limit: &String): Span {
+    let n = if text.len() < limit.len() { text.len() } else { limit.len() };
+    return Span { text: text.as_str()[0..n], len: n };
+}
+
+fn take(s: String): usize {
+    return s.len();
+}
+
+fn main() {
+    let text = String::from("borrowed");
+    let limit = String::from("four");
+    let s = span_of(&text, &limit);
+    let n = take(limit);
+    let m = take(text);
+    println("{s.text} {s.len} {n} {m}");
+}

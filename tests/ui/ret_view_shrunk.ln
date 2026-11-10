@@ -1,0 +1,19 @@
+// error: borrow::shrink_while_borrowed
+// once: borrow::shrink_while_borrowed
+// `first`'s body returns a view into `a`, so `v` points into `x` (but not
+// into `y`, which may change).
+fn first(a: &String, b: &String): str {
+    if b.len() > 3 {
+        return a.as_str()[1..];
+    }
+    return a.as_str();
+}
+
+fn main() {
+    let mut x = String::from("hello");
+    let mut y = String::from("world");
+    let v = first(&x, &y);
+    y.clear();
+    x.clear();
+    println("{v}");
+}

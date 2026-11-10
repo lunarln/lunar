@@ -44,9 +44,7 @@ const NAME_RULE: str = "names use lowercase letters, digits, `-` and `_`, and st
 /// A project error: a `manifest::` code, a message, and the place in a
 /// manifest or lockfile it is about.
 pub struct ProjectError {
-    /// The code, `scope::name` (owned, so that an error never points into
-    /// what it was made from).
-    pub code: String,
+    pub code: Code,
     pub message: String,
     /// The file it points into (empty if none), and the bytes.
     pub file: String,
@@ -63,9 +61,7 @@ impl ProjectError {
     pub fn new(code: Code, message: FmtArgs): ProjectError {
         let mut m = String::new();
         m.write(message);
-        let mut c = String::new();
-        c.write("{code.scope}::{code.name}");
-        return ProjectError { code: c, message: m, file: String::new(), lo: 0, hi: 0, label: String::new(), extra: String::new() };
+        return ProjectError { code, message: m, file: String::new(), lo: 0, hi: 0, label: String::new(), extra: String::new() };
     }
 
     pub fn at(mut self, file: str, lo: u32, hi: u32): ProjectError {

@@ -10,6 +10,7 @@
 use core::arena::{Arena, Id, List};
 use core::collections::HashMap;
 use core::intern::Symbol;
+use crater::borrowck::RetPoints;
 use crater::defs::*;
 use crater::diag::Diags;
 use crater::thir::{Body, ClosureKind, LocalId, Thir};
@@ -173,6 +174,10 @@ pub struct Program {
     pub refs: [Ref; ..+],
     pub closures: HashMap::<DefId, ClosureInfo>,
     pub opaques: HashMap::<(DefId, u32), OpaqueInfo>,
+    /// For each function (and closure) with a checked body, which of its
+    /// parameters the value it returns may point into, inferred from the
+    /// body (see `borrowck::infer_ret_points`).
+    pub ret_points: HashMap::<DefId, RetPoints>,
     /// Native libraries to link (`#[link(name = "...")]`).
     pub link_libs: [Symbol; ..+],
     pub diags: Diags,
@@ -210,6 +215,7 @@ impl Program {
             refs: [],
             closures: HashMap::new(),
             opaques: HashMap::new(),
+            ret_points: HashMap::new(),
             link_libs: [],
             diags: Diags::new(),
             symbols: Arena::new(),

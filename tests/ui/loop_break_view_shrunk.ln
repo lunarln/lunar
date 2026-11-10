@@ -1,0 +1,14 @@
+// error: borrow::shrink_while_borrowed
+// A loop's value is what its `break` gives: here a view into `s`.
+fn main() {
+    let mut s = String::from("hello");
+    let mut i: usize = 0;
+    let v = loop {
+        if i == 2 {
+            break s.as_str()[i..];
+        }
+        i += 1;
+    };
+    s.clear();
+    println("{v}");
+}

@@ -257,9 +257,30 @@ impl Sema {
             }
             checked.push(Checked { body: b, ok, is_std });
         }
+        // What each function's result may point into, from its body, for
+        // the borrow checking of its callers.
+        let mut bodies: [Body; ..+] = [];
+        let mut envs: [List::<Pred>; ..+] = [];
+        for c in checked[..] {
+            if c.ok {
+                bodies.push(c.body);
+                envs.push(self.body_env(c.body.def));
+            }
+        }
+        borrowck::infer_ret_points(&mut self.p, bodies[..], envs[..]);
         for c in checked[..] {
             self.finish_body(c.body, c.ok, c.is_std);
         }
+    }
+
+    /// The bounds a body is checked under: a closure's are those of the
+    /// function it is in.
+    fn body_env(&mut self, def: DefId): List::<Pred> {
+        let owner = match self.p.closures.get(def) {
+            Some(c) => c.parent,
+            None => def,
+        };
+        return self.env_of(owner);
     }
 
     /// Borrow check and lint a checked body (if type checking its function
@@ -267,12 +288,7 @@ impl Sema {
     fn finish_body(&mut self, b: Body, typeck_ok: bool, is_std: bool) {
         let errs_before = self.p.diags.error_count();
         if typeck_ok {
-            // A closure's body has the bounds of the function it is in.
-            let owner = match self.p.closures.get(b.def) {
-                Some(c) => c.parent,
-                None => b.def,
-            };
-            let env_list = self.env_of(owner);
+            let env_list = self.body_env(b.def);
             let env = self.p.preds.list(env_list).to_grow();
             borrowck::check(&mut self.p, b, env[..]);
             // Lints on a function with borrow errors would only add

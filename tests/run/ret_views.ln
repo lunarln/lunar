@@ -1,0 +1,173 @@
+// What a returned view points into is inferred from the function's body:
+// only the arguments it really comes from stay borrowed, so the others may
+// be changed or moved while the result is in use.
+
+// Points into `a` only.
+fn first(a: &String, b: &String): str {
+    if b.len() > 100 {
+        return "long";
+    }
+    return a.as_str();
+}
+
+// Points where the items of `names` point, not into `names` itself.
+fn first_name(names: &[str; -..+]): str {
+    return names[0];
+}
+
+// A struct holding a view into `text` only.
+struct Word {
+    text: str,
+    pos: usize,
+}
+
+fn word_at(text: &String, scratch: &mut String, pos: usize): Word {
+    scratch.push_str("scanned ");
+    let mut end = pos;
+    while end < text.len() && text.as_bytes()[end] != 32 {
+        end += 1;
+    }
+    return Word { text: text.as_str()[pos..end], pos };
+}
+
+// Recursion: into `a` only, whatever the depth.
+fn skip(a: &String, b: &String, n: usize): str {
+    if n == 0 {
+        return a.as_str();
+    }
+    return skip(a, b, n - 1);
+}
+
+// Mutual recursion: `even` and `odd` both return views into `s` only.
+fn even(s: &String, other: &String, n: usize): str {
+    if n == 0 {
+        return s.as_str();
+    }
+    return odd(s, other, n - 1);
+}
+
+fn odd(s: &String, other: &String, n: usize): str {
+    if n == 0 {
+        return s.as_str()[1..];
+    }
+    return even(s, other, n - 1);
+}
+
+// The value of a loop is what its `break` gives.
+fn find(hay: &String, needle: &String): str {
+    let mut i: usize = 0;
+    let v = loop {
+        if i + needle.len() > hay.len() || hay.as_str()[i..i + needle.len()] == needle.as_str() {
+            break hay.as_str()[i..];
+        }
+        i += 1;
+    };
+    return v;
+}
+
+struct Doc {
+    title: String,
+    body: String,
+}
+
+impl Doc {
+    // Into `self` only, not into `prefix`.
+    fn title_after(&self, prefix: &String): str {
+        return self.title.as_str()[prefix.len()..];
+    }
+}
+
+trait Label {
+    fn label(&self, extra: &String): str;
+}
+
+impl Label for Doc {
+    fn label(&self, extra: &String): str {
+        if extra.len() == 0 {
+            return "";
+        }
+        return self.body.as_str();
+    }
+}
+
+// A view of a `str` field points where the field points, not into `self`.
+struct Lexer {
+    src: str,
+    pos: usize,
+}
+
+impl Lexer {
+    fn rest(&self): str {
+        return self.src[self.pos..];
+    }
+
+    fn bump(&mut self) {
+        self.pos += 1;
+    }
+}
+
+// A closure that captures a borrowed parameter and returns a view of it.
+fn suffix(s: &String, n: usize): str {
+    let tail = |i: usize| s.as_str()[i..];
+    return tail(n);
+}
+
+fn main() {
+    let x = String::from("hello");
+    let mut y = String::from("world");
+    let v = first(&x, &y);
+    y.clear();
+    let moved = y;
+    println("{v} {moved.len()}");
+
+    let owner = String::from("ada grace");
+    let mut names: [str; -..+] = [owner.as_str()[0..3], owner.as_str()[4..]];
+    let n = first_name(&names);
+    names.clear();
+    println("{n} {names.len()}");
+
+    let text = String::from("lunar views point");
+    let mut scratch = String::new();
+    let w = word_at(&text, &mut scratch, 6);
+    scratch.clear();
+    println("{w.text} at {w.pos}");
+
+    let a = String::from("abc");
+    let mut b = String::from("xyz");
+    let s = skip(&a, &b, 3);
+    let e = even(&a, &b, 5);
+    b.push_str("!");
+    b.clear();
+    println("{s} {e}");
+
+    let hay = String::from("find the needle here");
+    let mut needle = String::from("needle");
+    let f = find(&hay, &needle);
+    needle.clear();
+    println("{f}");
+
+    let doc = Doc { title: String::from("Re: views"), body: String::from("inferred") };
+    let mut prefix = String::from("Re: ");
+    let t = doc.title_after(&prefix);
+    let l = doc.label(&prefix);
+    prefix.clear();
+    println("{t} {l}");
+
+    let source = String::from("tokens");
+    let mut lx = Lexer { src: source.as_str(), pos: 0 };
+    let r = lx.rest();
+    lx.bump();
+    println("{r} {lx.rest()}");
+
+    let word = String::from("closures");
+    let c = suffix(&word, 5);
+    println("{c}");
+
+    // A closure whose result points into what it captured, not into its
+    // argument.
+    let mut count = String::from("1");
+    let pick = |t: str| x.as_str()[t.len()..];
+    let p = pick(count.as_str());
+    count.clear();
+    println("{p} {count.len()}");
+}

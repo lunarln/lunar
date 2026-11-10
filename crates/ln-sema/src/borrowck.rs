@@ -13,8 +13,14 @@
 //!   used afterwards. A `&mut +T` parameter promises to only grow its
 //!   argument, so lending to one invalidates nothing; inside the function,
 //!   such a parameter may itself only be grown.
+//! * **Results**: which arguments a call's result may point into comes from
+//!   the called function's body ([`infer_ret_points`], before any body is
+//!   checked): the roots of the values it returns, mapped back to its
+//!   parameters. Without a body to look at, the result may point into
+//!   every argument.
 
 use crate::Program;
+use crate::defs::DefId;
 use crate::thir::*;
 use crate::ty::{ArrKind, Ty};
 use ln_diag::{Diagnostic, Diagnostics, Span, codes::borrow, codes::lint};
@@ -228,16 +234,239 @@ fn unreachable_expr(e: &Expr, diags: &mut Diagnostics) {
     }
 }
 
-/// Check `body`, whose generic parameters have the bounds `env`.
-pub fn check(p: &Program, body: &Body, env: &[crate::defs::Pred], diags: &mut Diagnostics) {
-    let mut cx =
-        Cx { p, body, env, diags, roots: HashMap::new(), reported: HashSet::new(), loop_exit: HashMap::new(), loop_head: HashMap::new(), held: Vec::new() };
-    // A parameter that can hold a view points into its caller's data.
-    for &l in &body.params {
-        if cx.has_view(&cx.local(l).ty) {
-            cx.roots.insert(l, [Root::Arg(l)].into());
+/// Which parameters the value a function returns may point into, inferred
+/// from its body: bit `i` of `into` if into parameter `i`'s own storage
+/// (and wherever its views point), bit `i` of `through` if only where its
+/// views point. Parameters from the 64th on always count as `into`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetPoints {
+    pub into: u64,
+    pub through: u64,
+}
+
+impl RetPoints {
+    /// Into every parameter: what is assumed of a body the checker cannot
+    /// follow.
+    pub const ALL: RetPoints = RetPoints { into: u64::MAX, through: u64::MAX };
+
+    /// How far the result may point into parameter `i`: 0 not at all, 1
+    /// where its views point, 2 into its storage too.
+    pub fn level(self, i: usize) -> u8 {
+        if i >= 64 || (self.into >> i) & 1 == 1 {
+            2
+        } else if (self.through >> i) & 1 == 1 {
+            1
+        } else {
+            0
         }
     }
+}
+
+/// Infer the `RetPoints` of every body in `bodies` (with its bounds) into
+/// `p.ret_points`. Over the call graph's strongly connected components,
+/// callees first; inside one, from nothing up to a fixed point.
+pub fn infer_ret_points(p: &mut Program, bodies: &[(&Body, &[crate::defs::Pred])]) {
+    let index: HashMap<DefId, usize> = bodies.iter().enumerate().map(|(i, (b, _))| (b.def, i)).collect();
+    let edges: Vec<Vec<usize>> = bodies
+        .iter()
+        .map(|(b, _)| {
+            let mut out = Vec::new();
+            visit_block(&b.block, &mut |e| collect_callees(p, e, &index, &mut out));
+            out.sort_unstable();
+            out.dedup();
+            out
+        })
+        .collect();
+    for scc in sccs(&edges) {
+        for &m in &scc {
+            p.ret_points.insert(bodies[m].0.def, RetPoints::default());
+        }
+        let recursive = scc.len() > 1 || edges[scc[0]].contains(&scc[0]);
+        loop {
+            let mut changed = false;
+            for &m in &scc {
+                let (b, env) = bodies[m];
+                let new = body_ret_points(p, b, env);
+                let old = p.ret_points[&b.def];
+                let merged = RetPoints { into: old.into | new.into, through: old.through | new.through };
+                if merged != old {
+                    p.ret_points.insert(b.def, merged);
+                    changed = true;
+                }
+            }
+            if !changed || !recursive {
+                break;
+            }
+        }
+    }
+}
+
+/// The bodies (indexes into the inferred ones) that calls in `e` run.
+fn collect_callees(p: &Program, e: &Expr, index: &HashMap<DefId, usize>, out: &mut Vec<usize>) {
+    if let ExprKind::Call { callee, .. } = &e.kind
+        && let Some(d) = callee_def(p, callee)
+        && let Some(&i) = index.get(&d)
+    {
+        out.push(i);
+    }
+    visit_children(e, &mut |c| collect_callees(p, c, index, out));
+}
+
+/// The strongly connected components of a graph, each sorted, callees
+/// (successors) before callers (Tarjan's algorithm).
+fn sccs(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let n = edges.len();
+    let mut index = vec![u32::MAX; n];
+    let mut low = vec![0u32; n];
+    let mut on = vec![false; n];
+    let mut stack = Vec::new();
+    let mut next = 0u32;
+    let mut out = Vec::new();
+    let mut work: Vec<(usize, usize)> = Vec::new();
+    for s in 0..n {
+        if index[s] != u32::MAX {
+            continue;
+        }
+        index[s] = next;
+        low[s] = next;
+        next += 1;
+        stack.push(s);
+        on[s] = true;
+        work.push((s, 0));
+        while let Some(&(v, ei)) = work.last() {
+            if ei < edges[v].len() {
+                let w = edges[v][ei];
+                work.last_mut().unwrap().1 += 1;
+                if index[w] == u32::MAX {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on[w] = true;
+                    work.push((w, 0));
+                } else if on[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(u, _)) = work.last() {
+                low[u] = low[u].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let mut c = Vec::new();
+                loop {
+                    let w = stack.pop().unwrap();
+                    on[w] = false;
+                    c.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                c.sort_unstable();
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// What the value `body` returns may point into, given the `RetPoints`
+/// known so far.
+fn body_ret_points(p: &Program, body: &Body, env: &[crate::defs::Pred]) -> RetPoints {
+    let mut diags = Diagnostics::new();
+    let mut cx = Cx::new(p, body, env, &mut diags);
+    if !cx.has_view(&p.fn_data(body.def).sig.ret) {
+        return RetPoints::default();
+    }
+    // A view made from a raw pointer points into nothing the checker
+    // knows of.
+    if uses_raw_pointers(&body.block) {
+        return RetPoints::ALL;
+    }
+    cx.compute_roots();
+    let mut roots = Roots::new();
+    if let Some(t) = &body.block.tail {
+        roots.extend(cx.value_roots(t));
+    }
+    visit_block(&body.block, &mut |e| return_roots(&cx, e, &mut roots));
+    let mut rp = RetPoints::default();
+    for r in roots {
+        let (l, into) = match r {
+            Root::Arg(l) => (l, false),
+            Root::Local(l) | Root::Slot(l) => (l, true),
+            Root::Temp => continue,
+        };
+        if let LocalKind::Param { index, .. } = cx.local(l).kind
+            && index < 64
+        {
+            if into {
+                rp.into |= 1 << index;
+            } else {
+                rp.through |= 1 << index;
+            }
+        }
+    }
+    rp
+}
+
+/// The roots of the values `return`ed in `e`, into `out`.
+fn return_roots(cx: &Cx, e: &Expr, out: &mut Roots) {
+    if let ExprKind::Return(Some(v)) = &e.kind {
+        out.extend(cx.value_roots(v));
+    }
+    visit_children(e, &mut |c| return_roots(cx, c, out));
+}
+
+/// Whether any expression in `b` is a raw pointer.
+fn uses_raw_pointers(b: &Block) -> bool {
+    fn walk(e: &Expr, found: &mut bool) {
+        if matches!(e.ty, Ty::Ptr(..)) {
+            *found = true;
+        }
+        if !*found {
+            visit_children(e, &mut |c| walk(c, found));
+        }
+    }
+    let mut found = false;
+    visit_block(b, &mut |e| walk(e, &mut found));
+    found
+}
+
+/// Whether `t` names a type without generic parameters, `impl Trait` or
+/// unknowns, so its impls can be looked up.
+fn is_concrete(t: &Ty) -> bool {
+    let mut ok = true;
+    t.walk(&mut |x| ok &= !matches!(x, Ty::Param(..) | Ty::Opaque(..) | Ty::Infer(_) | Ty::Error));
+    ok
+}
+
+/// The function whose body a call runs, when that is known here: a named
+/// function, a trait method on a concrete type (its impl's, or the trait's
+/// default), or a closure called where its type is known.
+fn callee_def(p: &Program, c: &Callee) -> Option<DefId> {
+    match c {
+        Callee::Fn { def, .. } => Some(*def),
+        Callee::Trait { trait_ref, self_ty, method, method_args } => {
+            if !is_concrete(self_ty) || !trait_ref.args.iter().all(is_concrete) {
+                return None;
+            }
+            match p.resolve_method(trait_ref, self_ty, method, method_args)? {
+                crate::traits::MethodImpl::Fn { def, .. } => Some(def),
+                crate::traits::MethodImpl::Builtin { .. } => None,
+            }
+        }
+        Callee::Value { callee, .. } => match &callee.ty {
+            Ty::Closure(def, _) => Some(*def),
+            _ => None,
+        },
+        Callee::Intrinsic { .. } | Callee::Indirect(_) => None,
+    }
+}
+
+/// Check `body`, whose generic parameters have the bounds `env`.
+pub fn check(p: &Program, body: &Body, env: &[crate::defs::Pred], diags: &mut Diagnostics) {
+    let mut cx = Cx::new(p, body, env, diags);
     cx.compute_roots();
     cx.check_views_block(&body.block);
     if let Some(t) = &body.block.tail {
@@ -262,6 +491,21 @@ struct Cx<'p, 'd> {
     loop_head: HashMap<LoopId, LiveSet>,
     /// Roots of the other arguments of the call being checked.
     held: Vec<Roots>,
+}
+
+impl<'p, 'd> Cx<'p, 'd> {
+    /// A checker for `body`, where each parameter that can hold a view
+    /// points into its caller's data.
+    fn new(p: &'p Program, body: &'p Body, env: &'p [crate::defs::Pred], diags: &'d mut Diagnostics) -> Self {
+        let mut cx =
+            Cx { p, body, env, diags, roots: HashMap::new(), reported: HashSet::new(), loop_exit: HashMap::new(), loop_head: HashMap::new(), held: Vec::new() };
+        for &l in &body.params {
+            if cx.has_view(&cx.local(l).ty) {
+                cx.roots.insert(l, [Root::Arg(l)].into());
+            }
+        }
+        cx
+    }
 }
 
 impl<'p> Cx<'p, '_> {
@@ -442,32 +686,43 @@ impl<'p> Cx<'p, '_> {
             ExprKind::Coerce { expr, .. } => self.value_roots(expr),
             ExprKind::Call { args, callee } => {
                 let mut r = Roots::new();
+                // What the body of the callee says its result points into;
+                // without one, into every argument.
+                let points = self.callee_ret_points(callee);
                 // What a closure returns may point at what it captured.
                 if let Callee::Value { callee: f, .. } = callee {
-                    r.extend(if f.is_place() { self.value_roots_of_place(f) } else { self.value_roots(f) });
+                    let fr = if f.is_place() { self.value_roots_of_place(f) } else { self.value_roots(f) };
+                    match (&f.ty, points) {
+                        (Ty::Closure(def, _), Some((_, rp))) => r.extend(self.closure_result_roots(f, fr, *def, rp)),
+                        _ => r.extend(fr),
+                    }
                 }
-                // A plain function whose declared return type has no view of
-                // its own (`pop(&mut self): Option::<T>`) cannot point into
-                // its arguments' storage: it can only hand back copies of
-                // items, which point where the items point. Trait methods
-                // stay conservative: an implementation may return views
-                // into itself.
-                let copies_only = match callee {
-                    Callee::Fn { def, .. } | Callee::Intrinsic { def, .. } => !self.has_own_view(&self.p.fn_data(*def).sig.ret, 0),
-                    _ => false,
-                };
-                for a in args {
-                    match a {
-                        Arg::InOut(p) if copies_only => r.extend(self.value_roots_of_place(p)),
-                        Arg::InOut(p) => r.extend(self.borrow_roots(p)),
-                        Arg::Value(Expr { kind: ExprKind::Read { place, mode: ReadMode::Borrow }, .. }) if copies_only => {
-                            r.extend(self.value_roots_of_place(place));
+                let offset = self.captures_before_args(callee);
+                let copies_only = self.copies_only(callee);
+                for (i, a) in args.iter().enumerate() {
+                    let level = points.map_or(2, |(_, rp)| rp.level(i + offset));
+                    r.extend(self.result_roots_from_arg(a, if copies_only { level.min(1) } else { level }));
+                }
+                // A result that cannot be a closure, but comes from one that
+                // borrows a variable (called here or by the callee), may be
+                // a view into that variable.
+                if !self.may_hold_closure(&e.ty, 0) {
+                    let slots: Vec<LocalId> = r.iter().filter_map(|x| if let Root::Slot(l) = x { Some(*l) } else { None }).collect();
+                    for l in slots {
+                        if self.has_storage(&self.local(l).ty, 0) {
+                            r.insert(Root::Local(l));
                         }
-                        Arg::Value(v) => r.extend(self.arg_roots(v)),
                     }
                 }
                 r
             }
+            // A loop's value is what its `break`s give.
+            ExprKind::Loop { body, id } => {
+                let mut r = Roots::new();
+                visit_block(body, &mut |e| self.break_roots(e, *id, &mut r));
+                r
+            }
+            ExprKind::ArrayRepeat { value, .. } => self.value_roots(value),
             ExprKind::Tuple(es) | ExprKind::Array(es) => es.iter().flat_map(|x| self.value_roots(x)).collect(),
             ExprKind::Adt { fields, .. } => fields.iter().flat_map(|(_, x)| self.value_roots(x)).collect(),
             // A borrowing closure points at the variables it borrows (and at
@@ -515,6 +770,217 @@ impl<'p> Cx<'p, '_> {
                 .collect(),
             _ => Roots::new(),
         }
+    }
+
+    /// The roots of the values `break` gives loop `id` in `e`, into `out`.
+    fn break_roots(&self, e: &Expr, id: LoopId, out: &mut Roots) {
+        if let ExprKind::Break { id: b, value: Some(v) } = &e.kind
+            && *b == id
+        {
+            out.extend(self.value_roots(v));
+        }
+        visit_children(e, &mut |c| self.break_roots(c, id, out));
+    }
+
+    /// The function a call runs and what its result points into, when its
+    /// body is known (see [`infer_ret_points`]).
+    fn callee_ret_points(&self, c: &Callee) -> Option<(DefId, RetPoints)> {
+        let def = callee_def(self.p, c)?;
+        Some((def, *self.p.ret_points.get(&def)?))
+    }
+
+    /// How many parameters of the called function come before the call's
+    /// arguments: a closure's captures.
+    fn captures_before_args(&self, c: &Callee) -> usize {
+        match c {
+            Callee::Value { callee: f, .. } => match &f.ty {
+                Ty::Closure(def, _) => self.p.closures.get(def).map_or(0, |c| c.captures.len()),
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+
+    /// A plain function whose declared return type has no view of its own
+    /// (`pop(&mut self): Option::<T>`) cannot point into its arguments'
+    /// storage: it can only hand back copies of items, which point where
+    /// the items point. Trait methods stay conservative: an implementation
+    /// may return views into itself.
+    fn copies_only(&self, c: &Callee) -> bool {
+        match c {
+            Callee::Fn { def, .. } | Callee::Intrinsic { def, .. } => !self.has_own_view(&self.p.fn_data(*def).sig.ret, 0),
+            _ => false,
+        }
+    }
+
+    /// The roots a call's result gains from argument `a`, if it may point
+    /// into it as far as `level` (see [`RetPoints::level`]).
+    fn result_roots_from_arg(&self, a: &Arg, level: u8) -> Roots {
+        match (a, level) {
+            (_, 0) => Roots::new(),
+            (Arg::InOut(p), 1) => self.value_roots_of_place(p),
+            (Arg::InOut(p), _) => self.borrow_roots(p),
+            (Arg::Value(Expr { kind: ExprKind::Read { place, mode: ReadMode::Borrow }, .. }), 1) => self.value_roots_of_place(place),
+            (Arg::Value(v), _) => self.arg_roots(v),
+        }
+    }
+
+    /// What calling closure `def`, the value `f` with roots `fr`, returns
+    /// from its captures, given what its body returns (`rp`): nothing if
+    /// it returns none of them. A view of a capture it borrowed points
+    /// into that variable (not at it, unless the result may be a closure
+    /// itself), and a view into a capture it holds points into `f`.
+    fn closure_result_roots(&self, f: &Expr, fr: Roots, def: DefId, rp: RetPoints) -> Roots {
+        let mut r = Roots::new();
+        let Some(info) = self.p.closures.get(&def) else { return fr };
+        let (mut any, mut into_borrowed, mut into_held) = (false, false, false);
+        for (i, cap) in info.captures.iter().enumerate() {
+            match rp.level(i) {
+                0 => {}
+                1 => any = true,
+                _ => {
+                    any = true;
+                    if cap.by_ref {
+                        into_borrowed = true;
+                    } else {
+                        into_held = true;
+                    }
+                }
+            }
+        }
+        if !any {
+            return r;
+        }
+        let closures = self.may_hold_closure(&self.p.fn_data(def).sig.ret, 0);
+        for x in fr {
+            match x {
+                Root::Slot(l) => {
+                    if closures {
+                        r.insert(Root::Slot(l));
+                    }
+                    if into_borrowed && self.has_storage(&self.local(l).ty, 0) {
+                        r.insert(Root::Local(l));
+                    }
+                }
+                other => {
+                    r.insert(other);
+                }
+            }
+        }
+        if into_held {
+            r.insert(self.place_root(f).unwrap_or(Root::Temp));
+        }
+        r
+    }
+
+    /// Whether a value of `t` may be or hold a closure.
+    fn may_hold_closure(&self, t: &Ty, depth: u32) -> bool {
+        if depth > 32 {
+            return true;
+        }
+        match t {
+            Ty::Closure(..) => true,
+            Ty::Array(e, _) | Ty::Grow(e) => self.may_hold_closure(e, depth + 1),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.may_hold_closure(t, depth + 1)),
+            Ty::Adt(d, args) => {
+                let adt = self.p.adt(*d);
+                adt.variants.iter().any(|v| v.fields.iter().any(|f| self.may_hold_closure(&f.ty.subst(args), depth + 1)))
+            }
+            Ty::Param(..) | Ty::Opaque(..) | Ty::Infer(_) => !self.p.is_dull(t, self.env),
+            _ => false,
+        }
+    }
+
+    /// Why local `v` points into `root`, when that comes from what the
+    /// body of a function says its result points into: `v` is bound to the
+    /// result of a call, and an argument of it points into `root`. That
+    /// argument's span, and what was called.
+    fn returned_into(&self, v: LocalId, root: LocalId) -> Option<(Span, String)> {
+        let mut found = None;
+        self.find_let_block(&self.body.block, v, root, &mut found);
+        found.flatten()
+    }
+
+    fn find_let_block(&self, b: &Block, v: LocalId, root: LocalId, found: &mut Option<Option<(Span, String)>>) {
+        for s in &b.stmts {
+            if found.is_some() {
+                return;
+            }
+            match s {
+                Stmt::Let { pat, init: Some(init), .. } => {
+                    let mut binds = Vec::new();
+                    pat_bindings(pat, &mut binds);
+                    if binds.contains(&v) {
+                        *found = Some(self.call_cause(init, root));
+                        return;
+                    }
+                    self.find_let_expr(init, v, root, found);
+                }
+                Stmt::Let { .. } => {}
+                Stmt::Expr(e) => self.find_let_expr(e, v, root, found),
+            }
+        }
+        if let Some(t) = &b.tail
+            && found.is_none()
+        {
+            self.find_let_expr(t, v, root, found);
+        }
+    }
+
+    fn find_let_expr(&self, e: &Expr, v: LocalId, root: LocalId, found: &mut Option<Option<(Span, String)>>) {
+        match &e.kind {
+            ExprKind::Block(b)
+            | ExprKind::Loop { body: b, .. }
+            | ExprKind::While { body: b, .. }
+            | ExprKind::ForRange { body: b, .. }
+            | ExprKind::ForArray { body: b, .. } => self.find_let_block(b, v, root, found),
+            _ => visit_children(e, &mut |c| {
+                if found.is_none() {
+                    self.find_let_expr(c, v, root, found);
+                }
+            }),
+        }
+    }
+
+    /// For [`returned_into`]: the argument of the call `init` (if it is
+    /// one, with an inferred result) whose roots give `root`.
+    fn call_cause(&self, init: &Expr, root: LocalId) -> Option<(Span, String)> {
+        let mut e = init;
+        while let ExprKind::Coerce { expr, .. } = &e.kind {
+            e = expr;
+        }
+        let ExprKind::Call { callee, args } = &e.kind else { return None };
+        let (_, rp) = self.callee_ret_points(callee)?;
+        if rp == RetPoints::ALL {
+            return None;
+        }
+        let name = match callee {
+            Callee::Fn { def, .. } => self.p.def(*def).name.clone(),
+            Callee::Trait { method, .. } => method.clone(),
+            Callee::Value { callee: f, .. } => match f.kind {
+                ExprKind::Local(l) => self.local(l).name.clone(),
+                _ => return None,
+            },
+            Callee::Intrinsic { .. } | Callee::Indirect(_) => return None,
+        };
+        // A closure: from what it captured, the closure itself.
+        if let Callee::Value { callee: f, .. } = callee
+            && let Ty::Closure(def, _) = &f.ty
+        {
+            let fr = if f.is_place() { self.value_roots_of_place(f) } else { self.value_roots(f) };
+            if self.closure_result_roots(f, fr, *def, rp).contains(&Root::Local(root)) {
+                return Some((f.span, name));
+            }
+        }
+        let offset = self.captures_before_args(callee);
+        let copies_only = self.copies_only(callee);
+        for (i, a) in args.iter().enumerate() {
+            let level = rp.level(i + offset);
+            if self.result_roots_from_arg(a, if copies_only { level.min(1) } else { level }).contains(&Root::Local(root)) {
+                return Some((a.expr().span, name));
+            }
+        }
+        None
     }
 
     /// Which parameters of what is called are `kept`, when known.
@@ -933,11 +1399,12 @@ impl<'p> Cx<'p, '_> {
                 "move" => (borrow::MOVE_WHILE_BORROWED, "is moved", format!("finish using `{vn}` before this point, or take a new slice afterwards")),
                 _ => (borrow::ASSIGN_WHILE_BORROWED, "is replaced", format!("finish using `{vn}` before this point, or take a new slice afterwards")),
             };
-            self.err(
-                Diagnostic::error(code, span, format!("`{rname}` {verb} here while `{vn}` still points into it"))
-                    .with_secondary(vs, format!("`{vn}` borrows from `{rname}` and is used later"))
-                    .with_help(help),
-            );
+            let mut d = Diagnostic::error(code, span, format!("`{rname}` {verb} here while `{vn}` still points into it"))
+                .with_secondary(vs, format!("`{vn}` borrows from `{rname}` and is used later"));
+            if let Some((arg, callee)) = self.returned_into(v, root) {
+                d = d.with_secondary(arg, format!("the value returned by `{callee}` points into `{rname}`"));
+            }
+            self.err(d.with_help(help));
         }
         let held_conflict = self.held.iter().any(|r| r.contains(&Root::Local(root)));
         if held_conflict && what == "shrink" && self.reported.insert((span, u32::MAX - 1)) {

@@ -126,8 +126,14 @@ compares its answers with the Rust server's.
 * Structs cannot hold references: state a Rust struct borrows is passed to
   methods as parameters, or owned.
 * Array items, map keys and values must be Light (own no array or string).
-* Methods returning views of `&self` count as pointing into `self`; slice a
-  `str` field through a free function instead (`tok_text(self.src, t)`).
+* What a returned value's views point into is inferred from the body of the
+  function returning it (`docs/reference.md` §4): only the arguments it
+  really comes from stay borrowed. A method returning a slice of a `str`
+  field of `&self` points where the field points, not into `self`, and a
+  function may build a struct holding views (such as `Sema`) from a local
+  it lends. Calls through function pointers, trait methods on a generic
+  receiver and closures of unknown type still count as pointing into every
+  argument.
 * No bindings inside `|` patterns; write separate arms.
 * Constants cannot hold structs.
 * `[T; ..+]` only grows; use `[T; -..+]` to `pop`/`truncate`/`clear`.
@@ -140,13 +146,6 @@ compares its answers with the Rust server's.
 * A `&mut` method may shrink what it is given, so it ends views into it;
   `&mut +self` methods only grow. Parameters whose views a function stores
   into an in-out argument are `kept`.
-* A returned value whose type can hold views (a struct with a `str` or a
-  `Code` field, such as `Sema`) counts as pointing into every borrowed
-  argument: an error type is easiest kept free of views (`ProjectError`
-  owns its texts), and a function returning a `Sema` should not build it
-  from a local it borrows.
-* Closures that capture a borrowed parameter and return a view of it are
-  rejected; use a free function taking that parameter.
 
 ## Checked against the Rust compiler
 

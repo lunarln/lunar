@@ -1,0 +1,13 @@
+// error: borrow::shrink_while_borrowed
+// `call` returns what the closure returns, a view into `s`: the closure
+// borrows `s`, so the result may point into it.
+fn call::<F: Fn(): str>(f: F): str {
+    return f();
+}
+
+fn main() {
+    let mut s = String::from("hello");
+    let v = call(|| s.as_str());
+    s.clear();
+    println("{v}");
+}

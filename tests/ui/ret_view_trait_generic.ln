@@ -1,0 +1,29 @@
+// error: borrow::shrink_while_borrowed
+// A trait method called on a generic receiver may be any implementation:
+// its result may point into every argument, even though the only one
+// here returns a view into `self`.
+trait Named {
+    fn name(&self, scratch: &String): str;
+}
+
+struct Person {
+    name: String,
+}
+
+impl Named for Person {
+    fn name(&self, scratch: &String): str {
+        return self.name.as_str();
+    }
+}
+
+fn name_of::<T: Named>(t: &T, scratch: &String): str {
+    return t.name(scratch);
+}
+
+fn main() {
+    let p = Person { name: String::from("ada") };
+    let mut scratch = String::from("tmp");
+    let n = name_of(&p, &scratch);
+    scratch.clear();
+    println("{n}");
+}
