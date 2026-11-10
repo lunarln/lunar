@@ -13,6 +13,9 @@ extern "C" {
     fn CloseHandle(h: *mut u8): i32;
     fn DeleteFileW(name: *u16): i32;
     fn GetLastError(): u32;
+    fn GetConsoleMode(h: *mut u8, mode: *mut u32): i32;
+    fn SetConsoleMode(h: *mut u8, mode: u32): i32;
+    fn GetFileInformationByHandleEx(h: *mut u8, class: i32, info: *mut u8, size: u32): i32;
 }
 
 // The C runtime (libcmt), for process spawning and the environment.
@@ -173,6 +176,60 @@ pub fn write(fd: i32, bytes: [u8; &]) {
         }
         off += written as usize;
     }
+}
+
+/// Whether `fd` is a terminal: a console, or the pipe of an MSYS or
+/// Cygwin terminal (such as Git Bash's mintty).
+pub fn is_terminal(fd: i32): bool {
+    let h = handle(fd);
+    let mut mode: u32 = 0;
+    if unsafe { GetConsoleMode(h, intrinsics::addr_of_mut(&mut mode)) } != 0 {
+        return true;
+    }
+    return is_msys_pty(h);
+}
+
+/// Whether ANSI escape codes written to `fd` show as colors: it is a
+/// console that interprets them (switched on here with
+/// `ENABLE_VIRTUAL_TERMINAL_PROCESSING`, for consoles that do not by
+/// default), or an MSYS or Cygwin terminal.
+pub fn enable_ansi(fd: i32): bool {
+    let h = handle(fd);
+    let mut mode: u32 = 0;
+    if unsafe { GetConsoleMode(h, intrinsics::addr_of_mut(&mut mode)) } == 0 {
+        return is_msys_pty(h);
+    }
+    // ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    if (mode & 4) != 0 {
+        return true;
+    }
+    return unsafe { SetConsoleMode(h, mode | 4) } != 0;
+}
+
+/// Whether `h` is the pipe an MSYS or Cygwin terminal connects programs
+/// to: its name has `msys-` or `cygwin-`, and `-pty` (as Rust's
+/// `is_terminal` checks).
+fn is_msys_pty(h: *mut u8): bool {
+    // FILE_NAME_INFO: the name's length in bytes (a u32), then the name
+    // in UTF-16.
+    let mut info: [u16; 520] = [0; 520];
+    // FileNameInfo = 2
+    let p = (intrinsics::addr_of_mut(&mut info) as usize) as *mut u8;
+    let ok = unsafe { GetFileInformationByHandleEx(h, 2, p, 1040) };
+    if ok == 0 {
+        return false;
+    }
+    let mut n = ((info[0] as usize) | ((info[1] as usize) << 16)) / 2;
+    if n > 518 {
+        n = 518;
+    }
+    let mut name = String::new();
+    for i in 0..n {
+        let c = info[i + 2];
+        name.push(if c < 128 { c as u8 as char } else { '?' });
+    }
+    let s = name.as_str();
+    return (s.contains("msys-") || s.contains("cygwin-")) && s.contains("-pty");
 }
 
 pub fn read(fd: i32, buf: [u8; &mut]): isize {
