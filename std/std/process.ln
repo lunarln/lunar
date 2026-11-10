@@ -46,6 +46,132 @@ pub fn run(program: str, args: [str; &]): Result::<i32, crater::io::Error> {
     return Ok(code);
 }
 
+/// How a process ended.
+pub struct ExitStatus {
+    /// What `sys::spawn` returned: the exit code, or on Unix `2^32 +` the
+    /// signal that ended it.
+    raw: i64,
+}
+
+impl ExitStatus {
+    /// Whether it exited with code 0.
+    pub fn success(&self): bool {
+        return self.raw == 0;
+    }
+
+    /// The exit code, or `None` if a signal ended the process. On Windows
+    /// a crash is an exit code too (an NTSTATUS such as `0xC0000005`,
+    /// negative as an `i32`).
+    pub fn code(&self): Option::<i32> {
+        if self.raw >= 0x100000000 {
+            return None;
+        }
+        return Some((self.raw as u32) as i32);
+    }
+
+    /// The signal that ended the process (Unix), if one did.
+    pub fn signal(&self): Option::<i32> {
+        if self.raw >= 0x100000000 {
+            return Some((self.raw - 0x100000000) as i32);
+        }
+        return None;
+    }
+}
+
+impl Display for ExitStatus {
+    /// `exit code: 1`, or `signal: 11`.
+    fn fmt(&self, out: &mut String) {
+        match self.signal() {
+            Some(s) => out.write("signal: {s}"),
+            None => out.write("exit code: {self.raw}"),
+        }
+    }
+}
+
+/// What a finished process wrote, and how it ended.
+pub struct Output {
+    pub status: ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Run `program` (searched for on `PATH`) with `args`, with this
+/// process's standard input, output and error, and wait for it. An error
+/// if it could not be started.
+pub fn status(program: str, args: [str; &]): Result::<ExitStatus, crater::io::Error> {
+    let mut all: [str; ..+] = [];
+    all.push(program);
+    all.extend(args);
+    let r = sys::spawn(all[..], "", "");
+    if r < 0 {
+        return Err(crater::io::Error::from_os((-1 - r) as i32));
+    }
+    return Ok(ExitStatus { raw: r });
+}
+
+/// How many `output` calls there were, for unique file names.
+static mut OUTPUTS: u32 = 0;
+
+/// Run `program` (searched for on `PATH`) with `args` and wait for it,
+/// collecting its standard output and error as text (bytes that are not
+/// UTF-8 become U+FFFD). An error if it could not be started.
+pub fn output(program: str, args: [str; &]): Result::<Output, crater::io::Error> {
+    let mut all: [str; ..+] = [];
+    all.push(program);
+    all.extend(args);
+    // The output goes through two temporary files, which, unlike pipes,
+    // cannot fill up while the other one is being read.
+    let n = unsafe { OUTPUTS };
+    unsafe {
+        OUTPUTS = n + 1;
+    }
+    let mut dir = String::new();
+    sys::temp_dir(&mut dir);
+    let mut out_path = String::new();
+    out_path.write("{dir}/lunar-{id()}-{n}.out");
+    let mut err_path = String::new();
+    err_path.write("{dir}/lunar-{id()}-{n}.err");
+    let r = sys::spawn(all[..], out_path.as_str(), err_path.as_str());
+    let stdout = read_lossy(out_path.as_str());
+    let stderr = read_lossy(err_path.as_str());
+    sys::remove_file(out_path.as_str());
+    sys::remove_file(err_path.as_str());
+    if r < 0 {
+        return Err(crater::io::Error::from_os((-1 - r) as i32));
+    }
+    return Ok(Output { status: ExitStatus { raw: r }, stdout, stderr });
+}
+
+/// The file at `path` as text, with U+FFFD for bytes that are not UTF-8
+/// (empty if it cannot be read).
+fn read_lossy(path: str): String {
+    let mut out = String::new();
+    let bytes = match crater::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return out,
+    };
+    let mut start: usize = 0;
+    while start < bytes.len() {
+        match core::str::utf8_error_at(bytes[start..]) {
+            None => {
+                out.push_str(unsafe { core::intrinsics::str_from_bytes(bytes[start..]) });
+                return out;
+            }
+            Some(i) => {
+                out.push_str(unsafe { core::intrinsics::str_from_bytes(bytes[start..start + i]) });
+                out.push(core::str::char_from_u32(0xFFFD));
+                start = start + i + 1;
+            }
+        }
+    }
+    return out;
+}
+
+/// This process's id.
+pub fn id(): u32 {
+    return sys::process_id();
+}
+
 /// `a` and a NUL.
 #[cfg(unix)]
 fn push_arg(text: &mut +String, a: str) {

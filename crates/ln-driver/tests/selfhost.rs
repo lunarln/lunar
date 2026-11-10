@@ -72,7 +72,7 @@ fn driver() -> &'static Path {
             .output()
             .unwrap();
         assert!(build.status.success(), "building craters/:\n{}{}", String::from_utf8_lossy(&build.stdout), String::from_utf8_lossy(&build.stderr));
-        craters.join("target/release").join(format!("ln-driver{}", std::env::consts::EXE_SUFFIX))
+        craters.join("target/release").join(format!("lunar{}", std::env::consts::EXE_SUFFIX))
     })
 }
 
@@ -88,7 +88,7 @@ fn compare(args: &[&str], what: &str, rust: impl Fn(&str) -> String) {
 /// file's output with `rust`'s for that file (given its path and text).
 fn compare_files(root: &Path, files: &[String], args: &[&str], what: &str, rust: impl Fn(&str, &str) -> String) {
     let run = Command::new(driver()).args(args).args(files).current_dir(root).env("LUNAR_STD_DIR", std_dir_of(root)).output().unwrap();
-    assert!(run.status.success(), "ln-driver failed:\n{}", String::from_utf8_lossy(&run.stderr));
+    assert!(run.status.success(), "the Lunar compiler failed:\n{}", String::from_utf8_lossy(&run.stderr));
     let stdout = String::from_utf8(run.stdout).unwrap();
     let mut lunar: BTreeMap<&str, String> = BTreeMap::new();
     let mut current = None;
@@ -155,7 +155,7 @@ fn rust_tree(src: &str) -> String {
 
 #[test]
 fn lexer_matches_rust_lexer() {
-    compare(&[], "lex", rust_tokens);
+    compare(&["--lex"], "lex", rust_tokens);
 }
 
 #[test]
@@ -240,7 +240,7 @@ fn compiler_builds_itself() {
         let exe = dir.join(format!("stage{n}{}", std::env::consts::EXE_SUFFIX));
         let ll = dir.join(format!("stage{n}.ll"));
         let out = Command::new(compiler)
-            .args(["build", "ln-driver", "-o"])
+            .args(["build", "-p", "lunar", "-o"])
             .arg(&exe)
             .arg("--emit-llvm")
             .arg(&ll)

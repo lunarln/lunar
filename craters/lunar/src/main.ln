@@ -1,0 +1,270 @@
+// `lunar`, the Lunar compiler and project manager, written in Lunar: a
+// port of crates/ln-driver (its command line in `cli.ln`, the commands in
+// `commands.ln`). `lunar --help` lists the commands.
+//
+// The standard library and the explanations of diagnostic codes are not
+// embedded: `sysroot.ln` finds them next to the executable.
+//
+// Hidden modes, for crates/ln-driver/tests/selfhost.rs, print one stage's
+// result for each file so that it can be compared with the Rust
+// compiler's:
+//
+//     lunar --lex FILE...         the tokens (`ln_lexer::dump`)
+//     lunar --parse FILE...       the syntax tree and syntax errors
+//                                 (`ln_ast::dump`, `ln_parser::dump_diags`)
+//     lunar --check FILE          the front end of semantic analysis on
+//                                 FILE with `core` and `std`: its
+//                                 diagnostics, one per line,
+//                                 `err(scope::name) line:col message`, then
+//                                 their labels, notes and helps indented
+//                                 (`LN_EXPANSIONS=1` also prints every
+//                                 macro expansion)
+//     lunar --render [--color] FILE...
+//                                 the same analysis of each FILE, and its
+//                                 diagnostics as `lunar check` draws them
+//                                 (without color unless `--color`), after
+//                                 a `== FILE` line
+//     lunar --craters DIR         the craters a build of the package in DIR
+//                                 analyzes
+
+mod cli;
+mod commands;
+mod compile;
+mod explain;
+mod git;
+mod link;
+mod lsp;
+mod paths;
+mod project;
+mod sysroot;
+mod testing;
+mod ui;
+
+use std::env;
+use std::fs;
+use ln_sema::diag::{Severity, is_dummy};
+use ln_sema::program::Program;
+use ln_sema::render::{plain_message, render_all};
+use crater::compile::analyze_file;
+use crater::project::{DepSpec, Project, Target};
+
+fn main() {
+    if env::arg_count() > 1 {
+        let first = env::arg(1).unwrap();
+        if first == "--lex" || first == "--parse" {
+            std::process::exit(dump_files(first == "--parse"));
+        }
+        if first == "--check" && env::arg_count() > 2 {
+            std::process::exit(check(env::arg(2).unwrap()));
+        }
+        if first == "--render" {
+            let color = env::arg_count() > 2 && env::arg(2).unwrap() == "--color";
+            std::process::exit(render_files(color, if color { 3 } else { 2 }));
+        }
+        if first == "--craters" && env::arg_count() > 2 {
+            std::process::exit(list_craters(env::arg(2).unwrap()));
+        }
+    }
+    let cli = match cli::parse() {
+        Ok(c) => c,
+        Err(code) => std::process::exit(code),
+    };
+    std::process::exit(run(&cli));
+}
+
+/// Run the parsed command; its exit code.
+fn run(c: &cli::Cli): i32 {
+    let cmd = c.command;
+    let file: Option::<str> = if c.positionals.len() > 0 { Some(c.positionals[0]) } else { None };
+    if cmd == "new" {
+        return commands::new_package(c.positionals[0], c.lib);
+    }
+    if cmd == "init" {
+        return commands::init_here(c.lib);
+    }
+    if cmd == "check" {
+        return match file {
+            Some(f) => commands::check_file(f, c.target_os),
+            None => commands::check_project(c.package, c.target_os),
+        };
+    }
+    if cmd == "build" {
+        return match file {
+            Some(f) => commands::build_file(f, c.output, c.release, c.emit_llvm),
+            None => commands::build_project(c.package, c.output, c.release, c.emit_llvm),
+        };
+    }
+    if cmd == "run" {
+        return match file {
+            Some(f) => commands::run_file(f, c.release, c.rest[..]),
+            None => commands::run_project(c.package, c.release, c.rest[..]),
+        };
+    }
+    if cmd == "test" {
+        return commands::test(c.positionals[..], c.package, c.release);
+    }
+    if cmd == "add" {
+        let spec = DepSpec { version: None, path: c.path, git: c.git, tag: c.tag, branch: c.branch, rev: c.rev, package: c.package };
+        return commands::add(c.positionals[0], spec);
+    }
+    if cmd == "remove" {
+        return commands::remove(c.positionals[0]);
+    }
+    if cmd == "update" {
+        return commands::update();
+    }
+    if cmd == "clean" {
+        return commands::clean();
+    }
+    if cmd == "emit-llvm" {
+        return commands::emit_llvm(c.positionals[0], c.output, c.release, c.test);
+    }
+    if cmd == "lsp" {
+        return lsp::serve();
+    }
+    if cmd == "explain" {
+        return explain::run(file, c.list);
+    }
+    return 2;
+}
+
+// ===================================================================== hidden modes
+
+/// `--lex FILE...` and `--parse FILE...`.
+fn dump_files(parse: bool): i32 {
+    let mut i: usize = 2;
+    while i < env::arg_count() {
+        let path = env::arg(i).unwrap();
+        match fs::read_to_string(path) {
+            Ok(text) => {
+                let mut out = String::new();
+                out.write("== {path}\n");
+                if parse {
+                    let parsed = ln_parser::parse_file(text.as_str());
+                    ln_ast::dump(&parsed.ast, &mut out);
+                    ln_parser::dump_diags(&parsed, &mut out);
+                } else {
+                    ln_lexer::dump(text.as_str(), &mut out);
+                }
+                std::io::write_str(out.as_str());
+            }
+            Err(e) => {
+                eprintln("lunar: {path}: {e}");
+                return 1;
+            }
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+/// `--craters DIR`: the craters a build of the package in `DIR` analyzes
+/// (its program, else its library), one per line with its dependencies.
+fn list_craters(dir: str): i32 {
+    let mut p = Project::new();
+    if let Err(e) = p.find_workspace(dir) {
+        commands::report_project(&e);
+        return 1;
+    }
+    if let Err(e) = p.resolve(false) {
+        commands::report_project(&e);
+        return 1;
+    }
+    let pkg = match p.current_member() {
+        Some(i) => i,
+        None => 0,
+    };
+    let target = if p.main_root(pkg).is_some() { Target::Main } else { Target::Lib };
+    if let Err(e) = p.craters(pkg, target) {
+        commands::report_project(&e);
+        return 1;
+    }
+    for s in p.specs {
+        print("{p.text(s.name)} {p.text(s.root)}");
+        for d in p.crater_deps.list(s.deps) {
+            print(" {p.text(d.alias)}={d.index}");
+        }
+        println("");
+    }
+    return 0;
+}
+
+/// `--render [--color] FILE...`: analyze each file as `--check` does and
+/// print its diagnostics rendered, after a `== FILE` line.
+fn render_files(color: bool, first: usize): i32 {
+    let mut i = first;
+    while i < env::arg_count() {
+        let path = env::arg(i).unwrap();
+        let mut out = String::new();
+        out.write("== {path}\n");
+        let s = analyze_file(path, false, None);
+        render_all(&s.p, color, &mut out);
+        std::io::write_str(out.as_str());
+        i += 1;
+    }
+    return 0;
+}
+
+/// `--check FILE`: load FILE, `core` and `std`, analyze them, and print
+/// the diagnostics. The exit code is 1 if there were errors.
+fn check(path: str): i32 {
+    let s = analyze_file(path, false, None);
+    print_diags(&s.p);
+    // `LN_EXPANSIONS=1`: also print what each macro invocation expanded to.
+    if env::var("LN_EXPANSIONS").is_some() {
+        let mut out = String::new();
+        let mut n_exp: usize = 0;
+        for i in 0..s.p.sources.files.len() {
+            let f = s.p.sources.files[i];
+            if let Some(site) = f.expansion_site {
+                n_exp += 1;
+                out.write("== {s.p.text(f.name)} at {position(&s.p, site)}\n{s.p.sources.file_text(i as u32)}\n");
+            }
+        }
+        out.write("-- {s.p.defs.len()} definitions, {s.p.impls.len()} impls, {n_exp} expansions\n");
+        std::io::write_str(out.as_str());
+    }
+    if s.p.diags.has_errors() {
+        return 1;
+    }
+    return 0;
+}
+
+fn print_diags(p: &Program) {
+    let mut out = String::new();
+    for d in p.diags.list {
+        let sev = if d.is_error() { "err" } else { "warn" };
+        out.write("{sev}({d.code.scope}::{d.code.name}) {position(p, d.span)} {p.text(d.message)}");
+        if !is_dummy(d.span) && p.sources.files.len() > 0 && p.sources.file_of(d.span.lo) != 0 {
+            let f = p.sources.files[p.sources.file_of(d.span.lo) as usize];
+            out.write("  [in {p.text(f.name)}]");
+        }
+        out.push('\n');
+        if let Some(l) = d.label {
+            out.write("    label: {p.text(l)}\n");
+        }
+        for l in p.diags.labels.list(d.labels) {
+            out.write("    {position(p, l.span)}: {p.text(l.message)}\n");
+        }
+        for n in p.diags.texts.list(d.notes) {
+            out.write("    note: {p.text(n)}\n");
+        }
+        for h in p.diags.texts.list(d.helps) {
+            out.write("    help: {p.text(h)}\n");
+        }
+    }
+    std::io::write_str(out.as_str());
+}
+
+/// `line:col` of where a span is in code someone wrote (a span inside a
+/// macro expansion is shown at the invocation).
+fn position(p: &Program, span: ln_ast::Span): String {
+    if is_dummy(span) || p.sources.files.len() == 0 {
+        return String::from("0:0");
+    }
+    let s = p.source_span(span);
+    let (line, col) = p.sources.line_col(s.lo);
+    let mut out = String::new();
+    out.write("{line}:{col}");
+    return out;
+}

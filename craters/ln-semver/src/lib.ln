@@ -1,0 +1,813 @@
+// Semantic versions and version requirements: a port of the parts of the
+// `semver` crate (1.0) that `lunar` uses, with the same syntax, matching
+// rules, display and error messages.
+//
+//     let v = Version::parse("1.2.3-beta.1")?;
+//     let r = VersionReq::parse("^1.2, <2")?;
+//     r.matches(&v)
+//
+// A requirement without an operator is a caret requirement (`1.2` is
+// `^1.2`); `*`, `1.*` and `1.2.*` are wildcards. A pre-release version only
+// matches a comparator that names a pre-release of the same
+// `major.minor.patch`.
+
+use core::cmp::Ordering;
+
+// ===================================================================== versions
+
+/// A version: `major.minor.patch`, optionally `-pre` and `+build`.
+pub struct Version {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+    /// The pre-release identifiers (`alpha.1`), or empty.
+    pub pre: String,
+    /// The build metadata (ignored when comparing), or empty.
+    pub build: String,
+}
+
+impl Version {
+    pub fn new(major: u64, minor: u64, patch: u64): Version {
+        return Version { major, minor, patch, pre: String::new(), build: String::new() };
+    }
+
+    /// Parse `1.2.3`, `1.2.3-alpha.1`, `1.2.3+build.5`, ...
+    pub fn parse(text: str): Result::<Version, Error> {
+        if text.is_empty() {
+            return Err(Error::new(ErrorKind::Empty, Position::Major, ' '));
+        }
+        let mut pos = Position::Major;
+        let (major, rest) = numeric(text, pos)?;
+        let rest = dot(rest, pos)?;
+        pos = Position::Minor;
+        let (minor, rest) = numeric(rest, pos)?;
+        let rest = dot(rest, pos)?;
+        pos = Position::Patch;
+        let (patch, rest) = numeric(rest, pos)?;
+        let mut v = Version::new(major, minor, patch);
+        let mut rest = rest;
+        if rest.starts_with("-") {
+            pos = Position::Pre;
+            let n = identifier(rest[1..], pos, true)?;
+            v.pre.push_str(rest[1..1 + n]);
+            rest = rest[1 + n..];
+        }
+        if rest.starts_with("+") {
+            pos = Position::Build;
+            let n = identifier(rest[1..], pos, false)?;
+            v.build.push_str(rest[1..1 + n]);
+            rest = rest[1 + n..];
+        }
+        if let Some(c) = rest.chars().next() {
+            return Err(Error::new(ErrorKind::UnexpectedCharAfter, pos, c));
+        }
+        return Ok(v);
+    }
+
+    /// Precedence: by number, then a pre-release before the release (build
+    /// metadata is ignored).
+    pub fn cmp_precedence(&self, other: &Version): Ordering {
+        if self.major != other.major {
+            return self.major.cmp(&other.major);
+        }
+        if self.minor != other.minor {
+            return self.minor.cmp(&other.minor);
+        }
+        if self.patch != other.patch {
+            return self.patch.cmp(&other.patch);
+        }
+        return cmp_pre(self.pre.as_str(), other.pre.as_str());
+    }
+}
+
+impl Display for Version {
+    fn fmt(&self, out: &mut String) {
+        out.write("{self.major}.{self.minor}.{self.patch}");
+        if !self.pre.is_empty() {
+            out.write("-{self.pre}");
+        }
+        if !self.build.is_empty() {
+            out.write("+{self.build}");
+        }
+    }
+}
+
+/// Compare pre-release strings: no pre-release is greater than any;
+/// identifiers compare numerically when both are numbers, a number is less
+/// than a word, and a longer list wins a tie.
+pub fn cmp_pre(a: str, b: str): Ordering {
+    if a.is_empty() || b.is_empty() {
+        if a.is_empty() && b.is_empty() {
+            return Ordering::Equal;
+        }
+        return if a.is_empty() { Ordering::Greater } else { Ordering::Less };
+    }
+    let mut xs = a.split(".");
+    let mut ys = b.split(".");
+    loop {
+        match (xs.next(), ys.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                let o = cmp_identifier(x, y);
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+        }
+    }
+}
+
+fn cmp_identifier(x: str, y: str): Ordering {
+    let xn = all_digits(x);
+    let yn = all_digits(y);
+    if xn && yn {
+        // Without leading zeros, a longer number is a larger one.
+        if x.len() != y.len() {
+            return x.len().cmp(&y.len());
+        }
+        return x.cmp(&y);
+    }
+    if xn {
+        return Ordering::Less;
+    }
+    if yn {
+        return Ordering::Greater;
+    }
+    return x.cmp(&y);
+}
+
+fn all_digits(s: str): bool {
+    for b in s.bytes() {
+        if b < b'0' || b > b'9' {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ===================================================================== requirements
+
+/// A comparison operator.
+#[derive(Eq, Debug)]
+pub enum Op {
+    /// `=1.2.3`
+    Exact,
+    /// `>1.2.3`
+    Greater,
+    /// `>=1.2.3`
+    GreaterEq,
+    /// `<1.2.3`
+    Less,
+    /// `<=1.2.3`
+    LessEq,
+    /// `~1.2.3`: at least 1.2.3, below 1.3.0.
+    Tilde,
+    /// `^1.2.3` (or no operator): at least 1.2.3, without a breaking change.
+    Caret,
+    /// `1.*`, `1.2.*`
+    Wildcard,
+}
+
+/// One comparator of a requirement. Its pre-release text is in the
+/// requirement's `pres`, from `pre_start` to `pre_end`.
+pub struct Comparator {
+    pub op: Op,
+    pub major: u64,
+    pub minor: Option::<u64>,
+    pub patch: Option::<u64>,
+    pre_start: u32,
+    pre_end: u32,
+}
+
+/// A version requirement: comparators that must all match (`>=1.2, <3`).
+/// No comparators is `*`, which every version without a pre-release
+/// matches.
+pub struct VersionReq {
+    pub comparators: [Comparator; ..+],
+    /// The comparators' pre-release texts, end to end.
+    pres: String,
+}
+
+/// At most this many comparators in a requirement.
+const MAX_COMPARATORS: usize = 32;
+
+impl VersionReq {
+    /// `*`: any version.
+    pub fn star(): VersionReq {
+        return VersionReq { comparators: [], pres: String::new() };
+    }
+
+    /// Parse `1.2`, `^1.2.3`, `=1.2.4`, `>=1, <3`, `~1.2`, `1.*`, `*`, ...
+    pub fn parse(text: str): Result::<VersionReq, Error> {
+        let text = trim_spaces(text);
+        if let Some((c, rest)) = wildcard(text) {
+            let rest = trim_spaces(rest);
+            if rest.is_empty() {
+                return Ok(VersionReq::star());
+            }
+            if rest.starts_with(",") {
+                return Err(Error::new(ErrorKind::WildcardNotTheOnlyComparator, Position::Major, c));
+            }
+            return Err(Error::new(ErrorKind::UnexpectedAfterWildcard, Position::Major, c));
+        }
+        let mut req = VersionReq::star();
+        let mut rest = text;
+        loop {
+            let (pos, after) = match comparator(rest, &mut req) {
+                Ok(r) => r,
+                Err(e) => {
+                    let mut e = e;
+                    if let Some((c, after)) = wildcard(rest) {
+                        let after = trim_spaces(after);
+                        if after.is_empty() || after.starts_with(",") {
+                            e = Error::new(ErrorKind::WildcardNotTheOnlyComparator, Position::Major, c);
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+            if after.is_empty() {
+                return Ok(req);
+            }
+            if !after.starts_with(",") {
+                return Err(Error::new(ErrorKind::ExpectedCommaFound, pos, after.chars().next().unwrap()));
+            }
+            if req.comparators.len() == MAX_COMPARATORS {
+                return Err(Error::new(ErrorKind::ExcessiveComparators, pos, ' '));
+            }
+            rest = trim_spaces(after[1..]);
+        }
+    }
+
+    /// Whether `v` satisfies every comparator. A pre-release version also
+    /// needs a comparator naming a pre-release of its `major.minor.patch`.
+    pub fn matches(&self, v: &Version): bool {
+        for c in self.comparators {
+            if !matches_one(c, pre_of(self, c), v) {
+                return false;
+            }
+        }
+        if v.pre.is_empty() {
+            return true;
+        }
+        for c in self.comparators {
+            let same = c.major == v.major && c.minor == Some(v.minor) && c.patch == Some(v.patch);
+            if same && c.pre_end > c.pre_start {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+/// The pre-release text of comparator `c` of `r`.
+pub fn pre_of(r: &VersionReq, c: Comparator): str {
+    return r.pres.as_str()[c.pre_start as usize..c.pre_end as usize];
+}
+
+impl Display for VersionReq {
+    /// `^1.2`, `>=1, <3`, `*`.
+    fn fmt(&self, out: &mut String) {
+        if self.comparators.len() == 0 {
+            out.push('*');
+            return;
+        }
+        for i in 0..self.comparators.len() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let c = self.comparators[i];
+            out.push_str(match c.op {
+                Op::Exact => "=",
+                Op::Greater => ">",
+                Op::GreaterEq => ">=",
+                Op::Less => "<",
+                Op::LessEq => "<=",
+                Op::Tilde => "~",
+                Op::Caret => "^",
+                Op::Wildcard => "",
+            });
+            out.write("{c.major}");
+            match c.minor {
+                Some(minor) => {
+                    out.write(".{minor}");
+                    match c.patch {
+                        Some(patch) => {
+                            out.write(".{patch}");
+                            let pre = pre_of(self, c);
+                            if !pre.is_empty() {
+                                out.write("-{pre}");
+                            }
+                        }
+                        None => {
+                            if c.op == Op::Wildcard {
+                                out.push_str(".*");
+                            }
+                        }
+                    }
+                }
+                None => {
+                    if c.op == Op::Wildcard {
+                        out.push_str(".*");
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn matches_one(c: Comparator, pre: str, v: &Version): bool {
+    return match c.op {
+        Op::Exact => matches_exact(c, pre, v),
+        Op::Wildcard => matches_exact(c, pre, v),
+        Op::Greater => matches_greater(c, pre, v),
+        Op::GreaterEq => matches_exact(c, pre, v) || matches_greater(c, pre, v),
+        Op::Less => matches_less(c, pre, v),
+        Op::LessEq => matches_exact(c, pre, v) || matches_less(c, pre, v),
+        Op::Tilde => matches_tilde(c, pre, v),
+        Op::Caret => matches_caret(c, pre, v),
+    };
+}
+
+fn matches_exact(c: Comparator, pre: str, v: &Version): bool {
+    if v.major != c.major {
+        return false;
+    }
+    if let Some(minor) = c.minor {
+        if v.minor != minor {
+            return false;
+        }
+    }
+    if let Some(patch) = c.patch {
+        if v.patch != patch {
+            return false;
+        }
+    }
+    return v.pre.as_str() == pre;
+}
+
+fn matches_greater(c: Comparator, pre: str, v: &Version): bool {
+    if v.major != c.major {
+        return v.major > c.major;
+    }
+    let minor = match c.minor {
+        None => return false,
+        Some(m) => m,
+    };
+    if v.minor != minor {
+        return v.minor > minor;
+    }
+    let patch = match c.patch {
+        None => return false,
+        Some(p) => p,
+    };
+    if v.patch != patch {
+        return v.patch > patch;
+    }
+    return cmp_pre(v.pre.as_str(), pre) == Ordering::Greater;
+}
+
+fn matches_less(c: Comparator, pre: str, v: &Version): bool {
+    if v.major != c.major {
+        return v.major < c.major;
+    }
+    let minor = match c.minor {
+        None => return false,
+        Some(m) => m,
+    };
+    if v.minor != minor {
+        return v.minor < minor;
+    }
+    let patch = match c.patch {
+        None => return false,
+        Some(p) => p,
+    };
+    if v.patch != patch {
+        return v.patch < patch;
+    }
+    return cmp_pre(v.pre.as_str(), pre) == Ordering::Less;
+}
+
+fn matches_tilde(c: Comparator, pre: str, v: &Version): bool {
+    if v.major != c.major {
+        return false;
+    }
+    if let Some(minor) = c.minor {
+        if v.minor != minor {
+            return false;
+        }
+    }
+    if let Some(patch) = c.patch {
+        if v.patch != patch {
+            return v.patch > patch;
+        }
+    }
+    return cmp_pre(v.pre.as_str(), pre) != Ordering::Less;
+}
+
+fn matches_caret(c: Comparator, pre: str, v: &Version): bool {
+    if v.major != c.major {
+        return false;
+    }
+    let minor = match c.minor {
+        None => return true,
+        Some(m) => m,
+    };
+    let patch = match c.patch {
+        None => {
+            if c.major > 0 {
+                return v.minor >= minor;
+            }
+            return v.minor == minor;
+        }
+        Some(p) => p,
+    };
+    if c.major > 0 {
+        if v.minor != minor {
+            return v.minor > minor;
+        }
+        if v.patch != patch {
+            return v.patch > patch;
+        }
+    } else if minor > 0 {
+        if v.minor != minor {
+            return false;
+        }
+        if v.patch != patch {
+            return v.patch > patch;
+        }
+    } else if v.minor != minor || v.patch != patch {
+        return false;
+    }
+    return cmp_pre(v.pre.as_str(), pre) != Ordering::Less;
+}
+
+/// Parse one comparator at the start of `text` into `req`: the position
+/// it ended in and the text after it (and its trailing spaces).
+fn comparator(text: str, req: &mut +VersionReq): Result::<(Position, str), Error> {
+    let (op0, after_op) = op(text);
+    let mut op = op0;
+    let default_op = after_op.len() == text.len();
+    let mut rest = trim_spaces(after_op);
+    let mut pos = Position::Major;
+    let (major, r) = numeric(rest, pos)?;
+    rest = r;
+    let mut has_wildcard = false;
+    let mut minor: Option::<u64> = None;
+    let mut patch: Option::<u64> = None;
+    if rest.starts_with(".") {
+        rest = rest[1..];
+        pos = Position::Minor;
+        if let Some((_, r)) = wildcard(rest) {
+            has_wildcard = true;
+            if default_op {
+                op = Op::Wildcard;
+            }
+            rest = r;
+        } else {
+            let (m, r) = numeric(rest, pos)?;
+            minor = Some(m);
+            rest = r;
+        }
+    }
+    if rest.starts_with(".") {
+        rest = rest[1..];
+        pos = Position::Patch;
+        if let Some((_, r)) = wildcard(rest) {
+            if default_op {
+                op = Op::Wildcard;
+            }
+            rest = r;
+        } else if has_wildcard {
+            return Err(Error::new(ErrorKind::UnexpectedAfterWildcard, pos, ' '));
+        } else {
+            let (p, r) = numeric(rest, pos)?;
+            patch = Some(p);
+            rest = r;
+        }
+    }
+    let pre_start = req.pres.len() as u32;
+    if patch.is_some() && rest.starts_with("-") {
+        pos = Position::Pre;
+        let n = identifier(rest[1..], pos, true)?;
+        req.pres.push_str(rest[1..1 + n]);
+        rest = rest[1 + n..];
+    }
+    let pre_end = req.pres.len() as u32;
+    if patch.is_some() && rest.starts_with("+") {
+        pos = Position::Build;
+        let n = identifier(rest[1..], pos, false)?;
+        rest = rest[1 + n..];
+    }
+    req.comparators.push(Comparator { op, major, minor, patch, pre_start, pre_end });
+    return Ok((pos, trim_spaces(rest)));
+}
+
+/// The operator at the start of `text` (`^` if there is none) and the
+/// text after it.
+fn op(text: str): (Op, str) {
+    if text.starts_with(">=") {
+        return (Op::GreaterEq, text[2..]);
+    }
+    if text.starts_with("<=") {
+        return (Op::LessEq, text[2..]);
+    }
+    if text.starts_with("=") {
+        return (Op::Exact, text[1..]);
+    }
+    if text.starts_with(">") {
+        return (Op::Greater, text[1..]);
+    }
+    if text.starts_with("<") {
+        return (Op::Less, text[1..]);
+    }
+    if text.starts_with("~") {
+        return (Op::Tilde, text[1..]);
+    }
+    if text.starts_with("^") {
+        return (Op::Caret, text[1..]);
+    }
+    return (Op::Caret, text);
+}
+
+/// `*`, `x` or `X` at the start of `text`, and the text after it.
+fn wildcard(text: str): Option::<(char, str)> {
+    if text.starts_with("*") || text.starts_with("x") || text.starts_with("X") {
+        return Some((text.chars().next().unwrap(), text[1..]));
+    }
+    return None;
+}
+
+fn trim_spaces(s: str): str {
+    let b = s.as_bytes();
+    let mut i: usize = 0;
+    while i < b.len() && b[i] == b' ' {
+        i += 1;
+    }
+    return s[i..];
+}
+
+// ===================================================================== lexing
+
+/// A number without leading zeros at the start of `text`, and the rest.
+fn numeric(text: str, pos: Position): Result::<(u64, str), Error> {
+    let b = text.as_bytes();
+    let mut value: u64 = 0;
+    let mut len: usize = 0;
+    while len < b.len() && b[len] >= b'0' && b[len] <= b'9' {
+        if value == 0 && len > 0 {
+            return Err(Error::new(ErrorKind::LeadingZero, pos, ' '));
+        }
+        let d = (b[len] - b'0') as u64;
+        if value > (18446744073709551615 - d) / 10 {
+            return Err(Error::new(ErrorKind::Overflow, pos, ' '));
+        }
+        value = value * 10 + d;
+        len += 1;
+    }
+    if len > 0 {
+        return Ok((value, text[len..]));
+    }
+    return match text.chars().next() {
+        Some(c) => Err(Error::new(ErrorKind::UnexpectedChar, pos, c)),
+        None => Err(Error::new(ErrorKind::UnexpectedEnd, pos, ' ')),
+    };
+}
+
+/// `.` at the start of `text`, after the part at `pos`; the rest.
+fn dot(text: str, pos: Position): Result::<str, Error> {
+    if text.starts_with(".") {
+        return Ok(text[1..]);
+    }
+    return match text.chars().next() {
+        Some(c) => Err(Error::new(ErrorKind::UnexpectedCharAfter, pos, c)),
+        None => Err(Error::new(ErrorKind::UnexpectedEnd, pos, ' ')),
+    };
+}
+
+/// The length of the dot-separated identifiers (letters, digits and `-`)
+/// at the start of `text`. In a pre-release, numeric identifiers have no
+/// leading zeros.
+fn identifier(text: str, pos: Position, pre: bool): Result::<usize, Error> {
+    let b = text.as_bytes();
+    let mut i: usize = 0;
+    loop {
+        let start = i;
+        let mut digits = true;
+        while i < b.len() && (is_alnum(b[i]) || b[i] == b'-') {
+            if b[i] < b'0' || b[i] > b'9' {
+                digits = false;
+            }
+            i += 1;
+        }
+        if i == start {
+            return Err(Error::new(ErrorKind::EmptySegment, pos, ' '));
+        }
+        if pre && digits && i - start > 1 && b[start] == b'0' {
+            return Err(Error::new(ErrorKind::LeadingZero, pos, ' '));
+        }
+        if i < b.len() && b[i] == b'.' {
+            i += 1;
+            continue;
+        }
+        return Ok(i);
+    }
+}
+
+fn is_alnum(c: u8): bool {
+    return (c >= b'0' && c <= b'9') || (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z');
+}
+
+// ===================================================================== errors
+
+/// Where in a version a parse error is.
+#[derive(Eq, Debug)]
+pub enum Position {
+    Major,
+    Minor,
+    Patch,
+    Pre,
+    Build,
+}
+
+impl Display for Position {
+    fn fmt(&self, out: &mut String) {
+        out.push_str(match self {
+            Position::Major => "major version number",
+            Position::Minor => "minor version number",
+            Position::Patch => "patch version number",
+            Position::Pre => "pre-release identifier",
+            Position::Build => "build metadata",
+        });
+    }
+}
+
+#[derive(Eq, Debug)]
+pub enum ErrorKind {
+    Empty,
+    UnexpectedEnd,
+    LeadingZero,
+    Overflow,
+    EmptySegment,
+    UnexpectedChar,
+    UnexpectedCharAfter,
+    ExpectedCommaFound,
+    WildcardNotTheOnlyComparator,
+    UnexpectedAfterWildcard,
+    ExcessiveComparators,
+}
+
+/// A version or requirement that does not parse. Its message is the
+/// `semver` crate's.
+pub struct Error {
+    pub kind: ErrorKind,
+    pub pos: Position,
+    /// The character it is about, for the kinds that name one.
+    pub ch: char,
+}
+
+impl Error {
+    pub fn new(kind: ErrorKind, pos: Position, ch: char): Error {
+        return Error { kind, pos, ch };
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, out: &mut String) {
+        let pos = self.pos;
+        let ch = self.ch;
+        match self.kind {
+            ErrorKind::Empty => out.push_str("empty string, expected a semver version"),
+            ErrorKind::UnexpectedEnd => out.write("unexpected end of input while parsing {pos}"),
+            ErrorKind::LeadingZero => out.write("invalid leading zero in {pos}"),
+            ErrorKind::Overflow => out.write("value of {pos} exceeds u64::MAX"),
+            ErrorKind::EmptySegment => out.write("empty identifier segment in {pos}"),
+            ErrorKind::UnexpectedChar => out.write("unexpected character {ch:?} while parsing {pos}"),
+            ErrorKind::UnexpectedCharAfter => out.write("unexpected character {ch:?} after {pos}"),
+            ErrorKind::ExpectedCommaFound => out.write("expected comma after {pos}, found {ch:?}"),
+            ErrorKind::WildcardNotTheOnlyComparator => out.write("wildcard req ({ch}) must be the only comparator in the version req"),
+            ErrorKind::UnexpectedAfterWildcard => out.push_str("unexpected character after wildcard in version req"),
+            ErrorKind::ExcessiveComparators => out.push_str("excessive number of version comparators"),
+        }
+    }
+}
+
+// ===================================================================== tests
+
+fn req(text: str): VersionReq {
+    return match VersionReq::parse(text) {
+        Ok(r) => r,
+        Err(e) => panic("`{text}`: {e}"),
+    };
+}
+
+fn ver(text: str): Version {
+    return match Version::parse(text) {
+        Ok(v) => v,
+        Err(e) => panic("`{text}`: {e}"),
+    };
+}
+
+fn shown(r: &VersionReq): String {
+    let mut s = String::new();
+    s.write("{r}");
+    return s;
+}
+
+fn version_error(text: str): String {
+    let mut s = String::new();
+    match Version::parse(text) {
+        Ok(_) => s.push_str("ok"),
+        Err(e) => s.write("{e}"),
+    }
+    return s;
+}
+
+fn req_error(text: str): String {
+    let mut s = String::new();
+    match VersionReq::parse(text) {
+        Ok(_) => s.push_str("ok"),
+        Err(e) => s.write("{e}"),
+    }
+    return s;
+}
+
+#[test]
+fn parses_and_shows_versions() {
+    let v = ver("1.2.3-alpha.1+build.5");
+    assert_eq(&v.major, &1, "major");
+    assert_eq(&v.pre, &String::from("alpha.1"), "pre");
+    assert_eq(&v.build, &String::from("build.5"), "build");
+    let mut s = String::new();
+    s.write("{v}");
+    assert_eq(&s, &String::from("1.2.3-alpha.1+build.5"), "display");
+}
+
+#[test]
+fn version_errors() {
+    assert_eq(&version_error("one"), &String::from("unexpected character 'o' while parsing major version number"), "one");
+    assert_eq(&version_error("1.2"), &String::from("unexpected end of input while parsing minor version number"), "1.2");
+    assert_eq(&version_error(""), &String::from("empty string, expected a semver version"), "empty");
+    assert_eq(&version_error("01.2.3"), &String::from("invalid leading zero in major version number"), "zero");
+    assert_eq(&version_error("1.2.3-"), &String::from("empty identifier segment in pre-release identifier"), "pre");
+    assert_eq(&version_error("1.2.3 x"), &String::from("unexpected character ' ' after patch version number"), "after");
+}
+
+#[test]
+fn shows_requirements() {
+    assert_eq(&shown(&req("2")), &String::from("^2"), "2");
+    assert_eq(&shown(&req("1.2")), &String::from("^1.2"), "1.2");
+    assert_eq(&shown(&req(">=1, <3")), &String::from(">=1, <3"), "range");
+    assert_eq(&shown(&req("=1.2.4")), &String::from("=1.2.4"), "exact");
+    assert_eq(&shown(&req("1.*")), &String::from("1.*"), "wildcard");
+    assert_eq(&shown(&req("*")), &String::from("*"), "star");
+    assert_eq(&shown(&req("~1.2.3-beta")), &String::from("~1.2.3-beta"), "tilde");
+}
+
+#[test]
+fn requirement_errors() {
+    assert_eq(&req_error("1.2 3"), &String::from("expected comma after minor version number, found '3'"), "comma");
+    assert_eq(&req_error("*, 1"), &String::from("wildcard req (*) must be the only comparator in the version req"), "star");
+    assert_eq(&req_error("abc"), &String::from("unexpected character 'a' while parsing major version number"), "abc");
+}
+
+#[test]
+fn caret_matching() {
+    let r = req("^1.2.3");
+    assert(r.matches(&ver("1.2.3")), "1.2.3");
+    assert(r.matches(&ver("1.9.0")), "1.9.0");
+    assert(!r.matches(&ver("2.0.0")), "2.0.0");
+    assert(!r.matches(&ver("1.2.2")), "1.2.2");
+    let r = req("0.2");
+    assert(r.matches(&ver("0.2.9")), "0.2.9");
+    assert(!r.matches(&ver("0.3.0")), "0.3.0");
+    let r = req("0.0.3");
+    assert(r.matches(&ver("0.0.3")), "0.0.3");
+    assert(!r.matches(&ver("0.0.4")), "0.0.4");
+    assert(!req("2").matches(&ver("0.1.0")), "^2 and 0.1.0");
+}
+
+#[test]
+fn other_operators() {
+    assert(req(">=1, <3").matches(&ver("2.5.0")), "range");
+    assert(!req(">=1, <3").matches(&ver("3.0.0")), "range end");
+    assert(req("~1.2").matches(&ver("1.2.9")), "tilde");
+    assert(!req("~1.2").matches(&ver("1.3.0")), "tilde end");
+    assert(req("=1.2.4").matches(&ver("1.2.4")), "exact");
+    assert(!req("=1.2.4").matches(&ver("1.2.5")), "exact other");
+    assert(req("1.*").matches(&ver("1.7.0")), "wildcard");
+    assert(req("*").matches(&ver("9.9.9")), "star");
+}
+
+#[test]
+fn pre_releases() {
+    assert(!req("^1.0").matches(&ver("1.1.0-beta")), "a pre-release needs a pre-release comparator");
+    assert(req(">=1.1.0-alpha").matches(&ver("1.1.0-beta")), "same version, later pre-release");
+    assert(!req(">=1.1.0-alpha").matches(&ver("1.2.0-beta")), "other version's pre-release");
+    assert(ver("1.0.0-alpha").cmp_precedence(&ver("1.0.0")) == Ordering::Less, "pre-release first");
+    assert(cmp_pre("alpha.2", "alpha.10") == Ordering::Less, "numeric identifiers");
+    assert(cmp_pre("alpha", "alpha.1") == Ordering::Less, "longer wins");
+    assert(cmp_pre("1", "a") == Ordering::Less, "numbers before words");
+}

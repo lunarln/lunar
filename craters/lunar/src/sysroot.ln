@@ -1,0 +1,86 @@
+// Where the compiler finds what it does not embed: the standard library
+// sources (`core` and `std`) and the explanations of diagnostic codes
+// (`docs/errors`). In order:
+//
+//   1. `$LUNAR_STD_DIR` (the standard library only), for working on std;
+//   2. the installation: `<exe dir>/../lib/lunar/std` and
+//      `<exe dir>/../lib/lunar/docs/errors`;
+//   3. a source checkout: the nearest directory above the executable with
+//      `std/core/lib.ln` (and `docs/errors`), so that the compiler built
+//      in `craters/target/<profile>/` finds the repository's.
+
+use std::env;
+use std::fs;
+use crater::paths::{join, normalize, parent};
+
+/// The directory with `core/` and `std/`, if there is one.
+pub fn std_dir(): Option::<String> {
+    if let Some(d) = env::var("LUNAR_STD_DIR") {
+        if d.len() > 0 {
+            return Some(d);
+        }
+    }
+    return find("lib/lunar/std", "std", "core/lib.ln");
+}
+
+/// The directory with the explanations, `<scope>/<name>.md`, if there is
+/// one.
+pub fn docs_dir(): Option::<String> {
+    return find("lib/lunar/docs/errors", "docs/errors", "");
+}
+
+/// The help shown when the standard library cannot be found.
+pub fn std_help(): str {
+    return "set `LUNAR_STD_DIR` to the directory with `core/` and `std/`, or install it as `<prefix>/lib/lunar/std` next to `<prefix>/bin/lunar`";
+}
+
+/// `installed` under the executable's parent directory, else `in_repo`
+/// under the nearest directory above the executable that has the
+/// standard library; it must contain `probe` (if not empty).
+fn find(installed: str, in_repo: str, probe: str): Option::<String> {
+    let dir = match exe_dir() {
+        Some(d) => d,
+        None => return None,
+    };
+    if let Some(up) = parent(dir.as_str()) {
+        let candidate = join(up.as_str(), installed);
+        if has(candidate.as_str(), probe) {
+            return Some(candidate);
+        }
+    }
+    let mut d = dir;
+    loop {
+        let std = join(d.as_str(), "std/core/lib.ln");
+        if fs::is_file(std.as_str()) {
+            let candidate = join(d.as_str(), in_repo);
+            if has(candidate.as_str(), probe) {
+                return Some(candidate);
+            }
+            return None;
+        }
+        match parent(d.as_str()) {
+            Some(p) => d = p,
+            None => return None,
+        }
+    }
+}
+
+fn has(dir: str, probe: str): bool {
+    if probe.is_empty() {
+        return fs::is_dir(dir);
+    }
+    return fs::is_file(join(dir, probe).as_str());
+}
+
+/// The directory of the running executable (links resolved).
+fn exe_dir(): Option::<String> {
+    let exe = match env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return None,
+    };
+    let real = match fs::canonicalize(exe.as_str()) {
+        Ok(r) => r,
+        Err(_) => exe,
+    };
+    return parent(normalize(real.as_str()).as_str());
+}
