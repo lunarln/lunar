@@ -63,6 +63,12 @@ fn system_libs() -> Vec<&'static str> {
     }
 }
 
+/// The main thread's stack on Windows, in bytes (reserved, used as
+/// needed). Windows' default, 1 MiB, is less than deeply recursive
+/// programs need, such as the self-hosted compiler on nested macro
+/// expansions (up to 128 deep); Linux gives 8 MiB by default.
+const MAIN_STACK: usize = 8 << 20;
+
 fn link_windows(obj: &Path, out: &Path, libs: &[String], search: &[PathBuf]) -> Result<(), Diagnostic> {
     if which("clang").is_some() {
         let mut cmd = Command::new("clang");
@@ -75,7 +81,7 @@ fn link_windows(obj: &Path, out: &Path, libs: &[String], search: &[PathBuf]) -> 
         }
         // `/Brepro`: no link timestamp, so the same program links to the
         // same bytes (the self-hosted compiler's bootstrap compares them).
-        return run(cmd.args(["-llegacy_stdio_definitions", "-lkernel32", "-Wl,/Brepro"]));
+        return run(cmd.args(["-llegacy_stdio_definitions", "-lkernel32", "-Wl,/Brepro", &format!("-Wl,/STACK:{MAIN_STACK}")]));
     }
     let target = if cfg!(target_arch = "aarch64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" };
     let Some(tool) = cc::windows_registry::find_tool(target, "link.exe") else {
@@ -88,6 +94,7 @@ fn link_windows(obj: &Path, out: &Path, libs: &[String], search: &[PathBuf]) -> 
         "kernel32.lib",
         "legacy_stdio_definitions.lib",
         "/Brepro",
+        &format!("/STACK:{MAIN_STACK}"),
     ]);
     for d in search {
         cmd.arg(format!("/LIBPATH:{}", d.display()));

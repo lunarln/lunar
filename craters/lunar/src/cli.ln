@@ -1,0 +1,550 @@
+// The command line, parsed as the Rust driver's clap definitions parse
+// it, with clap's help texts and error messages (and exit code 2 for
+// usage errors). `{BIN}` in the texts is the program's file name, as clap
+// shows it (`lunar` or `lunar.exe`).
+
+use std::env;
+
+/// A parsed command line. Texts are views into the program's arguments.
+pub struct Cli {
+    /// The subcommand: `build`, `run`, ...
+    pub command: str,
+    pub positionals: [str; ..+],
+    /// The arguments after `--` (for `run`).
+    pub rest: [str; ..+],
+    pub lib: bool,
+    pub release: bool,
+    pub test: bool,
+    pub list: bool,
+    pub package: Option::<str>,
+    pub output: Option::<str>,
+    pub target_os: Option::<str>,
+    pub emit_llvm: Option::<str>,
+    pub path: Option::<str>,
+    pub git: Option::<str>,
+    pub tag: Option::<str>,
+    pub branch: Option::<str>,
+    pub rev: Option::<str>,
+}
+
+/// One option of a subcommand.
+struct Opt {
+    long: str,
+    /// The short form's letter, or empty.
+    short: str,
+    /// The value's name (`PACKAGE`), or empty for a flag.
+    value: str,
+}
+
+/// The subcommands, in help order, with their one-line descriptions.
+fn commands(): [(str, str); 14] {
+    return [
+        ("new", "Create a new package in a new directory"),
+        ("init", "Create a new package in the current directory"),
+        ("check", "Type-check a file, or the current project, without generating code"),
+        ("build", "Compile a file, or the current project's programs, to executables"),
+        ("run", "Compile and run a file, or the current project's program"),
+        ("test", "Run the `#[test]` functions of a file (`lunar test file.ln [filter]`) or of the current project (`lunar test [filter]`)"),
+        ("add", "Add a dependency to the current package"),
+        ("remove", "Remove a dependency from the current package"),
+        ("update", "Re-resolve dependencies, updating git dependencies to the newest commit of their branch or tag, and rewrite lunar.lock"),
+        ("clean", "Remove the workspace's build output (target/)"),
+        ("emit-llvm", "Print the optimized LLVM IR for a program without building it"),
+        ("lsp", "Run the language server (LSP over stdio), for editors"),
+        ("explain", "Explain a diagnostic code, e.g. `borrow::shrink_while_borrowed`"),
+        ("help", "Print this message or the help of the given subcommand(s)"),
+    ];
+}
+
+/// The options a subcommand takes.
+fn options(cmd: str, out: &mut +[Opt; ..+]) {
+    let p = Opt { long: "package", short: "p", value: "PACKAGE" };
+    let release = Opt { long: "release", short: "", value: "" };
+    if cmd == "new" || cmd == "init" {
+        out.push(Opt { long: "lib", short: "", value: "" });
+    } else if cmd == "check" {
+        out.push(p);
+        out.push(Opt { long: "target-os", short: "", value: "TARGET_OS" });
+    } else if cmd == "build" {
+        out.push(p);
+        out.push(Opt { long: "output", short: "o", value: "OUTPUT" });
+        out.push(release);
+        out.push(Opt { long: "emit-llvm", short: "", value: "EMIT_LLVM" });
+    } else if cmd == "run" || cmd == "test" {
+        out.push(p);
+        out.push(release);
+    } else if cmd == "add" {
+        out.push(Opt { long: "path", short: "", value: "PATH" });
+        out.push(Opt { long: "git", short: "", value: "GIT" });
+        out.push(Opt { long: "tag", short: "", value: "TAG" });
+        out.push(Opt { long: "branch", short: "", value: "BRANCH" });
+        out.push(Opt { long: "rev", short: "", value: "REV" });
+        out.push(Opt { long: "package", short: "", value: "PACKAGE" });
+    } else if cmd == "emit-llvm" {
+        out.push(Opt { long: "output", short: "o", value: "OUTPUT" });
+        out.push(release);
+        out.push(Opt { long: "test", short: "", value: "" });
+    } else if cmd == "lsp" {
+        // Accepted for compatibility with LSP clients (hidden).
+        out.push(Opt { long: "stdio", short: "", value: "" });
+    } else if cmd == "explain" {
+        out.push(Opt { long: "list", short: "", value: "" });
+    }
+}
+
+/// How many positional arguments a subcommand takes (at most; 1000 for
+/// "any number"), and how many it needs.
+fn positional_counts(cmd: str): (usize, usize) {
+    if cmd == "new" || cmd == "add" || cmd == "remove" || cmd == "emit-llvm" {
+        return (1, 1);
+    }
+    if cmd == "check" || cmd == "build" || cmd == "run" || cmd == "explain" {
+        return (1, 0);
+    }
+    if cmd == "test" || cmd == "help" {
+        return (1000, 0);
+    }
+    return (0, 0);
+}
+
+/// The usage line after `Usage: {BIN} `.
+fn usage(cmd: str): str {
+    if cmd == "new" {
+        return "new [OPTIONS] <PATH>";
+    }
+    if cmd == "init" {
+        return "init [OPTIONS]";
+    }
+    if cmd == "check" {
+        return "check [OPTIONS] [FILE]";
+    }
+    if cmd == "build" {
+        return "build [OPTIONS] [FILE]";
+    }
+    if cmd == "run" {
+        return "run [OPTIONS] [FILE] [-- <ARGS>...]";
+    }
+    if cmd == "test" {
+        return "test [OPTIONS] [ARGS]...";
+    }
+    if cmd == "add" {
+        return "add [OPTIONS] <NAME>";
+    }
+    if cmd == "remove" {
+        return "remove <NAME>";
+    }
+    if cmd == "update" {
+        return "update";
+    }
+    if cmd == "clean" {
+        return "clean";
+    }
+    if cmd == "emit-llvm" {
+        return "emit-llvm [OPTIONS] <FILE>";
+    }
+    if cmd == "lsp" {
+        return "lsp";
+    }
+    if cmd == "explain" {
+        return "explain [OPTIONS] [CODE]";
+    }
+    if cmd == "help" {
+        return "help [COMMAND]...";
+    }
+    return "<COMMAND>";
+}
+
+/// The usage clap shows when a required argument is missing.
+fn required_usage(cmd: str): str {
+    if cmd == "new" {
+        return "new <PATH>";
+    }
+    if cmd == "add" {
+        return "add <NAME>";
+    }
+    if cmd == "emit-llvm" {
+        return "emit-llvm <FILE>";
+    }
+    return usage(cmd);
+}
+
+/// The name of the missing required argument.
+fn required_name(cmd: str): str {
+    if cmd == "new" {
+        return "<PATH>";
+    }
+    if cmd == "emit-llvm" {
+        return "<FILE>";
+    }
+    return "<NAME>";
+}
+
+/// A subcommand's help, after its description and usage.
+fn sections(cmd: str): str {
+    if cmd == "new" {
+        return "Arguments:\n  <PATH>  \n\nOptions:\n      --lib   Create a library (src/lib.ln) instead of a program (src/main.ln)\n  -h, --help  Print help\n";
+    }
+    if cmd == "init" {
+        return "Options:\n      --lib   \n  -h, --help  Print help\n";
+    }
+    if cmd == "check" {
+        return "Arguments:\n  [FILE]  \n\nOptions:\n  -p, --package <PACKAGE>      In a workspace, only this member package\n      --target-os <TARGET_OS>  Evaluate `#[cfg]` for this OS instead of the host (linux, macos, windows)\n  -h, --help                   Print help\n";
+    }
+    if cmd == "build" {
+        return "Arguments:\n  [FILE]  \n\nOptions:\n  -p, --package <PACKAGE>      In a workspace, only this member package\n  -o, --output <OUTPUT>        Output path (defaults to the file name without extension, or target/<profile>/<package> in a project)\n      --release                Optimize (and disable overflow checks)\n      --emit-llvm <EMIT_LLVM>  Also write the (optimized) LLVM IR to this file\n  -h, --help                   Print help\n";
+    }
+    if cmd == "run" {
+        return "Arguments:\n  [FILE]     \n  [ARGS]...  Arguments passed to the program (after `--`)\n\nOptions:\n  -p, --package <PACKAGE>  In a workspace, the member package whose program to run\n      --release            \n  -h, --help               Print help\n";
+    }
+    if cmd == "test" {
+        return "Arguments:\n  [ARGS]...  A `.ln` file and/or a filter: only tests whose name contains it run\n\nOptions:\n  -p, --package <PACKAGE>  In a workspace, only this member package\n      --release            \n  -h, --help               Print help\n";
+    }
+    if cmd == "add" {
+        return "Arguments:\n  <NAME>  The dependency's name, optionally with a version: `json` or `json@1.2`\n\nOptions:\n      --path <PATH>        A local package directory\n      --git <GIT>          A git repository URL\n      --tag <TAG>          \n      --branch <BRANCH>    \n      --rev <REV>          \n      --package <PACKAGE>  The package's real name, if the dependency is renamed\n  -h, --help               Print help\n";
+    }
+    if cmd == "remove" {
+        return "Arguments:\n  <NAME>  \n\nOptions:\n  -h, --help  Print help\n";
+    }
+    if cmd == "emit-llvm" {
+        return "Arguments:\n  <FILE>  \n\nOptions:\n  -o, --output <OUTPUT>  Write the IR to this file instead of stdout\n      --release          Optimize (and disable overflow checks), as `build --release` does\n      --test             Emit the `#[test]` harness instead of `main`\n  -h, --help             Print help\n";
+    }
+    if cmd == "explain" {
+        return "Arguments:\n  [CODE]  The code, as `scope::name` or pasted as `err(scope::name)`. Without one, list every code\n\nOptions:\n      --list  List every code with a one-line summary\n  -h, --help  Print help\n";
+    }
+    if cmd == "help" {
+        return "Arguments:\n  [COMMAND]...  Print help for the subcommand(s)\n";
+    }
+    return "Options:\n  -h, --help  Print help\n";
+}
+
+/// The program's name as clap shows it: argv[0]'s file name.
+fn bin(): str {
+    let a = match env::arg(0) {
+        Some(a) => a,
+        None => return "lunar",
+    };
+    let b = a.as_bytes();
+    let mut start = b.len();
+    while start > 0 && b[start - 1] != b'/' && b[start - 1] != b'\\' {
+        start -= 1;
+    }
+    if start == b.len() {
+        return "lunar";
+    }
+    return a[start..];
+}
+
+/// `text` with `{BIN}` replaced.
+fn with_bin(text: str): String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("{BIN}") {
+        out.push_str(rest[..i]);
+        out.push_str(bin());
+        rest = rest[i + 5..];
+    }
+    out.push_str(rest);
+    return out;
+}
+
+/// The top-level help.
+fn main_help(): String {
+    let mut s = String::from("The Lunar programming language: compiler and project manager\n\nUsage: {BIN} <COMMAND>\n\nCommands:\n");
+    for c in commands() {
+        let (name, about) = c;
+        s.push_str("  ");
+        s.push_str(name);
+        for _ in name.len()..11 {
+            s.push(' ');
+        }
+        s.push_str(about);
+        s.push('\n');
+    }
+    s.push_str("\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version\n");
+    return with_bin(s.as_str());
+}
+
+fn about(cmd: str): str {
+    for c in commands() {
+        let (name, a) = c;
+        if name == cmd {
+            return a;
+        }
+    }
+    return "";
+}
+
+/// A subcommand's help.
+fn command_help(cmd: str): String {
+    let mut s = String::new();
+    s.push_str(about(cmd));
+    s.push_str("\n\nUsage: {BIN} ");
+    s.push_str(usage(cmd));
+    s.push_str("\n\n");
+    s.push_str(sections(cmd));
+    return with_bin(s.as_str());
+}
+
+/// Print a usage error as clap does; its exit code (2).
+fn usage_error(message: str, usage_line: str, tip: str): i32 {
+    let mut s = String::from("error: ");
+    s.push_str(message);
+    s.push('\n');
+    if tip.len() > 0 {
+        s.push_str("\n  tip: ");
+        s.push_str(tip);
+        s.push('\n');
+    }
+    if usage_line.len() > 0 {
+        s.push_str("\nUsage: {BIN} ");
+        s.push_str(usage_line);
+        s.push('\n');
+    }
+    s.push_str("\nFor more information, try '--help'.\n");
+    std::io::ewrite_str(with_bin(s.as_str()).as_str());
+    return 2;
+}
+
+fn is_command(name: str): bool {
+    for c in commands() {
+        let (n, _) = c;
+        if n == name {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Parse the command line: the command to run, or the exit code after
+/// printing help, the version or a usage error.
+pub fn parse(): Result::<Cli, i32> {
+    let mut cli = Cli {
+        command: "",
+        positionals: [],
+        rest: [],
+        lib: false,
+        release: false,
+        test: false,
+        list: false,
+        package: None,
+        output: None,
+        target_os: None,
+        emit_llvm: None,
+        path: None,
+        git: None,
+        tag: None,
+        branch: None,
+        rev: None,
+    };
+    let n = env::arg_count();
+    if n < 2 {
+        std::io::ewrite_str(main_help().as_str());
+        return Err(2);
+    }
+    let first = env::arg(1).unwrap();
+    if first == "-h" || first == "--help" {
+        std::io::write_str(main_help().as_str());
+        return Err(0);
+    }
+    if first == "-V" || first == "--version" {
+        println("lunar 0.1.0");
+        return Err(0);
+    }
+    if first.starts_with("-") {
+        let mut m = String::new();
+        m.write("unexpected argument '{first}' found");
+        return Err(usage_error(m.as_str(), "<COMMAND>", ""));
+    }
+    if !is_command(first) {
+        let mut m = String::new();
+        m.write("unrecognized subcommand '{first}'");
+        return Err(usage_error(m.as_str(), "<COMMAND>", ""));
+    }
+    let cmd = first;
+    cli.command = cmd;
+    let mut opts: [Opt; ..+] = [];
+    options(cmd, &mut opts);
+    let (max_pos, min_pos) = positional_counts(cmd);
+    let mut seen: [str; ..+] = [];
+    let mut i: usize = 2;
+    let mut dashdash = false;
+    while i < n {
+        let a = env::arg(i).unwrap();
+        i += 1;
+        if dashdash || a == "-" || !a.starts_with("-") {
+            if dashdash && cmd == "run" {
+                cli.rest.push(a);
+                continue;
+            }
+            if cli.positionals.len() >= max_pos {
+                let mut m = String::new();
+                m.write("unexpected argument '{a}' found");
+                return Err(usage_error(m.as_str(), usage(cmd), ""));
+            }
+            cli.positionals.push(a);
+            continue;
+        }
+        if a == "--" {
+            dashdash = true;
+            continue;
+        }
+        if a == "-h" || a == "--help" {
+            std::io::write_str(command_help(cmd).as_str());
+            return Err(0);
+        }
+        // `--name`, `--name=value`, `-x`, `-xvalue`.
+        let mut name = a;
+        let mut inline: Option::<str> = None;
+        let mut found: Option::<Opt> = None;
+        if a.starts_with("--") {
+            let body = a[2..];
+            match body.find("=") {
+                Some(eq) => {
+                    name = body[..eq];
+                    inline = Some(body[eq + 1..]);
+                }
+                None => name = body,
+            }
+            for o in opts {
+                if o.long == name {
+                    found = Some(o);
+                }
+            }
+        } else {
+            let letter = a[1..2];
+            for o in opts {
+                if o.short == letter && o.short.len() > 0 {
+                    found = Some(o);
+                    name = o.long;
+                    if a.len() > 2 {
+                        inline = Some(a[2..]);
+                    }
+                }
+            }
+        }
+        let o = match found {
+            Some(o) => o,
+            None => {
+                let mut m = String::new();
+                m.write("unexpected argument '{a}' found");
+                let mut tip = String::new();
+                if max_pos > 0 {
+                    tip.write("to pass '{a}' as a value, use '-- {a}'");
+                }
+                return Err(usage_error(m.as_str(), usage(cmd), tip.as_str()));
+            }
+        };
+        let mut shown = String::from("--");
+        shown.push_str(o.long);
+        if o.value.len() > 0 {
+            shown.write(" <{o.value}>");
+        }
+        for s in seen {
+            if s == o.long {
+                let mut m = String::new();
+                m.write("the argument '{shown}' cannot be used multiple times");
+                return Err(usage_error(m.as_str(), usage(cmd), ""));
+            }
+        }
+        seen.push(o.long);
+        if o.value.len() == 0 {
+            if let Some(v) = inline {
+                let mut m = String::new();
+                m.write("unexpected value '{v}' for '--{o.long}' found; no more were expected");
+                // clap's usage names the flag in place of `[OPTIONS]`.
+                let u = usage(cmd);
+                let mut line = String::new();
+                match u.find("[OPTIONS]") {
+                    Some(k) => line.write("{u[..k]}--{o.long}{u[k + 9..]}"),
+                    None => line.push_str(u),
+                }
+                return Err(usage_error(m.as_str(), line.as_str(), ""));
+            }
+            set_flag(&mut cli, o.long);
+            continue;
+        }
+        let value = match inline {
+            Some(v) => v,
+            None => {
+                let next = env::arg(i);
+                match next {
+                    Some(v) => {
+                        if v.starts_with("-") && v.len() > 1 {
+                            return Err(missing_value(shown.as_str()));
+                        }
+                        i += 1;
+                        v
+                    }
+                    None => return Err(missing_value(shown.as_str())),
+                }
+            }
+        };
+        set_value(&mut cli, cmd, o.long, value);
+    }
+    if cli.positionals.len() < min_pos {
+        let mut m = String::from("the following required arguments were not provided:\n  ");
+        m.push_str(required_name(cmd));
+        return Err(usage_error(m.as_str(), required_usage(cmd), ""));
+    }
+    if cmd == "help" {
+        if cli.positionals.len() == 0 {
+            std::io::write_str(main_help().as_str());
+            return Err(0);
+        }
+        let c = cli.positionals[0];
+        if !is_command(c) {
+            let mut m = String::new();
+            m.write("unrecognized subcommand '{c}'");
+            return Err(usage_error(m.as_str(), "<COMMAND>", ""));
+        }
+        if c == "help" {
+            std::io::write_str(main_help().as_str());
+        } else {
+            std::io::write_str(command_help(c).as_str());
+        }
+        return Err(0);
+    }
+    return Ok(cli);
+}
+
+fn missing_value(shown: str): i32 {
+    let mut s = String::new();
+    s.write("error: a value is required for '{shown}' but none was supplied\n\nFor more information, try '--help'.\n");
+    std::io::ewrite_str(s.as_str());
+    return 2;
+}
+
+fn set_flag(cli: &mut Cli, long: str) {
+    if long == "lib" {
+        cli.lib = true;
+    } else if long == "release" {
+        cli.release = true;
+    } else if long == "test" {
+        cli.test = true;
+    } else if long == "list" {
+        cli.list = true;
+    }
+}
+
+fn set_value(cli: &mut Cli, cmd: str, long: str, kept v: str) {
+    let _ = cmd;
+    if long == "package" {
+        cli.package = Some(v);
+    } else if long == "output" {
+        cli.output = Some(v);
+    } else if long == "target-os" {
+        cli.target_os = Some(v);
+    } else if long == "emit-llvm" {
+        cli.emit_llvm = Some(v);
+    } else if long == "path" {
+        cli.path = Some(v);
+    } else if long == "git" {
+        cli.git = Some(v);
+    } else if long == "tag" {
+        cli.tag = Some(v);
+    } else if long == "branch" {
+        cli.branch = Some(v);
+    } else if long == "rev" {
+        cli.rev = Some(v);
+    }
+}

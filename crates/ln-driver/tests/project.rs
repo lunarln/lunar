@@ -5,8 +5,14 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// The compiler under test: `$LUNAR_BIN` if set (such as the Lunar-built
+/// `craters/target/release/lunar`), else this crate's `lunar`.
+fn lunar_bin() -> std::ffi::OsString {
+    std::env::var_os("LUNAR_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_lunar").into())
+}
+
 fn lunar(dir: &Path, home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_lunar")).args(args).current_dir(dir).env("LUNAR_HOME", home).env_remove("LUNAR_STD_DIR").output().unwrap()
+    Command::new(lunar_bin()).args(args).current_dir(dir).env("LUNAR_HOME", home).env_remove("LUNAR_STD_DIR").output().unwrap()
 }
 
 fn ok(dir: &Path, home: &Path, args: &[&str]) -> String {
@@ -213,8 +219,7 @@ struct Lsp {
 impl Lsp {
     fn start(home: &Path) -> Lsp {
         use std::process::Stdio;
-        // `$LUNAR_BIN` (such as the compiler built from craters/) if set.
-        let mut child = Command::new(std::env::var_os("LUNAR_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_lunar").into()))
+        let mut child = Command::new(lunar_bin())
             .args(["lsp", "--stdio"])
             .env("LUNAR_HOME", home)
             .env_remove("LUNAR_STD_DIR")

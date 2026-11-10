@@ -1,0 +1,412 @@
+// Editing a document's text in place, as `toml_edit` does: a changed
+// key-value pair takes the place (and only the place) of the old one,
+// comments and blank lines elsewhere stay as they are, and a new table goes
+// after the last item, before the comments that end the document.
+//
+// The comments and blank lines right before a key-value pair belong to it
+// (`toml_edit`'s "decor"): replacing or removing the pair replaces or
+// removes them too.
+
+use crater::{Doc, Error, Kind, TableKind, parse};
+
+/// `text` with `key = value` (`value` is TOML, such as `"1.2"` or
+/// `{ path = "../x" }`) in the top-level table `table`, replacing the key
+/// if it is there, and making the table if it is missing.
+pub fn set_key(text: str, table: str, key: str, value: str): Result::<String, Error> {
+    let d = parse(text)?;
+    let mut line = String::new();
+    line.write("{bare_or_quoted(key)} = {value}");
+    let te = match d.get(0, table) {
+        Some(e) => e,
+        None => return Ok(append_table(text, table, line.as_str())),
+    };
+    let t = d.entries[te as usize].value;
+    let tv = d.values[t as usize];
+    if tv.kind != Kind::Table {
+        return Err(not_a_table(table, d.entries[te as usize].key_lo, d.entries[te as usize].key_hi));
+    }
+    if tv.table == TableKind::Inline {
+        return Ok(set_inline(text, &d, t, key, value));
+    }
+    if tv.table == TableKind::Implicit {
+        // Only sub-tables (`[table.x]`) so far: define it at the end.
+        return Ok(append_table(text, table, line.as_str()));
+    }
+    if tv.table != TableKind::Header {
+        return Err(not_a_table(table, d.entries[te as usize].key_lo, d.entries[te as usize].key_hi));
+    }
+    let mut base = String::from(text);
+    if let Some(ke) = d.get(t, key) {
+        let e = d.entries[ke as usize];
+        let v = d.values[e.value as usize];
+        if v.kind == Kind::Table && (v.table == TableKind::Header || v.table == TableKind::Implicit) {
+            // `[table.key]`: drop the section, then add the key below.
+            base = remove_section(text, &d, e.value);
+        } else {
+            let lo = decor_start(text, e.line_lo as usize);
+            let hi = line_end(text, v.hi as usize);
+            let mut out = String::from(text[..lo]);
+            out.push_str(line.as_str());
+            out.push('\n');
+            out.push_str(text[hi..]);
+            return Ok(out);
+        }
+    }
+    return Ok(insert_in_table(base.as_str(), table, line.as_str()));
+}
+
+/// `text` without `key` in the top-level table `table`, or `None` if
+/// there is no such key.
+pub fn remove_key(text: str, table: str, key: str): Result::<Option::<String>, Error> {
+    let d = parse(text)?;
+    let te = match d.get(0, table) {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    let t = d.entries[te as usize].value;
+    if d.values[t as usize].kind != Kind::Table {
+        return Ok(None);
+    }
+    let ke = match d.get(t, key) {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    let e = d.entries[ke as usize];
+    let v = d.values[e.value as usize];
+    if v.kind == Kind::Table && (v.table == TableKind::Header || v.table == TableKind::Implicit) {
+        return Ok(Some(remove_section(text, &d, e.value)));
+    }
+    if d.values[t as usize].table == TableKind::Inline {
+        return Ok(Some(remove_inline(text, &d, t, ke)));
+    }
+    let lo = decor_start(text, e.line_lo as usize);
+    let hi = line_end(text, v.hi as usize);
+    let mut out = String::from(text[..lo]);
+    out.push_str(text[hi..]);
+    return Ok(Some(out));
+}
+
+/// A string as TOML: `'...'` if it has backslashes (and no `'` or
+/// control characters), else `"..."` with escapes.
+pub fn quote(s: str): String {
+    let mut out = String::new();
+    let mut controls = false;
+    for c in s.chars() {
+        if (c as u32) < 32 || (c as u32) == 127 {
+            controls = true;
+        }
+    }
+    if s.contains("\\") && !s.contains("'") && !controls {
+        out.push('\'');
+        out.push_str(s);
+        out.push('\'');
+        return out;
+    }
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' {
+            out.push_str("\\\"");
+        } else if c == '\\' {
+            out.push_str("\\\\");
+        } else if c == '\n' {
+            out.push_str("\\n");
+        } else if c == '\t' {
+            out.push_str("\\t");
+        } else if c == '\r' {
+            out.push_str("\\r");
+        } else if (c as u32) < 32 || (c as u32) == 127 {
+            out.write("\\u{hex4(c as u32)}");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('"');
+    return out;
+}
+
+/// A key as TOML: bare if it can be, else quoted.
+pub fn bare_or_quoted(k: str): String {
+    let mut bare = k.len() > 0;
+    for b in k.bytes() {
+        let ok = (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') || (b >= b'0' && b <= b'9') || b == b'_' || b == b'-';
+        if !ok {
+            bare = false;
+        }
+    }
+    if bare {
+        return String::from(k);
+    }
+    return quote(k);
+}
+
+fn hex4(n: u32): String {
+    let digits = "0123456789ABCDEF".as_bytes();
+    let mut s = String::new();
+    let mut shift: u32 = 12;
+    loop {
+        s.push(digits[((n >> shift) & 15) as usize] as char);
+        if shift == 0 {
+            return s;
+        }
+        shift -= 4;
+    }
+}
+
+fn not_a_table(table: str, lo: u32, hi: u32): Error {
+    let mut m = String::new();
+    m.write("`{table}` is not a table");
+    return Error { message: m, lo, hi };
+}
+
+// ===================================================================== lines
+
+/// Where the line holding `pos` starts.
+fn line_start(text: str, pos: usize): usize {
+    let b = text.as_bytes();
+    let mut i = pos;
+    while i > 0 && b[i - 1] != b'\n' {
+        i -= 1;
+    }
+    return i;
+}
+
+/// Just past the newline ending the line that holds `pos` (the end of the
+/// text if it has none).
+fn line_end(text: str, pos: usize): usize {
+    let b = text.as_bytes();
+    let mut i = pos;
+    while i < b.len() && b[i] != b'\n' {
+        i += 1;
+    }
+    return if i < b.len() { i + 1 } else { i };
+}
+
+/// Whether `line` holds nothing but a comment or whitespace.
+fn is_trivia(line: str): bool {
+    let t = line.trim();
+    return t.is_empty() || t.starts_with("#");
+}
+
+/// The start of the comments and blank lines right before the line at
+/// `pos`: what `toml_edit` counts as part of the item there.
+fn decor_start(text: str, pos: usize): usize {
+    let mut start = line_start(text, pos);
+    while start > 0 {
+        let prev = line_start(text, start - 1);
+        if !is_trivia(text[prev..start]) {
+            break;
+        }
+        start = prev;
+    }
+    return start;
+}
+
+/// Where the comments and blank lines that end the document start.
+fn trailing_start(text: str): usize {
+    let mut start = text.len();
+    while start > 0 {
+        let prev = line_start(text, start - 1);
+        if !is_trivia(text[prev..start]) {
+            break;
+        }
+        start = prev;
+    }
+    return start;
+}
+
+/// `text` with `[table]` and `line` added after the last item.
+fn append_table(text: str, table: str, line: str): String {
+    let p = trailing_start(text);
+    let mut out = String::from(text[..p]);
+    if p > 0 {
+        if !out.as_str().ends_with("\n") {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out.write("[{bare_or_quoted(table)}]\n{line}\n");
+    out.push_str(text[p..]);
+    return out;
+}
+
+/// `text` with `line` after the last key-value pair of the header table
+/// `table` (or right after its header).
+fn insert_in_table(text: str, table: str, line: str): String {
+    let d = match parse(text) {
+        Ok(d) => d,
+        Err(_) => return String::from(text),
+    };
+    let t = d.entries[d.get(0, table).unwrap() as usize].value;
+    let header = d.values[t as usize];
+    let mut at = line_end(text, header.hi as usize);
+    for i in 0..d.entries.len() {
+        let e = d.entries[i];
+        if e.parent != t || e.line_lo < header.hi {
+            continue;
+        }
+        let v = d.values[e.value as usize];
+        // Sub-tables have headers of their own, elsewhere.
+        if v.kind == Kind::Table && (v.table == TableKind::Header || v.table == TableKind::Implicit) {
+            continue;
+        }
+        if v.kind == Kind::Array && v.array_of_tables {
+            continue;
+        }
+        let end = line_end(text, v.hi as usize);
+        if end > at {
+            at = end;
+        }
+    }
+    let mut out = String::from(text[..at]);
+    if at > 0 && !out.as_str().ends_with("\n") {
+        out.push('\n');
+    }
+    out.push_str(line);
+    out.push('\n');
+    out.push_str(text[at..]);
+    return out;
+}
+
+/// `text` without the section of the header table `t` (from its header,
+/// with the comments before it, up to the next header's comments).
+fn remove_section(text: str, d: &Doc, t: u32): String {
+    let header = d.values[t as usize];
+    let lo = decor_start(text, header.lo as usize);
+    let mut hi = trailing_start(text);
+    if hi < lo {
+        hi = text.len();
+    }
+    for i in 0..d.values.len() {
+        let v = d.values[i];
+        let is_header = v.kind == Kind::Table && (v.table == TableKind::Header || v.table == TableKind::ArrayItem);
+        if is_header && v.lo > header.lo {
+            let s = decor_start(text, v.lo as usize);
+            if s < hi && s >= lo {
+                hi = s;
+            }
+        }
+    }
+    let mut out = String::from(text[..lo]);
+    out.push_str(text[hi..]);
+    return out;
+}
+
+// ===================================================================== inline tables
+
+fn set_inline(text: str, d: &Doc, t: u32, key: str, value: str): String {
+    let tv = d.values[t as usize];
+    if let Some(ke) = d.get(t, key) {
+        let v = d.values[d.entries[ke as usize].value as usize];
+        let mut out = String::from(text[..v.lo as usize]);
+        out.push_str(value);
+        out.push_str(text[v.hi as usize..]);
+        return out;
+    }
+    let close = (tv.hi - 1) as usize;
+    let mut out = String::new();
+    if d.children(t).len() == 0 {
+        out.push_str(text[..tv.lo as usize]);
+        out.write("{{ {bare_or_quoted(key)} = {value} }}");
+    } else {
+        out.push_str(text[..close]);
+        out.write(", {bare_or_quoted(key)} = {value} }}");
+    }
+    out.push_str(text[tv.hi as usize..]);
+    return out;
+}
+
+fn remove_inline(text: str, d: &Doc, t: u32, ke: u32): String {
+    let tv = d.values[t as usize];
+    let items = d.children(t);
+    let e = d.entries[ke as usize];
+    let v = d.values[e.value as usize];
+    let b = text.as_bytes();
+    let mut lo = e.line_lo as usize;
+    let mut hi = v.hi as usize;
+    // The comma after it, or, for the last pair, the one before it.
+    let mut j = hi;
+    while j < tv.hi as usize && (b[j] == b' ' || b[j] == b'\t') {
+        j += 1;
+    }
+    if j < tv.hi as usize && b[j] == b',' {
+        hi = j + 1;
+        while hi < tv.hi as usize && (b[hi] == b' ' || b[hi] == b'\t') {
+            hi += 1;
+        }
+    } else if items.len() > 1 {
+        let mut k = lo;
+        while k > tv.lo as usize + 1 && (b[k - 1] == b' ' || b[k - 1] == b'\t') {
+            k -= 1;
+        }
+        if k > tv.lo as usize + 1 && b[k - 1] == b',' {
+            lo = k - 1;
+        }
+    }
+    let mut out = String::from(text[..lo]);
+    out.push_str(text[hi..]);
+    return out;
+}
+
+// ===================================================================== tests
+
+fn set(text: str, table: str, key: str, value: str): String {
+    return match set_key(text, table, key, value) {
+        Ok(s) => s,
+        Err(e) => panic("{e.message}"),
+    };
+}
+
+fn removed(text: str, table: str, key: str): String {
+    return match remove_key(text, table, key) {
+        Ok(Some(s)) => s,
+        Ok(None) => String::from("<none>"),
+        Err(e) => panic("{e.message}"),
+    };
+}
+
+#[test]
+fn adds_to_a_missing_table() {
+    let r = set("[package]\nname = \"app\"\nversion = \"0.1.0\"\n# trailing\n", "dependencies", "lib2", "{ path = \"../lib2\" }");
+    assert_eq(&r, &String::from("[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nlib2 = { path = \"../lib2\" }\n# trailing\n"), "new table");
+    let r = set("[package]\nname = \"app\"\nversion = \"0.1.0\"", "dependencies", "lib2", "\"1\"");
+    assert_eq(&r, &String::from("[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nlib2 = \"1\"\n"), "no final newline");
+}
+
+#[test]
+fn adds_and_replaces_in_a_table() {
+    let src = "[package]\nname = \"app\"\n\n[dependencies]\n# comment\nlib2   =   \"1\"  # c\nzz = { path = \"x\" }\n\n# end\n";
+    let r = set(src, "dependencies", "lib2", "{ path = \"../lib2\" }");
+    assert_eq(&r, &String::from("[package]\nname = \"app\"\n\n[dependencies]\nlib2 = { path = \"../lib2\" }\nzz = { path = \"x\" }\n\n# end\n"), "replace");
+    let r = set(src, "dependencies", "new", "\"2\"");
+    assert_eq(&r, &String::from("[package]\nname = \"app\"\n\n[dependencies]\n# comment\nlib2   =   \"1\"  # c\nzz = { path = \"x\" }\nnew = \"2\"\n\n# end\n"), "append");
+    let r = set("[dependencies]\n\n\n[workspace]\nmembers = []\n", "dependencies", "a", "\"1\"");
+    assert_eq(&r, &String::from("[dependencies]\na = \"1\"\n\n\n[workspace]\nmembers = []\n"), "empty table");
+    let r = set("[dependencies]\na = \"1\"", "dependencies", "b", "\"2\"");
+    assert_eq(&r, &String::from("[dependencies]\na = \"1\"\nb = \"2\"\n"), "no final newline");
+}
+
+#[test]
+fn edits_inline_tables() {
+    let r = set("dependencies = { a = \"1\" }\n", "dependencies", "b", "\"2\"");
+    assert_eq(&r, &String::from("dependencies = { a = \"1\" , b = \"2\" }\n"), "inline add");
+    let r = removed("dependencies = { a = \"1\", b = \"2\" }\n", "dependencies", "a");
+    assert_eq(&r, &String::from("dependencies = { b = \"2\" }\n"), "inline remove");
+}
+
+#[test]
+fn removes_keys() {
+    let r = removed("[dependencies]\n# comment\nlib2 = \"1\"  # c\n\n[other]\nx = 1\n", "dependencies", "lib2");
+    assert_eq(&r, &String::from("[dependencies]\n\n[other]\nx = 1\n"), "remove");
+    assert_eq(&removed("[dependencies]\na = \"1\"\n", "dependencies", "b"), &String::from("<none>"), "missing");
+    let r = removed("[package]\nname = \"x\"\n\n[dependencies.foo]\npath = \"y\"\n\n[other]\n", "dependencies", "foo");
+    assert_eq(&r, &String::from("[package]\nname = \"x\"\n\n[other]\n"), "section");
+}
+
+#[test]
+fn quotes_strings() {
+    assert_eq(&quote("../x"), &String::from("\"../x\""), "plain");
+    assert_eq(&quote("C:\\x"), &String::from("'C:\\x'"), "backslash");
+    assert_eq(&quote("a\"b"), &String::from("\"a\\\"b\""), "quote");
+    assert_eq(&bare_or_quoted("my-dep"), &String::from("my-dep"), "bare");
+    assert_eq(&bare_or_quoted("a.b"), &String::from("\"a.b\""), "quoted key");
+}

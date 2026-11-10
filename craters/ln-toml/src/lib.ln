@@ -1,0 +1,986 @@
+// TOML documents with positions: a port of what `lunar` uses of the
+// `toml` and `toml_edit` crates. `parse` reads a document into a tree of
+// values in which every key and value knows where it is in the text (for
+// diagnostics that point into `lunar.toml`); `edit` changes a document's
+// text in place, keeping its comments and layout, as `toml_edit` does.
+//
+// The tree is flat: values and table entries are arrays indexed by `u32`.
+// Value 0 is the root table. A table's entries and an array's items are
+// the `Entry`s whose `parent` is that value, in document order.
+
+pub mod edit;
+
+/// What a value is.
+#[derive(Eq, Debug)]
+pub enum Kind {
+    String,
+    Integer,
+    Float,
+    Boolean,
+    Datetime,
+    Array,
+    Table,
+}
+
+/// How a table came to be.
+#[derive(Eq, Debug)]
+pub enum TableKind {
+    /// The document itself.
+    Root,
+    /// A `[header]`.
+    Header,
+    /// A parent named by a header (`a` of `[a.b]`) but not itself defined.
+    Implicit,
+    /// Made by a dotted key (`a` of `a.b = 1`).
+    Dotted,
+    /// `{ ... }`.
+    Inline,
+    /// An element of an array of tables (`[[header]]`).
+    ArrayItem,
+}
+
+pub struct Value {
+    pub kind: Kind,
+    /// Where it is in the text: the literal; a header table's `[header]`;
+    /// an inline table's or array's brackets.
+    pub lo: u32,
+    pub hi: u32,
+    /// An integer's value; a boolean's (as 0 or 1).
+    pub int: i64,
+    /// A string's text (after escapes), in `Doc::strs`.
+    pub s_lo: u32,
+    pub s_hi: u32,
+    pub table: TableKind,
+    /// An array made of `[[header]]` tables.
+    pub array_of_tables: bool,
+}
+
+/// A key and its value in a table, or an item of an array (without a key).
+pub struct Entry {
+    pub parent: u32,
+    /// The key (after escapes), in `Doc::strs`.
+    pub k_lo: u32,
+    pub k_hi: u32,
+    /// Where the key (its last part, for a dotted key) is in the text.
+    pub key_lo: u32,
+    pub key_hi: u32,
+    /// Where the line that defines it starts: the first key of a
+    /// key-value pair, or a header's `[`.
+    pub line_lo: u32,
+    pub value: u32,
+}
+
+/// A parsed document.
+pub struct Doc {
+    pub values: [Value; ..+],
+    pub entries: [Entry; ..+],
+    /// Strings and keys, end to end.
+    pub strs: String,
+}
+
+/// A syntax error, or a key defined twice: a message and where.
+pub struct Error {
+    pub message: String,
+    pub lo: u32,
+    pub hi: u32,
+}
+
+impl Doc {
+    /// The entry for `key` in table `table`.
+    pub fn get(&self, table: u32, key: str): Option::<u32> {
+        for i in 0..self.entries.len() {
+            let e = self.entries[i];
+            if e.parent == table && e.k_hi - e.k_lo == key.len() as u32 && key_of(self, i as u32) == key {
+                return Some(i as u32);
+            }
+        }
+        return None;
+    }
+
+    /// The entries of a table, or the items of an array, in order.
+    pub fn children(&self, parent: u32): [u32; ..+] {
+        let mut out: [u32; ..+] = [];
+        for i in 0..self.entries.len() {
+            if self.entries[i].parent == parent {
+                out.push(i as u32);
+            }
+        }
+        return out;
+    }
+
+    pub fn value(&self, v: u32): Value {
+        return self.values[v as usize];
+    }
+
+    pub fn entry(&self, e: u32): Entry {
+        return self.entries[e as usize];
+    }
+}
+
+/// The key of entry `e`.
+pub fn key_of(d: &Doc, e: u32): str {
+    let x = d.entries[e as usize];
+    return d.strs.as_str()[x.k_lo as usize..x.k_hi as usize];
+}
+
+/// The text of string value `v`.
+pub fn str_of(d: &Doc, v: u32): str {
+    let x = d.values[v as usize];
+    return d.strs.as_str()[x.s_lo as usize..x.s_hi as usize];
+}
+
+/// What a value is, for messages: `a string`, `an integer`, ...
+pub fn describe(k: Kind): str {
+    return match k {
+        Kind::String => "a string",
+        Kind::Integer => "an integer",
+        Kind::Float => "a float",
+        Kind::Boolean => "a boolean",
+        Kind::Datetime => "a datetime",
+        Kind::Array => "an array",
+        Kind::Table => "a table",
+    };
+}
+
+// ===================================================================== parsing
+
+/// Parse a TOML document.
+pub fn parse(src: str): Result::<Doc, Error> {
+    let mut p = Parser { pos: 0, cur: 0, doc: Doc { values: [], entries: [], strs: String::new() } };
+    p.new_value(Kind::Table, 0, src.len() as u32, TableKind::Root);
+    p.document(src)?;
+    return Ok(p.doc);
+}
+
+struct Parser {
+    pos: usize,
+    /// The table key-value pairs go into.
+    cur: u32,
+    doc: Doc,
+}
+
+/// A part of a key: its text in `strs` and its place.
+struct KeyPart {
+    k_lo: u32,
+    k_hi: u32,
+    lo: u32,
+    hi: u32,
+}
+
+fn err(message: FmtArgs, lo: usize, hi: usize): Error {
+    let mut m = String::new();
+    m.write(message);
+    return Error { message: m, lo: lo as u32, hi: hi as u32 };
+}
+
+fn byte(src: str, i: usize): u8 {
+    let b = src.as_bytes();
+    return if i < b.len() { b[i] } else { 0 };
+}
+
+fn is_bare(c: u8): bool {
+    return (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'_' || c == b'-';
+}
+
+/// A character for messages: `` `x` ``, or `end of input`, `newline`.
+fn shown(src: str, i: usize): String {
+    let mut s = String::new();
+    if i >= src.len() {
+        s.push_str("end of input");
+    } else if byte(src, i) == b'\n' || byte(src, i) == b'\r' {
+        s.push_str("newline");
+    } else {
+        let c = src[i..].chars().next().unwrap();
+        s.write("`{c}`");
+    }
+    return s;
+}
+
+impl Parser {
+    fn new_value(&mut self, kind: Kind, lo: u32, hi: u32, table: TableKind): u32 {
+        let i = self.doc.values.len() as u32;
+        self.doc.values.push(Value { kind, lo, hi, int: 0, s_lo: 0, s_hi: 0, table, array_of_tables: false });
+        return i;
+    }
+
+    fn add_entry(&mut self, parent: u32, k: KeyPart, line_lo: u32, value: u32) {
+        self.doc.entries.push(Entry { parent, k_lo: k.k_lo, k_hi: k.k_hi, key_lo: k.lo, key_hi: k.hi, line_lo, value });
+    }
+
+    fn key_text(&self, k: KeyPart): str {
+        return key_slice(&self.doc, k);
+    }
+
+    // ----------------------------------------------------------- lines
+
+    fn document(&mut self, src: str): Result::<(), Error> {
+        loop {
+            self.skip_ws(src);
+            let c = byte(src, self.pos);
+            if self.pos >= src.len() {
+                return Ok(());
+            }
+            if c == b'#' {
+                self.comment(src)?;
+            } else if c == b'\n' || c == b'\r' {
+                self.newline(src)?;
+            } else if c == b'[' {
+                self.header(src)?;
+                self.end_of_line(src)?;
+            } else {
+                let start = self.pos as u32;
+                let table = self.cur;
+                self.key_value(src, table, start)?;
+                self.end_of_line(src)?;
+            }
+        }
+    }
+
+    fn skip_ws(&mut self, src: str) {
+        while byte(src, self.pos) == b' ' || byte(src, self.pos) == b'\t' {
+            self.pos += 1;
+        }
+    }
+
+    fn comment(&mut self, src: str): Result::<(), Error> {
+        while self.pos < src.len() && byte(src, self.pos) != b'\n' {
+            let c = byte(src, self.pos);
+            if c == b'\r' && byte(src, self.pos + 1) == b'\n' {
+                break;
+            }
+            if (c < 32 && c != b'\t') || c == 127 {
+                return Err(err("invalid comment character", self.pos, self.pos + 1));
+            }
+            self.pos += 1;
+        }
+        return Ok(());
+    }
+
+    fn newline(&mut self, src: str): Result::<(), Error> {
+        if byte(src, self.pos) == b'\r' {
+            if byte(src, self.pos + 1) != b'\n' {
+                return Err(err("carriage return without a line feed", self.pos, self.pos + 1));
+            }
+            self.pos += 1;
+        }
+        self.pos += 1;
+        return Ok(());
+    }
+
+    /// After a header or key-value pair: only a comment, then a newline.
+    fn end_of_line(&mut self, src: str): Result::<(), Error> {
+        self.skip_ws(src);
+        if byte(src, self.pos) == b'#' {
+            self.comment(src)?;
+        }
+        if self.pos >= src.len() {
+            return Ok(());
+        }
+        let c = byte(src, self.pos);
+        if c == b'\n' || c == b'\r' {
+            return self.newline(src);
+        }
+        return Err(err("expected newline, found {shown(src, self.pos)}", self.pos, self.pos + 1));
+    }
+
+    /// Whitespace, newlines and comments (inside arrays).
+    fn skip_trivia(&mut self, src: str): Result::<(), Error> {
+        loop {
+            self.skip_ws(src);
+            let c = byte(src, self.pos);
+            if c == b'#' {
+                self.comment(src)?;
+            } else if (c == b'\n' || c == b'\r') && self.pos < src.len() {
+                self.newline(src)?;
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
+    // ----------------------------------------------------------- tables
+
+    /// `[a.b]` or `[[a.b]]`.
+    fn header(&mut self, src: str): Result::<(), Error> {
+        let open = self.pos;
+        let array = byte(src, self.pos + 1) == b'[';
+        self.pos += if array { 2 } else { 1 };
+        self.skip_ws(src);
+        let mut parts: [KeyPart; ..+] = [];
+        self.key(src, &mut parts)?;
+        self.skip_ws(src);
+        if byte(src, self.pos) != b']' || (array && byte(src, self.pos + 1) != b']') {
+            let what = if array { "array of tables" } else { "table" };
+            let close = if array { "]]" } else { "]" };
+            return Err(err("unclosed {what}, expected `{close}`", self.pos, self.pos));
+        }
+        self.pos += if array { 2 } else { 1 };
+        let close = self.pos;
+        // Every part but the last names a table to go into.
+        let mut t: u32 = 0;
+        for i in 0..parts.len() - 1 {
+            t = self.descend(t, parts[i], open as u32, true)?;
+        }
+        let last = parts[parts.len() - 1];
+        let existing = self.doc.get(t, self.key_text(last));
+        if array {
+            let arr = match existing {
+                Some(e) => {
+                    let v = self.doc.entries[e as usize].value;
+                    let x = self.doc.values[v as usize];
+                    if x.kind != Kind::Array || !x.array_of_tables {
+                        return Err(err("duplicate key `{self.key_text(last)}`", last.lo as usize, last.hi as usize));
+                    }
+                    v
+                }
+                None => {
+                    let v = self.new_value(Kind::Array, open as u32, close as u32, TableKind::Root);
+                    self.doc.values[v as usize].array_of_tables = true;
+                    self.add_entry(t, last, open as u32, v);
+                    v
+                }
+            };
+            let item = self.new_value(Kind::Table, open as u32, close as u32, TableKind::ArrayItem);
+            let none = KeyPart { k_lo: 0, k_hi: 0, lo: last.lo, hi: last.hi };
+            self.add_entry(arr, none, open as u32, item);
+            self.cur = item;
+            return Ok(());
+        }
+        match existing {
+            Some(e) => {
+                let v = self.doc.entries[e as usize].value;
+                let x = self.doc.values[v as usize];
+                if x.kind != Kind::Table || x.table != TableKind::Implicit {
+                    let what = if x.kind == Kind::Table { "table" } else { "key" };
+                    return Err(err("duplicate {what} `{self.key_text(last)}`", last.lo as usize, last.hi as usize));
+                }
+                // Now defined: its place is this header.
+                self.doc.values[v as usize].table = TableKind::Header;
+                self.doc.values[v as usize].lo = open as u32;
+                self.doc.values[v as usize].hi = close as u32;
+                self.doc.entries[e as usize].line_lo = open as u32;
+                self.cur = v;
+            }
+            None => {
+                let v = self.new_value(Kind::Table, open as u32, close as u32, TableKind::Header);
+                self.add_entry(t, last, open as u32, v);
+                self.cur = v;
+            }
+        }
+        return Ok(());
+    }
+
+    /// The table that `part` names in table `t`, made if missing. For a
+    /// header, an array of tables means its last element.
+    fn descend(&mut self, t: u32, part: KeyPart, line_lo: u32, header: bool): Result::<u32, Error> {
+        match self.doc.get(t, self.key_text(part)) {
+            Some(e) => {
+                let v = self.doc.entries[e as usize].value;
+                let x = self.doc.values[v as usize];
+                if x.kind == Kind::Array && x.array_of_tables && header {
+                    let items = self.doc.children(v);
+                    return Ok(self.doc.entries[items[items.len() - 1] as usize].value);
+                }
+                let ok = x.kind == Kind::Table && x.table != TableKind::Inline && (header || x.table == TableKind::Dotted || x.table == TableKind::Implicit);
+                if !ok {
+                    return Err(err("duplicate key `{self.key_text(part)}`", part.lo as usize, part.hi as usize));
+                }
+                return Ok(v);
+            }
+            None => {
+                let kind = if header { TableKind::Implicit } else { TableKind::Dotted };
+                let v = self.new_value(Kind::Table, part.lo, part.hi, kind);
+                self.add_entry(t, part, line_lo, v);
+                return Ok(v);
+            }
+        }
+    }
+
+    /// `a.b = value` into table `table`.
+    fn key_value(&mut self, src: str, table: u32, line_lo: u32): Result::<(), Error> {
+        let mut parts: [KeyPart; ..+] = [];
+        self.key(src, &mut parts)?;
+        self.skip_ws(src);
+        if byte(src, self.pos) != b'=' {
+            return Err(err("expected `=`, found {shown(src, self.pos)}", self.pos, self.pos + 1));
+        }
+        self.pos += 1;
+        self.skip_ws(src);
+        let mut t = table;
+        for i in 0..parts.len() - 1 {
+            t = self.descend(t, parts[i], line_lo, false)?;
+        }
+        let last = parts[parts.len() - 1];
+        if self.doc.get(t, self.key_text(last)).is_some() {
+            return Err(err("duplicate key `{self.key_text(last)}`", last.lo as usize, last.hi as usize));
+        }
+        let v = self.value(src)?;
+        self.add_entry(t, last, line_lo, v);
+        return Ok(());
+    }
+
+    /// A dotted key: its parts onto `out`.
+    fn key(&mut self, src: str, out: &mut +[KeyPart; ..+]): Result::<(), Error> {
+        loop {
+            let lo = self.pos;
+            let c = byte(src, self.pos);
+            let k_lo = self.doc.strs.len() as u32;
+            if c == b'"' {
+                self.pos += 1;
+                self.basic_string(src, lo, false)?;
+            } else if c == b'\'' {
+                self.pos += 1;
+                self.literal_string(src, lo, false)?;
+            } else if is_bare(c) && self.pos < src.len() {
+                while is_bare(byte(src, self.pos)) && self.pos < src.len() {
+                    self.pos += 1;
+                }
+                self.doc.strs.push_str(src[lo..self.pos]);
+            } else {
+                return Err(err("invalid key, found {shown(src, self.pos)}", self.pos, self.pos + 1));
+            }
+            out.push(KeyPart { k_lo, k_hi: self.doc.strs.len() as u32, lo: lo as u32, hi: self.pos as u32 });
+            let save = self.pos;
+            self.skip_ws(src);
+            if byte(src, self.pos) != b'.' {
+                self.pos = save;
+                return Ok(());
+            }
+            self.pos += 1;
+            self.skip_ws(src);
+        }
+    }
+
+    // ----------------------------------------------------------- values
+
+    fn value(&mut self, src: str): Result::<u32, Error> {
+        let lo = self.pos;
+        let c = byte(src, self.pos);
+        if self.pos >= src.len() || c == b'\n' || c == b'\r' || c == b'#' {
+            return Err(err("expected a value, found {shown(src, self.pos)}", self.pos, self.pos + 1));
+        }
+        if c == b'"' || c == b'\'' {
+            let s_lo = self.doc.strs.len() as u32;
+            self.pos += 1;
+            if c == b'"' {
+                self.basic_string(src, lo, true)?;
+            } else {
+                self.literal_string(src, lo, true)?;
+            }
+            let v = self.new_value(Kind::String, lo as u32, self.pos as u32, TableKind::Root);
+            self.doc.values[v as usize].s_lo = s_lo;
+            self.doc.values[v as usize].s_hi = self.doc.strs.len() as u32;
+            return Ok(v);
+        }
+        if c == b'[' {
+            return self.array(src);
+        }
+        if c == b'{' {
+            return self.inline_table(src);
+        }
+        if src[lo..].starts_with("true") && !is_bare(byte(src, lo + 4)) {
+            self.pos += 4;
+            let v = self.new_value(Kind::Boolean, lo as u32, self.pos as u32, TableKind::Root);
+            self.doc.values[v as usize].int = 1;
+            return Ok(v);
+        }
+        if src[lo..].starts_with("false") && !is_bare(byte(src, lo + 5)) {
+            self.pos += 5;
+            return Ok(self.new_value(Kind::Boolean, lo as u32, self.pos as u32, TableKind::Root));
+        }
+        return self.number_or_date(src);
+    }
+
+    /// An integer, float or datetime.
+    fn number_or_date(&mut self, src: str): Result::<u32, Error> {
+        let lo = self.pos;
+        // The token: everything up to a delimiter (a date and a time may be
+        // separated by one space).
+        let mut end = lo;
+        loop {
+            let c = byte(src, end);
+            if end >= src.len() || c == b',' || c == b']' || c == b'}' || c == b'#' || c == b'\n' || c == b'\r' || c == b'\t' {
+                break;
+            }
+            if c == b' ' {
+                let is_date = end - lo == 10 && byte(src, lo + 4) == b'-';
+                let next = byte(src, end + 1);
+                if is_date && next >= b'0' && next <= b'9' {
+                    end += 1;
+                    continue;
+                }
+                break;
+            }
+            end += 1;
+        }
+        let tok = src[lo..end];
+        let bad = err("invalid value `{tok}`", lo, end);
+        if tok.is_empty() {
+            return Err(err("expected a value, found {shown(src, lo)}", lo, lo + 1));
+        }
+        let b = tok.as_bytes();
+        // Datetimes: `1979-05-27`, `07:32:00`, ...
+        let date = b.len() >= 10 && b[4] == b'-' && b[7] == b'-' && all_digits(tok[..4]);
+        let time = b.len() >= 5 && b[2] == b':' && all_digits(tok[..2]);
+        if date || time {
+            for x in b {
+                let ok = (x >= b'0' && x <= b'9') || x == b'-' || x == b':' || x == b'.' || x == b'+' || x == b' ' || x == b'T' || x == b't' || x == b'Z' || x == b'z';
+                if !ok {
+                    return Err(bad);
+                }
+            }
+            self.pos = end;
+            return Ok(self.new_value(Kind::Datetime, lo as u32, end as u32, TableKind::Root));
+        }
+        let unsigned = if tok.starts_with("+") || tok.starts_with("-") { tok[1..] } else { tok };
+        if unsigned == "inf" || unsigned == "nan" {
+            self.pos = end;
+            return Ok(self.new_value(Kind::Float, lo as u32, end as u32, TableKind::Root));
+        }
+        // Integers in another base.
+        if tok.starts_with("0x") || tok.starts_with("0o") || tok.starts_with("0b") {
+            let radix: i64 = if b[1] == b'x' { 16 } else if b[1] == b'o' { 8 } else { 2 };
+            match digits_value(tok[2..], radix) {
+                Some(n) => {
+                    self.pos = end;
+                    let v = self.new_value(Kind::Integer, lo as u32, end as u32, TableKind::Root);
+                    self.doc.values[v as usize].int = n;
+                    return Ok(v);
+                }
+                None => return Err(bad),
+            }
+        }
+        let float = unsigned.contains(".") || unsigned.contains("e") || unsigned.contains("E");
+        if !float {
+            if unsigned.len() > 1 && unsigned.starts_with("0") {
+                return Err(err("invalid integer `{tok}`: leading zeros are not allowed", lo, end));
+            }
+            match digits_value(unsigned, 10) {
+                Some(n) => {
+                    self.pos = end;
+                    let v = self.new_value(Kind::Integer, lo as u32, end as u32, TableKind::Root);
+                    self.doc.values[v as usize].int = if tok.starts_with("-") { 0 - n } else { n };
+                    return Ok(v);
+                }
+                None => return Err(bad),
+            }
+        }
+        if !valid_float(unsigned) {
+            return Err(bad);
+        }
+        self.pos = end;
+        return Ok(self.new_value(Kind::Float, lo as u32, end as u32, TableKind::Root));
+    }
+
+    fn array(&mut self, src: str): Result::<u32, Error> {
+        let lo = self.pos;
+        self.pos += 1;
+        let v = self.new_value(Kind::Array, lo as u32, lo as u32, TableKind::Root);
+        loop {
+            self.skip_trivia(src)?;
+            if byte(src, self.pos) == b']' {
+                break;
+            }
+            if self.pos >= src.len() {
+                return Err(err("unclosed array, expected `]`", lo, lo + 1));
+            }
+            let item_lo = self.pos as u32;
+            let item = self.value(src)?;
+            let none = KeyPart { k_lo: 0, k_hi: 0, lo: item_lo, hi: item_lo };
+            self.add_entry(v, none, item_lo, item);
+            self.skip_trivia(src)?;
+            let c = byte(src, self.pos);
+            if c == b',' {
+                self.pos += 1;
+            } else if c != b']' {
+                return Err(err("expected `,` or `]` in an array, found {shown(src, self.pos)}", self.pos, self.pos + 1));
+            }
+        }
+        self.pos += 1;
+        self.doc.values[v as usize].hi = self.pos as u32;
+        return Ok(v);
+    }
+
+    fn inline_table(&mut self, src: str): Result::<u32, Error> {
+        let lo = self.pos;
+        self.pos += 1;
+        let v = self.new_value(Kind::Table, lo as u32, lo as u32, TableKind::Inline);
+        // Its dotted sub-tables are inline too, once it is closed.
+        let first_value = self.doc.values.len();
+        loop {
+            self.skip_trivia(src)?;
+            if byte(src, self.pos) == b'}' {
+                break;
+            }
+            if self.pos >= src.len() {
+                return Err(err("unclosed inline table, expected `}}`", lo, lo + 1));
+            }
+            let start = self.pos as u32;
+            self.key_value(src, v, start)?;
+            self.skip_trivia(src)?;
+            let c = byte(src, self.pos);
+            if c == b',' {
+                self.pos += 1;
+            } else if c != b'}' {
+                return Err(err("expected `,` or `}}` in an inline table, found {shown(src, self.pos)}", self.pos, self.pos + 1));
+            }
+        }
+        self.pos += 1;
+        self.doc.values[v as usize].hi = self.pos as u32;
+        for i in first_value..self.doc.values.len() {
+            if self.doc.values[i].table == TableKind::Dotted {
+                self.doc.values[i].table = TableKind::Inline;
+            }
+        }
+        return Ok(v);
+    }
+
+    // ----------------------------------------------------------- strings
+
+    /// The rest of a `"` string (the quote at `open` already read), or of
+    /// a `"""` one; its text onto `strs`.
+    fn basic_string(&mut self, src: str, open: usize, multi_ok: bool): Result::<(), Error> {
+        let multi = multi_ok && byte(src, self.pos) == b'"' && byte(src, self.pos + 1) == b'"';
+        if multi {
+            self.pos += 2;
+            self.skip_first_newline(src);
+        }
+        loop {
+            if self.pos >= src.len() {
+                return Err(err("unterminated string", open, src.len()));
+            }
+            let c = byte(src, self.pos);
+            if c == b'"' {
+                if !multi {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                if byte(src, self.pos + 1) == b'"' && byte(src, self.pos + 2) == b'"' {
+                    // Up to two more quotes belong to the string.
+                    let mut n: usize = 3;
+                    while n < 5 && byte(src, self.pos + n) == b'"' {
+                        n += 1;
+                    }
+                    for _ in 3..n {
+                        self.doc.strs.push('"');
+                    }
+                    self.pos += n;
+                    return Ok(());
+                }
+                self.doc.strs.push('"');
+                self.pos += 1;
+            } else if c == b'\\' {
+                self.escape(src, multi)?;
+            } else if c == b'\n' || c == b'\r' {
+                if !multi {
+                    return Err(err("unterminated string", open, self.pos));
+                }
+                self.line_break(src)?;
+            } else if (c < 32 && c != b'\t') || c == 127 {
+                return Err(err("invalid character in a string", self.pos, self.pos + 1));
+            } else {
+                let ch = src[self.pos..].chars().next().unwrap();
+                self.doc.strs.push(ch);
+                self.pos += ch.len_utf8();
+            }
+        }
+    }
+
+    /// The rest of a `'` (or `'''`) string.
+    fn literal_string(&mut self, src: str, open: usize, multi_ok: bool): Result::<(), Error> {
+        let multi = multi_ok && byte(src, self.pos) == b'\'' && byte(src, self.pos + 1) == b'\'';
+        if multi {
+            self.pos += 2;
+            self.skip_first_newline(src);
+        }
+        loop {
+            if self.pos >= src.len() {
+                return Err(err("unterminated string", open, src.len()));
+            }
+            let c = byte(src, self.pos);
+            if c == b'\'' {
+                if !multi {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                if byte(src, self.pos + 1) == b'\'' && byte(src, self.pos + 2) == b'\'' {
+                    let mut n: usize = 3;
+                    while n < 5 && byte(src, self.pos + n) == b'\'' {
+                        n += 1;
+                    }
+                    for _ in 3..n {
+                        self.doc.strs.push('\'');
+                    }
+                    self.pos += n;
+                    return Ok(());
+                }
+                self.doc.strs.push('\'');
+                self.pos += 1;
+            } else if c == b'\n' || c == b'\r' {
+                if !multi {
+                    return Err(err("unterminated string", open, self.pos));
+                }
+                self.line_break(src)?;
+            } else if (c < 32 && c != b'\t') || c == 127 {
+                return Err(err("invalid character in a string", self.pos, self.pos + 1));
+            } else {
+                let ch = src[self.pos..].chars().next().unwrap();
+                self.doc.strs.push(ch);
+                self.pos += ch.len_utf8();
+            }
+        }
+    }
+
+    /// A newline right after `"""` or `'''` is not part of the string.
+    fn skip_first_newline(&mut self, src: str) {
+        if byte(src, self.pos) == b'\n' {
+            self.pos += 1;
+        } else if byte(src, self.pos) == b'\r' && byte(src, self.pos + 1) == b'\n' {
+            self.pos += 2;
+        }
+    }
+
+    /// A newline in a multi-line string (kept as `\n`).
+    fn line_break(&mut self, src: str): Result::<(), Error> {
+        self.newline(src)?;
+        self.doc.strs.push('\n');
+        return Ok(());
+    }
+
+    fn escape(&mut self, src: str, multi: bool): Result::<(), Error> {
+        let at = self.pos;
+        let c = byte(src, self.pos + 1);
+        self.pos += 2;
+        if c == b'b' {
+            self.doc.strs.push(core::str::char_from_u32(8));
+        } else if c == b't' {
+            self.doc.strs.push('\t');
+        } else if c == b'n' {
+            self.doc.strs.push('\n');
+        } else if c == b'f' {
+            self.doc.strs.push(core::str::char_from_u32(12));
+        } else if c == b'r' {
+            self.doc.strs.push('\r');
+        } else if c == b'e' {
+            self.doc.strs.push(core::str::char_from_u32(27));
+        } else if c == b'"' {
+            self.doc.strs.push('"');
+        } else if c == b'\\' {
+            self.doc.strs.push('\\');
+        } else if c == b'u' || c == b'U' || c == b'x' {
+            let n: usize = if c == b'u' { 4 } else if c == b'U' { 8 } else { 2 };
+            if self.pos + n > src.len() {
+                return Err(err("invalid escape sequence", at, src.len()));
+            }
+            let cp = match digits_value(src[self.pos..self.pos + n], 16) {
+                Some(v) => v,
+                None => return Err(err("invalid escape sequence", at, self.pos + n)),
+            };
+            match char::from_u32(cp as u32) {
+                Some(ch) => self.doc.strs.push(ch),
+                None => return Err(err("invalid unicode escape: not a scalar value", at, self.pos + n)),
+            }
+            self.pos += n;
+        } else if multi && (c == b' ' || c == b'\t' || c == b'\n' || c == b'\r') {
+            // A line-ending backslash: drop the whitespace and newlines after it.
+            self.pos = at + 1;
+            while byte(src, self.pos) == b' ' || byte(src, self.pos) == b'\t' {
+                self.pos += 1;
+            }
+            let nl = byte(src, self.pos);
+            if nl != b'\n' && nl != b'\r' {
+                return Err(err("invalid escape sequence", at, at + 2));
+            }
+            while self.pos < src.len() {
+                let d = byte(src, self.pos);
+                if d == b' ' || d == b'\t' || d == b'\n' {
+                    self.pos += 1;
+                } else if d == b'\r' && byte(src, self.pos + 1) == b'\n' {
+                    self.pos += 2;
+                } else {
+                    break;
+                }
+            }
+        } else {
+            return Err(err("invalid escape sequence", at, at + 2));
+        }
+        return Ok(());
+    }
+}
+
+/// The text of a key part.
+fn key_slice(d: &Doc, k: KeyPart): str {
+    return d.strs.as_str()[k.k_lo as usize..k.k_hi as usize];
+}
+
+fn all_digits(s: str): bool {
+    for b in s.bytes() {
+        if b < b'0' || b > b'9' {
+            return false;
+        }
+    }
+    return s.len() > 0;
+}
+
+/// The value of digits in `radix`, with `_` allowed between digits.
+fn digits_value(s: str, radix: i64): Option::<i64> {
+    let b = s.as_bytes();
+    if b.len() == 0 || b[0] == b'_' || b[b.len() - 1] == b'_' {
+        return None;
+    }
+    let mut n: i64 = 0;
+    let mut prev_underscore = false;
+    for c in b {
+        if c == b'_' {
+            if prev_underscore {
+                return None;
+            }
+            prev_underscore = true;
+            continue;
+        }
+        prev_underscore = false;
+        let d: i64 = if c >= b'0' && c <= b'9' {
+            (c - b'0') as i64
+        } else if c >= b'a' && c <= b'f' {
+            (c - b'a') as i64 + 10
+        } else if c >= b'A' && c <= b'F' {
+            (c - b'A') as i64 + 10
+        } else {
+            return None;
+        };
+        if d >= radix {
+            return None;
+        }
+        if n > (9223372036854775807 - d) / radix {
+            return None;
+        }
+        n = n * radix + d;
+    }
+    return Some(n);
+}
+
+/// `1.5`, `1e6`, `6.626e-34`, `1_000.0`.
+fn valid_float(s: str): bool {
+    let b = s.as_bytes();
+    let mut i: usize = 0;
+    let int_start = i;
+    while i < b.len() && ((b[i] >= b'0' && b[i] <= b'9') || b[i] == b'_') {
+        i += 1;
+    }
+    if i == int_start || digits_value(s[int_start..i], 10).is_none() {
+        return false;
+    }
+    if i - int_start > 1 && b[int_start] == b'0' {
+        return false;
+    }
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        let f = i;
+        while i < b.len() && ((b[i] >= b'0' && b[i] <= b'9') || b[i] == b'_') {
+            i += 1;
+        }
+        if i == f || digits_value(s[f..i], 10).is_none() {
+            return false;
+        }
+    }
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        i += 1;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            i += 1;
+        }
+        let e = i;
+        while i < b.len() && ((b[i] >= b'0' && b[i] <= b'9') || b[i] == b'_') {
+            i += 1;
+        }
+        if i == e || digits_value(s[e..i], 10).is_none() {
+            return false;
+        }
+    }
+    return i == b.len();
+}
+
+// ===================================================================== tests
+
+fn parsed(src: str): Doc {
+    return match parse(src) {
+        Ok(d) => d,
+        Err(e) => panic("{e.message} at {e.lo}..{e.hi}"),
+    };
+}
+
+fn error_of(src: str): String {
+    let mut s = String::new();
+    match parse(src) {
+        Ok(_) => s.push_str("ok"),
+        Err(e) => s.write("{e.message} @{e.lo}"),
+    }
+    return s;
+}
+
+/// The string at `path` (`a.b`) from the root, or `<none>`.
+fn get_str(d: &Doc, path: str): String {
+    let mut t: u32 = 0;
+    let mut out = String::from("<none>");
+    for part in path.split(".") {
+        match d.get(t, part) {
+            Some(e) => t = d.entries[e as usize].value,
+            None => return out,
+        }
+    }
+    if d.values[t as usize].kind == Kind::String {
+        out.clear();
+        out.push_str(str_of(d, t));
+    }
+    return out;
+}
+
+#[test]
+fn parses_manifests() {
+    let src = "# A package.\n[package]\nname = \"app\" # its name\nversion = '0.1.0'\n\n[dependencies]\nlib = { path = \"../lib\", version = \"2\" }\njson = \"1.2\"\n\n[workspace]\nmembers = [\n    \"a\",\n    \"crates/*\", # all\n]\n";
+    let d = parsed(src);
+    assert_eq(&get_str(&d, "package.name"), &String::from("app"), "name");
+    assert_eq(&get_str(&d, "package.version"), &String::from("0.1.0"), "version");
+    assert_eq(&get_str(&d, "dependencies.lib.path"), &String::from("../lib"), "inline");
+    assert_eq(&get_str(&d, "dependencies.json"), &String::from("1.2"), "plain");
+    let ws = d.entries[d.get(0, "workspace").unwrap() as usize].value;
+    let members = d.entries[d.get(ws, "members").unwrap() as usize].value;
+    assert_eq(&d.children(members).len(), &2, "members");
+    // Positions: the name's string, quotes included.
+    let pkg = d.entries[d.get(0, "package").unwrap() as usize].value;
+    let name = d.values[d.entries[d.get(pkg, "name").unwrap() as usize].value as usize];
+    assert_eq(&src[name.lo as usize..name.hi as usize], &"\"app\"", "span");
+}
+
+#[test]
+fn parses_lockfiles() {
+    let d = parsed("version = 1\n\n[[package]]\nname = \"a\"\n\n[[package]]\nname = \"b\"\n");
+    let pkgs = d.entries[d.get(0, "package").unwrap() as usize].value;
+    let items = d.children(pkgs);
+    assert_eq(&items.len(), &2, "two packages");
+    let second = d.entries[items[1] as usize].value;
+    assert_eq(&str_of(&d, d.entries[d.get(second, "name").unwrap() as usize].value), &"b", "second");
+    assert_eq(&d.values[d.entries[d.get(0, "version").unwrap() as usize].value as usize].int, &1, "version");
+}
+
+#[test]
+fn strings_keys_and_numbers() {
+    let d = parsed("\"quoted key\" = \"a\\tb\\u00e9\"\na.b.c = 1_000\nml = \"\"\"\nline \\\n   joined\"\"\"\nlit = '''C:\\x'''\nf = -1.5e3\nd = 1979-05-27T07:32:00Z\n[x.y]\nz = true\n");
+    assert_eq(&get_str(&d, "quoted key"), &String::from("a\tb\u{e9}"), "escapes");
+    assert_eq(&get_str(&d, "ml"), &String::from("line joined"), "multi-line");
+    assert_eq(&get_str(&d, "lit"), &String::from("C:\\x"), "literal");
+    let a = d.entries[d.get(0, "a").unwrap() as usize].value;
+    let b = d.entries[d.get(a, "b").unwrap() as usize].value;
+    let c = d.values[d.entries[d.get(b, "c").unwrap() as usize].value as usize];
+    assert_eq(&c.int, &1000, "dotted keys and underscores");
+}
+
+#[test]
+fn syntax_errors() {
+    assert_eq(&error_of("[package\nname = \"app\"\n"), &String::from("unclosed table, expected `]` @8"), "header");
+    assert_eq(&error_of("a = 1\na = 2\n"), &String::from("duplicate key `a` @6"), "duplicate");
+    assert_eq(&error_of("a = \"x\n"), &String::from("unterminated string @4"), "string");
+    assert_eq(&error_of("a = 1 2\n"), &String::from("expected newline, found `2` @6"), "newline");
+    assert_eq(&error_of("[a]\n[a]\n"), &String::from("duplicate table `a` @5"), "table");
+    assert_eq(&error_of("a = 01\n"), &String::from("invalid integer `01`: leading zeros are not allowed @4"), "zeros");
+    assert_eq(&error_of("[a.b]\n[a]\nb = 1\n"), &String::from("duplicate key `b` @10"), "implicit then defined");
+}

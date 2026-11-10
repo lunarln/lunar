@@ -14,7 +14,7 @@
 // `initialize` then `initialized`, and `shutdown` then `exit`. Text
 // documents are synchronized in full.
 //
-// The standard library is the one on disk (`find_std_dir`), so definitions
+// The standard library is the one on disk (`sysroot::std_dir`), so definitions
 // in it are `file:` locations of real files. The Rust server's virtual
 // `lunar-std:` documents (`lunar/stdSource`) still work, read from there.
 //
@@ -24,7 +24,6 @@
 
 use core::collections::HashMap;
 use core::intern::{Interner, Symbol};
-use std::env;
 use std::fs;
 use std::io;
 use ln_ast::Span;
@@ -34,16 +33,20 @@ use ln_sema::diag::{Diag, Severity, is_dummy};
 use ln_sema::loader::{CraterDep, Craters, Overlay, load_crate, path_key};
 use ln_sema::program::Program;
 use ln_sema::sema::{Options, Sema, analyze};
+use crater::git;
 use crater::ide;
-use crater::project;
+use crater::paths::{absolute, canonical, join, normalize, parent};
+use crater::project::{Project, ProjectError, Target, find_project};
+use crater::sysroot;
 
 /// Run the server on standard input and output until the client shuts it
 /// down: the exit code.
 pub fn serve(): i32 {
-    let std_dir = match find_std_dir() {
-        Some(d) => d,
+    // Absolute, so that its files have `file:` URIs.
+    let std_dir = match sysroot::std_dir() {
+        Some(d) => absolute(d.as_str()),
         None => {
-            eprintln("lunar lsp: the standard library was not found (set LUNAR_STD_DIR to its directory)");
+            eprintln("lunar lsp: could not find the standard library: {sysroot::std_help()}");
             String::new()
         }
     };
@@ -60,31 +63,6 @@ pub fn serve(): i32 {
             1
         }
     };
-}
-
-/// Where `core` and `std` are: `$LUNAR_STD_DIR`, else
-/// `<exe dir>/../lib/lunar/std` (an installed compiler), else the `std` of
-/// the nearest ancestor of the executable's directory that has
-/// `std/core/lib.ln` (a compiler built in its source tree).
-pub fn find_std_dir(): Option::<String> {
-    if let Some(d) = env::var("LUNAR_STD_DIR") {
-        return Some(project::normalize(d.as_str()));
-    }
-    let exe = env::current_exe()?;
-    let dir = project::parent(project::normalize(exe.as_str()).as_str())?;
-    let installed = project::join(dir.as_str(), "../lib/lunar/std");
-    if fs::is_file(project::join(installed.as_str(), "core/lib.ln").as_str()) {
-        return Some(installed);
-    }
-    let mut cur: Option::<String> = Some(dir);
-    while let Some(d) = cur {
-        let s = project::join(d.as_str(), "std");
-        if fs::is_file(project::join(s.as_str(), "core/lib.ln").as_str()) {
-            return Some(s);
-        }
-        cur = project::parent(d.as_str());
-    }
-    return None;
 }
 
 // ===================================================================== transport
@@ -464,52 +442,52 @@ fn analyze_in_project(ov: Overlay, std_dir: String, root: String): Analysis {
     if let Some(tree) = std_tree_of(root.as_str()) {
         return analyze_std_tree(ov, tree);
     }
-    let norm = project::normalize(root.as_str());
-    let dir = match project::parent(norm.as_str()) {
+    let dir = match parent(root.as_str()) {
         Some(d) => d,
-        None => return analyze_alone(ov, std_dir, root, String::new()),
+        None => return analyze_alone(ov, std_dir, root),
     };
-    // The nearest directory with a manifest.
-    let mut cur: Option::<String> = Some(dir);
-    let mut pkg_dir = String::new();
-    while let Some(d) = cur {
-        if fs::is_file(project::join(d.as_str(), "lunar.toml").as_str()) {
-            pkg_dir = d;
+    if find_project(dir.as_str()).is_none() {
+        return analyze_alone(ov, std_dir, root);
+    }
+    let mut proj = Project::new();
+    if let Err(e) = proj.find_workspace(dir.as_str()) {
+        return with_project_error(analyze_alone(ov, std_dir, root), e);
+    }
+    if let Err(e) = proj.resolve(false) {
+        return with_project_error(analyze_alone(ov, std_dir, root), e);
+    }
+    // The member package whose crater this file is. Members are canonical
+    // paths, so compare against the canonical form (on Windows this also
+    // turns 8.3 short names like `OCS12_~1` into long ones).
+    let key = match canonical(root.as_str()) {
+        Ok(c) => path_key(c.as_str()),
+        Err(_) => path_key(root.as_str()),
+    };
+    let mut found: Option::<(usize, Target)> = None;
+    for i in 0..proj.members {
+        if same_key(proj.main_root(i), key.as_str()) {
+            found = Some((i, Target::Main));
+        } else if same_key(proj.lib_root(i), key.as_str()) {
+            found = Some((i, Target::Lib));
+        } else {
+            let mut tests: [Symbol; ..+] = [];
+            proj.test_files(i, &mut tests);
+            for t in tests {
+                if path_key(proj.text(t)).as_str() == key.as_str() {
+                    found = Some((i, Target::TestFile(t)));
+                }
+            }
+        }
+        if found.is_some() {
             break;
         }
-        cur = project::parent(d.as_str());
     }
-    if pkg_dir.len() == 0 {
-        return analyze_alone(ov, std_dir, root, String::new());
-    }
-    let is_package = match fs::read_to_string(project::join(pkg_dir.as_str(), "lunar.toml").as_str()) {
-        Ok(t) => t.as_str().contains("[package]"),
-        Err(_) => false,
+    let (pkg, target) = match found {
+        Some(f) => f,
+        None => return analyze_alone(ov, std_dir, root),
     };
-    if !is_package {
-        return analyze_alone(ov, std_dir, root, String::new());
-    }
-    let mut proj = project::Project::new();
-    let pkg = proj.load_package(pkg_dir.as_str());
-    if proj.errors.len() > 0 || pkg.is_none() {
-        return analyze_alone(ov, std_dir, root, project_errors(&proj));
-    }
-    let pkg = pkg.unwrap();
-    let info = proj.packages[pkg as usize];
-    if same_path(pkg_dir.as_str(), "src/main.ln", norm.as_str()) && info.has_main {
-        proj.craters(pkg, false);
-    } else if same_path(pkg_dir.as_str(), "src/lib.ln", norm.as_str()) && info.has_lib {
-        proj.craters(pkg, true);
-    } else if is_test_file(pkg_dir.as_str(), norm.as_str()) {
-        // A test crater uses the package's library like its program.
-        proj.craters(pkg, false);
-        let r = proj.names.intern(norm.as_str());
-        proj.specs[0].root = r;
-    } else {
-        return analyze_alone(ov, std_dir, root, String::new());
-    }
-    if proj.errors.len() > 0 {
-        return analyze_alone(ov, std_dir, root, project_errors(&proj));
+    if let Err(e) = proj.craters(pkg, target) {
+        return with_project_error(analyze_alone(ov, std_dir, root), e);
     }
     let mut p = Program::new();
     let mut cs = Craters::new();
@@ -532,9 +510,8 @@ fn analyze_in_project(ov: Overlay, std_dir: String, root: String): Analysis {
     return finish_analysis(p, cs, std_dir, false);
 }
 
-/// `root` alone, with the problems with its package (`errors`, one per
-/// line).
-fn analyze_alone(ov: Overlay, std_dir: String, root: String, errors: String): Analysis {
+/// `root` alone.
+fn analyze_alone(ov: Overlay, std_dir: String, root: String): Analysis {
     let mut p = Program::new();
     let mut cs = Craters::new();
     cs.overlay = ov;
@@ -543,12 +520,66 @@ fn analyze_alone(ov: Overlay, std_dir: String, root: String, errors: String): An
         Some(c) => cs.list.push(c),
         None => return not_read(p, cs, root),
     }
-    for e in errors.as_str().lines() {
-        let m = p.sym(e);
-        p.diags.error(codes::manifest::PARSE(), ln_sema::diag::dummy_span(), m);
-        p.diags.finish();
-    }
     return finish_analysis(p, cs, std_dir, false);
+}
+
+/// `a` with the error of its package, where it is in `lunar.toml` (that
+/// file joins the analysis, so the editor shows it there).
+fn with_project_error(a: Analysis, e: ProjectError): Analysis {
+    let mut a = a;
+    let mut span = ln_sema::diag::dummy_span();
+    if e.file.len() > 0 {
+        if let Ok(text) = fs::read_to_string(e.file.as_str()) {
+            let mut hi = e.hi as usize;
+            if hi > text.len() {
+                hi = text.len();
+            }
+            let mut lo = e.lo as usize;
+            if lo > hi {
+                lo = hi;
+            }
+            let name = a.s.p.sym(normalize(e.file.as_str()).as_str());
+            let (_, start) = a.s.p.sources.add(name, text.as_str(), None);
+            span = Span::new(start + lo as u32, start + hi as u32);
+        }
+    }
+    let mut code = codes::manifest::PARSE();
+    for c in codes::all_codes() {
+        if e.code.as_str().starts_with(c.scope) && e.code.as_str().ends_with(c.name) && e.code.len() == c.scope.len() + 2 + c.name.len() {
+            code = c;
+        }
+    }
+    let m = a.s.p.sym(e.message.as_str());
+    a.s.p.diags.error(code, span, m);
+    if e.label.len() > 0 {
+        let l = a.s.p.sym(e.label.as_str());
+        a.s.p.diags.label(l);
+    }
+    // Notes and helps, in order: a kind byte, the text, a NUL.
+    let extra = e.extra.as_str();
+    let b = extra.as_bytes();
+    let mut start: usize = 0;
+    for i in 0..b.len() {
+        if b[i] == 0 {
+            let s = a.s.p.sym(extra[start + 1..i]);
+            if b[start] == b'n' {
+                a.s.p.diags.note(s);
+            } else {
+                a.s.p.diags.help(s);
+            }
+            start = i + 1;
+        }
+    }
+    a.s.p.diags.finish();
+    return a;
+}
+
+/// Whether `path` (if any) has the key `key`.
+fn same_key(path: Option::<String>, key: str): bool {
+    return match path {
+        Some(p) => path_key(p.as_str()).as_str() == key,
+        None => false,
+    };
 }
 
 /// The standard library tree at `dir` on its own, from disk and the open
@@ -597,18 +628,6 @@ fn not_read(p: Program, cs: Craters, path: String): Analysis {
     p.diags.error(codes::build::IO(), ln_sema::diag::dummy_span(), m);
     p.diags.finish();
     return Analysis { s: Sema::new(p, cs, Options::host(false)), ok: false, std_tree: false };
-}
-
-/// The problems a project loader found, one per line.
-fn project_errors(proj: &project::Project): String {
-    let mut out = String::new();
-    for e in proj.errors {
-        if out.len() > 0 {
-            out.push('\n');
-        }
-        out.push_str(proj.text(e));
-    }
-    return out;
 }
 
 /// The file and offset of a position in `path`, if `a` has the file.
@@ -986,7 +1005,7 @@ impl State {
     /// module, so the search repeats upwards. A file nobody declares is its
     /// own root.
     fn crate_root_of(&mut self, file: str): String {
-        let mut cur = project::normalize(file);
+        let mut cur = normalize(file);
         for _ in 0..32 {
             match self.declaring_file(cur.as_str()) {
                 Some(parent) => {
@@ -1006,44 +1025,30 @@ impl State {
         let mut name = String::new();
         let mut dir = String::new();
         if is_mod_ln {
-            let d = project::parent(file)?;
+            let d = parent(file)?;
             name.push_str(file_name(d.as_str()));
-            dir = project::parent(d.as_str())?;
+            dir = parent(d.as_str())?;
         } else {
             name.push_str(file_stem(file));
-            dir = project::parent(file)?;
+            dir = parent(file)?;
         }
         // The candidates, end to end in `texts`.
         let mut texts = String::new();
         let mut ends: [usize; -..+] = [];
         // `dir.ln`, a file whose children live in `dir/`.
-        if let Some(up) = project::parent(dir.as_str()) {
+        if let Some(up) = parent(dir.as_str()) {
             texts.write("{up}/{file_name(dir.as_str())}.ln");
             ends.push(texts.len());
         }
         // Files in `dir` that own it: `mod.ln` and crate roots.
+        // (`read_dir` sorts them by name, as Rust sorts the paths.)
         if let Ok(entries) = fs::read_dir(dir.as_str()) {
-            let mut order: [usize; -..+] = [];
             for i in 0..entries.len() {
-                if !entries.is_dir(i) && entries.name(i).ends_with(".ln") {
-                    order.push(i);
+                let p = join(dir.as_str(), entries.name(i));
+                if entries.name(i).ends_with(".ln") && fs::is_file(p.as_str()) {
+                    texts.push_str(p.as_str());
+                    ends.push(texts.len());
                 }
-            }
-            // By name, as Rust sorts the paths.
-            let mut a: usize = 1;
-            while a < order.len() {
-                let mut b = a;
-                while b > 0 && less(entries.name(order[b]), entries.name(order[b - 1])) {
-                    let t = order[b - 1];
-                    order[b - 1] = order[b];
-                    order[b] = t;
-                    b -= 1;
-                }
-                a += 1;
-            }
-            for i in order {
-                texts.write("{dir}/{entries.name(i)}");
-                ends.push(texts.len());
             }
         }
         let file_key = path_key(file);
@@ -1077,9 +1082,9 @@ impl State {
             first = false;
             parts.push_str(seg);
         }
-        let base = project::join(self.std_dir.as_str(), parts.as_str());
+        let base = join(self.std_dir.as_str(), parts.as_str());
         if !module.contains("::") {
-            let lib = project::join(base.as_str(), "lib.ln");
+            let lib = join(base.as_str(), "lib.ln");
             if fs::is_file(lib.as_str()) {
                 return Some(lib);
             }
@@ -1090,7 +1095,7 @@ impl State {
         if fs::is_file(flat.as_str()) {
             return Some(flat);
         }
-        let nested = project::join(base.as_str(), "mod.ln");
+        let nested = join(base.as_str(), "mod.ln");
         if fs::is_file(nested.as_str()) {
             return Some(nested);
         }
@@ -1334,7 +1339,7 @@ impl Server {
                 // it. Every file of a std source tree is analyzed under one
                 // root.
                 None => match std_tree_of(p.as_str()) {
-                    Some(tree) => project::join(tree.as_str(), "std/lib.ln"),
+                    Some(tree) => join(tree.as_str(), "std/lib.ln"),
                     None => self.st.crate_root_of(p.as_str()),
                 },
             };
@@ -1362,13 +1367,15 @@ impl Server {
         // own root but is now a module of this crate stops being a root.
         let mut files: [(u32, Symbol, Symbol); -..+] = [];
         let std_key = path_key(self.st.std_dir.as_str());
+        // Dependencies checked out from git are not the user's to fix.
+        let home_key = path_key(normalize(git::home().as_str()).as_str());
         for i in 0..a.s.p.sources.files.len() {
             let f = a.s.p.sources.files[i];
             if f.expansion_site.is_some() {
                 continue;
             }
             let name = String::from(a.s.p.text(f.name));
-            if !a.std_tree && under(std_key.as_str(), name.as_str()) {
+            if (!a.std_tree && under(std_key.as_str(), name.as_str())) || under(home_key.as_str(), name.as_str()) {
                 continue;
             }
             let k = self.st.key_of(name.as_str());
@@ -1605,8 +1612,19 @@ fn position_json(j: &mut Json, line: u32, character: u32): Value {
 
 // ===================================================================== paths and URIs
 
-/// The path of a `file:` URI.
+/// The canonical path of a document, so that the same file always has the
+/// same path (on Windows: long names instead of 8.3 short ones), matching
+/// the canonical paths projects use.
 fn to_path(uri: str): Option::<String> {
+    let p = uri_path(uri)?;
+    return match canonical(p.as_str()) {
+        Ok(c) => Some(c),
+        Err(_) => Some(p),
+    };
+}
+
+/// The path of a `file:` URI.
+fn uri_path(uri: str): Option::<String> {
     if !uri.starts_with("file://") {
         return None;
     }
@@ -1663,7 +1681,7 @@ fn hex_digit(c: u8): Option::<u8> {
 /// A `file:` URI for `path`, encoded as the `url` crate encodes paths.
 fn uri_from_path(path: str): String {
     let mut out = String::from("file://");
-    let norm = project::normalize(path);
+    let norm = normalize(path);
     if !norm.as_str().starts_with("/") {
         out.push('/');
     }
@@ -1706,34 +1724,23 @@ fn under(dir_key: str, path: str): bool {
     return k.len() > dir_key.len() && k.as_str().starts_with(dir_key) && k.as_bytes()[dir_key.len()] == b'/';
 }
 
-/// Whether `path` is `dir/rel`.
-fn same_path(dir: str, rel: str, path: str): bool {
-    return path_key(project::join(dir, rel).as_str()).as_str() == path_key(path).as_str();
-}
-
 /// The root of the standard library source tree that `path` belongs to:
 /// an ancestor directory with `core/lib.ln` and `std/lib.ln`, with `path`
 /// under its `core/` or `std/`. Such files are the standard library being
 /// worked on, not programs.
 fn std_tree_of(path: str): Option::<String> {
-    let norm = project::normalize(path);
-    let mut cur = project::parent(norm.as_str());
+    let norm = normalize(path);
+    let mut cur = parent(norm.as_str());
     while let Some(d) = cur {
-        let core_dir = project::join(d.as_str(), "core");
-        let std_dir = project::join(d.as_str(), "std");
+        let core_dir = join(d.as_str(), "core");
+        let std_dir = join(d.as_str(), "std");
         let inside = under(path_key(core_dir.as_str()).as_str(), norm.as_str()) || under(path_key(std_dir.as_str()).as_str(), norm.as_str());
-        if inside && fs::is_file(project::join(core_dir.as_str(), "lib.ln").as_str()) && fs::is_file(project::join(std_dir.as_str(), "lib.ln").as_str()) {
+        if inside && fs::is_file(join(core_dir.as_str(), "lib.ln").as_str()) && fs::is_file(join(std_dir.as_str(), "lib.ln").as_str()) {
             return Some(d);
         }
-        cur = project::parent(d.as_str());
+        cur = parent(d.as_str());
     }
     return None;
-}
-
-/// Whether `file` is a test of the package in `dir` (`tests/*.ln`).
-fn is_test_file(dir: str, file: str): bool {
-    let tests = project::join(dir, "tests");
-    return file.ends_with(".ln") && under(path_key(tests.as_str()).as_str(), file) && !file[tests.len() + 1..].contains("/");
 }
 
 /// The last component of a path.
@@ -1777,20 +1784,6 @@ fn sanitize_stem(path: str): String {
         return s;
     }
     return out;
-}
-
-/// Whether `a` sorts before `b`, byte by byte.
-fn less(a: str, b: str): bool {
-    let x = a.as_bytes();
-    let y = b.as_bytes();
-    let mut i: usize = 0;
-    while i < x.len() && i < y.len() {
-        if x[i] != y[i] {
-            return x[i] < y[i];
-        }
-        i += 1;
-    }
-    return x.len() < y.len();
 }
 
 /// Whether `text` has a `mod name;` declaration (possibly `pub`).

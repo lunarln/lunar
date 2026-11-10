@@ -19,8 +19,14 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
 }
 
+/// The compiler under test: `$LUNAR_BIN` if set (such as the Lunar-built
+/// `craters/target/release/lunar`), else this crate's `lunar`.
+fn lunar_bin() -> std::ffi::OsString {
+    std::env::var_os("LUNAR_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_lunar").into())
+}
+
 fn lunar() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_lunar"));
+    let mut c = Command::new(lunar_bin());
     c.env_remove("LUNAR_STD_DIR");
     c
 }
@@ -195,17 +201,10 @@ fn fatal_tests_fail_cleanly() {
 }
 
 mod lsp {
+    use super::lunar;
     use serde_json::{Value, json};
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::process::{ChildStdin, ChildStdout, Command, Stdio};
-
-    /// The compiler whose language server is tested: `$LUNAR_BIN` if set
-    /// (such as the one built from craters/), else this crate's.
-    fn lunar() -> Command {
-        let mut c = Command::new(std::env::var_os("LUNAR_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_lunar").into()));
-        c.env_remove("LUNAR_STD_DIR");
-        c
-    }
+    use std::process::{ChildStdin, ChildStdout, Stdio};
 
     struct Client {
         stdin: ChildStdin,

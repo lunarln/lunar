@@ -1,5 +1,5 @@
 [package]
-name = "ln-driver"
+name = "lunar"
 version = "0.1.0"
 
 [dependencies]
@@ -8,4 +8,6 @@ ln-ast = { path = "../ln-ast" }
 ln-parser = { path = "../ln-parser" }
 ln-sema = { path = "../ln-sema" }
 ln-codegen = { path = "../ln-codegen" }
+ln-toml = { path = "../ln-toml" }
+ln-semver = { path = "../ln-semver" }
 ln-json = { path = "../ln-json" }

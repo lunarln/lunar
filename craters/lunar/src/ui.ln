@@ -1,0 +1,41 @@
+// What the driver prints besides diagnostics: Cargo-style status lines and
+// plain errors.
+
+use std::env;
+
+/// Whether stderr shows colors: it is a terminal that interprets ANSI
+/// codes, and `NO_COLOR` is not set (or empty).
+pub fn use_color(): bool {
+    if let Some(v) = env::var("NO_COLOR") {
+        if v.len() > 0 {
+            return false;
+        }
+    }
+    return std::io::enable_colors(2);
+}
+
+/// A status line on stderr: `   Compiling hello v0.1.0`, the verb
+/// right-aligned in 12 columns (bold green in color).
+pub fn status(verb: str, what: str) {
+    let mut s = String::new();
+    let color = use_color();
+    if color {
+        s.push_str("\u{1b}[1;32m");
+    }
+    for _ in verb.len()..12 {
+        s.push(' ');
+    }
+    s.push_str(verb);
+    if color {
+        s.push_str("\u{1b}[0m");
+    }
+    s.push(' ');
+    s.push_str(what);
+    s.push('\n');
+    std::io::ewrite_str(s.as_str());
+}
+
+/// `error: msg` on stderr.
+pub fn fail(msg: str) {
+    eprintln("error: {msg}");
+}
