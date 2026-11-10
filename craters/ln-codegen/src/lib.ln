@@ -1,7 +1,1002 @@
 // Code generation for Lunar, written in Lunar: a port of the Rust
-// `ln-codegen` crate (crates/ln-codegen), calling LLVM through its C API.
+// `ln-codegen` crate (crates/ln-codegen), calling LLVM through its C API
+// (`llvm.ln`) where Rust goes through inkwell.
+//
+// Generic functions are monomorphized on demand: starting from `main` (or
+// the test harness), every reached `(function, type arguments)` instance is
+// declared and queued, then lowered from THIR.
+//
+// Layouts:
+// * owning arrays and `String`: `{ ptr, len, cap }` handle; the elements
+//   live on a data stack managed by the runtime (`ds_grow` / `ds_free`).
+// * slices, `str`: `{ ptr, len }`; `FmtArgs`: `{ env, thunk }`.
+// * enums: `{ i32 tag, [N x i64] payload }`.
+//
+// Rust's `FnCg` (the state of the function being lowered, which borrows the
+// `Cg`) is folded into `Cg` here: structs cannot hold references, and only
+// one function body is lowered at a time. The program is passed to every
+// method (`p: &mut +Program`): type interning and the trait queries grow it.
 
 pub mod llvm;
 mod init;
+mod func;
+mod ops;
 #[cfg(test)]
 mod smoke;
+
+use core::arena::List;
+use core::collections::HashMap;
+use core::ffi::c_string;
+use core::intern::Symbol;
+use core::intrinsics::addr_of_mut;
+use ln_ast::Span;
+use ln_sema::defs::{Abi, ConstVal, DefData, DefId};
+use ln_sema::diag::is_dummy;
+use ln_sema::program::Program;
+use ln_sema::thir::{Body, LoopId};
+use ln_sema::ty::{ArrKind, FloatTy, IntTy, Ty, TyKind, TyList};
+use crater::llvm::*;
+
+/// How to compile.
+pub struct Options {
+    /// 0 = no optimization, 1..=3 = LLVM `default<On>`.
+    pub opt_level: u32,
+    /// Generate the `#[test]` harness instead of calling `main`.
+    pub test: bool,
+    /// Panic on integer overflow.
+    pub overflow_checks: bool,
+    /// Write the LLVM IR to this path as well.
+    pub emit_llvm: Option::<String>,
+}
+
+/// Compile `p` to a native object file at `obj_path`.
+pub fn compile(p: &mut +Program, opts: Options, obj_path: str): Result::<(), String> {
+    // (`generate(p, opts)?` is wrongly reported as using `opts` after a
+    // move.)
+    let r = generate(p, opts);
+    let g = r?;
+    let path = c_string(obj_path);
+    let mut err = null();
+    let failed = unsafe { LLVMTargetMachineEmitToFile(g.tm, g.module, path.as_ptr(), OBJECT_FILE, addr_of_mut(&mut err)) } != 0;
+    let mut msg = String::new();
+    if failed {
+        let e = take_message(err);
+        msg.write("could not write object file: {e}");
+    }
+    g.dispose();
+    if failed {
+        return Err(msg);
+    }
+    return Ok(());
+}
+
+/// Generate and optimize `p`, returning its textual LLVM IR.
+pub fn emit_ir(p: &mut +Program, opts: Options): Result::<String, String> {
+    let r = generate(p, opts);
+    let g = r?;
+    let ir = take_message(unsafe { LLVMPrintModuleToString(g.module) });
+    g.dispose();
+    return Ok(ir);
+}
+
+/// A lowered, verified and optimized module, with the target machine it
+/// was made for.
+struct Generated {
+    ctx: ContextRef,
+    module: ModuleRef,
+    tm: TargetMachineRef,
+    td: TargetDataRef,
+}
+
+impl Generated {
+    fn dispose(self) {
+        unsafe {
+            LLVMDisposeModule(self.module);
+            LLVMContextDispose(self.ctx);
+            LLVMDisposeTargetData(self.td);
+            LLVMDisposeTargetMachine(self.tm);
+        }
+    }
+}
+
+/// Lower, verify and optimize `p`. `opts.emit_llvm` receives the optimized
+/// IR, or the unoptimized IR if verification fails (so a compiler bug can
+/// be inspected).
+fn generate(p: &mut +Program, opts: Options): Result::<Generated, String> {
+    // The IR path is kept apart: a `String` inside an `Option` field cannot
+    // be viewed without moving it out.
+    let Options { opt_level, test, overflow_checks, emit_llvm } = opts;
+    let opts = Options { opt_level, test, overflow_checks, emit_llvm: None };
+    let mut emit = false;
+    let mut emit_path = String::new();
+    if let Some(path) = emit_llvm {
+        emit = true;
+        emit_path = path;
+    }
+    init::native();
+    let triple = unsafe { LLVMGetDefaultTargetTriple() };
+    let mut target: TargetRef = null();
+    let mut err = null();
+    if unsafe { LLVMGetTargetFromTriple(triple as *u8, addr_of_mut(&mut target), addr_of_mut(&mut err)) } != 0 {
+        let e = take_message(err);
+        take_message(triple);
+        let mut msg = String::new();
+        msg.write("unsupported target: {e}");
+        return Err(msg);
+    }
+    let level = match opts.opt_level {
+        0 => CODEGEN_LEVEL_NONE,
+        1 => CODEGEN_LEVEL_LESS,
+        2 => CODEGEN_LEVEL_DEFAULT,
+        _ => CODEGEN_LEVEL_AGGRESSIVE,
+    };
+    let tm = unsafe { LLVMCreateTargetMachine(target, triple as *u8, z("generic\0"), z("\0"), level, RELOC_PIC, CODE_MODEL_DEFAULT) };
+    if is_null(tm) {
+        take_message(triple);
+        return Err(String::from("could not create an LLVM target machine"));
+    }
+    let ctx = unsafe { LLVMContextCreate() };
+    let module = unsafe { LLVMModuleCreateWithNameInContext(z("lunar\0"), ctx) };
+    unsafe { LLVMSetTarget(module, triple as *u8) };
+    take_message(triple);
+    let td = unsafe { LLVMCreateTargetDataLayout(tm) };
+    unsafe { LLVMSetModuleDataLayout(module, td) };
+    let mut cg = Cg {
+        ctx,
+        module,
+        b: unsafe { LLVMCreateBuilderInContext(ctx) },
+        ab: unsafe { LLVMCreateBuilderInContext(ctx) },
+        td,
+        opts,
+        emit,
+        emit_path,
+        fns: HashMap::new(),
+        queue: [],
+        adt_types: HashMap::new(),
+        statics: HashMap::new(),
+        strs: HashMap::new(),
+        glue: HashMap::new(),
+        externs: HashMap::new(),
+        counter: 0,
+        f: null(),
+        body: Body { def: DefId::new(0), locals: List::empty(), params: List::empty(), block: core::arena::Id::from_index(0), span: Span::new(0, 0) },
+        args: List::empty(),
+        locals: [],
+        cleanups: [],
+        marks: [],
+        loops: HashMap::new(),
+        error: String::new(),
+        failed: false,
+    };
+    let r = cg.run(p, tm);
+    unsafe {
+        LLVMDisposeBuilder(cg.b);
+        LLVMDisposeBuilder(cg.ab);
+    }
+    let g = Generated { ctx, module, tm, td };
+    return match r {
+        Ok(()) => Ok(g),
+        Err(e) => {
+            g.dispose();
+            Err(e)
+        }
+    };
+}
+
+/// A declared function instance whose body is still to be generated.
+struct Queued {
+    def: DefId,
+    args: TyList,
+    f: ValueRef,
+}
+
+/// An owned value to drop when its scope ends: its place and type.
+pub struct Cleanup {
+    pub ptr: ValueRef,
+    pub ty: Ty,
+}
+
+/// Where `break` and `continue` go in a loop, where a `break` value is
+/// stored (null for none), and the cleanup depth at the loop.
+pub struct LoopInfo {
+    pub brk: BasicBlockRef,
+    pub cont: BasicBlockRef,
+    pub slot: ValueRef,
+    pub mark: usize,
+}
+
+/// The code generator: the module being built, and the state of the
+/// function body being lowered.
+pub struct Cg {
+    ctx: ContextRef,
+    module: ModuleRef,
+    b: BuilderRef,
+    /// Builds the entry-block allocas.
+    ab: BuilderRef,
+    td: TargetDataRef,
+    /// The options (without `emit_llvm`, which is `emit` and `emit_path`).
+    opts: Options,
+    /// Write the IR to `emit_path`.
+    emit: bool,
+    emit_path: String,
+    /// Declared function instances.
+    fns: HashMap::<(DefId, TyList), ValueRef>,
+    /// Instances whose bodies still need to be generated.
+    queue: [Queued; -..+],
+    adt_types: HashMap::<Ty, TypeRef>,
+    statics: HashMap::<DefId, ValueRef>,
+    /// String constants, by their text.
+    strs: HashMap::<Symbol, ValueRef>,
+    /// Drop glue functions per type.
+    glue: HashMap::<Ty, ValueRef>,
+    /// libc helpers (memcmp, atoi), by name.
+    externs: HashMap::<Symbol, ValueRef>,
+    counter: u32,
+
+    // ----- the function being lowered (`FnCg` in Rust) -----
+    f: ValueRef,
+    body: Body,
+    /// The instance's generic arguments.
+    args: TyList,
+    /// Each local's slot (null until allocated).
+    locals: [ValueRef; -..+],
+    cleanups: [Cleanup; -..+],
+    marks: [usize; -..+],
+    loops: HashMap::<LoopId, LoopInfo>,
+    /// The first internal error in the function (when `failed`).
+    error: String,
+    failed: bool,
+}
+
+impl Cg {
+    /// Generate everything reachable from the entry point, verify the
+    /// module, optimize it and write the IR if asked.
+    fn run(&mut self, p: &mut +Program, tm: TargetMachineRef): Result::<(), String> {
+        self.gen_entry(p)?;
+        while let Some(q) = self.queue.pop() {
+            self.gen_fn(p, q.def, q.args, q.f)?;
+        }
+        let mut msg = null();
+        let broken = unsafe { LLVMVerifyModule(self.module, RETURN_STATUS_ACTION, addr_of_mut(&mut msg)) } != 0;
+        let text = take_message(msg);
+        if broken {
+            self.write_ir()?;
+            let mut e = String::new();
+            e.write("internal compiler error: invalid LLVM IR generated:\n{text}");
+            return Err(e);
+        }
+        let level = if self.opts.opt_level < 3 { self.opts.opt_level } else { 3 };
+        let mut pipeline = String::new();
+        pipeline.write("default<O{level}>");
+        let pc = c_string(pipeline.as_str());
+        let o = unsafe { LLVMCreatePassBuilderOptions() };
+        let e = unsafe { LLVMRunPasses(self.module, pc.as_ptr(), tm, o) };
+        unsafe { LLVMDisposePassBuilderOptions(o) };
+        if !is_null(e) {
+            let m = take_error(e);
+            let mut err = String::new();
+            err.write("LLVM optimization failed: {m}");
+            return Err(err);
+        }
+        self.write_ir()?;
+        return Ok(());
+    }
+
+    /// Write the module's IR to `opts.emit_llvm`, if set.
+    fn write_ir(&self): Result::<(), String> {
+        if !self.emit {
+            return Ok(());
+        }
+        let path = c_string(self.emit_path.as_str());
+        let mut err = null();
+        if unsafe { LLVMPrintModuleToFile(self.module, path.as_ptr(), addr_of_mut(&mut err)) } != 0 {
+            let m = take_message(err);
+            let mut e = String::new();
+            e.write("could not write LLVM IR: {m}");
+            return Err(e);
+        }
+        return Ok(());
+    }
+
+    // ===================================================================== types
+
+    pub fn ptr_ty(&self): TypeRef {
+        return unsafe { LLVMPointerTypeInContext(self.ctx, 0) };
+    }
+
+    pub fn usize_ty(&self): TypeRef {
+        return unsafe { LLVMInt64TypeInContext(self.ctx) };
+    }
+
+    pub fn i32_ty(&self): TypeRef {
+        return unsafe { LLVMInt32TypeInContext(self.ctx) };
+    }
+
+    pub fn i8_ty(&self): TypeRef {
+        return unsafe { LLVMInt8TypeInContext(self.ctx) };
+    }
+
+    pub fn bool_ty(&self): TypeRef {
+        return unsafe { LLVMInt1TypeInContext(self.ctx) };
+    }
+
+    pub fn void_ty(&self): TypeRef {
+        return unsafe { LLVMVoidTypeInContext(self.ctx) };
+    }
+
+    /// A literal (unnamed, unpacked) struct type.
+    pub fn struct_ty(&self, fields: [TypeRef; &]): TypeRef {
+        return unsafe { LLVMStructTypeInContext(self.ctx, fields.as_ptr(), fields.len() as u32, 0) };
+    }
+
+    pub fn unit_ty(&self): TypeRef {
+        let none: [TypeRef; 0] = [];
+        return self.struct_ty(none[..]);
+    }
+
+    pub fn slice_ty(&self): TypeRef {
+        let fields = [self.ptr_ty(), self.usize_ty()];
+        return self.struct_ty(fields[..]);
+    }
+
+    pub fn handle_ty(&self): TypeRef {
+        let fields = [self.ptr_ty(), self.usize_ty(), self.usize_ty()];
+        return self.struct_ty(fields[..]);
+    }
+
+    pub fn int_ty(&self, i: IntTy): TypeRef {
+        return match i.bits() {
+            8 => unsafe { LLVMInt8TypeInContext(self.ctx) },
+            16 => unsafe { LLVMInt16TypeInContext(self.ctx) },
+            32 => unsafe { LLVMInt32TypeInContext(self.ctx) },
+            _ => unsafe { LLVMInt64TypeInContext(self.ctx) },
+        };
+    }
+
+    pub fn float_ty(&self, f: FloatTy): TypeRef {
+        return match f {
+            FloatTy::F32 => unsafe { LLVMFloatTypeInContext(self.ctx) },
+            FloatTy::F64 => unsafe { LLVMDoubleTypeInContext(self.ctx) },
+        };
+    }
+
+    /// The LLVM type of values of type `t`.
+    pub fn llty(&mut self, p: &mut +Program, t: Ty): TypeRef {
+        return match p.types.kind(t) {
+            TyKind::Int(i) => self.int_ty(i),
+            TyKind::Float(f) => self.float_ty(f),
+            TyKind::Bool => self.bool_ty(),
+            TyKind::Char => self.i32_ty(),
+            TyKind::Str | TyKind::FmtArgs => self.slice_ty(),
+            TyKind::String => self.handle_ty(),
+            TyKind::Tuple(ts) => {
+                let mut fields: [TypeRef; ..+] = [];
+                for i in 0..ts.len() {
+                    let ft = p.types.at(ts, i);
+                    fields.push(self.llty(p, ft));
+                }
+                self.struct_ty(fields[..])
+            }
+            TyKind::Adt(..) => self.adt_ty(p, t),
+            TyKind::Array(e, k) => match k {
+                ArrKind::Fixed(n) => {
+                    let et = self.llty(p, e);
+                    unsafe { LLVMArrayType2(et, n) }
+                }
+                ArrKind::FixedVar(_) => {
+                    let et = self.llty(p, e);
+                    unsafe { LLVMArrayType2(et, 0) }
+                }
+                ArrKind::Slice | ArrKind::SliceMut => self.slice_ty(),
+                ArrKind::Dyn | ArrKind::Grow | ArrKind::Shrink => self.handle_ty(),
+            },
+            TyKind::Grow(inner) => self.llty(p, inner),
+            TyKind::Ptr(..) | TyKind::FnPtr(..) => self.ptr_ty(),
+            // The captures: a pointer to each borrowed one, each taken value.
+            TyKind::Closure(def, args) => {
+                let fs = p.closure_fields(def, args);
+                let mut fields: [TypeRef; ..+] = [];
+                for i in 0..fs.len() {
+                    let ft = p.types.at(fs, i);
+                    fields.push(self.llty(p, ft));
+                }
+                self.struct_ty(fields[..])
+            }
+            TyKind::Opaque(..) => {
+                let r = p.reveal(t);
+                self.llty(p, r)
+            }
+            TyKind::Never | TyKind::Error | TyKind::Param(..) | TyKind::Infer(_) => self.unit_ty(),
+        };
+    }
+
+    /// The named struct of a struct or enum instance.
+    fn adt_ty(&mut self, p: &mut +Program, t: Ty): TypeRef {
+        if let Some(s) = self.adt_types.get(t) {
+            return s;
+        }
+        let TyKind::Adt(d, args) = p.types.kind(t) else {
+            panic("adt_ty of a non-ADT type");
+        };
+        let name = p.ty_str(t);
+        let cname = c_string(name.as_str());
+        let st = unsafe { LLVMStructCreateNamed(self.ctx, cname.as_ptr()) };
+        self.adt_types.insert(t, st);
+        let adt = p.adt(d);
+        if adt.is_enum {
+            let mut max: u64 = 0;
+            for v in 0..adt.variants.len() {
+                let vs = self.variant_struct(p, t, v);
+                let size = unsafe { LLVMABISizeOfType(self.td, vs) };
+                if size > max {
+                    max = size;
+                }
+            }
+            let words = (max + 7) / 8;
+            let body = [self.i32_ty(), unsafe { LLVMArrayType2(LLVMInt64TypeInContext(self.ctx), words) }];
+            unsafe { LLVMStructSetBody(st, body[..].as_ptr(), 2, 0) };
+        } else {
+            let v = p.variants.list(adt.variants)[0];
+            let mut fields: [TypeRef; ..+] = [];
+            for i in 0..v.fields.len() {
+                let fty = p.fields.list(v.fields)[i].ty;
+                let ft = p.types.subst(fty, args);
+                fields.push(self.llty(p, ft));
+            }
+            unsafe { LLVMStructSetBody(st, fields[..].as_ptr(), fields.len() as u32, 0) };
+        }
+        return st;
+    }
+
+    /// The payload layout of enum variant `v` (or the struct itself).
+    pub fn variant_struct(&mut self, p: &mut +Program, t: Ty, v: usize): TypeRef {
+        let TyKind::Adt(d, args) = p.types.kind(t) else {
+            panic("variant_struct of a non-ADT type");
+        };
+        let adt = p.adt(d);
+        if !adt.is_enum {
+            return self.adt_ty(p, t);
+        }
+        let var = p.variants.list(adt.variants)[v];
+        let mut fields: [TypeRef; ..+] = [];
+        for i in 0..var.fields.len() {
+            let fty = p.fields.list(var.fields)[i].ty;
+            let ft = p.types.subst(fty, args);
+            fields.push(self.llty(p, ft));
+        }
+        return self.struct_ty(fields[..]);
+    }
+
+    pub fn size_of(&mut self, p: &mut +Program, t: Ty): u64 {
+        let l = self.llty(p, t);
+        return unsafe { LLVMABISizeOfType(self.td, l) };
+    }
+
+    pub fn align_of(&mut self, p: &mut +Program, t: Ty): u32 {
+        let l = self.llty(p, t);
+        return unsafe { LLVMABIAlignmentOfType(self.td, l) };
+    }
+
+    /// Whether values of type `t` are not passed at all (`()` and `!`).
+    pub fn is_void(p: &mut +Program, t: Ty): bool {
+        return p.types.is_unit(t) || p.types.is_never(t);
+    }
+
+    /// LLVM function type for a Lunar signature: `(type, passed by
+    /// pointer)` per parameter.
+    pub fn fn_ty(&mut self, p: &mut +Program, params: [(Ty, bool); &], ret: Ty, variadic: bool): TypeRef {
+        let mut ps: [TypeRef; ..+] = [];
+        for x in params {
+            let (t, by_ref) = x;
+            if by_ref {
+                ps.push(self.ptr_ty());
+            } else {
+                ps.push(self.llty(p, t));
+            }
+        }
+        let r = if Cg::is_void(p, ret) { self.void_ty() } else { self.llty(p, ret) };
+        return unsafe { LLVMFunctionType(r, ps[..].as_ptr(), ps.len() as u32, variadic as i32) };
+    }
+
+    // ===================================================================== functions
+
+    /// The symbol of instance `def<args>`: `_LN<index>_<path><<args>>`,
+    /// with every character other than ASCII letters, digits and `_.$`
+    /// replaced by `_`.
+    fn mangle(&mut self, p: &mut +Program, def: DefId, args: TyList): String {
+        let mut s = String::new();
+        let path = p.path_of(def);
+        s.write("_LN{def.index}_{path}");
+        if args.len() > 0 {
+            s.push('<');
+            for i in 0..args.len() {
+                if i > 0 {
+                    s.push(',');
+                }
+                let a = p.types.at(args, i);
+                let ts = p.ty_str(a);
+                s.push_str(ts.as_str());
+            }
+            s.push('>');
+        }
+        let mut out = String::new();
+        for c in s.as_str().chars() {
+            let keep = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '$';
+            out.push(if keep { c } else { '_' });
+        }
+        return out;
+    }
+
+    /// Get (declaring and queueing if needed) the instance `def<args>`.
+    pub fn instance(&mut self, p: &mut +Program, def: DefId, args: TyList): ValueRef {
+        if let Some(f) = self.fns.get((def, args)) {
+            return f;
+        }
+        let fd = p.fn_data(def);
+        let mut params: [(Ty, bool); ..+] = [];
+        for i in 0..fd.sig.params.len() {
+            let pty = p.params.list(fd.sig.params)[i].ty;
+            let st = p.types.subst(pty, args);
+            let t = p.reveal(st);
+            params.push((t, p.param_by_ref(def, i)));
+        }
+        let sret = p.types.subst(fd.sig.ret, args);
+        let ret = p.reveal(sret);
+        let fty = self.fn_ty(p, params[..], ret, fd.variadic);
+        let f = if fd.abi == Abi::C {
+            let info = p.def(def);
+            let name = match info.attrs.link_name {
+                Some(n) => n,
+                None => info.name,
+            };
+            let cname = c_string(p.text(name));
+            let existing = unsafe { LLVMGetNamedFunction(self.module, cname.as_ptr()) };
+            if !is_null(existing) {
+                existing
+            } else {
+                let f = unsafe { LLVMAddFunction(self.module, cname.as_ptr(), fty) };
+                unsafe { LLVMSetLinkage(f, EXTERNAL_LINKAGE) };
+                f
+            }
+        } else {
+            let name = self.mangle(p, def, args);
+            let cname = c_string(name.as_str());
+            let f = unsafe { LLVMAddFunction(self.module, cname.as_ptr(), fty) };
+            unsafe { LLVMSetLinkage(f, INTERNAL_LINKAGE) };
+            if fd.has_body {
+                self.queue.push(Queued { def, args, f });
+            }
+            f
+        };
+        if p.types.is_never(ret) {
+            let attr = "noreturn";
+            let kind = unsafe { LLVMGetEnumAttributeKindForName(attr.as_bytes().as_ptr(), attr.len()) };
+            let a = unsafe { LLVMCreateEnumAttribute(self.ctx, kind, 0) };
+            unsafe { LLVMAddAttributeAtIndex(f, ATTRIBUTE_FUNCTION_INDEX, a) };
+        }
+        self.fns.insert((def, args), f);
+        return f;
+    }
+
+    /// The function of lang item `name` (not generic).
+    pub fn lang_fn(&mut self, p: &mut +Program, name: str): Result::<ValueRef, String> {
+        let Some(def) = p.lang_item(name) else {
+            let mut e = String::new();
+            e.write("missing lang item `{name}`");
+            return Err(e);
+        };
+        return Ok(self.instance(p, def, List::empty()));
+    }
+
+    /// A libc helper: `memcmp` or `atoi`.
+    pub fn libc(&mut self, p: &mut +Program, name: str): ValueRef {
+        let key = p.sym(name);
+        if let Some(f) = self.externs.get(key) {
+            return f;
+        }
+        let i32t = self.i32_ty();
+        let ptr = self.ptr_ty();
+        let fty = if name == "memcmp" {
+            let ps = [ptr, ptr, self.usize_ty()];
+            unsafe { LLVMFunctionType(i32t, ps[..].as_ptr(), 3, 0) }
+        } else if name == "atoi" {
+            let ps = [ptr];
+            unsafe { LLVMFunctionType(i32t, ps[..].as_ptr(), 1, 0) }
+        } else {
+            panic("unknown libc helper");
+        };
+        let cname = c_string(name);
+        let mut f = unsafe { LLVMGetNamedFunction(self.module, cname.as_ptr()) };
+        if is_null(f) {
+            f = unsafe { LLVMAddFunction(self.module, cname.as_ptr(), fty) };
+            unsafe { LLVMSetLinkage(f, EXTERNAL_LINKAGE) };
+        }
+        self.externs.insert(key, f);
+        return f;
+    }
+
+    fn gen_fn(&mut self, p: &mut +Program, def: DefId, args: TyList, f: ValueRef): Result::<(), String> {
+        let Some(body) = p.bodies.get(def) else {
+            let path = p.path_of(def);
+            let mut e = String::new();
+            e.write("internal compiler error: no body for `{path}`");
+            return Err(e);
+        };
+        return self.gen_body(p, f, body, args);
+    }
+
+    // ===================================================================== constants
+
+    /// A private global holding the bytes of `s`.
+    pub fn str_global(&mut self, p: &mut +Program, s: str): ValueRef {
+        let key = p.sym(s);
+        if let Some(g) = self.strs.get(key) {
+            return g;
+        }
+        let data = unsafe { LLVMConstStringInContext2(self.ctx, s.as_bytes().as_ptr(), s.len(), 1) };
+        let mut name = String::new();
+        name.write(".str.{self.strs.len()}");
+        let cname = c_string(name.as_str());
+        let g = unsafe { LLVMAddGlobal(self.module, LLVMTypeOf(data), cname.as_ptr()) };
+        unsafe {
+            LLVMSetInitializer(g, data);
+            LLVMSetGlobalConstant(g, 1);
+            LLVMSetLinkage(g, PRIVATE_LINKAGE);
+            LLVMSetUnnamedAddress(g, GLOBAL_UNNAMED_ADDR);
+        }
+        self.strs.insert(key, g);
+        return g;
+    }
+
+    /// The `str` value `s`.
+    pub fn const_str(&mut self, p: &mut +Program, s: str): ValueRef {
+        let ptr = self.str_global(p, s);
+        let len = self.const_int(self.usize_ty(), s.len() as u64);
+        let vals = [ptr, len];
+        return unsafe { LLVMConstNamedStruct(self.slice_ty(), vals[..].as_ptr(), 2) };
+    }
+
+    pub fn const_val(&mut self, p: &mut +Program, v: ConstVal, t: Ty): Result::<ValueRef, String> {
+        let k = p.types.kind(t);
+        match v {
+            ConstVal::Int(i) => match k {
+                TyKind::Int(it) => return Ok(unsafe { LLVMConstInt(self.int_ty(it), i.bits(), it.signed() as i32) }),
+                TyKind::Float(_) => {
+                    let f = if i.neg { -(i.mag as f64) } else { i.mag as f64 };
+                    let ft = self.llty(p, t);
+                    return Ok(unsafe { LLVMConstReal(ft, f) });
+                }
+                TyKind::Ptr(..) => {
+                    let n = self.const_int(self.usize_ty(), i.bits());
+                    return Ok(unsafe { LLVMConstIntToPtr(n, self.ptr_ty()) });
+                }
+                TyKind::Char => return Ok(self.const_int(self.i32_ty(), i.bits())),
+                _ => {}
+            },
+            ConstVal::Float(f) => {
+                if let TyKind::Float(_) = k {
+                    let ft = self.llty(p, t);
+                    return Ok(unsafe { LLVMConstReal(ft, f) });
+                }
+            }
+            ConstVal::Bool(b) => return Ok(self.const_int(self.bool_ty(), b as u64)),
+            ConstVal::Char(c) => return Ok(self.const_int(self.i32_ty(), (c as u32) as u64)),
+            ConstVal::Str(s) => return Ok(self.const_str(p, p.text(s))),
+            ConstVal::Unit => return Ok(self.unit()),
+            ConstVal::Tuple(vs) => {
+                if let TyKind::Tuple(ts) = k {
+                    let mut vals: [ValueRef; ..+] = [];
+                    let n = if vs.len() < ts.len() { vs.len() } else { ts.len() };
+                    for i in 0..n {
+                        let cv = p.consts.list(vs)[i];
+                        let ct = p.types.at(ts, i);
+                        vals.push(self.const_val(p, cv, ct)?);
+                    }
+                    let st = self.llty(p, t);
+                    return Ok(unsafe { LLVMConstNamedStruct(st, vals[..].as_ptr(), vals.len() as u32) });
+                }
+            }
+            ConstVal::Array(vs) => {
+                if let TyKind::Array(e, ArrKind::Fixed(_)) = k {
+                    let et = self.llty(p, e);
+                    let mut vals: [ValueRef; ..+] = [];
+                    for i in 0..vs.len() {
+                        let cv = p.consts.list(vs)[i];
+                        vals.push(self.const_val(p, cv, e)?);
+                    }
+                    return Ok(unsafe { LLVMConstArray2(et, vals[..].as_ptr(), vals.len() as u64) });
+                }
+            }
+            _ => {}
+        }
+        let vs = describe_const(p, v);
+        let ts = p.ty_str(t);
+        let mut e = String::new();
+        e.write("internal compiler error: unsupported constant {vs} of type {ts}");
+        return Err(e);
+    }
+
+    /// The global of static `def`.
+    pub fn static_ptr(&mut self, p: &mut +Program, def: DefId): Result::<ValueRef, String> {
+        if let Some(g) = self.statics.get(def) {
+            return Ok(g);
+        }
+        let DefData::Static(s) = p.def(def).data else {
+            return Err(String::from("not a static"));
+        };
+        let llty = self.llty(p, s.ty);
+        let name = self.mangle(p, def, List::empty());
+        let cname = c_string(name.as_str());
+        let g = unsafe { LLVMAddGlobal(self.module, llty, cname.as_ptr()) };
+        let init = match s.value {
+            Some(v) => self.const_val(p, v, s.ty)?,
+            None => unsafe { LLVMConstNull(llty) },
+        };
+        unsafe {
+            LLVMSetInitializer(g, init);
+            LLVMSetGlobalConstant(g, (!s.mutable) as i32);
+            LLVMSetLinkage(g, INTERNAL_LINKAGE);
+        }
+        self.statics.insert(def, g);
+        return Ok(g);
+    }
+
+    /// The file name, line and column of `span` (`<unknown>` for none).
+    pub fn location(&self, p: &mut +Program, span: Span): (Symbol, u32, u32) {
+        if is_dummy(span) {
+            return (p.sym("<unknown>"), 0, 0);
+        }
+        let fi = p.sources.file_of(span.lo);
+        let name = p.sources.files[fi as usize].name;
+        let (l, c) = p.sources.line_col(span.lo);
+        return (name, l, c);
+    }
+
+    // ===================================================================== entry point
+
+    fn gen_entry(&mut self, p: &mut +Program): Result::<(), String> {
+        let i32t = self.i32_ty();
+        let ps = [i32t, self.ptr_ty()];
+        let fty = unsafe { LLVMFunctionType(i32t, ps[..].as_ptr(), 2, 0) };
+        let main = unsafe { LLVMAddFunction(self.module, z("main\0"), fty) };
+        unsafe { LLVMSetLinkage(main, EXTERNAL_LINKAGE) };
+        let entry = self.append_block(main, z("entry\0"));
+        self.position(entry);
+        let argc = unsafe { LLVMGetParam(main, 0) };
+        let argv = unsafe { LLVMGetParam(main, 1) };
+        let rt_init = self.lang_fn(p, "rt_init")?;
+        let argv_int = unsafe { LLVMBuildPtrToInt(self.b, argv, self.usize_ty(), z("argv\0")) };
+        let init_args = [argc, argv_int];
+        self.call(rt_init, init_args[..]);
+        if self.opts.test {
+            let run_all = self.append_block(main, z("run_all\0"));
+            let pick = self.append_block(main, z("pick\0"));
+            let has_arg = unsafe { LLVMBuildICmp(self.b, INT_SGE, argc, self.const_int(i32t, 2), z("has_arg\0")) };
+            self.cond_br(has_arg, pick, run_all);
+            self.position(run_all);
+            let none: [ValueRef; 0] = [];
+            for i in 0..p.tests.len() {
+                let t = p.tests[i];
+                let f = self.instance(p, t, List::empty());
+                self.call(f, none[..]);
+            }
+            self.ret(self.const_int(i32t, 0));
+            self.position(pick);
+            let one = [self.const_int(self.usize_ty(), 1)];
+            let arg1p = unsafe { LLVMBuildGEP2(self.b, self.ptr_ty(), argv, one[..].as_ptr(), 1, z("arg1p\0")) };
+            let arg1 = unsafe { LLVMBuildLoad2(self.b, self.ptr_ty(), arg1p, z("arg1\0")) };
+            let atoi = self.libc(p, "atoi");
+            let atoi_args = [arg1];
+            let idx = unsafe { LLVMBuildCall2(self.b, LLVMGlobalGetValueType(atoi), atoi, atoi_args[..].as_ptr(), 1, z("idx\0")) };
+            let done = self.append_block(main, z("done\0"));
+            let mut blocks: [BasicBlockRef; ..+] = [];
+            for i in 0..p.tests.len() {
+                let mut name = String::new();
+                name.write("test{i}");
+                let cname = c_string(name.as_str());
+                blocks.push(self.append_block(main, cname.as_ptr()));
+            }
+            let sw = unsafe { LLVMBuildSwitch(self.b, idx, done, blocks.len() as u32) };
+            for i in 0..blocks.len() {
+                unsafe { LLVMAddCase(sw, self.const_int(i32t, i as u64), blocks[i]) };
+            }
+            for i in 0..blocks.len() {
+                self.position(blocks[i]);
+                let t = p.tests[i];
+                let f = self.instance(p, t, List::empty());
+                self.call(f, none[..]);
+                self.br(done);
+            }
+            self.position(done);
+            self.ret(self.const_int(i32t, 0));
+        } else {
+            let Some(user_main) = p.main else {
+                return Err(String::from("no `main` function"));
+            };
+            let f = self.instance(p, user_main, List::empty());
+            let none: [ValueRef; 0] = [];
+            let code = match self.call_value(f, none[..]) {
+                Some(v) => v,
+                None => self.const_int(i32t, 0),
+            };
+            self.ret(code);
+        }
+        return Ok(());
+    }
+
+    // ===================================================================== builder helpers
+
+    pub fn append_block(&self, f: ValueRef, name: *u8): BasicBlockRef {
+        return unsafe { LLVMAppendBasicBlockInContext(self.ctx, f, name) };
+    }
+
+    pub fn position(&self, bb: BasicBlockRef) {
+        unsafe { LLVMPositionBuilderAtEnd(self.b, bb) };
+    }
+
+    pub fn insert_block(&self): BasicBlockRef {
+        return unsafe { LLVMGetInsertBlock(self.b) };
+    }
+
+    pub fn const_int(&self, t: TypeRef, v: u64): ValueRef {
+        return unsafe { LLVMConstInt(t, v, 0) };
+    }
+
+    pub fn const_null(&self, t: TypeRef): ValueRef {
+        return unsafe { LLVMConstNull(t) };
+    }
+
+    pub fn undef(&self, t: TypeRef): ValueRef {
+        return unsafe { LLVMGetUndef(t) };
+    }
+
+    /// The `()` value.
+    pub fn unit(&self): ValueRef {
+        let none: [ValueRef; 0] = [];
+        return unsafe { LLVMConstNamedStruct(self.unit_ty(), none[..].as_ptr(), 0) };
+    }
+
+    pub fn store(&self, v: ValueRef, ptr: ValueRef) {
+        unsafe { LLVMBuildStore(self.b, v, ptr) };
+    }
+
+    pub fn load_ty(&self, t: TypeRef, ptr: ValueRef, name: *u8): ValueRef {
+        return unsafe { LLVMBuildLoad2(self.b, t, ptr, name) };
+    }
+
+    pub fn br(&self, bb: BasicBlockRef) {
+        unsafe { LLVMBuildBr(self.b, bb) };
+    }
+
+    pub fn cond_br(&self, c: ValueRef, then: BasicBlockRef, else_: BasicBlockRef) {
+        unsafe { LLVMBuildCondBr(self.b, c, then, else_) };
+    }
+
+    pub fn ret(&self, v: ValueRef) {
+        unsafe { LLVMBuildRet(self.b, v) };
+    }
+
+    pub fn ret_void(&self) {
+        unsafe { LLVMBuildRetVoid(self.b) };
+    }
+
+    pub fn unreachable(&self) {
+        unsafe { LLVMBuildUnreachable(self.b) };
+    }
+
+    pub fn icmp(&self, pred: u32, a: ValueRef, b: ValueRef, name: *u8): ValueRef {
+        return unsafe { LLVMBuildICmp(self.b, pred, a, b, name) };
+    }
+
+    pub fn extract(&self, agg: ValueRef, i: u32, name: *u8): ValueRef {
+        return unsafe { LLVMBuildExtractValue(self.b, agg, i, name) };
+    }
+
+    pub fn insert(&self, agg: ValueRef, v: ValueRef, i: u32): ValueRef {
+        return unsafe { LLVMBuildInsertValue(self.b, agg, v, i, noname()) };
+    }
+
+    pub fn struct_gep(&self, t: TypeRef, ptr: ValueRef, i: u32, name: *u8): ValueRef {
+        return unsafe { LLVMBuildStructGEP2(self.b, t, ptr, i, name) };
+    }
+
+    /// `&ptr[i]` for elements of type `t`.
+    pub fn gep(&self, t: TypeRef, ptr: ValueRef, i: ValueRef, name: *u8): ValueRef {
+        let idx = [i];
+        return unsafe { LLVMBuildGEP2(self.b, t, ptr, idx[..].as_ptr(), 1, name) };
+    }
+
+    pub fn add(&self, a: ValueRef, b: ValueRef, name: *u8): ValueRef {
+        return unsafe { LLVMBuildAdd(self.b, a, b, name) };
+    }
+
+    pub fn sub(&self, a: ValueRef, b: ValueRef, name: *u8): ValueRef {
+        return unsafe { LLVMBuildSub(self.b, a, b, name) };
+    }
+
+    pub fn mul(&self, a: ValueRef, b: ValueRef, name: *u8): ValueRef {
+        return unsafe { LLVMBuildMul(self.b, a, b, name) };
+    }
+
+    pub fn and(&self, a: ValueRef, b: ValueRef, name: *u8): ValueRef {
+        return unsafe { LLVMBuildAnd(self.b, a, b, name) };
+    }
+
+    pub fn select(&self, c: ValueRef, a: ValueRef, b: ValueRef, name: *u8): ValueRef {
+        return unsafe { LLVMBuildSelect(self.b, c, a, b, name) };
+    }
+
+    /// Call function `f` (its own type).
+    pub fn call(&self, f: ValueRef, args: [ValueRef; &]): ValueRef {
+        return unsafe { LLVMBuildCall2(self.b, LLVMGlobalGetValueType(f), f, args.as_ptr(), args.len() as u32, noname()) };
+    }
+
+    /// Call `callee` of function type `fty`; its value, if it returns one.
+    pub fn call_typed(&self, fty: TypeRef, callee: ValueRef, args: [ValueRef; &]): Option::<ValueRef> {
+        let c = unsafe { LLVMBuildCall2(self.b, fty, callee, args.as_ptr(), args.len() as u32, noname()) };
+        if unsafe { LLVMGetTypeKind(LLVMGetReturnType(fty)) } == VOID_TYPE_KIND {
+            return None;
+        }
+        return Some(c);
+    }
+
+    /// Call function `f`; its value, if it returns one.
+    pub fn call_value(&self, f: ValueRef, args: [ValueRef; &]): Option::<ValueRef> {
+        return self.call_typed(unsafe { LLVMGlobalGetValueType(f) }, f, args);
+    }
+
+    /// The declaration of LLVM intrinsic `name` overloaded on `tys`.
+    pub fn intrinsic_decl(&self, name: str, tys: [TypeRef; &]): ValueRef {
+        let id = unsafe { LLVMLookupIntrinsicID(name.as_bytes().as_ptr(), name.len()) };
+        if id == 0 {
+            panic("unknown LLVM intrinsic {name}");
+        }
+        return unsafe { LLVMGetIntrinsicDeclaration(self.module, id, tys.as_ptr(), tys.len()) };
+    }
+}
+
+/// A constant, for error messages.
+fn describe_const(p: &mut +Program, v: ConstVal): String {
+    let mut s = String::new();
+    match v {
+        ConstVal::Int(i) => {
+            if i.neg {
+                s.write("Int(-{i.mag})");
+            } else {
+                s.write("Int({i.mag})");
+            }
+        }
+        ConstVal::Float(f) => s.write("Float({f})"),
+        ConstVal::Bool(b) => s.write("Bool({b})"),
+        ConstVal::Char(c) => s.write("Char({c:?})"),
+        ConstVal::Str(t) => s.write("Str({p.text(t):?})"),
+        ConstVal::Unit => s.push_str("Unit"),
+        ConstVal::Tuple(vs) => {
+            s.push_str("Tuple([");
+            write_consts(p, &mut s, vs);
+            s.push_str("])");
+        }
+        ConstVal::Adt(var, vs) => {
+            s.write("Adt({var}, [");
+            write_consts(p, &mut s, vs);
+            s.push_str("])");
+        }
+        ConstVal::Array(vs) => {
+            s.push_str("Array([");
+            write_consts(p, &mut s, vs);
+            s.push_str("])");
+        }
+    }
+    return s;
+}
+
+fn write_consts(p: &mut +Program, out: &mut +String, vs: List::<ConstVal>) {
+    for i in 0..vs.len() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let v = p.consts.list(vs)[i];
+        let d = describe_const(p, v);
+        out.push_str(d.as_str());
+    }
+}

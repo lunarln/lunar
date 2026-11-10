@@ -1,0 +1,1278 @@
+// Lowering of THIR function bodies: a port of crates/ln-codegen/src/func.rs.
+//
+// Every local lives in an entry-block `alloca` (LLVM promotes them to
+// registers). Owned values are tracked on a *cleanup stack*: locals and
+// statement temporaries that own data stacks are dropped when their scope
+// ends, including on `return`, `break` and `continue`. Moving out of a
+// place zeroes it, and dropping a zeroed handle is a no-op.
+//
+// A lowering function returns `None` when control cannot continue after
+// the expression (it diverged), like the Rust `tri!` macro (`?` here).
+
+use core::arena::{Id, List};
+use core::collections::HashMap;
+use core::ffi::c_string;
+use ln_ast::Span;
+use ln_sema::program::Program;
+use ln_sema::thir::*;
+use ln_sema::ty::{ArrKind, IntTy, Ty, TyKind, TyList};
+use crater::{Cg, Cleanup, LoopInfo};
+use crater::llvm::*;
+
+impl Cg {
+    /// Lower `body` into `f`, the instance with generic arguments `args`.
+    pub fn gen_body(&mut self, p: &mut +Program, f: ValueRef, body: Body, args: TyList): Result::<(), String> {
+        let entry = self.append_block(f, z("entry\0"));
+        self.position(entry);
+        self.f = f;
+        self.body = body;
+        self.args = args;
+        self.locals.clear();
+        for _ in 0..body.locals.len() {
+            self.locals.push(null());
+        }
+        self.cleanups.clear();
+        self.marks.clear();
+        self.loops = HashMap::new();
+        self.error.clear();
+        self.failed = false;
+        // Parameters.
+        for i in 0..body.params.len() {
+            let l = p.thir.local_ids.list(body.params)[i];
+            let param = unsafe { LLVMGetParam(f, i as u32) };
+            let local = p.thir.local(body, l);
+            // In-out and borrowed parameters arrive as pointers to the
+            // caller's place.
+            let by_ref = match local.kind {
+                LocalKind::Param { index, .. } => p.param_by_ref(body.def, index as usize),
+                _ => false,
+            };
+            if by_ref {
+                self.locals[l.index()] = param;
+            } else {
+                let ty = self.t(p, local.ty);
+                let lt = self.llty(p, ty);
+                let name = c_string(p.text(local.name));
+                let slot = self.alloca(lt, name.as_ptr());
+                self.store(param, slot);
+                self.locals[l.index()] = slot;
+                // A parameter that took ownership is this function's to
+                // free (moving out of it zeroes the slot, making the drop a
+                // no-op).
+                if let LocalKind::Param { owned: true, .. } = local.kind {
+                    let st = p.types.strip_grow(ty);
+                    self.register_cleanup(p, slot, st);
+                }
+            }
+        }
+        // Other locals.
+        for i in 0..body.locals.len() {
+            if !is_null(self.locals[i]) {
+                continue;
+            }
+            let local = p.thir.locals.list(body.locals)[i];
+            let ty = self.t(p, local.ty);
+            let name = c_string(p.text(local.name));
+            let slot = self.alloca_for(p, ty, name.as_ptr());
+            self.locals[i] = slot;
+        }
+        let v = self.block(p, body.block);
+        if v.is_some() && !self.terminated() {
+            let ret = self.t(p, p.fn_data(body.def).sig.ret);
+            if Cg::is_void(p, ret) {
+                if p.types.is_never(ret) {
+                    self.unreachable();
+                } else {
+                    self.ret_void();
+                }
+            } else {
+                self.ret(v.unwrap());
+            }
+        } else if !self.terminated() {
+            self.unreachable();
+        }
+        if self.failed {
+            return Err(String::from(self.error.as_str()));
+        }
+        return Ok(());
+    }
+
+    // ===================================================================== helpers
+
+    /// Record an internal compiler error (the first one wins).
+    pub fn ice(&mut self, p: &mut +Program, msg: str) {
+        if !self.failed {
+            let path = p.path_of(self.body.def);
+            self.error.write("internal compiler error in `{path}`: {msg}");
+            self.failed = true;
+        }
+    }
+
+    /// Substitute the instance's generic arguments, and reveal the types
+    /// behind `impl Trait`.
+    pub fn t(&mut self, p: &mut +Program, t: Ty): Ty {
+        let s = p.types.subst(t, self.args);
+        return p.reveal(s);
+    }
+
+    /// `t` applied to every type of `l`.
+    pub fn t_list(&mut self, p: &mut +Program, l: TyList): TyList {
+        let mut out: [Ty; ..+] = [];
+        for i in 0..l.len() {
+            let x = p.types.at(l, i);
+            out.push(self.t(p, x));
+        }
+        return p.types.mk_list(out[..]);
+    }
+
+    /// The type of expression `e`, instantiated.
+    pub fn ety(&mut self, p: &mut +Program, e: Id::<Expr>): Ty {
+        let t = p.thir.expr(e).ty;
+        return self.t(p, t);
+    }
+
+    /// The instantiated type of place `e`, without a `+`.
+    pub fn place_ty(&mut self, p: &mut +Program, e: Id::<Expr>): Ty {
+        let t = self.ety(p, e);
+        return p.types.strip_grow(t);
+    }
+
+    /// An alloca in the entry block.
+    pub fn alloca(&mut self, ty: TypeRef, name: *u8): ValueRef {
+        let entry = unsafe { LLVMGetFirstBasicBlock(self.f) };
+        let first = unsafe { LLVMGetFirstInstruction(entry) };
+        if is_null(first) {
+            unsafe { LLVMPositionBuilderAtEnd(self.ab, entry) };
+        } else {
+            unsafe { LLVMPositionBuilderBefore(self.ab, first) };
+        }
+        return unsafe { LLVMBuildAlloca(self.ab, ty, name) };
+    }
+
+    /// An alloca for a value of type `t`, zero-initialized if it owns data.
+    pub fn alloca_for(&mut self, p: &mut +Program, t: Ty, name: *u8): ValueRef {
+        let lt = self.llty(p, t);
+        let slot = self.alloca(lt, name);
+        if p.has_owner(t) {
+            // Zero right after the alloca so drops of never-written slots
+            // are no-ops.
+            let next = unsafe { LLVMGetNextInstruction(slot) };
+            if is_null(next) {
+                unsafe { LLVMPositionBuilderAtEnd(self.ab, LLVMGetFirstBasicBlock(self.f)) };
+            } else {
+                unsafe { LLVMPositionBuilderBefore(self.ab, next) };
+            }
+            unsafe { LLVMBuildStore(self.ab, LLVMConstNull(lt), slot) };
+        }
+        return slot;
+    }
+
+    /// Whether the current block already ends in a terminator.
+    pub fn terminated(&self): bool {
+        let bb = self.insert_block();
+        return !is_null(bb) && !is_null(unsafe { LLVMGetBasicBlockTerminator(bb) });
+    }
+
+    pub fn block_named(&self, name: *u8): BasicBlockRef {
+        return self.append_block(self.f, name);
+    }
+
+    pub fn usize(&self, v: u64): ValueRef {
+        return self.const_int(self.usize_ty(), v);
+    }
+
+    pub fn load(&mut self, p: &mut +Program, ptr: ValueRef, t: Ty): ValueRef {
+        let lt = self.llty(p, t);
+        return self.load_ty(lt, ptr, noname());
+    }
+
+    pub fn struct_field(&self, sty: TypeRef, ptr: ValueRef, idx: u32): ValueRef {
+        return self.struct_gep(sty, ptr, idx, noname());
+    }
+
+    // ===================================================================== cleanups
+
+    pub fn push_mark(&mut self) {
+        self.marks.push(self.cleanups.len());
+    }
+
+    /// Pop the innermost mark, emitting drops if control reaches here.
+    pub fn pop_mark(&mut self, p: &mut +Program) {
+        let m = self.marks.pop().unwrap();
+        if !self.terminated() {
+            self.emit_cleanups(p, m);
+        }
+        self.cleanups.truncate(m);
+    }
+
+    /// Pop the innermost mark without emitting drops (control diverged).
+    pub fn drop_mark(&mut self) {
+        let m = self.marks.pop().unwrap();
+        self.cleanups.truncate(m);
+    }
+
+    /// Emit drops for cleanup entries above `mark` (without popping them).
+    pub fn emit_cleanups(&mut self, p: &mut +Program, mark: usize) {
+        let mut i = self.cleanups.len();
+        while i > mark {
+            i -= 1;
+            let c = self.cleanups[i];
+            self.drop_in_place(p, c.ptr, c.ty);
+            let lt = self.llty(p, c.ty);
+            self.store(self.const_null(lt), c.ptr);
+        }
+    }
+
+    pub fn register_cleanup(&mut self, p: &mut +Program, ptr: ValueRef, t: Ty) {
+        if p.has_owner(t) {
+            self.cleanups.push(Cleanup { ptr, ty: t });
+        }
+    }
+
+    // ===================================================================== blocks & statements
+
+    pub fn block(&mut self, p: &mut +Program, b: Id::<Block>): Option::<ValueRef> {
+        let blk = p.thir.block(b);
+        self.push_mark();
+        for i in 0..blk.stmts.len() {
+            let s = p.thir.stmts.list(blk.stmts)[i];
+            if self.stmt(p, s).is_none() {
+                self.marks.pop();
+                return None;
+            }
+        }
+        let v = match blk.tail {
+            Some(t) => self.value(p, t),
+            None => Some(self.unit()),
+        };
+        match v {
+            Some(v) => {
+                self.pop_mark(p);
+                return Some(v);
+            }
+            None => {
+                self.drop_mark();
+                return None;
+            }
+        }
+    }
+
+    fn stmt(&mut self, p: &mut +Program, s: Stmt): Option::<()> {
+        match s {
+            Stmt::Let { pat, init, .. } => {
+                let Some(init) = init else {
+                    return Some(());
+                };
+                self.push_mark();
+                let v = match self.value(p, init) {
+                    Some(v) => v,
+                    None => {
+                        self.drop_mark();
+                        return None;
+                    }
+                };
+                self.pop_mark(p);
+                let pt = p.thir.pat(pat);
+                let ty = self.t(p, pt.ty);
+                match pt.kind {
+                    PatKind::Binding { local, sub: None, .. } => {
+                        let slot = self.locals[local.index()];
+                        self.store(v, slot);
+                        self.register_cleanup(p, slot, ty);
+                    }
+                    PatKind::Wild => {
+                        let tmp = self.alloca_for(p, ty, z("let_tmp\0"));
+                        self.store(v, tmp);
+                        self.drop_in_place(p, tmp, ty);
+                    }
+                    _ => {
+                        let tmp = self.alloca_for(p, ty, z("let_tmp\0"));
+                        self.store(v, tmp);
+                        self.bind_pat(p, pat, tmp, ty, true);
+                        self.register_cleanup(p, tmp, ty);
+                    }
+                }
+                return Some(());
+            }
+            Stmt::Expr(e) => {
+                self.push_mark();
+                match self.value(p, e) {
+                    Some(v) => {
+                        let ty = self.ety(p, e);
+                        if p.has_owner(ty) {
+                            // A discarded owned value is dropped right away.
+                            let tmp = self.alloca_for(p, ty, z("discard\0"));
+                            self.store(v, tmp);
+                            self.drop_in_place(p, tmp, ty);
+                            let lt = self.llty(p, ty);
+                            self.store(self.const_null(lt), tmp);
+                        }
+                        self.pop_mark(p);
+                        return Some(());
+                    }
+                    None => {
+                        self.drop_mark();
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Evaluate `e` inside its own temporary scope (conditions, guards).
+    fn scoped_value(&mut self, p: &mut +Program, e: Id::<Expr>): Option::<ValueRef> {
+        self.push_mark();
+        match self.value(p, e) {
+            Some(v) => {
+                self.pop_mark(p);
+                return Some(v);
+            }
+            None => {
+                self.drop_mark();
+                return None;
+            }
+        }
+    }
+
+    // ===================================================================== places
+
+    pub fn place(&mut self, p: &mut +Program, e: Id::<Expr>): Option::<ValueRef> {
+        let ex = p.thir.expr(e);
+        match ex.kind {
+            ExprKind::Local(l) => return Some(self.locals[l.index()]),
+            ExprKind::Static(d) => match self.static_ptr(p, d) {
+                Ok(g) => return Some(g),
+                Err(err) => {
+                    self.ice(p, err.as_str());
+                    return None;
+                }
+            },
+            ExprKind::Field { base, variant, field } => {
+                let bp = self.place(p, base)?;
+                let bt = self.place_ty(p, base);
+                return Some(self.field_ptr(p, bp, bt, variant as usize, field as usize));
+            }
+            ExprKind::Index { base, index } => {
+                let bp = self.place(p, base)?;
+                let i = self.value(p, index)?;
+                let bt = self.place_ty(p, base);
+                let (data, len, elem) = self.array_parts(p, bp, bt);
+                self.check_bounds(p, i, len, ex.span);
+                let et = self.llty(p, elem);
+                return Some(self.gep(et, data, i, z("elem\0")));
+            }
+            ExprKind::Deref(x) => return Some(self.value(p, x)?),
+            ExprKind::Temp(v) => {
+                let val = self.value(p, v)?;
+                let ty = self.ety(p, v);
+                let tmp = self.alloca_for(p, ty, z("tmp\0"));
+                self.store(val, tmp);
+                self.register_cleanup(p, tmp, ty);
+                return Some(tmp);
+            }
+            _ => {
+                // A value used where a place is needed.
+                let val = self.value(p, e)?;
+                let ty = self.t(p, ex.ty);
+                let tmp = self.alloca_for(p, ty, z("tmp\0"));
+                self.store(val, tmp);
+                self.register_cleanup(p, tmp, ty);
+                return Some(tmp);
+            }
+        }
+    }
+
+    /// The address of field `field` (of `variant`, for enums) of the value
+    /// of type `bt` at `bp`.
+    pub fn field_ptr(&mut self, p: &mut +Program, bp: ValueRef, bt: Ty, variant: usize, field: usize): ValueRef {
+        if let TyKind::Adt(d, _) = p.types.kind(bt) {
+            if p.is_enum(d) {
+                let et = self.llty(p, bt);
+                let payload = self.struct_field(et, bp, 1);
+                let vs = self.variant_struct(p, bt, variant);
+                return self.struct_field(vs, payload, field as u32);
+            }
+        }
+        let lt = self.llty(p, bt);
+        return self.struct_field(lt, bp, field as u32);
+    }
+
+    /// Data pointer, length and element type of an array-like place.
+    pub fn array_parts(&mut self, p: &mut +Program, ptr: ValueRef, t: Ty): (ValueRef, ValueRef, Ty) {
+        match p.types.kind(t) {
+            TyKind::Array(e, ArrKind::Fixed(n)) => return (ptr, self.usize(n), e),
+            TyKind::Array(e, k) => {
+                let st = if k.is_slice() { self.slice_ty() } else { self.handle_ty() };
+                let dp = self.struct_field(st, ptr, 0);
+                let lp = self.struct_field(st, ptr, 1);
+                let data = self.load_ty(self.ptr_ty(), dp, z("data\0"));
+                let len = self.load_ty(self.usize_ty(), lp, z("len\0"));
+                return (data, len, e);
+            }
+            TyKind::Str | TyKind::String => {
+                let st = if p.types.kind(t) == TyKind::Str { self.slice_ty() } else { self.handle_ty() };
+                let dp = self.struct_field(st, ptr, 0);
+                let lp = self.struct_field(st, ptr, 1);
+                let data = self.load_ty(self.ptr_ty(), dp, z("data\0"));
+                let len = self.load_ty(self.usize_ty(), lp, z("len\0"));
+                return (data, len, p.types.int(IntTy::U8));
+            }
+            _ => {
+                let s = p.ty_str(t);
+                let mut msg = String::new();
+                msg.write("not an array type: {s}");
+                self.ice(p, msg.as_str());
+                let null_ptr = unsafe { LLVMConstPointerNull(self.ptr_ty()) };
+                return (null_ptr, self.usize(0), p.types.unit());
+            }
+        }
+    }
+
+    pub fn check_bounds(&mut self, p: &mut +Program, i: ValueRef, len: ValueRef, span: Span) {
+        let ok = self.icmp(INT_ULT, i, len, z("inb\0"));
+        let good = self.block_named(z("inbounds\0"));
+        let bad = self.block_named(z("oob\0"));
+        self.cond_br(ok, good, bad);
+        self.position(bad);
+        self.panic_bounds(p, i, len, span);
+        self.position(good);
+    }
+
+    // ===================================================================== values
+
+    pub fn value(&mut self, p: &mut +Program, e: Id::<Expr>): Option::<ValueRef> {
+        let ex = p.thir.expr(e);
+        let ty = self.t(p, ex.ty);
+        match ex.kind {
+            ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Deref(_) => {
+                let ptr = self.place(p, e)?;
+                let t = p.types.strip_grow(ty);
+                return Some(self.load(p, ptr, t));
+            }
+            ExprKind::Temp(v) => return self.value(p, v),
+            ExprKind::Read { place, mode } => {
+                let ptr = self.place(p, place)?;
+                let pt = self.place_ty(p, place);
+                let v = self.load(p, ptr, pt);
+                if mode == ReadMode::Move && p.has_owner(pt) {
+                    let lt = self.llty(p, pt);
+                    self.store(self.const_null(lt), ptr);
+                }
+                return Some(v);
+            }
+            ExprKind::Lit(v) => match self.const_val(p, v, ty) {
+                Ok(c) => return Some(c),
+                Err(err) => {
+                    self.ice(p, err.as_str());
+                    return Some(self.unit());
+                }
+            },
+            ExprKind::FnRef { def, args } => {
+                let targs = self.t_list(p, args);
+                return Some(self.instance(p, def, targs));
+            }
+            ExprKind::Call { callee, args } => return self.call_expr(p, callee, args, ty, ex.span),
+            ExprKind::Unary(op, x) => {
+                let v = self.value(p, x)?;
+                return Some(self.unary(p, op, v, ty, ex.span));
+            }
+            ExprKind::Binary(op, a, b) => {
+                let va = self.value(p, a)?;
+                let vb = self.value(p, b)?;
+                let at = self.ety(p, a);
+                return Some(self.binop(p, op, va, vb, at, ex.span));
+            }
+            ExprKind::Logical { and, lhs, rhs } => {
+                let l = self.value(p, lhs)?;
+                let lhs_bb = self.insert_block();
+                let rhs_bb = self.block_named(z("rhs\0"));
+                let merge = self.block_named(z("logic\0"));
+                if and {
+                    self.cond_br(l, rhs_bb, merge);
+                } else {
+                    self.cond_br(l, merge, rhs_bb);
+                }
+                self.position(rhs_bb);
+                let r = self.scoped_value(p, rhs);
+                let r_end = self.insert_block();
+                if r.is_some() {
+                    self.br(merge);
+                }
+                self.position(merge);
+                let phi = unsafe { LLVMBuildPhi(self.b, self.bool_ty(), z("logic\0")) };
+                let short = [self.const_int(self.bool_ty(), (!and) as u64)];
+                let short_bb = [lhs_bb];
+                unsafe { LLVMAddIncoming(phi, short[..].as_ptr(), short_bb[..].as_ptr(), 1) };
+                if let Some(r) = r {
+                    let rv = [r];
+                    let rb = [r_end];
+                    unsafe { LLVMAddIncoming(phi, rv[..].as_ptr(), rb[..].as_ptr(), 1) };
+                }
+                return Some(phi);
+            }
+            ExprKind::Cast(x) => {
+                let v = self.value(p, x)?;
+                let from = self.ety(p, x);
+                return Some(self.cast(p, v, from, ty));
+            }
+            ExprKind::Assign { place, value } => {
+                let v = self.value(p, value)?;
+                let ptr = self.place(p, place)?;
+                let pt = self.place_ty(p, place);
+                self.drop_in_place(p, ptr, pt);
+                self.store(v, ptr);
+                return Some(self.unit());
+            }
+            ExprKind::AssignOp { op, place, value } => {
+                let v = self.value(p, value)?;
+                let ptr = self.place(p, place)?;
+                let pt = self.place_ty(p, place);
+                let cur = self.load(p, ptr, pt);
+                let new = self.binop(p, op, cur, v, pt, ex.span);
+                self.store(new, ptr);
+                return Some(self.unit());
+            }
+            ExprKind::Tuple(es) => {
+                let lt = self.llty(p, ty);
+                let mut agg = self.undef(lt);
+                for i in 0..es.len() {
+                    let x = p.thir.expr_ids.list(es)[i];
+                    let v = self.value(p, x)?;
+                    agg = self.insert(agg, v, i as u32);
+                }
+                return Some(agg);
+            }
+            ExprKind::Adt { variant, fields, .. } => {
+                let mut vals: [(usize, ValueRef); ..+] = [];
+                for i in 0..fields.len() {
+                    let fe = p.thir.field_exprs.list(fields)[i];
+                    let v = self.value(p, fe.expr)?;
+                    vals.push((fe.field as usize, v));
+                }
+                return Some(self.build_adt(p, ty, variant as usize, vals[..]));
+            }
+            ExprKind::Array(es) => {
+                let TyKind::Array(elem, kind) = p.types.kind(ty) else {
+                    self.ice(p, "array literal of non-array type");
+                    return None;
+                };
+                let mut vals: [ValueRef; ..+] = [];
+                for i in 0..es.len() {
+                    let x = p.thir.expr_ids.list(es)[i];
+                    vals.push(self.value(p, x)?);
+                }
+                match kind {
+                    ArrKind::Fixed(_) | ArrKind::FixedVar(_) => {
+                        let lt = self.llty(p, ty);
+                        let mut agg = self.undef(lt);
+                        for i in 0..vals.len() {
+                            agg = self.insert(agg, vals[i], i as u32);
+                        }
+                        return Some(agg);
+                    }
+                    ArrKind::Slice | ArrKind::SliceMut => return Some(self.const_null(self.slice_ty())),
+                    _ => return Some(self.owner_from_values(p, elem, kind, vals[..])),
+                }
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                let v = self.value(p, value)?;
+                let n = self.value(p, count)?;
+                let TyKind::Array(elem, kind) = p.types.kind(ty) else {
+                    return None;
+                };
+                return Some(self.array_repeat(p, elem, kind, ty, v, n));
+            }
+            ExprKind::Slice { base, start, end, inclusive, .. } => {
+                let bp = self.place(p, base)?;
+                let bt = self.place_ty(p, base);
+                let s = match start {
+                    Some(x) => Some(self.value(p, x)?),
+                    None => None,
+                };
+                let en = match end {
+                    Some(x) => Some(self.value(p, x)?),
+                    None => None,
+                };
+                return Some(self.slice(p, bp, bt, s, en, inclusive, ex.span));
+            }
+            ExprKind::Block(b) => return self.block(p, b),
+            ExprKind::If { cond, then, else_ } => return self.if_expr(p, cond, then, else_, ty),
+            ExprKind::Match { scrut, arms } => return self.match_expr(p, scrut, arms, ty),
+            ExprKind::Loop { body, id } => {
+                let head = self.block_named(z("loop\0"));
+                let exit = self.block_named(z("loop_end\0"));
+                let slot = if Cg::is_void(p, ty) { null() } else { self.alloca_for(p, ty, z("brk\0")) };
+                let mark = self.cleanups.len();
+                self.loops.insert(id, LoopInfo { brk: exit, cont: head, slot, mark });
+                self.br(head);
+                self.position(head);
+                if self.block(p, body).is_some() && !self.terminated() {
+                    self.br(head);
+                }
+                self.position(exit);
+                if is_null(unsafe { LLVMGetFirstUse(LLVMBasicBlockAsValue(exit)) }) {
+                    self.unreachable();
+                    return None;
+                }
+                if is_null(slot) {
+                    return Some(self.unit());
+                }
+                return Some(self.load(p, slot, ty));
+            }
+            ExprKind::While { cond, body, id } => {
+                let head = self.block_named(z("while\0"));
+                let body_bb = self.block_named(z("while_body\0"));
+                let exit = self.block_named(z("while_end\0"));
+                let mark = self.cleanups.len();
+                self.loops.insert(id, LoopInfo { brk: exit, cont: head, slot: null(), mark });
+                self.br(head);
+                self.position(head);
+                if let Some(c) = self.scoped_value(p, cond) {
+                    self.cond_br(c, body_bb, exit);
+                }
+                self.position(body_bb);
+                if self.block(p, body).is_some() && !self.terminated() {
+                    self.br(head);
+                }
+                self.position(exit);
+                return Some(self.unit());
+            }
+            ExprKind::ForRange { var, start, end, inclusive, body, id } => return self.for_range(p, var, start, end, inclusive, body, id),
+            ExprKind::ForArray { pat, array, index, body, id } => return self.for_array(p, pat, array, index, body, id),
+            ExprKind::Break { id, value } => {
+                let v = match value {
+                    Some(x) => Some(self.value(p, x)?),
+                    None => None,
+                };
+                let l = self.loops.get(id).unwrap();
+                if let Some(v) = v {
+                    if !is_null(l.slot) {
+                        self.store(v, l.slot);
+                    }
+                }
+                self.emit_cleanups(p, l.mark);
+                self.br(l.brk);
+                return None;
+            }
+            ExprKind::Continue { id } => {
+                let l = self.loops.get(id).unwrap();
+                self.emit_cleanups(p, l.mark);
+                self.br(l.cont);
+                return None;
+            }
+            ExprKind::Return(v) => {
+                let val = match v {
+                    Some(x) => self.value(p, x)?,
+                    None => self.unit(),
+                };
+                self.emit_cleanups(p, 0);
+                let ret = self.t(p, p.fn_data(self.body.def).sig.ret);
+                if Cg::is_void(p, ret) {
+                    self.ret_void();
+                } else {
+                    self.ret(val);
+                }
+                return None;
+            }
+            ExprKind::Coerce { kind, expr } => match kind {
+                Coercion::NeverToAny => {
+                    let v = self.value(p, expr);
+                    if v.is_some() && !self.terminated() {
+                        self.unreachable();
+                    }
+                    return None;
+                }
+                Coercion::Weaken | Coercion::FnToPtr => return self.value(p, expr),
+                Coercion::ToSlice { .. } | Coercion::StringToStr => {
+                    let ptr = self.place(p, expr)?;
+                    let at = self.place_ty(p, expr);
+                    let (data, len, _) = self.array_parts(p, ptr, at);
+                    return Some(self.make_slice(data, len));
+                }
+            },
+            ExprKind::FmtArgs(pieces) => return self.fmt_args(p, pieces),
+            // The captures: the address of each borrowed variable, the
+            // value of each taken one.
+            ExprKind::Closure { captures, .. } => {
+                let lt = self.llty(p, ty);
+                let mut agg = self.undef(lt);
+                for i in 0..captures.len() {
+                    let a = p.thir.args.list(captures)[i];
+                    let v = match a {
+                        Arg::InOut(x) => self.place(p, x)?,
+                        Arg::Value(x) => {
+                            if p.thir.is_place(x) {
+                                self.place(p, x)?
+                            } else {
+                                self.value(p, x)?
+                            }
+                        }
+                    };
+                    agg = self.insert(agg, v, i as u32);
+                }
+                return Some(agg);
+            }
+            ExprKind::Error => {
+                self.ice(p, "error expression reached code generation");
+                return None;
+            }
+        }
+    }
+
+    pub fn make_slice(&self, data: ValueRef, len: ValueRef): ValueRef {
+        let a = self.insert(self.undef(self.slice_ty()), data, 0);
+        return self.insert(a, len, 1);
+    }
+
+    /// A struct or enum value of type `ty`: variant `variant` with the
+    /// given `(field index, value)`s.
+    pub fn build_adt(&mut self, p: &mut +Program, ty: Ty, variant: usize, vals: [(usize, ValueRef); &]): ValueRef {
+        let TyKind::Adt(d, _) = p.types.kind(ty) else {
+            panic("build_adt of a non-ADT type");
+        };
+        if p.is_enum(d) {
+            let lt = self.llty(p, ty);
+            let tmp = self.alloca(lt, z("enum\0"));
+            self.store(self.const_null(lt), tmp);
+            let tag = self.struct_field(lt, tmp, 0);
+            self.store(self.const_int(self.i32_ty(), variant as u64), tag);
+            for x in vals {
+                let (i, v) = x;
+                let fp = self.field_ptr(p, tmp, ty, variant, i);
+                self.store(v, fp);
+            }
+            return self.load_ty(lt, tmp, noname());
+        }
+        let st = self.llty(p, ty);
+        let mut agg = self.undef(st);
+        for x in vals {
+            let (i, v) = x;
+            agg = self.insert(agg, v, i as u32);
+        }
+        return agg;
+    }
+
+    fn slice(&mut self, p: &mut +Program, bp: ValueRef, bt: Ty, start: Option::<ValueRef>, end: Option::<ValueRef>, inclusive: bool, span: Span): ValueRef {
+        let (data, len, elem) = self.array_parts(p, bp, bt);
+        let s = match start {
+            Some(x) => x,
+            None => self.usize(0),
+        };
+        let mut e = match end {
+            Some(x) => x,
+            None => len,
+        };
+        if inclusive {
+            e = self.add(e, self.usize(1), noname());
+        }
+        let ok1 = self.icmp(INT_ULE, s, e, noname());
+        let ok2 = self.icmp(INT_ULE, e, len, noname());
+        let ok = self.and(ok1, ok2, noname());
+        let good = self.block_named(z("slice_ok\0"));
+        let bad = self.block_named(z("slice_bad\0"));
+        self.cond_br(ok, good, bad);
+        self.position(bad);
+        self.panic_msg(p, "slice range out of bounds", span);
+        self.position(good);
+        let is_text = match p.types.kind(bt) {
+            TyKind::Str | TyKind::String => true,
+            _ => false,
+        };
+        if is_text {
+            self.check_char_boundary(p, data, len, s, span);
+            self.check_char_boundary(p, data, len, e, span);
+        }
+        let et = self.llty(p, elem);
+        let ptr = self.gep(et, data, s, z("slice\0"));
+        let n = self.sub(e, s, noname());
+        return self.make_slice(ptr, n);
+    }
+
+    /// Panic if byte index `i` (< len) falls inside a UTF-8 sequence.
+    fn check_char_boundary(&mut self, p: &mut +Program, data: ValueRef, len: ValueRef, i: ValueRef, span: Span) {
+        let in_range = self.icmp(INT_ULT, i, len, noname());
+        let check = self.block_named(z("utf8_check\0"));
+        let ok = self.block_named(z("utf8_ok\0"));
+        self.cond_br(in_range, check, ok);
+        self.position(check);
+        let i8t = self.i8_ty();
+        let bp = self.gep(i8t, data, i, noname());
+        let byte = self.load_ty(i8t, bp, noname());
+        let masked = self.and(byte, self.const_int(i8t, 192), noname());
+        let cont = self.icmp(INT_EQ, masked, self.const_int(i8t, 128), noname());
+        let bad = self.block_named(z("utf8_bad\0"));
+        self.cond_br(cont, bad, ok);
+        self.position(bad);
+        self.panic_msg(p, "string slice is not on a character boundary", span);
+        self.position(ok);
+    }
+
+    fn array_repeat(&mut self, p: &mut +Program, elem: Ty, kind: ArrKind, ty: Ty, v: ValueRef, n: ValueRef): ValueRef {
+        let et = self.llty(p, elem);
+        let mut slot = null();
+        let mut data = null();
+        let mut count = null();
+        if let ArrKind::Fixed(k) = kind {
+            let lt = self.llty(p, ty);
+            slot = self.alloca(lt, z("rep\0"));
+            data = slot;
+            count = self.usize(k);
+        } else {
+            slot = self.alloca_for(p, ty, z("rep\0"));
+            let ht = self.handle_ty();
+            self.store(self.const_null(ht), slot);
+            self.size_frozen(p, slot, elem, kind, n);
+            self.ensure_cap(p, slot, n, elem);
+            let dp = self.struct_field(ht, slot, 0);
+            data = self.load_ty(self.ptr_ty(), dp, noname());
+            let lp = self.struct_field(ht, slot, 1);
+            self.store(n, lp);
+            count = n;
+        }
+        // for i in 0..count: data[i] = v
+        let idx = self.alloca(self.usize_ty(), z("i\0"));
+        self.store(self.usize(0), idx);
+        let head = self.block_named(z("rep_head\0"));
+        let body = self.block_named(z("rep_body\0"));
+        let exit = self.block_named(z("rep_end\0"));
+        self.br(head);
+        self.position(head);
+        let i = self.load_ty(self.usize_ty(), idx, noname());
+        let c = self.icmp(INT_ULT, i, count, noname());
+        self.cond_br(c, body, exit);
+        self.position(body);
+        let ptr = self.gep(et, data, i, noname());
+        self.store(v, ptr);
+        let next = self.add(i, self.usize(1), noname());
+        self.store(next, idx);
+        self.br(head);
+        self.position(exit);
+        return self.load(p, slot, ty);
+    }
+
+    /// `[T]` never grows after it is built, so it gets a slot sized to fit
+    /// instead of the default reservation.
+    fn size_frozen(&mut self, p: &mut +Program, slot: ValueRef, elem: Ty, kind: ArrKind, n: ValueRef) {
+        let bytes = self.size_of(p, elem);
+        if kind == ArrKind::Dyn && bytes > 0 {
+            let size = self.usize(bytes);
+            self.emit_ds_cap(p, slot, size, n);
+        }
+    }
+
+    /// A new owning array holding `vals`.
+    fn owner_from_values(&mut self, p: &mut +Program, elem: Ty, kind: ArrKind, vals: [ValueRef; &]): ValueRef {
+        let ht = self.handle_ty();
+        let slot = self.alloca(ht, z("arr\0"));
+        self.store(self.const_null(ht), slot);
+        if vals.len() > 0 {
+            let n = self.usize(vals.len() as u64);
+            self.size_frozen(p, slot, elem, kind, n);
+            self.ensure_cap(p, slot, n, elem);
+            let dp = self.struct_field(ht, slot, 0);
+            let data = self.load_ty(self.ptr_ty(), dp, noname());
+            let et = self.llty(p, elem);
+            for i in 0..vals.len() {
+                let ptr = self.gep(et, data, self.usize(i as u64), noname());
+                self.store(vals[i], ptr);
+            }
+            let lp = self.struct_field(ht, slot, 1);
+            self.store(n, lp);
+        }
+        return self.load_ty(ht, slot, noname());
+    }
+
+    // ===================================================================== control flow
+
+    fn if_expr(&mut self, p: &mut +Program, cond: Id::<Expr>, then: Id::<Expr>, else_: Option::<Id::<Expr>>, ty: Ty): Option::<ValueRef> {
+        let c = self.scoped_value(p, cond)?;
+        let then_bb = self.block_named(z("then\0"));
+        let else_bb = self.block_named(z("else\0"));
+        let merge = self.block_named(z("endif\0"));
+        self.cond_br(c, then_bb, else_bb);
+        let slot = if Cg::is_void(p, ty) { null() } else { self.alloca_for(p, ty, z("ifv\0")) };
+        let mut reached = false;
+        self.position(then_bb);
+        if let Some(v) = self.value(p, then) {
+            if !is_null(slot) {
+                self.store(v, slot);
+            }
+            self.br(merge);
+            reached = true;
+        }
+        self.position(else_bb);
+        let ev = match else_ {
+            Some(x) => self.value(p, x),
+            None => Some(self.unit()),
+        };
+        if let Some(v) = ev {
+            if !is_null(slot) {
+                self.store(v, slot);
+            }
+            self.br(merge);
+            reached = true;
+        }
+        self.position(merge);
+        if !reached {
+            self.unreachable();
+            return None;
+        }
+        if is_null(slot) {
+            return Some(self.unit());
+        }
+        return Some(self.load(p, slot, ty));
+    }
+
+    fn match_expr(&mut self, p: &mut +Program, scrut: Id::<Expr>, arms: List::<Arm>, ty: Ty): Option::<ValueRef> {
+        let sp = self.place(p, scrut)?;
+        let st = self.place_ty(p, scrut);
+        let merge = self.block_named(z("match_end\0"));
+        let slot = if Cg::is_void(p, ty) { null() } else { self.alloca_for(p, ty, z("matchv\0")) };
+        let mut reached = false;
+        for ai in 0..arms.len() {
+            let arm = p.thir.arms.list(arms)[ai];
+            let next = self.block_named(z("arm_next\0"));
+            self.test_pat(p, arm.pat, sp, st, next);
+            self.push_mark();
+            if let Some(g) = arm.guard {
+                self.bind_pat(p, arm.pat, sp, st, false);
+                let Some(gv) = self.scoped_value(p, g) else {
+                    self.drop_mark();
+                    self.position(next);
+                    continue;
+                };
+                let body_bb = self.block_named(z("guard_ok\0"));
+                // Guard failed: bindings were copies, nothing to undo.
+                let m = self.marks[self.marks.len() - 1];
+                let mut saved: [Cleanup; ..+] = [];
+                for i in m..self.cleanups.len() {
+                    saved.push(self.cleanups[i]);
+                }
+                self.cleanups.truncate(m);
+                self.cond_br(gv, body_bb, next);
+                self.position(body_bb);
+                self.cleanups.extend(saved[..]);
+                self.null_moves(p, arm.pat, sp, st);
+            } else {
+                self.bind_pat(p, arm.pat, sp, st, true);
+            }
+            match self.value(p, arm.body) {
+                Some(v) => {
+                    if !is_null(slot) {
+                        self.store(v, slot);
+                    }
+                    self.pop_mark(p);
+                    self.br(merge);
+                    reached = true;
+                }
+                None => self.drop_mark(),
+            }
+            self.position(next);
+        }
+        // No arm matched: unreachable (matches are exhaustive).
+        self.unreachable();
+        self.position(merge);
+        if !reached {
+            self.unreachable();
+            return None;
+        }
+        if is_null(slot) {
+            return Some(self.unit());
+        }
+        return Some(self.load(p, slot, ty));
+    }
+
+    fn for_range(&mut self, p: &mut +Program, var: LocalId, start: Id::<Expr>, end: Id::<Expr>, inclusive: bool, body: Id::<Block>, id: LoopId): Option::<ValueRef> {
+        let s = self.value(p, start)?;
+        let e = self.value(p, end)?;
+        let ty = self.ety(p, start);
+        let signed = match p.types.kind(ty) {
+            TyKind::Int(i) => i.signed(),
+            _ => false,
+        };
+        let it = unsafe { LLVMTypeOf(s) };
+        let counter = self.alloca(it, z("ctr\0"));
+        self.store(s, counter);
+        let head = self.block_named(z("for\0"));
+        let body_bb = self.block_named(z("for_body\0"));
+        let latch = self.block_named(z("for_next\0"));
+        let exit = self.block_named(z("for_end\0"));
+        let mark = self.cleanups.len();
+        self.loops.insert(id, LoopInfo { brk: exit, cont: latch, slot: null(), mark });
+        self.br(head);
+        self.position(head);
+        let cur = self.load_ty(it, counter, z("i\0"));
+        let pred = if inclusive {
+            if signed { INT_SLE } else { INT_ULE }
+        } else {
+            if signed { INT_SLT } else { INT_ULT }
+        };
+        let c = self.icmp(pred, cur, e, noname());
+        self.cond_br(c, body_bb, exit);
+        self.position(body_bb);
+        let vslot = self.locals[var.index()];
+        self.store(cur, vslot);
+        if self.block(p, body).is_some() && !self.terminated() {
+            self.br(latch);
+        }
+        self.position(latch);
+        let cur = self.load_ty(it, counter, noname());
+        if inclusive {
+            // Stop before incrementing past `end` (avoids overflow at the
+            // type's max).
+            let at_end = self.icmp(INT_EQ, cur, e, noname());
+            let inc = self.block_named(z("for_inc\0"));
+            self.cond_br(at_end, exit, inc);
+            self.position(inc);
+        }
+        let next = self.add(cur, self.const_int(it, 1), noname());
+        self.store(next, counter);
+        self.br(head);
+        self.position(exit);
+        return Some(self.unit());
+    }
+
+    fn for_array(&mut self, p: &mut +Program, pat: Id::<Pat>, array: Id::<Expr>, index: LocalId, body: Id::<Block>, id: LoopId): Option::<ValueRef> {
+        let ap = self.place(p, array)?;
+        let at = self.place_ty(p, array);
+        let idx = self.locals[index.index()];
+        self.store(self.usize(0), idx);
+        let head = self.block_named(z("each\0"));
+        let body_bb = self.block_named(z("each_body\0"));
+        let latch = self.block_named(z("each_next\0"));
+        let exit = self.block_named(z("each_end\0"));
+        let mark = self.cleanups.len();
+        self.loops.insert(id, LoopInfo { brk: exit, cont: latch, slot: null(), mark });
+        self.br(head);
+        self.position(head);
+        let i = self.load_ty(self.usize_ty(), idx, z("i\0"));
+        // Reload the length every iteration: the array may change in the
+        // body.
+        let (data, len, elem) = self.array_parts(p, ap, at);
+        let c = self.icmp(INT_ULT, i, len, noname());
+        self.cond_br(c, body_bb, exit);
+        self.position(body_bb);
+        let et = self.llty(p, elem);
+        let ep = self.gep(et, data, i, noname());
+        self.push_mark();
+        self.bind_pat(p, pat, ep, elem, false);
+        let r = self.block(p, body);
+        if r.is_some() {
+            self.pop_mark(p);
+            if !self.terminated() {
+                self.br(latch);
+            }
+        } else {
+            self.drop_mark();
+        }
+        self.position(latch);
+        let i = self.load_ty(self.usize_ty(), idx, noname());
+        let next = self.add(i, self.usize(1), noname());
+        self.store(next, idx);
+        self.br(head);
+        self.position(exit);
+        return Some(self.unit());
+    }
+
+    // ===================================================================== patterns
+
+    /// The type of field `fi` of variant `variant` of ADT `def`, for an
+    /// instance with arguments `args`.
+    fn field_ty(&mut self, p: &mut +Program, def: ln_sema::defs::DefId, variant: u32, fi: u32, args: TyList): Ty {
+        let adt = p.adt(def);
+        let v = p.variants.list(adt.variants)[variant as usize];
+        let fty = p.fields.list(v.fields)[fi as usize].ty;
+        return p.types.subst(fty, args);
+    }
+
+    /// Emit tests for `pat` against the value at `ptr`; on failure branch
+    /// to `fail`, on success continue in the current block.
+    pub fn test_pat(&mut self, p: &mut +Program, pat: Id::<Pat>, ptr: ValueRef, ty: Ty, fail: BasicBlockRef) {
+        let pt = p.thir.pat(pat);
+        match pt.kind {
+            PatKind::Wild => {}
+            PatKind::Binding { sub, .. } => {
+                if let Some(s) = sub {
+                    self.test_pat(p, s, ptr, ty, fail);
+                }
+            }
+            PatKind::Lit(v) => {
+                let val = self.load(p, ptr, ty);
+                let c = match self.const_val(p, v, ty) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.ice(p, e.as_str());
+                        return;
+                    }
+                };
+                let eq = self.values_eq(p, val, c, ty);
+                self.branch_or(eq, fail);
+            }
+            PatKind::Range { lo, hi, inclusive } => {
+                let val = self.load(p, ptr, ty);
+                let lr = self.const_val(p, lo, ty);
+                let hr = self.const_val(p, hi, ty);
+                let Ok(l) = lr else {
+                    return;
+                };
+                let Ok(h) = hr else {
+                    return;
+                };
+                let signed = match p.types.kind(ty) {
+                    TyKind::Int(i) => i.signed(),
+                    _ => false,
+                };
+                let ge = if signed { INT_SGE } else { INT_UGE };
+                let le = if signed {
+                    if inclusive { INT_SLE } else { INT_SLT }
+                } else {
+                    if inclusive { INT_ULE } else { INT_ULT }
+                };
+                let a = self.icmp(ge, val, l, noname());
+                let b = self.icmp(le, val, h, noname());
+                let both = self.and(a, b, noname());
+                self.branch_or(both, fail);
+            }
+            PatKind::Tuple(ps) => {
+                let TyKind::Tuple(ts) = p.types.kind(ty) else {
+                    return;
+                };
+                let lt = self.llty(p, ty);
+                let n = if ps.len() < ts.len() { ps.len() } else { ts.len() };
+                for i in 0..n {
+                    let sub = p.thir.pat_ids.list(ps)[i];
+                    let t = p.types.at(ts, i);
+                    let fp = self.struct_field(lt, ptr, i as u32);
+                    self.test_pat(p, sub, fp, t, fail);
+                }
+            }
+            PatKind::Adt { def, variant, fields } => {
+                let TyKind::Adt(_, args) = p.types.kind(ty) else {
+                    return;
+                };
+                if p.is_enum(def) {
+                    let lt = self.llty(p, ty);
+                    let tp = self.struct_field(lt, ptr, 0);
+                    let tag = self.load_ty(self.i32_ty(), tp, z("tag\0"));
+                    let want = self.const_int(self.i32_ty(), variant as u64);
+                    let eq = self.icmp(INT_EQ, tag, want, noname());
+                    self.branch_or(eq, fail);
+                }
+                for i in 0..fields.len() {
+                    let fp = p.thir.field_pats.list(fields)[i];
+                    let ft = self.field_ty(p, def, variant, fp.field, args);
+                    let at = self.field_ptr(p, ptr, ty, variant as usize, fp.field as usize);
+                    self.test_pat(p, fp.pat, at, ft, fail);
+                }
+            }
+            PatKind::Or(alts) => {
+                let ok = self.block_named(z("or_ok\0"));
+                for i in 0..alts.len() {
+                    let a = p.thir.pat_ids.list(alts)[i];
+                    if i + 1 == alts.len() {
+                        self.test_pat(p, a, ptr, ty, fail);
+                        self.br(ok);
+                    } else {
+                        let next = self.block_named(z("or_next\0"));
+                        self.test_pat(p, a, ptr, ty, next);
+                        self.br(ok);
+                        self.position(next);
+                    }
+                }
+                self.position(ok);
+            }
+        }
+    }
+
+    fn branch_or(&mut self, cond: ValueRef, fail: BasicBlockRef) {
+        let ok = self.block_named(z("pat_ok\0"));
+        self.cond_br(cond, ok, fail);
+        self.position(ok);
+    }
+
+    /// Copy matched parts into the pattern's bindings. With `null_moves`,
+    /// moved owner values are zeroed in the source.
+    pub fn bind_pat(&mut self, p: &mut +Program, pat: Id::<Pat>, ptr: ValueRef, ty: Ty, null_moves: bool) {
+        let pt = p.thir.pat(pat);
+        match pt.kind {
+            PatKind::Wild | PatKind::Lit(_) | PatKind::Range { .. } | PatKind::Or(_) => {}
+            PatKind::Binding { local, mode, sub } => {
+                let v = self.load(p, ptr, ty);
+                let slot = self.locals[local.index()];
+                self.store(v, slot);
+                if mode == ReadMode::Move {
+                    self.register_cleanup(p, slot, ty);
+                    if null_moves && p.has_owner(ty) {
+                        let lt = self.llty(p, ty);
+                        self.store(self.const_null(lt), ptr);
+                    }
+                }
+                if let Some(s) = sub {
+                    self.bind_pat(p, s, ptr, ty, null_moves);
+                }
+            }
+            PatKind::Tuple(ps) => {
+                let TyKind::Tuple(ts) = p.types.kind(ty) else {
+                    return;
+                };
+                let lt = self.llty(p, ty);
+                let n = if ps.len() < ts.len() { ps.len() } else { ts.len() };
+                for i in 0..n {
+                    let sub = p.thir.pat_ids.list(ps)[i];
+                    let t = p.types.at(ts, i);
+                    let fp = self.struct_field(lt, ptr, i as u32);
+                    self.bind_pat(p, sub, fp, t, null_moves);
+                }
+            }
+            PatKind::Adt { def, variant, fields } => {
+                let TyKind::Adt(_, args) = p.types.kind(ty) else {
+                    return;
+                };
+                for i in 0..fields.len() {
+                    let fp = p.thir.field_pats.list(fields)[i];
+                    let ft = self.field_ty(p, def, variant, fp.field, args);
+                    let at = self.field_ptr(p, ptr, ty, variant as usize, fp.field as usize);
+                    self.bind_pat(p, fp.pat, at, ft, null_moves);
+                }
+            }
+        }
+    }
+
+    /// Zero the sources of moved bindings (after a guard succeeded).
+    fn null_moves(&mut self, p: &mut +Program, pat: Id::<Pat>, ptr: ValueRef, ty: Ty) {
+        let pt = p.thir.pat(pat);
+        match pt.kind {
+            PatKind::Binding { mode, .. } => {
+                if mode == ReadMode::Move && p.has_owner(ty) {
+                    let lt = self.llty(p, ty);
+                    self.store(self.const_null(lt), ptr);
+                }
+            }
+            PatKind::Tuple(ps) => {
+                let TyKind::Tuple(ts) = p.types.kind(ty) else {
+                    return;
+                };
+                let lt = self.llty(p, ty);
+                let n = if ps.len() < ts.len() { ps.len() } else { ts.len() };
+                for i in 0..n {
+                    let sub = p.thir.pat_ids.list(ps)[i];
+                    let t = p.types.at(ts, i);
+                    let fp = self.struct_field(lt, ptr, i as u32);
+                    self.null_moves(p, sub, fp, t);
+                }
+            }
+            PatKind::Adt { def, variant, fields } => {
+                let TyKind::Adt(_, args) = p.types.kind(ty) else {
+                    return;
+                };
+                for i in 0..fields.len() {
+                    let fp = p.thir.field_pats.list(fields)[i];
+                    let ft = self.field_ty(p, def, variant, fp.field, args);
+                    let at = self.field_ptr(p, ptr, ty, variant as usize, fp.field as usize);
+                    self.null_moves(p, fp.pat, at, ft);
+                }
+            }
+            _ => {}
+        }
+    }
+}
