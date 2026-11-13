@@ -2733,9 +2733,13 @@ impl Sema {
                     return Err(core::fmt::format("`{shown}` is not a struct or variant"));
                 };
                 let mut out: [ConstVal; ..+] = [];
-                for f in self.p.fields.list(fields) {
+                // By index: evaluating a field needs `self` in-out, which
+                // could shrink the lists a loop over them would hold.
+                for fi in 0..fields.len() {
+                    let f = self.p.fields.list(fields)[fi];
                     let mut value: Option::<ConstVal> = None;
-                    for init in self.p.ast.field_inits.list(inits) {
+                    for ii in 0..inits.len() {
+                        let init = self.p.ast.field_inits.list(inits)[ii];
                         if init.name.name != f.name {
                             continue;
                         }
@@ -3125,7 +3129,9 @@ impl Sema {
     fn const_block(&mut self, module: DefId, b: Id::<ln_ast::Block>, ty: Ty, env: &mut ConstEnv): Result::<ConstVal, String> {
         let blk = self.p.ast.blocks.get(b);
         let err = self.p.types.error();
-        for s in self.p.ast.stmts.list(blk.stmts) {
+        // By index: evaluating needs `self` in-out (see `eval_const_inner`).
+        for si in 0..blk.stmts.len() {
+            let s = self.p.ast.stmts.list(blk.stmts)[si];
             match s.kind {
                 ln_ast::StmtKind::Let { pat, init: Some(init), else_: None, .. } => {
                     let ln_ast::PatKind::Binding { name, .. } = self.p.ast.pats.get(pat).kind else {

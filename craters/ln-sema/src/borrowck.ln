@@ -747,6 +747,7 @@ fn new_cx(p: &mut +Program, body: Body, env: [Pred; &]): Cx {
         words: (body.locals.len() + 63) / 64,
         held: [],
         pending: [],
+        loop_held: [],
         from: None,
     };
     for i in 0..body.params.len() {
@@ -797,6 +798,10 @@ struct Cx {
     /// the whole expression is evaluated, so the operand may not shrink,
     /// replace or move what they point into. Each with the operand's span.
     pending: [(Root, Span); -..+],
+    /// The same for the arrays of the `for` loops around the expression
+    /// being checked: their address (or temporary slice) is kept for the
+    /// whole loop.
+    loop_held: [(Root, Span); -..+],
     /// For a named function, what its signature says its result points
     /// into, to check what it returns against.
     from: Option::<FromCheck>,
@@ -2713,6 +2718,34 @@ impl Cx {
             p.diags.note(say(p, "the operands of a call, tuple, array, struct literal or operator are evaluated left to right, and each value is kept until the whole expression is done"));
             p.diags.help(say(p, "compute this operand with `let` before the expression, so it runs before the view into `{rname}` is taken"));
             p.diags.finish();
+            return;
+        }
+        // The array of a `for` loop around this.
+        let mut loop_at: Option::<Span> = None;
+        for lr in self.loop_held[..] {
+            let (r, sp) = lr;
+            if loop_at.is_none() && r == Root::Local(root) {
+                loop_at = Some(sp);
+            }
+        }
+        if let Some(sp) = loop_at {
+            if !self.report(span, 4294967292) {
+                return;
+            }
+            let (code, verb) = if what == "shrink" {
+                (codes::borrow::SHRINK_WHILE_BORROWED(), "may be shrunk or replaced")
+            } else if what == "move" {
+                (codes::borrow::MOVE_WHILE_BORROWED(), "is moved")
+            } else {
+                (codes::borrow::ASSIGN_WHILE_BORROWED(), "is replaced")
+            };
+            let m = say(p, "`{rname}` {verb} here, inside a loop over an array that points into it");
+            p.diags.error(code, span, m);
+            if !is_dummy(sp) {
+                p.diags.secondary(sp, say(p, "this points into `{rname}`, and is kept for the whole loop"));
+            }
+            p.diags.help(say(p, "loop over indexes (`for i in 0..n`) and read each item inside the loop, after anything that changes `{rname}`"));
+            p.diags.finish();
         }
     }
 
@@ -3119,10 +3152,18 @@ impl Cx {
             }
             ExprKind::ForArray { pat, array, body, id, .. } => {
                 self.set_loop_exit(id, after[..]);
+                // The array's address is taken once, before the loop (and a
+                // temporary slice is made once): the body may not shrink
+                // what they point into. Its items and length are read
+                // again on each pass.
+                let held = self.addr_held(p, array);
                 let mut head = self.use_place(p, array, after.clone());
                 for _ in 0..8 {
                     self.set_loop_head(id, head[..]);
+                    let n = self.loop_held.len();
+                    self.loop_held.extend(held[..]);
                     let mut b = self.live_block(p, body, head.clone());
+                    self.loop_held.truncate(n);
                     // Each pass binds the pattern afresh.
                     self.kill_bindings(p, pat, &mut b);
                     ls_union(&mut b, after[..]);
