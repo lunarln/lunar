@@ -1,3 +1,7 @@
+// Numbers: the `Int` and `Float` traits, and methods on the integer types
+// (checked, wrapping and saturating arithmetic, powers, bit counts,
+// formatting in any radix, and parsing).
+
 use crater::ops::{Add, Sub, Mul, Div, Rem};
 
 /// Integer types.
@@ -24,38 +28,6 @@ impl Int for usize { fn zero(): usize { return 0; } fn one(): usize { return 1; 
 #[intrinsic] pub fn wrapping_sub::<T: Int>(a: T, b: T): T;
 #[intrinsic] pub fn wrapping_mul::<T: Int>(a: T, b: T): T;
 
-impl u64 {
-    pub fn wrapping_sub(self, rhs: u64): u64 { return wrapping_sub(self, rhs); }
-    pub fn wrapping_add(self, rhs: u64): u64 { return wrapping_add(self, rhs); }
-    pub fn wrapping_mul(self, rhs: u64): u64 { return wrapping_mul(self, rhs); }
-}
-
-impl u32 {
-    pub fn wrapping_sub(self, rhs: u32): u32 { return wrapping_sub(self, rhs); }
-    pub fn wrapping_add(self, rhs: u32): u32 { return wrapping_add(self, rhs); }
-    pub fn wrapping_mul(self, rhs: u32): u32 { return wrapping_mul(self, rhs); }
-}
-
-impl usize {
-    pub fn wrapping_sub(self, rhs: usize): usize { return wrapping_sub(self, rhs); }
-    pub fn wrapping_add(self, rhs: usize): usize { return wrapping_add(self, rhs); }
-    pub fn wrapping_mul(self, rhs: usize): usize { return wrapping_mul(self, rhs); }
-}
-
-impl i64 {
-    pub fn wrapping_sub(self, rhs: i64): i64 { return wrapping_sub(self, rhs); }
-    pub fn wrapping_add(self, rhs: i64): i64 { return wrapping_add(self, rhs); }
-    pub fn wrapping_mul(self, rhs: i64): i64 { return wrapping_mul(self, rhs); }
-    pub fn abs(self): i64 { if self < 0 { return -self; } return self; }
-}
-
-impl i32 {
-    pub fn wrapping_sub(self, rhs: i32): i32 { return wrapping_sub(self, rhs); }
-    pub fn wrapping_add(self, rhs: i32): i32 { return wrapping_add(self, rhs); }
-    pub fn wrapping_mul(self, rhs: i32): i32 { return wrapping_mul(self, rhs); }
-    pub fn abs(self): i32 { if self < 0 { return -self; } return self; }
-}
-
 /// Floating point types.
 pub trait Float: Add + Sub + Mul + Div + Eq + Ord + Dull {
     fn zero(): Self;
@@ -64,3 +36,654 @@ pub trait Float: Add + Sub + Mul + Div + Eq + Ord + Dull {
 
 impl Float for f32 { fn zero(): f32 { return 0.0; } fn one(): f32 { return 1.0; } }
 impl Float for f64 { fn zero(): f64 { return 0.0; } fn one(): f64 { return 1.0; } }
+
+// ===================================================================== parse errors
+
+/// Why text did not parse as a number (or another `FromStr` type).
+#[derive(Eq, Debug)]
+pub enum ParseErrorKind {
+    /// There was no text.
+    Empty,
+    /// A character that is not a digit (in the radix), or a misplaced sign.
+    InvalidDigit,
+    /// The number is too large for the type.
+    PosOverflow,
+    /// The number is too small (too negative) for the type.
+    NegOverflow,
+    /// The text is not in the expected form (floats, `bool`, `char`,
+    /// addresses).
+    Invalid,
+}
+
+/// A failed `str::parse` or `from_str_radix`.
+#[derive(Eq, Debug)]
+pub struct ParseError {
+    kind: ParseErrorKind,
+}
+
+impl ParseError {
+    pub fn new(kind: ParseErrorKind): ParseError {
+        return ParseError { kind };
+    }
+
+    pub fn kind(&self): ParseErrorKind {
+        return self.kind;
+    }
+}
+
+impl crater::fmt::Display for ParseError {
+    fn fmt(&self, out: &mut +String) {
+        out.push_str(match self.kind {
+            ParseErrorKind::Empty => "cannot parse from empty string",
+            ParseErrorKind::InvalidDigit => "invalid digit found in string",
+            ParseErrorKind::PosOverflow => "number too large to fit in target type",
+            ParseErrorKind::NegOverflow => "number too small to fit in target type",
+            ParseErrorKind::Invalid => "invalid syntax",
+        });
+    }
+}
+
+fn parse_err::<T>(kind: ParseErrorKind): Result::<T, ParseError> {
+    return Err(ParseError { kind });
+}
+
+/// The value of the digit `c` in `radix`, if it is one.
+fn digit(c: u8, radix: u32): Option::<u64> {
+    let d: u32 = if c >= b'0' && c <= b'9' {
+        (c - b'0') as u32
+    } else if c >= b'a' && c <= b'z' {
+        (c - b'a') as u32 + 10
+    } else if c >= b'A' && c <= b'Z' {
+        (c - b'A') as u32 + 10
+    } else {
+        return None;
+    };
+    if d >= radix {
+        return None;
+    }
+    return Some(d as u64);
+}
+
+fn check_radix(radix: u32) {
+    if radix < 2 || radix > 36 {
+        panic("from_str_radix: radix {radix} is not in 2..=36");
+    }
+}
+
+/// The digits `b` (no sign) in `radix`, at most `limit`; `over` if more.
+fn parse_digits(b: [u8; &], radix: u32, limit: u64, over: ParseErrorKind): Result::<u64, ParseError> {
+    if b.len() == 0 {
+        return parse_err(ParseErrorKind::InvalidDigit);
+    }
+    let r = radix as u64;
+    let mut v: u64 = 0;
+    for c in b {
+        let d = match digit(c, radix) {
+            Some(d) => d,
+            None => return parse_err(ParseErrorKind::InvalidDigit),
+        };
+        // v * r + d > limit, without overflowing.
+        if v > (limit - d) / r {
+            return parse_err(over);
+        }
+        v = v * r + d;
+    }
+    return Ok(v);
+}
+
+/// An unsigned number in `radix` (an optional `+`, then digits), at most
+/// `max`.
+pub fn parse_unsigned(s: str, radix: u32, max: u64): Result::<u64, ParseError> {
+    check_radix(radix);
+    let b = s.as_bytes();
+    if b.len() == 0 {
+        return parse_err(ParseErrorKind::Empty);
+    }
+    let digits = if b[0] == b'+' { b[1..] } else { b };
+    return parse_digits(digits, radix, max, ParseErrorKind::PosOverflow);
+}
+
+/// A signed number in `radix` (an optional `+` or `-`, then digits),
+/// from `min` to `max`.
+pub fn parse_signed(s: str, radix: u32, min: i64, max: i64): Result::<i64, ParseError> {
+    check_radix(radix);
+    let b = s.as_bytes();
+    if b.len() == 0 {
+        return parse_err(ParseErrorKind::Empty);
+    }
+    if b[0] == b'-' {
+        // |min| = -(min + 1) + 1, computed without overflowing.
+        let limit = (-(min + 1)) as u64 + 1;
+        let v = parse_digits(b[1..], radix, limit, ParseErrorKind::NegOverflow)?;
+        return Ok((0 as u64).wrapping_sub(v) as i64);
+    }
+    let digits = if b[0] == b'+' { b[1..] } else { b };
+    let v = parse_digits(digits, radix, max as u64, ParseErrorKind::PosOverflow)?;
+    return Ok(v as i64);
+}
+
+// ===================================================================== helpers
+
+const I64_MIN: i64 = -9223372036854775808;
+
+fn int_max::<T: Int>(): T {
+    return T::max_value();
+}
+
+fn int_min::<T: Int>(): T {
+    return T::min_value();
+}
+
+fn ck_add_u(a: u64, b: u64, max: u64): Option::<u64> {
+    let r = wrapping_add(a, b);
+    if r < a || r > max {
+        return None;
+    }
+    return Some(r);
+}
+
+fn ck_mul_u(a: u64, b: u64, max: u64): Option::<u64> {
+    if a == 0 || b == 0 {
+        return Some(0);
+    }
+    let r = wrapping_mul(a, b);
+    if r / a != b || r > max {
+        return None;
+    }
+    return Some(r);
+}
+
+fn in_range(r: i64, min: i64, max: i64): Option::<i64> {
+    if r < min || r > max {
+        return None;
+    }
+    return Some(r);
+}
+
+fn ck_add_i(a: i64, b: i64, min: i64, max: i64): Option::<i64> {
+    let r = wrapping_add(a, b);
+    if (a >= 0) == (b >= 0) && (r >= 0) != (a >= 0) {
+        return None;
+    }
+    return in_range(r, min, max);
+}
+
+fn ck_sub_i(a: i64, b: i64, min: i64, max: i64): Option::<i64> {
+    let r = wrapping_sub(a, b);
+    if (a >= 0) != (b >= 0) && (r >= 0) != (a >= 0) {
+        return None;
+    }
+    return in_range(r, min, max);
+}
+
+fn ck_mul_i(a: i64, b: i64, min: i64, max: i64): Option::<i64> {
+    if a == 0 || b == 0 {
+        return Some(0);
+    }
+    if (a == -1 && b == I64_MIN) || (b == -1 && a == I64_MIN) {
+        return None;
+    }
+    let r = wrapping_mul(a, b);
+    if r / b != a {
+        return None;
+    }
+    return in_range(r, min, max);
+}
+
+fn ck_div_i(a: i64, b: i64, min: i64, max: i64): Option::<i64> {
+    if b == 0 || (a == min && b == -1) {
+        return None;
+    }
+    return in_range(a / b, min, max);
+}
+
+fn ck_rem_i(a: i64, b: i64, min: i64): Option::<i64> {
+    if b == 0 || (a == min && b == -1) {
+        return None;
+    }
+    return Some(a % b);
+}
+
+/// Leading zero bits of a 64-bit value.
+fn lz64(x: u64): u32 {
+    if x == 0 {
+        return 64;
+    }
+    let mut n: u32 = 0;
+    let mut v = x;
+    if (v >> 32) == 0 { n += 32; v = v << 32; }
+    if (v >> 48) == 0 { n += 16; v = v << 16; }
+    if (v >> 56) == 0 { n += 8; v = v << 8; }
+    if (v >> 60) == 0 { n += 4; v = v << 4; }
+    if (v >> 62) == 0 { n += 2; v = v << 2; }
+    if (v >> 63) == 0 { n += 1; }
+    return n;
+}
+
+/// Trailing zero bits of a 64-bit value (64 for 0).
+fn tz64(x: u64): u32 {
+    if x == 0 {
+        return 64;
+    }
+    let mut n: u32 = 0;
+    let mut v = x;
+    while (v & 1) == 0 {
+        n += 1;
+        v = v >> 1;
+    }
+    return n;
+}
+
+/// Set bits of a 64-bit value.
+fn ones64(x: u64): u32 {
+    let mut v = x - ((x >> 1) & 0x5555555555555555);
+    v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333);
+    v = (v + (v >> 4)) & 0x0f0f0f0f0f0f0f0f;
+    return (wrapping_mul(v, 0x0101010101010101) >> 56) as u32;
+}
+
+/// `x` (the low `bits` bits) rotated left by `n`.
+fn rotl(x: u64, n: u32, bits: u32): u64 {
+    let k = (n % bits) as u64;
+    let mask: u64 = if bits == 64 { 18446744073709551615 } else { ((1 as u64) << (bits as u64)) - 1 };
+    let v = x & mask;
+    if k == 0 {
+        return v;
+    }
+    return ((v << k) | (v >> ((bits as u64) - k))) & mask;
+}
+
+fn radix_string(neg: bool, magnitude: u64, radix: u32): String {
+    if radix < 2 || radix > 36 {
+        panic("to_string_radix: radix {radix} is not in 2..=36");
+    }
+    let mut s = String::new();
+    if neg {
+        s.push('-');
+    }
+    crater::fmt::write_radix(&mut s, magnitude, radix as u64);
+    return s;
+}
+
+// ===================================================================== unsigned
+
+/// Methods of an unsigned integer type `$t` of `$bits` bits, largest
+/// value `$max`.
+macro unsigned_int {
+    ($t:ty, $bits:expr, $max:expr) => {
+        impl $t {
+            /// `self + rhs`, or `None` on overflow.
+            pub fn checked_add(self, rhs: $t): Option::<$t> {
+                return match ck_add_u(self as u64, rhs as u64, $max) { Some(v) => Some(v as $t), None => None };
+            }
+
+            /// `self - rhs`, or `None` if `rhs` is larger.
+            pub fn checked_sub(self, rhs: $t): Option::<$t> {
+                if rhs > self {
+                    return None;
+                }
+                return Some(self - rhs);
+            }
+
+            /// `self * rhs`, or `None` on overflow.
+            pub fn checked_mul(self, rhs: $t): Option::<$t> {
+                return match ck_mul_u(self as u64, rhs as u64, $max) { Some(v) => Some(v as $t), None => None };
+            }
+
+            /// `self / rhs`, or `None` if `rhs` is 0.
+            pub fn checked_div(self, rhs: $t): Option::<$t> {
+                if rhs == 0 {
+                    return None;
+                }
+                return Some(self / rhs);
+            }
+
+            /// `self % rhs`, or `None` if `rhs` is 0.
+            pub fn checked_rem(self, rhs: $t): Option::<$t> {
+                if rhs == 0 {
+                    return None;
+                }
+                return Some(self % rhs);
+            }
+
+            /// `-self`: `Some(0)` for 0, else `None`.
+            pub fn checked_neg(self): Option::<$t> {
+                if self == 0 {
+                    return Some(0);
+                }
+                return None;
+            }
+
+            /// `self` to the power `exp`, or `None` on overflow.
+            pub fn checked_pow(self, exp: u32): Option::<$t> {
+                let mut r: $t = 1;
+                for _ in 0..exp {
+                    r = r.checked_mul(self)?;
+                }
+                return Some(r);
+            }
+
+            pub fn wrapping_add(self, rhs: $t): $t { return wrapping_add(self, rhs); }
+            pub fn wrapping_sub(self, rhs: $t): $t { return wrapping_sub(self, rhs); }
+            pub fn wrapping_mul(self, rhs: $t): $t { return wrapping_mul(self, rhs); }
+            pub fn wrapping_neg(self): $t { return wrapping_sub(0, self); }
+
+            pub fn wrapping_pow(self, exp: u32): $t {
+                let mut r: $t = 1;
+                for _ in 0..exp {
+                    r = wrapping_mul(r, self);
+                }
+                return r;
+            }
+
+            /// `self + rhs`, or the largest value on overflow.
+            pub fn saturating_add(self, rhs: $t): $t {
+                return match self.checked_add(rhs) { Some(v) => v, None => int_max::<$t>() };
+            }
+
+            /// `self - rhs`, or 0 if `rhs` is larger.
+            pub fn saturating_sub(self, rhs: $t): $t {
+                return if rhs > self { 0 } else { self - rhs };
+            }
+
+            /// `self * rhs`, or the largest value on overflow.
+            pub fn saturating_mul(self, rhs: $t): $t {
+                return match self.checked_mul(rhs) { Some(v) => v, None => int_max::<$t>() };
+            }
+
+            pub fn saturating_pow(self, exp: u32): $t {
+                return match self.checked_pow(exp) { Some(v) => v, None => int_max::<$t>() };
+            }
+
+            /// `self` to the power `exp` (overflow as for `*`).
+            pub fn pow(self, exp: u32): $t {
+                let mut r: $t = 1;
+                for _ in 0..exp {
+                    r = r * self;
+                }
+                return r;
+            }
+
+            /// How far apart `self` and `other` are.
+            pub fn abs_diff(self, other: $t): $t {
+                return if self > other { self - other } else { other - self };
+            }
+
+            /// `self / rhs`, rounded up.
+            pub fn div_ceil(self, rhs: $t): $t {
+                let q = self / rhs;
+                return if self % rhs != 0 { q + 1 } else { q };
+            }
+
+            pub fn leading_zeros(self): u32 { return lz64(self as u64) - (64 - $bits); }
+            pub fn trailing_zeros(self): u32 { return if self == 0 { $bits } else { tz64(self as u64) }; }
+            pub fn count_ones(self): u32 { return ones64(self as u64); }
+            pub fn count_zeros(self): u32 { return $bits - ones64(self as u64); }
+            pub fn rotate_left(self, n: u32): $t { return rotl(self as u64, n, $bits) as $t; }
+            pub fn rotate_right(self, n: u32): $t { return rotl(self as u64, $bits - n % $bits, $bits) as $t; }
+
+            /// Whether `self` is a power of two (0 is not).
+            pub fn is_power_of_two(self): bool {
+                return self != 0 && (self & (self - 1)) == 0;
+            }
+
+            /// The smallest power of two at least `self`, or `None` if
+            /// that does not fit.
+            pub fn checked_next_power_of_two(self): Option::<$t> {
+                if self <= 1 {
+                    return Some(1);
+                }
+                let shift = $bits - (self - 1).leading_zeros();
+                if shift >= $bits {
+                    return None;
+                }
+                return Some(((1 as u64) << (shift as u64)) as $t);
+            }
+
+            /// The smallest power of two at least `self` (panics if that
+            /// does not fit).
+            pub fn next_power_of_two(self): $t {
+                return match self.checked_next_power_of_two() {
+                    Some(v) => v,
+                    None => panic("next_power_of_two: overflow"),
+                };
+            }
+
+            /// The decimal digits.
+            pub fn to_string(self): String {
+                let mut s = String::new();
+                crater::fmt::write_u64(&mut s, self as u64);
+                return s;
+            }
+
+            /// The digits in `radix` (2 to 36, lowercase letters past 9).
+            pub fn to_string_radix(self, radix: u32): String {
+                return radix_string(false, self as u64, radix);
+            }
+
+            /// Parse digits in `radix` (2 to 36, letters in either case),
+            /// with an optional `+`.
+            pub fn from_str_radix(s: str, radix: u32): Result::<$t, ParseError> {
+                let v = parse_unsigned(s, radix, $max)?;
+                return Ok(v as $t);
+            }
+        }
+
+        impl crater::str::FromStr for $t {
+            fn from_str(s: str): Result::<$t, ParseError> {
+                let v = parse_unsigned(s, 10, $max)?;
+                return Ok(v as $t);
+            }
+        }
+    },
+}
+
+unsigned_int!(u8, 8, 255);
+unsigned_int!(u16, 16, 65535);
+unsigned_int!(u32, 32, 4294967295);
+unsigned_int!(u64, 64, 18446744073709551615);
+unsigned_int!(usize, 64, 18446744073709551615);
+
+// ===================================================================== signed
+
+/// Methods of a signed integer type `$t` (with the unsigned `$u` of the
+/// same size) of `$bits` bits, from `$min` to `$max`.
+macro signed_int {
+    ($t:ty, $u:ty, $bits:expr, $min:expr, $max:expr) => {
+        impl $t {
+            /// `self + rhs`, or `None` on overflow.
+            pub fn checked_add(self, rhs: $t): Option::<$t> {
+                return match ck_add_i(self as i64, rhs as i64, $min, $max) { Some(v) => Some(v as $t), None => None };
+            }
+
+            /// `self - rhs`, or `None` on overflow.
+            pub fn checked_sub(self, rhs: $t): Option::<$t> {
+                return match ck_sub_i(self as i64, rhs as i64, $min, $max) { Some(v) => Some(v as $t), None => None };
+            }
+
+            /// `self * rhs`, or `None` on overflow.
+            pub fn checked_mul(self, rhs: $t): Option::<$t> {
+                return match ck_mul_i(self as i64, rhs as i64, $min, $max) { Some(v) => Some(v as $t), None => None };
+            }
+
+            /// `self / rhs`, or `None` if `rhs` is 0 or the result
+            /// overflows (the smallest value divided by -1).
+            pub fn checked_div(self, rhs: $t): Option::<$t> {
+                return match ck_div_i(self as i64, rhs as i64, $min, $max) { Some(v) => Some(v as $t), None => None };
+            }
+
+            /// `self % rhs`, or `None` if `rhs` is 0 or the division
+            /// overflows.
+            pub fn checked_rem(self, rhs: $t): Option::<$t> {
+                return match ck_rem_i(self as i64, rhs as i64, $min) { Some(v) => Some(v as $t), None => None };
+            }
+
+            /// `-self`, or `None` for the smallest value.
+            pub fn checked_neg(self): Option::<$t> {
+                return self.checked_mul(-1);
+            }
+
+            /// `self` to the power `exp`, or `None` on overflow.
+            pub fn checked_pow(self, exp: u32): Option::<$t> {
+                let mut r: $t = 1;
+                for _ in 0..exp {
+                    r = r.checked_mul(self)?;
+                }
+                return Some(r);
+            }
+
+            /// `|self|`, or `None` for the smallest value.
+            pub fn checked_abs(self): Option::<$t> {
+                return if self < 0 { self.checked_neg() } else { Some(self) };
+            }
+
+            pub fn wrapping_add(self, rhs: $t): $t { return wrapping_add(self, rhs); }
+            pub fn wrapping_sub(self, rhs: $t): $t { return wrapping_sub(self, rhs); }
+            pub fn wrapping_mul(self, rhs: $t): $t { return wrapping_mul(self, rhs); }
+            pub fn wrapping_neg(self): $t { return wrapping_sub(0, self); }
+            pub fn wrapping_abs(self): $t { return if self < 0 { wrapping_sub(0, self) } else { self }; }
+
+            pub fn wrapping_pow(self, exp: u32): $t {
+                let mut r: $t = 1;
+                for _ in 0..exp {
+                    r = wrapping_mul(r, self);
+                }
+                return r;
+            }
+
+            /// `self + rhs`, or the nearest bound on overflow.
+            pub fn saturating_add(self, rhs: $t): $t {
+                return match self.checked_add(rhs) { Some(v) => v, None => if rhs > 0 { int_max::<$t>() } else { int_min::<$t>() } };
+            }
+
+            /// `self - rhs`, or the nearest bound on overflow.
+            pub fn saturating_sub(self, rhs: $t): $t {
+                return match self.checked_sub(rhs) { Some(v) => v, None => if rhs < 0 { int_max::<$t>() } else { int_min::<$t>() } };
+            }
+
+            /// `self * rhs`, or the nearest bound on overflow.
+            pub fn saturating_mul(self, rhs: $t): $t {
+                return match self.checked_mul(rhs) {
+                    Some(v) => v,
+                    None => if (self < 0) == (rhs < 0) { int_max::<$t>() } else { int_min::<$t>() },
+                };
+            }
+
+            pub fn saturating_pow(self, exp: u32): $t {
+                return match self.checked_pow(exp) {
+                    Some(v) => v,
+                    None => if self < 0 && exp % 2 == 1 { int_min::<$t>() } else { int_max::<$t>() },
+                };
+            }
+
+            /// `-self`, or the largest value for the smallest.
+            pub fn saturating_neg(self): $t {
+                return match self.checked_neg() { Some(v) => v, None => int_max::<$t>() };
+            }
+
+            /// `|self|`, or the largest value for the smallest.
+            pub fn saturating_abs(self): $t {
+                return match self.checked_abs() { Some(v) => v, None => int_max::<$t>() };
+            }
+
+            /// `self` to the power `exp` (overflow as for `*`).
+            pub fn pow(self, exp: u32): $t {
+                let mut r: $t = 1;
+                for _ in 0..exp {
+                    r = r * self;
+                }
+                return r;
+            }
+
+            /// `|self|` (overflow as for `-` on the smallest value).
+            pub fn abs(self): $t {
+                if self < 0 {
+                    return -self;
+                }
+                return self;
+            }
+
+            /// `|self|` as the unsigned type, which always fits.
+            pub fn unsigned_abs(self): $u {
+                if self < 0 {
+                    return wrapping_sub(0, self as i64) as $u;
+                }
+                return self as $u;
+            }
+
+            /// How far apart `self` and `other` are, as the unsigned type.
+            pub fn abs_diff(self, other: $t): $u {
+                if self > other {
+                    return wrapping_sub(self as i64, other as i64) as $u;
+                }
+                return wrapping_sub(other as i64, self as i64) as $u;
+            }
+
+            /// -1, 0 or 1.
+            pub fn signum(self): $t {
+                return if self < 0 { -1 } else if self > 0 { 1 } else { 0 };
+            }
+
+            pub fn is_negative(self): bool { return self < 0; }
+            pub fn is_positive(self): bool { return self > 0; }
+
+            /// The quotient rounded so that `rem_euclid` is never negative.
+            pub fn div_euclid(self, rhs: $t): $t {
+                let q = self / rhs;
+                if self % rhs < 0 {
+                    return if rhs > 0 { q - 1 } else { q + 1 };
+                }
+                return q;
+            }
+
+            /// The remainder, never negative: `-7.rem_euclid(3)` is 2.
+            pub fn rem_euclid(self, rhs: $t): $t {
+                let r = self % rhs;
+                if r < 0 {
+                    return if rhs < 0 { r - rhs } else { r + rhs };
+                }
+                return r;
+            }
+
+            pub fn leading_zeros(self): u32 { return lz64((self as $u) as u64) - (64 - $bits); }
+            pub fn trailing_zeros(self): u32 { return if self == 0 { $bits } else { tz64((self as $u) as u64) }; }
+            pub fn count_ones(self): u32 { return ones64((self as $u) as u64); }
+            pub fn count_zeros(self): u32 { return $bits - ones64((self as $u) as u64); }
+            pub fn rotate_left(self, n: u32): $t { return (rotl((self as $u) as u64, n, $bits) as $u) as $t; }
+            pub fn rotate_right(self, n: u32): $t { return (rotl((self as $u) as u64, $bits - n % $bits, $bits) as $u) as $t; }
+
+            /// The decimal digits, with `-` if negative.
+            pub fn to_string(self): String {
+                let mut s = String::new();
+                crater::fmt::write_i64(&mut s, self as i64);
+                return s;
+            }
+
+            /// The digits in `radix` (2 to 36, lowercase letters past 9),
+            /// with `-` if negative.
+            pub fn to_string_radix(self, radix: u32): String {
+                return radix_string(self < 0, self.unsigned_abs() as u64, radix);
+            }
+
+            /// Parse digits in `radix` (2 to 36, letters in either case),
+            /// with an optional `+` or `-`.
+            pub fn from_str_radix(s: str, radix: u32): Result::<$t, ParseError> {
+                let v = parse_signed(s, radix, $min, $max)?;
+                return Ok(v as $t);
+            }
+        }
+
+        impl crater::str::FromStr for $t {
+            fn from_str(s: str): Result::<$t, ParseError> {
+                let v = parse_signed(s, 10, $min, $max)?;
+                return Ok(v as $t);
+            }
+        }
+    },
+}
+
+signed_int!(i8, u8, 8, -128, 127);
+signed_int!(i16, u16, 16, -32768, 32767);
+signed_int!(i32, u32, 32, -2147483648, 2147483647);
+signed_int!(i64, u64, 64, -9223372036854775808, 9223372036854775807);
+signed_int!(isize, usize, 64, -9223372036854775808, 9223372036854775807);

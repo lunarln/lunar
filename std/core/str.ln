@@ -1,6 +1,43 @@
-// Methods on `str`, a borrowed view of UTF-8 text.
+// Methods on `str`, a borrowed view of UTF-8 text, and on `char`;
+// parsing text into values (`FromStr`, `str::parse`).
 
 use crater::intrinsics;
+use crater::num::{ParseError, ParseErrorKind};
+
+/// Types that can be parsed from text, with `s.parse::<T>()` or
+/// `T::from_str(s)`: the integer and float types, `bool` and `char`, and
+/// others such as network addresses.
+pub trait FromStr {
+    fn from_str(s: str): Result::<Self, ParseError>;
+}
+
+impl FromStr for bool {
+    /// `true` or `false`, exactly.
+    fn from_str(s: str): Result::<bool, ParseError> {
+        if s == "true" {
+            return Ok(true);
+        }
+        if s == "false" {
+            return Ok(false);
+        }
+        return Err(ParseError::new(ParseErrorKind::Invalid));
+    }
+}
+
+impl FromStr for char {
+    /// Exactly one character.
+    fn from_str(s: str): Result::<char, ParseError> {
+        let mut it = s.chars();
+        let c = match it.next() {
+            Some(c) => c,
+            None => return Err(ParseError::new(ParseErrorKind::Empty)),
+        };
+        if it.next().is_some() {
+            return Err(ParseError::new(ParseErrorKind::Invalid));
+        }
+        return Ok(c);
+    }
+}
 
 impl str {
     /// `bytes` as text, or `None` if they are not valid UTF-8 (overlong
@@ -127,6 +164,361 @@ impl str {
 
     pub fn to_string(self): String {
         return String::from(self);
+    }
+
+    /// Parse the text as a `T`: `"42".parse::<i32>()`, `"1.5".parse::<f64>()`.
+    pub fn parse::<T: FromStr>(self): Result::<T, ParseError> {
+        return T::from_str(self);
+    }
+
+    /// Whether byte `i` starts a character (or is the end).
+    pub fn is_char_boundary(self, i: usize): bool {
+        if i == 0 || i == self.len() {
+            return true;
+        }
+        if i > self.len() {
+            return false;
+        }
+        let b = self.as_bytes()[i];
+        return b < 128 || b >= 192;
+    }
+
+    /// The text before and from byte `mid` (which must be a character
+    /// boundary).
+    pub fn split_at(self, mid: usize): (str, str) {
+        if !self.is_char_boundary(mid) {
+            panic("str::split_at: {mid} is not a char boundary");
+        }
+        return (self[..mid], self[mid..]);
+    }
+
+    /// How many characters (not bytes) there are.
+    pub fn char_count(self): usize {
+        let mut n: usize = 0;
+        for b in self.as_bytes() {
+            if b < 128 || b >= 192 {
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// Each character with the byte index where it starts.
+    pub fn char_indices(self): CharIndices {
+        return CharIndices { s: self, pos: 0 };
+    }
+
+    /// Byte index of the last occurrence of `needle`.
+    pub fn rfind(self, needle: str): Option::<usize> {
+        let h = self.as_bytes();
+        let n = needle.as_bytes();
+        if n.len() > h.len() {
+            return None;
+        }
+        let mut i = h.len() - n.len() + 1;
+        while i > 0 {
+            i -= 1;
+            if h[i..i + n.len()] == n {
+                return Some(i);
+            }
+        }
+        return None;
+    }
+
+    /// At most `n` pieces between occurrences of `sep`: the last piece is
+    /// the rest of the text. `"a,b,c".splitn(2, ",")` gives `a`, `b,c`.
+    pub fn splitn(self, n: usize, sep: str): impl Iterator::<str> {
+        return SplitN { inner: Split { rest: self, sep, done: n == 0 }, left: n };
+    }
+
+    /// The pieces between occurrences of `sep`, from the end.
+    pub fn rsplit(self, sep: str): impl Iterator::<str> {
+        return RSplit { rest: self, sep, done: false, left: 18446744073709551615 };
+    }
+
+    /// At most `n` pieces between occurrences of `sep`, from the end: the
+    /// last piece is the start of the text.
+    pub fn rsplitn(self, n: usize, sep: str): impl Iterator::<str> {
+        return RSplit { rest: self, sep, done: n == 0, left: n };
+    }
+
+    /// The text before and after the first `sep`.
+    pub fn split_once(self, sep: str): Option::<(str, str)> {
+        let i = self.find(sep)?;
+        return Some((self[..i], self[i + sep.len()..]));
+    }
+
+    /// The text before and after the last `sep`.
+    pub fn rsplit_once(self, sep: str): Option::<(str, str)> {
+        let i = self.rfind(sep)?;
+        return Some((self[..i], self[i + sep.len()..]));
+    }
+
+    /// The pieces separated by whitespace, without empty ones.
+    pub fn split_whitespace(self): impl Iterator::<str> {
+        return SplitWhitespace { rest: self };
+    }
+
+    /// The text without `prefix`, or `None` if it does not start with it.
+    pub fn strip_prefix(self, prefix: str): Option::<str> {
+        if self.starts_with(prefix) {
+            return Some(self[prefix.len()..]);
+        }
+        return None;
+    }
+
+    /// The text without `suffix`, or `None` if it does not end with it.
+    pub fn strip_suffix(self, suffix: str): Option::<str> {
+        if self.ends_with(suffix) {
+            return Some(self[..self.len() - suffix.len()]);
+        }
+        return None;
+    }
+
+    /// Without leading ASCII whitespace.
+    pub fn trim_start(self): str {
+        let b = self.as_bytes();
+        let mut start: usize = 0;
+        while start < b.len() && is_space(b[start]) {
+            start += 1;
+        }
+        return self[start..];
+    }
+
+    /// Without trailing ASCII whitespace.
+    pub fn trim_end(self): str {
+        let b = self.as_bytes();
+        let mut end = b.len();
+        while end > 0 && is_space(b[end - 1]) {
+            end -= 1;
+        }
+        return self[..end];
+    }
+
+    /// Without any number of leading `prefix`es.
+    pub fn trim_start_matches(self, prefix: str): str {
+        let mut s = self;
+        if prefix.is_empty() {
+            return s;
+        }
+        while s.starts_with(prefix) {
+            s = s[prefix.len()..];
+        }
+        return s;
+    }
+
+    /// Without any number of trailing `suffix`es.
+    pub fn trim_end_matches(self, suffix: str): str {
+        let mut s = self;
+        if suffix.is_empty() {
+            return s;
+        }
+        while s.ends_with(suffix) {
+            s = s[..s.len() - suffix.len()];
+        }
+        return s;
+    }
+
+    /// A copy with every `from` replaced by `to`.
+    pub fn replace(self, from: str, to: str): String {
+        return self.replacen(from, to, 18446744073709551615);
+    }
+
+    /// A copy with the first `n` occurrences of `from` replaced by `to`.
+    /// An empty `from` matches before every character and at the end.
+    pub fn replacen(self, from: str, to: str, n: usize): String {
+        let mut out = String::new();
+        let mut rest = self;
+        let mut left = n;
+        if from.is_empty() {
+            for c in self.chars() {
+                if left > 0 {
+                    out.push_str(to);
+                    left -= 1;
+                }
+                out.push(c);
+            }
+            if left > 0 {
+                out.push_str(to);
+            }
+            return out;
+        }
+        while left > 0 {
+            match rest.find(from) {
+                Some(i) => {
+                    out.push_str(rest[..i]);
+                    out.push_str(to);
+                    rest = rest[i + from.len()..];
+                    left -= 1;
+                }
+                None => break,
+            }
+        }
+        out.push_str(rest);
+        return out;
+    }
+
+    /// The text `n` times over.
+    pub fn repeat(self, n: usize): String {
+        let mut out = String::new();
+        for _ in 0..n {
+            out.push_str(self);
+        }
+        return out;
+    }
+
+    /// A copy in lowercase, character by character (Unicode simple case
+    /// mapping, for the scripts `char::to_lowercase` knows).
+    pub fn to_lowercase(self): String {
+        let mut out = String::new();
+        for c in self.chars() {
+            out.push(c.to_lowercase());
+        }
+        return out;
+    }
+
+    /// A copy in uppercase, character by character (Unicode simple case
+    /// mapping: `ß` stays `ß`).
+    pub fn to_uppercase(self): String {
+        let mut out = String::new();
+        for c in self.chars() {
+            out.push(c.to_uppercase());
+        }
+        return out;
+    }
+
+    /// A copy with `A`-`Z` made lowercase (other characters unchanged).
+    pub fn to_ascii_lowercase(self): String {
+        let mut out = String::new();
+        for c in self.chars() {
+            out.push(c.to_ascii_lowercase());
+        }
+        return out;
+    }
+
+    /// A copy with `a`-`z` made uppercase (other characters unchanged).
+    pub fn to_ascii_uppercase(self): String {
+        let mut out = String::new();
+        for c in self.chars() {
+            out.push(c.to_ascii_uppercase());
+        }
+        return out;
+    }
+
+    /// Whether the two are equal, ignoring the case of ASCII letters.
+    pub fn eq_ignore_ascii_case(self, other: str): bool {
+        let a = self.as_bytes();
+        let b = other.as_bytes();
+        if a.len() != b.len() {
+            return false;
+        }
+        for i in 0..a.len() {
+            if ascii_lower(a[i]) != ascii_lower(b[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+fn ascii_lower(b: u8): u8 {
+    if b >= b'A' && b <= b'Z' {
+        return b + 32;
+    }
+    return b;
+}
+
+/// Each character of a `str` with its byte index (`str::char_indices`).
+pub struct CharIndices {
+    s: str,
+    pos: usize,
+}
+
+impl Iterator::<(usize, char)> for CharIndices {
+    fn next(&mut self): Option::<(usize, char)> {
+        if self.pos >= self.s.len() {
+            return None;
+        }
+        let start = self.pos;
+        let mut it = self.s[start..].chars();
+        let c = it.next()?;
+        self.pos = start + c.len_utf8();
+        return Some((start, c));
+    }
+}
+
+/// At most `left` pieces (`str::splitn`).
+struct SplitN {
+    inner: Split,
+    left: usize,
+}
+
+impl Iterator::<str> for SplitN {
+    fn next(&mut self): Option::<str> {
+        if self.left == 0 || self.inner.done {
+            return None;
+        }
+        self.left -= 1;
+        if self.left == 0 {
+            self.inner.done = true;
+            return Some(self.inner.rest);
+        }
+        return self.inner.next();
+    }
+}
+
+/// The pieces between separators from the end (`str::rsplit`,
+/// `str::rsplitn`).
+struct RSplit {
+    rest: str,
+    sep: str,
+    done: bool,
+    left: usize,
+}
+
+impl Iterator::<str> for RSplit {
+    fn next(&mut self): Option::<str> {
+        if self.done || self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        if self.sep.is_empty() || self.left == 0 {
+            self.done = true;
+            return Some(self.rest);
+        }
+        return match self.rest.rfind(self.sep) {
+            Some(i) => {
+                let piece = self.rest[i + self.sep.len()..];
+                self.rest = self.rest[..i];
+                Some(piece)
+            }
+            None => {
+                self.done = true;
+                Some(self.rest)
+            }
+        };
+    }
+}
+
+/// The pieces between whitespace (`str::split_whitespace`).
+struct SplitWhitespace {
+    rest: str,
+}
+
+impl Iterator::<str> for SplitWhitespace {
+    fn next(&mut self): Option::<str> {
+        let s = self.rest.trim_start();
+        if s.is_empty() {
+            self.rest = s;
+            return None;
+        }
+        let b = s.as_bytes();
+        let mut end: usize = 0;
+        while end < b.len() && !is_space(b[end]) {
+            end += 1;
+        }
+        self.rest = s[end..];
+        return Some(s[..end]);
     }
 }
 
@@ -306,5 +698,140 @@ impl char {
         if c < 2048 { return 2; }
         if c < 65536 { return 3; }
         return 4;
+    }
+
+    /// The lowercase form (Unicode simple case mapping: one character
+    /// for one) for Latin, Greek, Cyrillic, Armenian, Georgian, Cherokee,
+    /// Glagolitic, Coptic, Deseret, Osage, Adlam and the other cased
+    /// scripts in `core::unicode`; anything else is unchanged.
+    pub fn to_lowercase(self): char {
+        return char_from_u32(crater::unicode::to_lower(self as u32));
+    }
+
+    /// The uppercase form (Unicode simple case mapping: `ß` stays `ß`).
+    pub fn to_uppercase(self): char {
+        return char_from_u32(crater::unicode::to_upper(self as u32));
+    }
+
+    /// Whether this is a lowercase letter (one with an uppercase form).
+    pub fn is_lowercase(self): bool {
+        let c = self as u32;
+        return crater::unicode::to_upper(c) != c || c == 223;
+    }
+
+    /// Whether this is an uppercase letter (one with a lowercase form).
+    pub fn is_uppercase(self): bool {
+        let c = self as u32;
+        return crater::unicode::to_lower(c) != c;
+    }
+
+    /// `A`-`Z` made lowercase; anything else unchanged.
+    pub fn to_ascii_lowercase(self): char {
+        let c = self as u32;
+        if c >= 65 && c <= 90 {
+            return char_from_u32(c + 32);
+        }
+        return self;
+    }
+
+    /// `a`-`z` made uppercase; anything else unchanged.
+    pub fn to_ascii_uppercase(self): char {
+        let c = self as u32;
+        if c >= 97 && c <= 122 {
+            return char_from_u32(c - 32);
+        }
+        return self;
+    }
+
+    pub fn is_ascii(self): bool {
+        return (self as u32) < 128;
+    }
+
+    pub fn is_ascii_digit(self): bool {
+        return self.is_digit();
+    }
+
+    /// `0`-`9`, `a`-`f` or `A`-`F`.
+    pub fn is_ascii_hexdigit(self): bool {
+        return self.to_digit(16).is_some();
+    }
+
+    pub fn is_ascii_alphabetic(self): bool {
+        let c = self as u32;
+        return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+    }
+
+    pub fn is_ascii_alphanumeric(self): bool {
+        return self.is_ascii_alphabetic() || self.is_digit();
+    }
+
+    pub fn is_ascii_uppercase(self): bool {
+        let c = self as u32;
+        return c >= 65 && c <= 90;
+    }
+
+    pub fn is_ascii_lowercase(self): bool {
+        let c = self as u32;
+        return c >= 97 && c <= 122;
+    }
+
+    /// Space, tab, newline, carriage return or form feed.
+    pub fn is_ascii_whitespace(self): bool {
+        let c = self as u32;
+        return c == 32 || c == 9 || c == 10 || c == 12 || c == 13;
+    }
+
+    /// ASCII punctuation and symbols: `!` to `/`, `:` to `@`, `[` to `` ` ``,
+    /// `{` to `~`.
+    pub fn is_ascii_punctuation(self): bool {
+        let c = self as u32;
+        return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+    }
+
+    /// A control character (U+0000 to U+001F, U+007F to U+009F).
+    pub fn is_control(self): bool {
+        let c = self as u32;
+        return c < 32 || (c >= 127 && c < 160);
+    }
+
+    /// A letter (ASCII, or a cased letter `to_lowercase` knows) or a
+    /// digit.
+    pub fn is_alphanumeric(self): bool {
+        let c = self as u32;
+        return self.is_alphabetic() || self.is_digit() || (c >= 128 && (self.is_lowercase() || self.is_uppercase()));
+    }
+
+    /// The value of this digit in `radix` (2 to 36; letters in either
+    /// case past 9).
+    pub fn to_digit(self, radix: u32): Option::<u32> {
+        let c = self as u32;
+        let d = if c >= 48 && c <= 57 {
+            c - 48
+        } else if c >= 97 && c <= 122 {
+            c - 87
+        } else if c >= 65 && c <= 90 {
+            c - 55
+        } else {
+            return None;
+        };
+        if d >= radix {
+            return None;
+        }
+        return Some(d);
+    }
+
+    /// The digit for `d` in `radix` (lowercase letters past 9).
+    pub fn from_digit(d: u32, radix: u32): Option::<char> {
+        if radix > 36 || d >= radix {
+            return None;
+        }
+        return Some(char_from_u32(if d < 10 { 48 + d } else { 87 + d }));
+    }
+
+    /// The character as a one-character `String`.
+    pub fn to_string(self): String {
+        let mut s = String::new();
+        s.push(self);
+        return s;
     }
 }

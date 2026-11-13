@@ -157,6 +157,28 @@ impl Debug for () {
     }
 }
 
+impl::<A: Debug, B: Debug> Debug for (A, B) {
+    fn debug(&self, out: &mut +String) {
+        out.push('(');
+        self.0.debug(out);
+        out.push_str(", ");
+        self.1.debug(out);
+        out.push(')');
+    }
+}
+
+impl::<A: Debug, B: Debug, C: Debug> Debug for (A, B, C) {
+    fn debug(&self, out: &mut +String) {
+        out.push('(');
+        self.0.debug(out);
+        out.push_str(", ");
+        self.1.debug(out);
+        out.push_str(", ");
+        self.2.debug(out);
+        out.push(')');
+    }
+}
+
 /// `c` as it is written inside a quoted literal.
 fn escape_char(out: &mut +String, c: char, quote: char) {
     if c == '\n' {
