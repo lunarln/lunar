@@ -1,0 +1,12 @@
+// error: borrow::shrink_while_borrowed
+// `apply` gets a view into `s` and a closure that clears `s`, and may call
+// the closure before it reads the view.
+fn apply::<F: FnMut()>(word: str, mut f: F) {
+    f();
+    println("{word}");
+}
+
+fn main() {
+    let mut s = String::from("hello");
+    apply(s.as_str(), || s.clear());
+}

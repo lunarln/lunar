@@ -709,6 +709,7 @@ fn new_cx(p: &mut +Program, body: Body, env: [Pred; &]): Cx {
         saved_sets: [],
         words: (body.locals.len() + 63) / 64,
         held: [],
+        pending: [],
         from: None,
     };
     for i in 0..body.params.len() {
@@ -753,6 +754,12 @@ struct Cx {
     words: usize,
     /// Roots of the other arguments of the call being checked.
     held: Roots,
+    /// Roots of the operands evaluated before the one being checked, in
+    /// every expression around it (call arguments, tuple and array items,
+    /// struct literal fields, ...): their values wait in temporaries until
+    /// the whole expression is evaluated, so the operand may not shrink,
+    /// replace or move what they point into. Each with the operand's span.
+    pending: [(Root, Span); -..+],
     /// For a named function, what its signature says its result points
     /// into, to check what it returns against.
     from: Option::<FromCheck>,
@@ -2546,7 +2553,9 @@ impl Cx {
             }
             ExprKind::Field { base, .. } => self.use_place(p, base, live),
             ExprKind::Index { base, index } => {
-                let live = self.live(p, index, live);
+                // The address of `base` is taken first.
+                let held = self.addr_held(p, base);
+                let live = self.live_holding(p, index, held[..], live);
                 self.use_place(p, base, live)
             }
             ExprKind::Deref(x) => self.live(p, x, live),
@@ -2616,6 +2625,112 @@ impl Cx {
             p.diags.error(codes::borrow::SHRINK_WHILE_BORROWED(), span, m);
             p.diags.finish();
         }
+        // An operand evaluated earlier in an expression around this one
+        // waits in a temporary until the expression is done.
+        let mut pending_at: Option::<Span> = None;
+        for pr in self.pending[..] {
+            let (r, sp) = pr;
+            if pending_at.is_none() && (r == Root::Local(root) || (what == "move" && r == Root::Slot(root))) {
+                pending_at = Some(sp);
+            }
+        }
+        if let Some(sp) = pending_at {
+            if (held_conflict && what == "shrink") || !self.report(span, 4294967293) {
+                return;
+            }
+            let (code, verb) = if what == "shrink" {
+                (codes::borrow::SHRINK_WHILE_BORROWED(), "may be shrunk or replaced")
+            } else if what == "move" {
+                (codes::borrow::MOVE_WHILE_BORROWED(), "is moved")
+            } else {
+                (codes::borrow::ASSIGN_WHILE_BORROWED(), "is replaced")
+            };
+            let m = say(p, "`{rname}` {verb} here while an operand evaluated before it still points into it");
+            p.diags.error(code, span, m);
+            if !is_dummy(sp) {
+                p.diags.secondary(sp, say(p, "this value points into `{rname}`, and is kept until the whole expression is evaluated"));
+            }
+            p.diags.note(say(p, "the operands of a call, tuple, array, struct literal or operator are evaluated left to right, and each value is kept until the whole expression is done"));
+            p.diags.help(say(p, "compute this operand with `let` before the expression, so it runs before the view into `{rname}` is taken"));
+            p.diags.finish();
+        }
+    }
+
+    /// The storage the address of place `place` points into, when computing
+    /// the address goes through an array's items (`a[i].f`) or a temporary:
+    /// a later operand of the same expression must not shrink it while the
+    /// address waits. The address of a variable or of a field of one is the
+    /// variable's own slot, which nothing frees.
+    fn addr_roots(&self, p: &mut +Program, place: Id::<Expr>): Roots {
+        return match p.thir.expr(place).kind {
+            ExprKind::Field { base, .. } => self.addr_roots(p, base),
+            ExprKind::Index { .. } => self.borrow_roots(p, place),
+            ExprKind::Temp(inner) => self.value_roots(p, inner),
+            _ => [],
+        };
+    }
+
+    /// What lending place `x` (in-out, or borrowed with `&`) leaves waiting
+    /// until the call: its address, and the views the value there holds.
+    fn place_held_roots(&self, p: &mut +Program, x: Id::<Expr>): Roots {
+        let mut r = self.addr_roots(p, x);
+        if self.has_view(p, p.thir.expr(x).ty) {
+            let vr = self.value_roots_of_place(p, x);
+            roots_extend(&mut r, vr[..]);
+        }
+        return r;
+    }
+
+    /// What evaluating operand `v` leaves waiting until the expression
+    /// around it is done (see `pending`).
+    fn operand_roots(&self, p: &mut +Program, v: Id::<Expr>): Roots {
+        if let ExprKind::Read { place, mode: ReadMode::Borrow } = p.thir.expr(v).kind {
+            return self.place_held_roots(p, place);
+        }
+        return self.value_roots(p, v);
+    }
+
+    /// `operand_roots` of call argument `a`.
+    fn arg_held_roots(&self, p: &mut +Program, a: Arg): Roots {
+        return match a {
+            Arg::InOut(x) => self.place_held_roots(p, x),
+            Arg::Value(v) => self.operand_roots(p, v),
+        };
+    }
+
+    /// `operand_roots` of `e`, each with `e`'s span, onto `out`.
+    fn held_by(&self, p: &mut +Program, e: Id::<Expr>, out: &mut [(Root, Span); -..+]) {
+        let sp = p.thir.expr(e).span;
+        for r in self.operand_roots(p, e) {
+            out.push((r, sp));
+        }
+    }
+
+    /// Add `held` to `pending` while an operand evaluated after the ones
+    /// they come from is checked; the length to cut `pending` back to.
+    fn hold(&mut self, held: [(Root, Span); &]): usize {
+        let n = self.pending.len();
+        self.pending.extend(held);
+        return n;
+    }
+
+    /// `live` of operand `e`, evaluated after operands whose values (with
+    /// roots `held`) wait until the expression is done.
+    fn live_holding(&mut self, p: &mut +Program, e: Id::<Expr>, held: [(Root, Span); &], after: LiveSet): LiveSet {
+        let n = self.hold(held);
+        let l = self.live(p, e, after);
+        self.pending.truncate(n);
+        return l;
+    }
+
+    /// `addr_roots` of place `base`, with its span.
+    fn addr_held(&self, p: &mut +Program, base: Id::<Expr>): [(Root, Span); -..+] {
+        let mut out: [(Root, Span); -..+] = [];
+        let sp = p.thir.expr(base).span;
+        for r in self.addr_roots(p, base) {
+            out.push((r, sp));
+        }
+        return out;
     }
 
     /// `place` (an owner) is about to be lent where it may be shrunk or
@@ -2803,6 +2918,11 @@ impl Cx {
             ExprKind::Assign { place, value } => {
                 let mut live = after.clone();
                 let pe = p.thir.expr(place);
+                // The value is computed first, and waits while the place's
+                // address is computed and its old value freed.
+                let mut held: [(Root, Span); -..+] = [];
+                self.held_by(p, value, &mut held);
+                let saved = self.hold(held[..]);
                 if p.has_owner(pe.ty) {
                     if let Some(Root::Local(r)) = self.place_root(p, place) {
                         if !self.place_through_view(p, place) {
@@ -2816,6 +2936,7 @@ impl Cx {
                 } else {
                     live = self.use_place(p, place, live);
                 }
+                self.pending.truncate(saved);
                 self.live(p, value, live)
             }
             ExprKind::AssignOp { place, value, .. } => {
@@ -2826,7 +2947,9 @@ impl Cx {
             ExprKind::Cast(x) => self.live(p, x, after),
             ExprKind::Coerce { expr, .. } => self.live(p, expr, after),
             ExprKind::Binary(_, a, b) => {
-                let l = self.live(p, b, after);
+                let mut held: [(Root, Span); -..+] = [];
+                self.held_by(p, a, &mut held);
+                let l = self.live_holding(p, b, held[..], after);
                 self.live(p, a, l)
             }
             ExprKind::Logical { lhs, rhs, .. } => {
@@ -2837,25 +2960,27 @@ impl Cx {
             ExprKind::Tuple(es) => self.live_list(p, es, after),
             ExprKind::Array(es) => self.live_list(p, es, after),
             ExprKind::Adt { fields, .. } => {
-                let mut l = after;
-                let mut i = fields.len();
-                while i > 0 {
-                    i -= 1;
-                    l = self.live(p, p.thir.field_exprs.list(fields)[i].expr, l);
+                let mut ids: [Id::<Expr>; ..+] = [];
+                for f in p.thir.field_exprs.list(fields) {
+                    ids.push(f.expr);
                 }
-                l
+                self.live_operands(p, ids[..], after)
             }
             ExprKind::ArrayRepeat { value, count } => {
-                let l = self.live(p, count, after);
+                let mut held: [(Root, Span); -..+] = [];
+                self.held_by(p, value, &mut held);
+                let l = self.live_holding(p, count, held[..], after);
                 self.live(p, value, l)
             }
             ExprKind::Slice { base, start, end, .. } => {
+                // The address of `base` is taken first.
+                let held = self.addr_held(p, base);
                 let mut l = after;
                 if let Some(x) = end {
-                    l = self.live(p, x, l);
+                    l = self.live_holding(p, x, held[..], l);
                 }
                 if let Some(x) = start {
-                    l = self.live(p, x, l);
+                    l = self.live_holding(p, x, held[..], l);
                 }
                 self.use_place(p, base, l)
             }
@@ -2964,26 +3089,41 @@ impl Cx {
                 None => self.ls_new(),
             },
             ExprKind::FmtArgs(pieces) => {
-                let mut l = after;
-                let mut i = pieces.len();
-                while i > 0 {
-                    i -= 1;
-                    if let FmtPiece::Arg(x, _) = p.thir.fmt_pieces.list(pieces)[i] {
-                        l = self.live(p, x, l);
+                let mut ids: [Id::<Expr>; ..+] = [];
+                for q in p.thir.fmt_pieces.list(pieces) {
+                    if let FmtPiece::Arg(x, _) = q {
+                        ids.push(x);
                     }
                 }
-                l
+                self.live_operands(p, ids[..], after)
             }
         };
     }
 
-    /// `live` of the expressions `es`, last first.
+    /// `live` of the expressions `es`, evaluated in order (so each waits
+    /// for the ones after it), last first.
     fn live_list(&mut self, p: &mut +Program, es: List::<Id::<Expr>>, after: LiveSet): LiveSet {
+        let ids = p.thir.expr_ids.list(es).to_grow();
+        return self.live_operands(p, ids[..], after);
+    }
+
+    /// `live` of the operands `es` of one expression, evaluated in order:
+    /// each waits in a temporary while the ones after it are evaluated.
+    fn live_operands(&mut self, p: &mut +Program, es: [Id::<Expr>; &], after: LiveSet): LiveSet {
+        // `held` holds the roots of operands `0..k`, in order: `ends[k]` is
+        // where those of operand `k` end.
+        let mut held: [(Root, Span); -..+] = [];
+        let mut ends: [usize; ..+] = [];
+        for e in es {
+            self.held_by(p, e, &mut held);
+            ends.push(held.len());
+        }
         let mut l = after;
         let mut i = es.len();
         while i > 0 {
             i -= 1;
-            l = self.live(p, p.thir.expr_ids.list(es)[i], l);
+            let before = if i == 0 { 0 } else { ends[i - 1] };
+            l = self.live_holding(p, es[i], held[0..before], l);
         }
         return l;
     }
@@ -3040,13 +3180,17 @@ impl Cx {
             let ty = p.thir.expr(a.expr()).ty;
             if self.may_change_captures(p, ty) {
                 let mut roots: Roots = [];
+                self.held.clear();
                 for ar in arg_roots[..] {
                     let (j, r) = ar;
                     if j as usize == i {
                         roots_insert(&mut roots, r);
+                    } else {
+                        roots_insert(&mut self.held, r);
                     }
                 }
                 self.invalidate_captures(p, roots[..], after[..], ex.span);
+                self.held.clear();
             }
             // So may a method called through a `dyn mut` (unless it only
             // reads or grows what the `dyn` views).
@@ -3070,20 +3214,44 @@ impl Cx {
             let through_dyn = self.may_hold_dyn_mut(p, ft, 0);
             if kind != ClosureKind::Fn || through_dyn {
                 let roots = if p.thir.is_place(f) { self.value_roots_of_place(p, f) } else { self.value_roots(p, f) };
+                // The closure is called with every argument in hand.
+                self.held.clear();
+                for ar in arg_roots[..] {
+                    let (_, r) = ar;
+                    roots_insert(&mut self.held, r);
+                }
                 self.invalidate_captures(p, roots[..], after[..], ex.span);
                 if through_dyn {
                     self.invalidate_dyn_mut(p, roots[..], after[..], ex.span);
                 }
+                self.held.clear();
             }
+        }
+        // The arguments are evaluated in order, and each waits for the ones
+        // after it.
+        // `held` holds the roots of arguments `0..k`, in order: `ends[k]`
+        // is where those of argument `k` end.
+        let mut held: [(Root, Span); -..+] = [];
+        let mut ends: [usize; ..+] = [];
+        for i in 0..args.len() {
+            let a = p.thir.args.list(args)[i];
+            let sp = p.thir.expr(a.expr()).span;
+            for r in self.arg_held_roots(p, a) {
+                held.push((r, sp));
+            }
+            ends.push(held.len());
         }
         let mut live = after;
         let mut i = args.len();
         while i > 0 {
             i -= 1;
+            let before = if i == 0 { 0 } else { ends[i - 1] };
+            let saved = self.hold(held[0..before]);
             live = match p.thir.args.list(args)[i] {
                 Arg::InOut(x) => self.use_place(p, x, live),
                 Arg::Value(v) => self.live(p, v, live),
             };
+            self.pending.truncate(saved);
         }
         match callee {
             Callee::Indirect(f) => {

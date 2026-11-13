@@ -1,0 +1,16 @@
+// error: borrow::assign_while_borrowed
+// once: borrow::assign_while_borrowed
+// The second argument replaces `s`, freeing the string the first one
+// points into.
+fn show(word: str, n: i32) {
+    println("{word} {n}");
+}
+
+fn main() {
+    let mut s = String::from("hello");
+    show(s.as_str(), {
+        s = String::from("bye");
+        1
+    });
+    println("{s}");
+}

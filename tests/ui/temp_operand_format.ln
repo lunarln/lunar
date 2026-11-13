@@ -1,0 +1,13 @@
+// error: borrow::shrink_while_borrowed
+// once: borrow::shrink_while_borrowed
+// The holes of a format string are evaluated in order, and all of them are
+// written once every hole has a value.
+fn clear_len(s: &mut String): usize {
+    s.clear();
+    return s.len();
+}
+
+fn main() {
+    let mut s = String::from("hello");
+    println("{s.as_str()} {clear_len(&mut s)}");
+}

@@ -310,6 +310,14 @@ to 64 MiB in total.
   disjoint fields separately is planned. A view taken from a `str` or slice
   *field* points where that field points, not into the struct, so it
   survives changes to the struct.
+* The operands of an expression are evaluated left to right: a call's
+  receiver and arguments, the items of a tuple or array literal, the fields
+  of a struct literal, the two sides of an operator, the holes of a format
+  string, an indexed place before its index, and the value of an
+  assignment before its place. Each value waits in a temporary until the
+  whole expression is done, so a later operand may not shrink, replace or
+  move what an earlier one points into:
+  `show(c.first(), c.clear_get())` is `err(borrow::shrink_while_borrowed)`.
 * Owners are freed when they go out of scope (also on `return`, `break`,
   `continue`). Moving out of a variable makes it unusable
   (`err(borrow::use_after_move)`).

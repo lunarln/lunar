@@ -22,7 +22,13 @@ Views are tracked per variable: a view into one field of a struct is ended
 by lending the whole struct.
 
 The same error is reported when one argument of a call may shrink a value
-that another argument of the same call points into.
+that another argument of the same call points into, and when an operand
+shrinks a value that an operand evaluated before it points into. The
+operands of a call (its receiver first), a tuple, an array or struct
+literal, an operator and a format string are evaluated left to right, and
+each value waits in a temporary until the whole expression is done:
+`show(c.first(), c.clear_get())` would hand `show` a view into the items
+`clear_get` freed. Compute the shrinking operand with `let` first.
 
 A view returned by a function points into the arguments its signature
 says (its `from` clause; without one, `self` for a method that borrows it,

@@ -1,0 +1,26 @@
+// error: borrow::shrink_while_borrowed
+// once: borrow::shrink_while_borrowed
+// The first argument is a view into `c`, kept in a temporary while the
+// second argument clears `c`: `show` would read freed items.
+struct Store {
+    nums: [i32; -..+],
+}
+
+impl Store {
+    fn first(&self): [i32; &] {
+        return self.nums[0..1];
+    }
+    fn clear_get(&mut self): i32 {
+        self.nums.clear();
+        return 0;
+    }
+}
+
+fn show(a: [i32; &], b: i32) {
+    println("{a[0]} {b}");
+}
+
+fn main() {
+    let mut c = Store { nums: [1, 2, 3] };
+    show(c.first(), c.clear_get());
+}

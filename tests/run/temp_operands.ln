@@ -1,0 +1,57 @@
+// Operands are evaluated left to right, and a view made by one waits in a
+// temporary until the whole expression is done. Later operands may read,
+// grow and lend what it points into; only shrinking, replacing or moving
+// it is an error (tests/ui/temp_operand_*.ln).
+
+struct Store {
+    nums: [i32; -..+],
+}
+
+impl Store {
+    fn first(&self): [i32; &] {
+        return self.nums[0..1];
+    }
+    fn count(&self): usize {
+        return self.nums.len();
+    }
+    fn add(&mut +self, v: i32): i32 {
+        self.nums.push(v);
+        return v;
+    }
+    fn clear_get(&mut self): i32 {
+        self.nums.clear();
+        return 0;
+    }
+}
+
+fn show(a: [i32; &], b: usize) {
+    println("{a[0]} {b}");
+}
+
+fn show_grown(a: [i32; &], b: i32) {
+    println("{a[0]} {b}");
+}
+
+fn main() {
+    let mut c = Store { nums: [1, 2, 3] };
+    // Reading, or growing through `&mut +`, keeps the view valid.
+    show(c.first(), c.count());
+    show_grown(c.first(), c.add(4));
+    let (a, n) = (c.first(), c.count());
+    println("{a[0]} {n}");
+    // Shrinking first, then viewing, is fine: the view is made afterwards.
+    let z = c.clear_get();
+    let pair = (z, c.count());
+    println("{pair.0} {pair.1}");
+    // The receiver's own slot is not freed by changing the value in it.
+    let mut v: [usize; ..+] = [1];
+    v.push(v.len());
+    let mut s = String::from("ab");
+    s.truncate(s.len() - 1);
+    let t = String::from("cd");
+    s.push_str(t.as_str());
+    println("{v.len()} {v[1]} {s}");
+    // Assigning a value computed from the old one.
+    s = s.as_str().to_uppercase();
+    println("{s}");
+}

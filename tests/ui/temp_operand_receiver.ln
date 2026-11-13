@@ -1,0 +1,14 @@
+// error: borrow::shrink_while_borrowed
+// once: borrow::shrink_while_borrowed
+// A method's receiver is evaluated before its arguments.
+fn reset(s: &mut String): str from static {
+    s.clear();
+    return "he";
+}
+
+fn main() {
+    let mut s = String::from("hello");
+    if s.as_str().starts_with(reset(&mut s)) {
+        println("yes");
+    }
+}
