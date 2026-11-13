@@ -7,8 +7,8 @@
   enum variant or struct field that follows; it is the attribute
   `#[doc = "text"]`, one per line. Elsewhere it is an ordinary comment.
 * Identifiers: `[a-zA-Z_][a-zA-Z0-9_]*`. `_` alone is the placeholder.
-* Keywords: `as break const continue crater else enum extern false fn for if
-  impl in let loop match mod mut pub return self Self static struct super
+* Keywords: `as break const continue crater dyn else enum extern false fn for
+  if impl in let loop match mod mut pub return self Self static struct super
   trait true type unsafe use while`.
 * Integers: `42`, `1_000`, `0xff`, `0o17`, `0b1010`, with optional suffix
   `i8 i16 i32 i64 isize u8 u16 u32 u64 usize`.
@@ -153,6 +153,7 @@ let m = max!(3, square!(2), 1);
 | `[T; &]`, `[T; &mut]` | read-only / mutable slices (views) |
 | `+T` | `&mut` parameters and receivers only, where `T` owns an array or string (or contains one): the argument only grows, so the caller's views into it stay valid (see §4) |
 | `str` | UTF-8 view (like Rust's `&str`) |
+| `dyn Trait`, `dyn mut Trait` | trait objects: a shared / changing view of a value of any type implementing `Trait` (see §7) |
 | `String` | owned UTF-8 text (a `[u8; -..+]` with a UTF-8 invariant) |
 | `FmtArgs` | parameter only: an interpolated string literal |
 | `*T`, `*mut T` | raw pointers (dereferencing is unsafe) |
@@ -167,8 +168,8 @@ implemented or `!`implemented manually (`err(trait::dull_impl)`):
 * `core::ptr::Dull`: the type is not a pointer, slice, string or array and
   contains none. All other types are *pointy*.
 * `core::ptr::Light`: the type owns no array or string. Dull types are
-  Light (`Dull: Light`), and so are views (`str`, `[T; &]`, raw pointers)
-  and anything built only from Light types. `String`, owning arrays and
+  Light (`Dull: Light`), and so are views (`str`, `[T; &]`, `dyn Trait`,
+  raw pointers) and anything built only from Light types. `String`, owning arrays and
   types containing them are not.
 
 **Array and slice items must be Light:**
@@ -201,7 +202,8 @@ decide what may cross between threads (§6a):
   Send except raw pointers, mutable slices (`[T; &mut]`: they are copied
   freely, so two threads could write through the same one), `FmtArgs`,
   shared slices `[T; &]` whose items are not Sync, closures that change a
-  variable they borrow, and types holding one of those.
+  variable they borrow, `dyn` views (unless `dyn Trait + Sync`, below), and
+  types holding one of those.
 * `core::marker::Sync`: threads may share views of a value (read it at the
   same time). Everything that is not Send is not Sync, and neither is
   `UnsafeCell`.
@@ -213,6 +215,13 @@ decide what may cross between threads (§6a):
 
 A closure borrowing a variable is Send and Sync if the variable's type is
 Sync; one owning a capture is Send (Sync) if the capture is.
+
+A `dyn Trait` is a shared view, like `[T; &]`: it is Send and Sync when the
+value it views is Sync. Its type does not say which type that is, so only
+`dyn Trait + Sync` is (the value is checked to be Sync where it is first
+viewed as `dyn`). `+ Send` records that the value is Send; it makes no view
+Send by itself. A `dyn mut Trait` is like `[T; &mut]`: neither Send nor
+Sync. No `dyn` is Detached.
 
 A struct or enum may promise `Send` or `Sync` with `unsafe impl` (for raw
 pointers or cells it guards itself), or give them up with a negative impl
@@ -480,7 +489,8 @@ let size = match shape { Shape::Circle(r) | Shape::Square(r) => r, _ => 0.0 };
 * Array literals `[1, 2, 3]`, repeats `[0.; 8]` (the count may be a runtime
   value for owning arrays).
 * Casts with `as` between numeric types, `bool`/`char` to integers, `u8` to
-  `char`, and between pointers and `usize`.
+  `char`, and between pointers and `usize`. `x as dyn Trait` views `x` as a
+  trait object (§7).
 * Operators on user types go through the traits in `core::ops` and
   `core::cmp` (`Add`, `Sub`, ..., `Eq` for `==`, `Ord` for `<`).
 * Integer overflow panics in debug builds and wraps in `--release`.
@@ -611,7 +621,78 @@ negated). An implementation's methods
 take their parameters exactly as the trait declares, `+` included: an
 `out: &mut String` where the trait says `out: &mut +String` is
 `err(trait::signature)`. Trait method calls are resolved
-statically and monomorphized; there are no trait objects.
+statically and monomorphized, except through trait objects.
+
+### Trait objects
+
+`dyn Trait` is a view of a value of any type implementing `Trait`: a
+pointer to the value and a pointer to its type's *vtable* for the trait, a
+table of the type's methods. Calls through it go through the table, so one
+array can hold views of different types:
+
+```lunar
+trait Shape { fn area(&self): f64; }
+
+let c = Circle { r: 1.0 };
+let r = Rect { w: 2.0, h: 3.0 };
+let shapes = [c as dyn Shape, r as dyn Shape];
+for s in shapes { total += s.area(); }
+```
+
+* A `dyn` is made only with an explicit `x as dyn Trait`, never implicitly
+  (at a call, a `return` or in an array literal it is `err(type::mismatch)`).
+  `x`'s type must implement the trait (`err(type::unsatisfied_bound)`).
+* It is a view, like a slice, and is Light: it is copied, stored in arrays
+  and fields, passed and returned like a `str`. It never owns its value and
+  is never Detached. It points at the place `x`: a variable, a field, an
+  item of an array, or the caller's value behind a borrowed parameter. The
+  borrow checker treats it like a closure borrowing that place: it cannot
+  outlive it (`err(borrow::outlives_root)`; a view of a temporary dies with
+  its statement), the place cannot be moved while it is used
+  (`err(borrow::move_while_borrowed)`), and it is returned only from a
+  parameter the caller lent, as its signature says (`from`). The variable
+  may still be assigned and changed: the `dyn` sees the new value.
+* `dyn Trait` gives shared access: only `&self` methods can be called
+  through it. `dyn mut Trait`, made from a mutable place, may also call
+  `&mut self` and `&mut +self` methods (else `err(type::immutable)`). Like
+  lending the value in-out, a `&mut self` call through a `dyn mut` may
+  shrink or replace the value, so it ends views into it
+  (`err(borrow::shrink_while_borrowed)`), and so does passing a `dyn mut`
+  to a call, which may make such calls. A `&mut +self` call only grows the
+  value and keeps them. A `dyn mut` cannot be stored inside the value it
+  views (`err(borrow::views_itself)`).
+* A `dyn mut Trait` converts implicitly to a `dyn Trait`, and `+ Send` and
+  `+ Sync` may be dropped implicitly. `d as dyn Super` views a `dyn Sub` as
+  one of its supertraits (upcasting).
+* The supertraits' methods can be called through a `dyn`, and generic
+  traits take their arguments: `dyn Iterator::<u8>`. Format holes call
+  `Display` and `Debug`, so `{x}` works for `x: dyn Display`.
+* `dyn Trait` implements `Trait` and its supertraits, so it can be passed
+  to generic code; a shared `dyn Trait` implements only traits whose
+  vtable methods (with their supertraits') all take `&self`, so generic
+  code cannot change a value through it.
+* The crater that defines a trait may give `dyn Trait` methods of its own
+  (`impl dyn Shape { fn double_area(&self): f64 { ... } }`); they are found
+  on `dyn mut Shape` and `dyn Shape + Sync` too.
+* Auto traits follow the trait: `dyn Trait + Send + Sync` (§3); `Dull`,
+  `Light` and `Detached` cannot follow it, and a `dyn` names exactly one
+  trait besides them (`err(type::bad_dyn)`).
+
+A trait can be used as `dyn` (is *dyn compatible*) when every method of it
+and of its supertraits without a default body takes `&self`, `&mut self` or
+`&mut +self`, has no generic parameters, and mentions `Self` nowhere else in
+its signature; and its supertraits do not take `Self` as an argument
+(`err(trait::not_dyn_compatible)`). Methods with a default body that break
+these rules are not in the vtable: calling one on a `dyn` runs the default
+body with `Self` being the `dyn` type itself (which needs `dyn Trait` to
+implement `Trait`). Closure traits (`Fn`, ...) cannot be used as `dyn` yet.
+
+The vtable of a type for a trait is one constant per program (shared by all
+craters): a null slot reserved for drop glue (for future owned trait
+objects), the type's size and alignment, the vtables of the supertraits
+(for upcasting), then the methods, trait by trait (the trait itself, then
+its supertraits depth first), each in declaration order. Associated
+constants will come after the methods.
 
 Method calls *autoslice*: a method called on `[T; -..+]` also finds the
 methods of `[T; ..+]`, `[T]`, `[T; &mut]` and `[T; &]`, in that order, and a
@@ -719,7 +800,8 @@ alone lists every code. The explanations are the files in
     (`write`, `flush`; `write_all`, `write_str`, and `print(..)` /
     `println(..)` for format strings), implemented by `fs::File`, the
     standard streams, `net::TcpStream`, `Cursor` (reading a byte slice)
-    and growable byte arrays (writing).
+    and growable byte arrays (writing). Both can be used as trait objects:
+    `fn emit(out: dyn mut Write)` takes any of them.
   * `stdin()` (buffered for the whole program: `read_line(&mut +String)`,
     `lines()`), `stdout()` and `stderr()`. `stdout().buffered()` is a
     `BufWriter` for printing much in a loop: one write per 8 KiB instead

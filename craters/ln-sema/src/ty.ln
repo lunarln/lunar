@@ -221,6 +221,10 @@ pub enum TyKind {
     Closure(DefId, TyList),
     /// `impl Trait` number `idx` in the return type of function `def`.
     Opaque(DefId, u32, TyList),
+    /// `dyn Trait::<args>`: a view of a value of some type implementing
+    /// the trait (its principal trait and arguments), with the `DYN_`
+    /// flags (`dyn mut`, `+ Send`, `+ Sync`). Laid out as `{ data, vtable }`.
+    Dyn(DefId, TyList, u32),
     /// Generic parameter number `idx` of the enclosing item.
     Param(u32, Symbol),
     /// Inference variable.
@@ -229,6 +233,13 @@ pub enum TyKind {
     /// Produced after an error; unifies with anything.
     Error,
 }
+
+/// `dyn mut Trait`: exclusive access, `&mut self` methods callable.
+pub const DYN_MUT: u32 = 1;
+/// `dyn Trait + Send`: the value viewed is Send.
+pub const DYN_SEND: u32 = 2;
+/// `dyn Trait + Sync`: the value viewed is Sync.
+pub const DYN_SYNC: u32 = 4;
 
 /// A reference to a trait with its generic arguments (excluding `Self`).
 #[derive(Eq, Hash, Debug)]
@@ -483,7 +494,7 @@ impl Types {
             return true;
         }
         return match k {
-            TyKind::Tuple(l) | TyKind::Adt(_, l) | TyKind::Closure(_, l) | TyKind::Opaque(_, _, l) => self.any_in(l, f),
+            TyKind::Tuple(l) | TyKind::Adt(_, l) | TyKind::Closure(_, l) | TyKind::Opaque(_, _, l) | TyKind::Dyn(_, l, _) => self.any_in(l, f),
             TyKind::Array(e, _) | TyKind::Grow(e) | TyKind::Ptr(e, _) => self.any(e, f),
             TyKind::FnPtr(ps, _, r) => self.any_in(ps, f) || self.any(r, f),
             _ => false,
@@ -540,6 +551,10 @@ impl Types {
             TyKind::Opaque(d, i, l) => {
                 let l2 = self.fold_list(l, f);
                 if l2 == l { t } else { self.mk(TyKind::Opaque(d, i, l2)) }
+            }
+            TyKind::Dyn(d, l, fl) => {
+                let l2 = self.fold_list(l, f);
+                if l2 == l { t } else { self.mk(TyKind::Dyn(d, l2, fl)) }
             }
             TyKind::Array(e, k) => {
                 let e2 = self.fold(e, f);

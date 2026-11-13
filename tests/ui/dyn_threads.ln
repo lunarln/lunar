@@ -1,0 +1,49 @@
+// error: type::not_sync
+// error: type::not_send
+// error: type::not_detached
+// A `dyn` is a view: threads may share one only with `+ Sync`, which the
+// value must be; it never outlives its variable, so `thread::spawn` takes
+// none; and a `dyn mut` is never Send.
+use core::cell::UnsafeCell;
+use std::thread;
+
+trait Show {
+    fn show(&self): i32;
+}
+
+struct P {
+    x: i32,
+}
+
+impl Show for P {
+    fn show(&self): i32 {
+        return self.x;
+    }
+}
+
+struct Cell {
+    c: UnsafeCell::<i32>,
+}
+
+impl Show for Cell {
+    fn show(&self): i32 {
+        return 0;
+    }
+}
+
+fn main() {
+    let p = P { x: 1 };
+    let plain = p as dyn Show;
+    thread::scope(|s| {
+        s.spawn(|| plain.show());
+    });
+    let c = Cell { c: UnsafeCell::new(1) };
+    let shared = c as dyn Show + Sync;
+    let synced = p as dyn Show + Sync;
+    thread::spawn(move || synced.show());
+    let mut q = P { x: 2 };
+    let m = q as dyn mut Show;
+    thread::scope(|s| {
+        s.spawn_with(m, |v| v.show());
+    });
+}

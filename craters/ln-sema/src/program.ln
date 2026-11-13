@@ -561,6 +561,16 @@ impl Program {
                     self.write_trait_ref(out, preds[j].trait_ref);
                 }
             }
+            TyKind::Dyn(d, args, flags) => {
+                out.push_str(if flags & DYN_MUT != 0 { "dyn mut " } else { "dyn " });
+                self.write_trait_ref(out, TraitRef { trait_id: d, args });
+                if flags & DYN_SEND != 0 {
+                    out.push_str(" + Send");
+                }
+                if flags & DYN_SYNC != 0 {
+                    out.push_str(" + Sync");
+                }
+            }
             TyKind::Param(_, n) => out.push_str(self.text(n)),
             TyKind::Infer(_) => out.push('_'),
             TyKind::Never => out.push('!'),

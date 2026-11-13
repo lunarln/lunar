@@ -1,0 +1,56 @@
+// Trait objects: one array holding views of shapes of different types,
+// each called through its type's vtable, and a `dyn mut` writer.
+
+use std::io::Write;
+
+trait Shape {
+    fn area(&self): f64;
+    fn name(&self): str;
+}
+
+struct Circle {
+    r: f64,
+}
+
+struct Rect {
+    w: f64,
+    h: f64,
+}
+
+impl Shape for Circle {
+    fn area(&self): f64 {
+        return 3.14159 * self.r * self.r;
+    }
+
+    fn name(&self): str {
+        return "circle";
+    }
+}
+
+impl Shape for Rect {
+    fn area(&self): f64 {
+        return self.w * self.h;
+    }
+
+    fn name(&self): str {
+        return "rectangle";
+    }
+}
+
+/// Any writer: the standard output, a file, a byte array...
+fn report(shapes: [dyn Shape; &], out: dyn mut Write) {
+    for s in shapes {
+        out.println("{s.name()}: {s.area()}").unwrap();
+    }
+}
+
+fn main() {
+    let small = Circle { r: 1.0 };
+    let wide = Rect { w: 4.0, h: 2.0 };
+    let shapes = [small as dyn Shape, wide as dyn Shape];
+    let mut text: [u8; ..+] = [];
+    report(shapes[..], text as dyn mut Write);
+    print("{str::from_utf8(text[..]).unwrap()}");
+    let mut stdout = std::io::stdout();
+    report(shapes[1..], stdout as dyn mut Write);
+}

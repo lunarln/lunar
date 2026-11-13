@@ -38,6 +38,9 @@ pub enum DeferKind {
     Grow,
     /// `x: &T` where `T` might be Dull (a pointless borrow).
     NeedlessBorrow,
+    /// `dyn Trait`: the trait must be dyn compatible (once every method
+    /// signature is known).
+    DynCompat,
 }
 
 /// Where a type appears.
@@ -550,6 +553,83 @@ impl Sema {
         return self.p.types.mk(TyKind::Opaque(owner, idx, al));
     }
 
+    /// `dyn Trait + Send + Sync`, `dyn mut Trait`: one trait whose methods
+    /// it calls, and the auto traits `Send` and `Sync` of the value viewed.
+    fn lower_dyn(&mut self, cx: LowerCx, is_mut: bool, bounds: List::<Path>, span: Span): Ty {
+        let mut principal: Option::<TraitRef> = None;
+        let mut flags: u32 = if is_mut { DYN_MUT } else { 0 };
+        let mut resolved = true;
+        for i in 0..bounds.len() {
+            let b = self.p.ast.paths.list(bounds)[i];
+            let Some(tr) = self.lower_trait_ref(cx, b) else {
+                resolved = false;
+                continue;
+            };
+            let id = tr.trait_id;
+            if self.p.is_lang(id, "send") {
+                flags = flags | DYN_SEND;
+                continue;
+            }
+            if self.p.is_lang(id, "sync") {
+                flags = flags | DYN_SYNC;
+                continue;
+            }
+            let name = self.def_name(id);
+            if self.p.is_lang(id, "dull") || self.p.is_lang(id, "light") || self.p.is_lang(id, "detached") {
+                self.error(codes::ty::BAD_DYN(), b.span, "`{name}` cannot be a bound of a `dyn`");
+                self.note("a `dyn` is a view: it is Light but never Dull or Detached, whatever it views; only `Send` and `Sync` say something about the value viewed");
+                self.emit();
+                continue;
+            }
+            if let Some(first) = principal {
+                let fname = self.def_name(first.trait_id);
+                self.error(codes::ty::BAD_DYN(), b.span, "a `dyn` views its value through one trait, but this one has `{fname}` and `{name}`");
+                self.help("make a trait with both as supertraits: `trait Both: {fname} + {name} {{}}`, with an impl for every type that has both");
+                self.emit();
+                continue;
+            }
+            principal = Some(tr);
+        }
+        let Some(tr) = principal else {
+            if resolved {
+                self.error(codes::ty::BAD_DYN(), span, "a `dyn` needs a trait whose methods it calls");
+                self.help("name the trait first: `dyn Trait + Send`");
+                self.emit();
+            }
+            return self.p.types.error();
+        };
+        let ty = self.p.types.mk(TyKind::Dyn(tr.trait_id, tr.args, flags));
+        self.deferred.push(Deferred { kind: DeferKind::DynCompat, ty, env: cx.env, span, generics_span: cx.generics_span });
+        return ty;
+    }
+
+    /// `err(trait::not_dyn_compatible)` if the trait of `dyn` type `t`
+    /// cannot be viewed as `dyn` (written at `span`); whether it can.
+    pub fn check_dyn_compat(&mut self, t: Ty, span: Span): bool {
+        let TyKind::Dyn(d, _, _) = self.p.types.kind(t) else { return true; };
+        let mut why: [(Span, Symbol); ..+] = [];
+        self.p.dyn_violations(d, &mut why);
+        if why.len() == 0 {
+            return true;
+        }
+        let name = self.def_name(d);
+        self.error(codes::trait_::NOT_DYN_COMPATIBLE(), span, "the trait `{name}` cannot be used as `dyn {name}`");
+        for w in why {
+            let (at, text) = w;
+            let t = self.str_of(text);
+            if is_dummy(at) {
+                self.note("{t}");
+            } else {
+                self.secondary(at, "{t}");
+            }
+        }
+        if self.p.lang_name(d).is_none() {
+            self.help("a `dyn` calls methods through a table of functions: each method without a default body must take `&self`, `&mut self` or `&mut +self`, have no generic parameters, and not mention `Self` elsewhere; give the others a default body to keep them out of the table");
+        }
+        self.emit();
+        return false;
+    }
+
     /// The identifiers of a path's segments.
     pub fn path_idents(&self, path: Path, out: &mut +[Ident; ..+]) {
         for s in self.p.ast.segments.list(path.segments) {
@@ -713,6 +793,7 @@ impl Sema {
     fn lower_fn(&mut self, id: DefId, f: ln_ast::FnDecl, is_extern: bool) {
         let cx = self.lower_cx(id);
         let parent = self.p.defs[id.index()].parent;
+        let deferred_before = self.deferred.len();
         let mut params: [Param; ..+] = [];
         let mut has_self = false;
         for i in 0..f.params.len() {
@@ -811,6 +892,23 @@ impl Sema {
         };
         if is_extern {
             self.check_ffi_ty(ret, ret_span);
+        }
+        // A `dyn` result may view a borrowed parameter itself: borrowing
+        // it is not pointless.
+        let returns_dyn = self.p.types.any(ret, &|k| match k {
+            TyKind::Dyn(..) => true,
+            _ => false,
+        });
+        if returns_dyn {
+            let mut keep: [Deferred; -..+] = [];
+            for i in deferred_before..self.deferred.len() {
+                let d = self.deferred[i];
+                if d.kind != DeferKind::NeedlessBorrow {
+                    keep.push(d);
+                }
+            }
+            self.deferred.truncate(deferred_before);
+            self.deferred.extend(keep[..]);
         }
         let attrs = self.p.defs[id.index()].attrs;
         if f.body.is_none() && !is_extern && !attrs.intrinsic {
@@ -926,6 +1024,7 @@ impl Sema {
             }
             ln_ast::TyKind::Never => self.p.types.never(),
             ln_ast::TyKind::ImplTrait(bounds) => return self.lower_impl_trait(cx, bounds, at.span),
+            ln_ast::TyKind::Dyn { is_mut, bounds } => return self.lower_dyn(cx, is_mut, bounds, at.span),
             ln_ast::TyKind::Tuple(ts) => {
                 let mut tys: [Ty; ..+] = [];
                 for i in 0..ts.len() {
@@ -1260,6 +1359,9 @@ impl Sema {
                         self.emit();
                     }
                 }
+                DeferKind::DynCompat => {
+                    self.check_dyn_compat(d.ty, d.span);
+                }
             }
         }
     }
@@ -1455,6 +1557,8 @@ impl Sema {
                 // Inherent impl.
                 let ok = match self.p.types.kind(data.self_ty) {
                     TyKind::Adt(d, _) => self.p.mod_data(self.p.defs[d.index()].module).krate == krate,
+                    // `impl dyn Trait`: in the trait's crater.
+                    TyKind::Dyn(d, _, _) => is_std || self.p.mod_data(self.p.defs[d.index()].module).krate == krate,
                     TyKind::Error => true,
                     _ => is_std,
                 };

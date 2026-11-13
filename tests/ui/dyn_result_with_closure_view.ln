@@ -1,0 +1,28 @@
+// error: borrow::shrink_while_borrowed
+// A result holding a `dyn` and a view a closure made of a variable still
+// points into that variable's storage.
+trait Show {
+    fn show(&self): i32;
+}
+
+struct P {
+    x: i32,
+}
+
+impl Show for P {
+    fn show(&self): i32 {
+        return self.x;
+    }
+}
+
+fn both::<F: Fn(): str>(g: F, d: dyn Show): (dyn Show, str) {
+    return (d, g());
+}
+
+fn main() {
+    let mut s = String::from("abc");
+    let p = P { x: 1 };
+    let (d, v) = both(|| s.as_str(), p as dyn Show);
+    s.clear();
+    println("{v} {d.show()}");
+}

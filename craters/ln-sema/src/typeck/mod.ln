@@ -502,6 +502,15 @@ impl Sema {
                     self.suggest_fix(span, text.as_str(), "Build a `String` with `String::from`");
                 }
             }
+            (TyKind::Dyn(..), TyKind::Dyn(..)) => {}
+            (TyKind::Dyn(..), _) => {
+                let mut h = String::new();
+                h.write("a `dyn` is never made implicitly; view the value with `as {e}`");
+                self.with_help(h.as_str());
+                let suffix = core::fmt::format(" as {e}");
+                let (at, text) = self.p.postfix_edit(span, suffix.as_str());
+                self.suggest_fix(at, text.as_str(), "View it with `as dyn`");
+            }
             (TyKind::Closure(..), TyKind::Closure(..)) => {
                 self.with_note("every closure has a type of its own, even when two are written alike");
                 if opaque {
@@ -790,6 +799,7 @@ impl Sema {
             (TyKind::Array(e1, k1), TyKind::Array(e2, k2)) => self.unify_len(k1, k2) && self.unify(e1, e2),
             (TyKind::Ptr(x, m1), TyKind::Ptr(y, m2)) => m1 == m2 && self.unify(x, y),
             (TyKind::Grow(x), TyKind::Grow(y)) => self.unify(x, y),
+            (TyKind::Dyn(d1, xs, f1), TyKind::Dyn(d2, ys, f2)) => d1 == d2 && f1 == f2 && self.unify_lists(xs, ys),
             (TyKind::FnPtr(p1, m1, r1), TyKind::FnPtr(p2, m2, r2)) => {
                 if p1.len() != p2.len() {
                     return false;
@@ -941,6 +951,17 @@ impl Sema {
                 if self.unify(a, b) {
                     let x = self.node(e);
                     return Ok(Expr { kind: ExprKind::Coerce { kind: Coercion::Weaken, expr: x }, ty: to, span });
+                }
+            }
+            // `dyn mut T` to `dyn T`, and dropping `+ Send` / `+ Sync`.
+            (TyKind::Dyn(d1, xs, f1), TyKind::Dyn(d2, ys, f2)) => {
+                if d1 == d2 && f1 != f2 && f2 & f1 == f2 {
+                    let snap = self.snapshot();
+                    if self.unify_lists(xs, ys) {
+                        let x = self.node(e);
+                        return Ok(Expr { kind: ExprKind::Coerce { kind: Coercion::Weaken, expr: x }, ty: to, span });
+                    }
+                    self.rollback(snap);
                 }
             }
             _ => {}
@@ -1174,6 +1195,14 @@ impl Sema {
             self.p.opaque_preds(d, i, args, &mut promised);
             self.p.elaborate(promised[..], &mut out);
         }
+        // A `dyn` has the methods of its traits.
+        if let TyKind::Dyn(d, args, _) = self.p.types.kind(ty) {
+            let mut ts: [TraitRef; ..+] = [];
+            self.p.dyn_traits(TraitRef { trait_id: d, args }, &mut ts);
+            for t in ts {
+                out.push(Pred { ty, trait_ref: t, span: dummy_span() });
+            }
+        }
         return out;
     }
 
@@ -1396,6 +1425,21 @@ impl Sema {
                     let mut h = String::new();
                     h.write("`{ts}` owns an array or string");
                     self.with_note(h.as_str());
+                } else if let TyKind::Dyn(d, dargs, _) = self.p.types.kind(t) {
+                    let principal = TraitRef { trait_id: d, args: dargs };
+                    if self.p.dyn_has_trait(principal, tr) {
+                        if let Some(im) = self.p.dyn_inout_method(tr) {
+                            let imn = self.p.name(im).to_string();
+                            let mut h = String::new();
+                            h.write("a shared `dyn` implements only traits whose methods take `&self`, and `{tn}::{imn}` takes `&mut self`");
+                            self.with_note(h.as_str());
+                            self.with_help("view the value as `dyn mut`");
+                        }
+                    } else {
+                        let mut h = String::new();
+                        h.write("a `{ts}` implements the traits of its trait object (the trait and its supertraits), and those of impls that cover it");
+                        self.with_note(h.as_str());
+                    }
                 }
                 self.emit();
             }

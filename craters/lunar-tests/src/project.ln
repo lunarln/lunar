@@ -235,3 +235,34 @@ fn env_names_the_package() {
     expect(out.as_str().contains("envy 1.2.3\n"), "env! in a package", out.as_str());
     let _ = fs::remove_dir_all(w.as_str());
 }
+
+/// Trait objects across craters: a library's trait implemented in the
+/// program, `dyn`s made on both sides and called on both sides, and one
+/// vtable per (type, trait) in the whole program.
+#[test]
+fn trait_objects_across_craters() {
+    let w = scratch("dyn");
+    let home = join(w.as_str(), "home");
+    let h = home.as_str();
+    ok(w.as_str(), h, ["new", "app"][..]);
+    ok(w.as_str(), h, ["new", "shapes", "--lib"][..]);
+    let shapes = join(w.as_str(), "shapes");
+    write_file(
+        join(shapes.as_str(), "src/lib.ln").as_str(),
+        "pub trait Shape {\n    fn area(&self): f64;\n    fn name(&self): str {\n        return \"shape\";\n    }\n}\n\npub struct Square {\n    pub side: f64,\n}\n\nimpl Shape for Square {\n    fn area(&self): f64 {\n        return self.side * self.side;\n    }\n\n    fn name(&self): str {\n        return \"square\";\n    }\n}\n\npub fn view(s: &Square): dyn Shape {\n    return s as dyn Shape;\n}\n\npub fn total(xs: [dyn Shape; &]): f64 {\n    let mut t = 0.0;\n    for x in xs {\n        t += x.area();\n    }\n    return t;\n}\n",
+    );
+    let app = join(w.as_str(), "app");
+    write_file(
+        join(app.as_str(), "src/main.ln").as_str(),
+        "use shapes::{Shape, Square};\n\nstruct Circle {\n    r: f64,\n}\n\nimpl Shape for Circle {\n    fn area(&self): f64 {\n        return 3.0 * self.r * self.r;\n    }\n}\n\nfn main() {\n    let sq = Square { side: 2.0 };\n    let c = Circle { r: 1.0 };\n    let mine = sq as dyn Shape;\n    let theirs = shapes::view(&sq);\n    let all = [mine, theirs, c as dyn Shape];\n    println(\"{shapes::total(all[..])}\");\n    println(\"{theirs.name()} {all[2].name()}\");\n}\n",
+    );
+    ok(app.as_str(), h, ["add", "shapes", "--path", "../shapes"][..]);
+    let out = ok(app.as_str(), h, ["run"][..]);
+    expect(out.as_str().contains("11\n") && out.as_str().contains("square shape\n"), "calls through dyns made in both craters", out.as_str());
+    let ll = join(w.as_str(), "app.ll");
+    ok(app.as_str(), h, ["build", "--emit-llvm", ll.as_str()][..]);
+    let ir = fs::read_to_string(ll.as_str()).unwrap();
+    let n = crater::count(ir.as_str(), "@_LN_vtable.Square.Shape = ");
+    expect(n == 1, "one vtable for `Square` as `dyn Shape`", ir.as_str());
+    let _ = fs::remove_dir_all(w.as_str());
+}

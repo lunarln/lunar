@@ -1,0 +1,72 @@
+// error: borrow::outlives_root
+// error: borrow::move_while_borrowed
+// error: borrow::escapes_function
+// error: borrow::escapes_via_return
+// error: borrow::shrink_while_borrowed
+// A `dyn` is a view of the place it was made from, checked like a slice:
+// not of a temporary kept past its statement, not past the variable's
+// scope, not across a move, not of an array's item once the array may
+// shrink, and returned only if the caller lent it.
+trait Show {
+    fn show(&self): i32;
+}
+
+struct P {
+    x: i32,
+}
+
+impl Show for P {
+    fn show(&self): i32 {
+        return self.x;
+    }
+}
+
+impl Show for String {
+    fn show(&self): i32 {
+        return self.len() as i32;
+    }
+}
+
+fn temporary(): i32 {
+    let d = P { x: 1 } as dyn Show;
+    return d.show();
+}
+
+fn scoped(): i32 {
+    let keep = P { x: 0 };
+    let mut d = keep as dyn Show;
+    {
+        let inner = P { x: 2 };
+        d = inner as dyn Show;
+    }
+    return d.show();
+}
+
+fn moved(): i32 {
+    let s = String::from("text");
+    let d = s as dyn Show;
+    let t = s;
+    return d.show() + t.show();
+}
+
+fn item(): i32 {
+    let mut items: [P; -..+] = [P { x: 1 }, P { x: 2 }];
+    let last = items[1] as dyn Show;
+    items.pop();
+    return last.show();
+}
+
+fn local(): dyn Show {
+    let p = P { x: 3 };
+    return p as dyn Show;
+}
+
+fn lent(p: &P): dyn Show {
+    return p as dyn Show;
+}
+
+fn wrong_from(a: &P, b: &P): dyn Show from a {
+    return b as dyn Show;
+}
+
+fn main() {}

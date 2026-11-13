@@ -1,0 +1,42 @@
+// error: borrow::shrink_while_borrowed
+// A `&mut self` method called through a `dyn mut` may shrink the value it
+// views, so views into that value end there, as when lending it in-out.
+// Methods taking `&self` or `&mut +self` keep them.
+trait Buffer {
+    fn len(&self): usize;
+    fn append(&mut +self, s: str);
+    fn reset(&mut self);
+}
+
+impl Buffer for String {
+    fn len(&self): usize {
+        return self.len();
+    }
+
+    fn append(&mut +self, s: str) {
+        self.push_str(s);
+    }
+
+    fn reset(&mut self) {
+        self.clear();
+    }
+}
+
+fn through(b: dyn mut Buffer) {
+    b.reset();
+}
+
+fn main() {
+    let mut text = String::from("abc");
+    let view = text.as_str();
+    let b = text as dyn mut Buffer;
+    b.append("d");
+    println("{view} {b.len()}");
+    b.reset();
+    println("{view}");
+
+    let mut more = String::from("xyz");
+    let v2 = more.as_str();
+    through(more as dyn mut Buffer);
+    println("{v2}");
+}

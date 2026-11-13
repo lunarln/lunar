@@ -1,0 +1,173 @@
+// `dyn mut Trait`: a view that may change the value it views, through
+// `&mut self` and `&mut +self` methods. Views into the value survive calls
+// that only grow it; std's `io::Write` and `io::Read` are made for it.
+
+use std::io::{Read, Write};
+use std::io::Cursor;
+
+trait Counter {
+    fn get(&self): u32;
+    fn bump(&mut self);
+}
+
+struct Clicks {
+    n: u32,
+}
+
+impl Counter for Clicks {
+    fn get(&self): u32 {
+        return self.n;
+    }
+
+    fn bump(&mut self) {
+        self.n += 1;
+    }
+}
+
+struct Doubler {
+    n: u32,
+}
+
+impl Counter for Doubler {
+    fn get(&self): u32 {
+        return self.n;
+    }
+
+    fn bump(&mut self) {
+        self.n = if self.n == 0 { 1 } else { self.n * 2 };
+    }
+}
+
+fn bump_all(cs: [dyn mut Counter; &], times: u32) {
+    for c in cs {
+        for _ in 0..times {
+            c.bump();
+        }
+    }
+}
+
+/// Only reads: a `dyn mut` converts to a `dyn` implicitly.
+fn sum(cs: [dyn Counter; &]): u32 {
+    let mut t: u32 = 0;
+    for c in cs {
+        t += c.get();
+    }
+    return t;
+}
+
+fn read_one(c: dyn Counter): u32 {
+    return c.get();
+}
+
+#[test]
+fn changes_go_to_the_value() {
+    let mut a = Clicks { n: 0 };
+    let mut b = Doubler { n: 0 };
+    let cs = [a as dyn mut Counter, b as dyn mut Counter];
+    bump_all(cs[..], 3);
+    assert_eq!(a.n, 3);
+    assert_eq!(b.n, 4);
+    assert_eq!(read_one(cs[0]), 3);
+    let shared: dyn Counter = cs[1];
+    assert_eq!(shared.get(), 4);
+}
+
+trait Log {
+    fn add(&mut +self, line: str);
+    fn reset(&mut self);
+    fn count(&self): usize;
+}
+
+impl Log for String {
+    fn add(&mut +self, line: str) {
+        self.push_str(line);
+        self.push('\n');
+    }
+
+    fn reset(&mut self) {
+        self.clear();
+    }
+
+    fn count(&self): usize {
+        let mut n: usize = 0;
+        for _ in self.as_str().lines() {
+            n += 1;
+        }
+        return n;
+    }
+}
+
+#[test]
+fn growing_keeps_views() {
+    let mut text = String::from("first\n");
+    let start = text.as_str();
+    let log = text as dyn mut Log;
+    // `&mut +self` only grows: `start` stays valid.
+    log.add("second");
+    log.add("third");
+    assert_eq!(start, "first\n");
+    assert_eq!(log.count(), 3);
+    log.reset();
+    assert_eq!(log.count(), 0);
+    assert_eq!(text.len(), 0);
+}
+
+/// Views stored through a `dyn mut` end up in the value it views, which
+/// then borrows from them (`kept`).
+trait Slot {
+    fn put(&mut self, kept s: str);
+    fn take(&self): str;
+}
+
+struct Holder {
+    s: str,
+}
+
+impl Slot for Holder {
+    fn put(&mut self, kept s: str) {
+        self.s = s;
+    }
+
+    fn take(&self): str {
+        return self.s;
+    }
+}
+
+#[test]
+fn kept_views_through_dyn() {
+    let owned = String::from("kept");
+    let mut h = Holder { s: "" };
+    let d = h as dyn mut Slot;
+    d.put(owned.as_str());
+    assert_eq!(d.take(), "kept");
+    assert_eq!(h.s, "kept");
+}
+
+fn emit(out: dyn mut Write, n: i32) {
+    out.write_all("n = ".as_bytes()).unwrap();
+    out.print("{n}").unwrap();
+    out.println("!").unwrap();
+    out.flush().unwrap();
+}
+
+#[test]
+fn write_through_dyn_mut() {
+    let mut buf: [u8; ..+] = [];
+    emit(buf as dyn mut Write, 7);
+    let w = buf as dyn mut Write;
+    w.write_str("more").unwrap();
+    assert_eq!(str::from_utf8(buf[..]).unwrap(), "n = 7!\nmore");
+}
+
+fn slurp(r: dyn mut Read): String {
+    let mut s = String::new();
+    r.read_to_string(&mut s).unwrap();
+    return s;
+}
+
+#[test]
+fn read_through_dyn_mut() {
+    let data = "line one\nline two";
+    let mut c = Cursor::new(data.as_bytes());
+    assert_eq!(slurp(c as dyn mut Read), String::from(data));
+}

@@ -74,6 +74,22 @@ fn main() {
     let nums: [i32; ..+] = [10, 20, 30];
     let n = describe(p, \"pt\", &label, shape, nums[..]);
     println(\"{n}\");
+    let viewed = p as dyn Named;
+    println(\"{named(viewed)}\");
+}
+
+trait Named {
+    fn name(&self): i32;
+}
+
+impl Named for Point {
+    fn name(&self): i32 {
+        return self.x;
+    }
+}
+
+fn named(n: dyn Named): i32 {
+    return n.name();
 }
 ";
 
@@ -170,6 +186,12 @@ fn ir_describes_functions_variables_and_types() {
     expect(t, "!DICompositeType(tag: DW_TAG_array_type");
     expect(t, "!DICompositeType(tag: DW_TAG_structure_type, name: \"{closure_env#0}\"");
     expect(t, "!DIBasicType(name: \"char\", size: 32, encoding: DW_ATE_UTF)");
+    // A trait object: its data pointer and vtable (`dyn Named`, or
+    // `dyn$<Named>` in CodeView).
+    expect(t, "!DILocalVariable(name: \"viewed\"");
+    expect(t, "!DICompositeType(tag: DW_TAG_structure_type, name: \"dyn");
+    expect(t, "!DIDerivedType(tag: DW_TAG_member, name: \"pointer\"");
+    expect(t, "!DIDerivedType(tag: DW_TAG_member, name: \"vtable\"");
     // Calls have locations: line 34, `p.sum()`.
     expect(t, "!DILocation(line: 34, column: 17,");
     cleanup(file.as_str());

@@ -1284,7 +1284,7 @@ fn is_word(t: Token): bool {
 
 fn keyword_token(t: Token): bool {
     return match t {
-        Token::As | Token::Break | Token::Const | Token::Continue | Token::Crater | Token::Else | Token::Enum | Token::Extern => true,
+        Token::As | Token::Break | Token::Const | Token::Continue | Token::Crater | Token::Dyn | Token::Else | Token::Enum | Token::Extern => true,
         Token::False | Token::Fn | Token::For | Token::If | Token::Impl | Token::In | Token::Let | Token::Loop | Token::Macro => true,
         Token::Match | Token::Mod | Token::Move | Token::Mut | Token::Pub | Token::Return | Token::SelfValue | Token::SelfType => true,
         Token::Static | Token::Struct | Token::Super | Token::Trait | Token::True | Token::Type | Token::Unsafe | Token::Use | Token::While => true,
@@ -2025,7 +2025,7 @@ fn add_fn(s: &mut Sema, cx: Cx, d: DefId, kind: u32, method: bool, plain: bool, 
 /// statements and expressions in a body, types after `:`.
 fn add_keywords(toks: [Spanned; &], before: usize, type_pos: bool, out: &mut +Items) {
     if type_pos {
-        for k in ["Self", "crater", "self", "super", "fn", "impl"] {
+        for k in ["Self", "crater", "self", "super", "fn", "impl", "dyn"] {
             out.add(k, CK_KEYWORD, "", k, false, "", S_KEYWORD, 0);
         }
         return;

@@ -1050,6 +1050,15 @@ impl Printer {
                 self.text(" ");
                 self.bounds(bs);
             }
+            TyKind::Dyn { is_mut, bounds } => {
+                self.tok(lo, "dyn");
+                self.text(" ");
+                if is_mut {
+                    self.tok(self.s.find(lo + 3, Token::Mut), "mut");
+                    self.text(" ");
+                }
+                self.bounds(bounds);
+            }
         }
     }
 

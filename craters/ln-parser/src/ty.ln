@@ -111,6 +111,19 @@ impl Parser {
                 self.bump();
                 TyKind::ImplTrait(self.bounds()?)
             }
+            // `dyn Trait + Send`, `dyn mut Trait`. A `+` continues the
+            // bounds only before a path, so `x as dyn T + 1` stays an
+            // addition.
+            Some(T::Dyn) => {
+                self.bump();
+                let is_mut = self.eat(T::Mut);
+                let mut out: [Path; ..+] = [self.bound()?];
+                while self.at(T::Plus) && self.path_keyword_or_ident_at(1) {
+                    self.bump();
+                    out.push(self.bound()?);
+                }
+                TyKind::Dyn { is_mut, bounds: self.ast.paths.add_list(out[..]) }
+            }
             Some(T::LBracket) => {
                 self.bump();
                 let elem = self.ty()?;

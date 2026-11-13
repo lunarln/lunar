@@ -15,7 +15,7 @@ use crater::defs::*;
 use crater::diag::{Code, dummy_span};
 use crater::program::{Capture, ClosureInfo, Program};
 use crater::sema::{AstRef, Sema};
-use crater::thir::{Arg, Block, Body, Callee, ClosureKind, Expr, ExprKind, FmtPiece, Local, LocalId, LocalKind, ReadMode, Stmt};
+use crater::thir::{Arg, Block, Body, Callee, ClosureKind, Coercion, Expr, ExprKind, FmtPiece, Local, LocalId, LocalKind, ReadMode, Stmt};
 use crater::ty::*;
 use crater::typeck::{default_ty, root_local};
 use ln_ast as ast;
@@ -703,6 +703,11 @@ fn collect_uses(p: &Program, e: Expr, first: u32, out: &mut [(LocalId, Use); -..
             }
         }
         ExprKind::Slice { base, mutable: true, .. } => {
+            if let Some(l) = root_local(p, p.thir.expr(base)) {
+                note_use(l, changed, first, out);
+            }
+        }
+        ExprKind::Coerce { kind: Coercion::ToDyn { mutable: true }, expr: base } => {
             if let Some(l) = root_local(p, p.thir.expr(base)) {
                 note_use(l, changed, first, out);
             }

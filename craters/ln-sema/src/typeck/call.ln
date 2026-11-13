@@ -977,6 +977,12 @@ impl Sema {
                 }
             }
             TyKind::String => out.push(self.p.types.str()),
+            // `impl dyn Trait` methods, from a `dyn mut Trait + Sync`.
+            TyKind::Dyn(d, args, flags) => {
+                if flags != 0 {
+                    out.push(self.p.types.mk(TyKind::Dyn(d, args, 0)));
+                }
+            }
             _ => {}
         }
         return out;
@@ -1136,7 +1142,10 @@ impl Sema {
         }
         // Receiver adjustment.
         let (self_ty, self_mode) = params[0];
-        let recv_arg = self.adjust_receiver(r, rt, step_ty, step_idx, self_ty, self_mode, rspan);
+        let recv_arg = match self.dyn_receiver(r, step_ty, pick, self_mode, name, rspan) {
+            Some(a) => a,
+            None => self.adjust_receiver(r, rt, step_ty, step_idx, self_ty, self_mode, rspan),
+        };
         let mut out: [Arg; ..+] = [recv_arg];
         self.oblige_preds(pick.def, all, name.span);
         self.check_args_into(params[1..], false, args, span, &mut out);
@@ -1155,6 +1164,53 @@ impl Sema {
         };
         let al = self.p.thir.args.add_list(out[..]);
         return self.mk(ExprKind::Call { callee, args: al }, ret, span);
+    }
+
+    /// The receiver of a method of a `dyn`'s traits called on a `dyn`
+    /// (`step`): for a method in its vtable, the `dyn` itself, whose value
+    /// the method changes only if the method takes `&mut self` (or `&mut
+    /// +self`), which needs a `dyn mut`. A method outside the vtable runs
+    /// its default body with `Self` being the `dyn` (`None`: the receiver
+    /// is passed as for any type), which needs the `dyn` to implement the
+    /// trait.
+    fn dyn_receiver(&mut self, r: Expr, step: Ty, pick: MethodPick, mode: ParamMode, name: Ident, span: Span): Option::<Arg> {
+        let TyKind::Dyn(d, dargs, flags) = self.p.types.kind(step) else { return None; };
+        let Some(tc) = pick.trait_call else { return None; };
+        let (tr, _) = tc;
+        let principal = TraitRef { trait_id: d, args: dargs };
+        let tr = self.resolve_trait_ref(tr);
+        if !self.p.dyn_has_trait(principal, tr) {
+            return None;
+        }
+        let mutable = flags & DYN_MUT != 0;
+        let ds = self.ty_str(step);
+        let mn = self.p.text(name.name).to_string();
+        if !self.p.dyn_dispatchable(pick.def) {
+            if !self.p.dyn_implements(principal, mutable, tr) {
+                let tn = self.p.trait_ref_str(tr);
+                let mut m = String::new();
+                m.write("`{mn}` runs its default body with `Self` being `{ds}`, which needs `{ds}` to implement `{tn}`");
+                self.error_at(codes::ty::IMMUTABLE(), name.span, m.as_str());
+                if let Some(im) = self.p.dyn_inout_method(tr) {
+                    let imn = self.p.name(im).to_string();
+                    let mut n = String::new();
+                    n.write("a shared `dyn` does not implement `{tn}`: its method `{imn}` takes `&mut self`, and generic code could call it");
+                    self.with_note(n.as_str());
+                }
+                self.with_help("view the value as `dyn mut`");
+                self.emit();
+            }
+            return None;
+        }
+        if mode == ParamMode::InOut && !mutable {
+            let mut m = String::new();
+            m.write("cannot call `{mn}`, which takes `&mut self`, through a `{ds}`: it only gives shared access");
+            self.error_at(codes::ty::IMMUTABLE(), span, m.as_str());
+            self.with_help("view the value as `dyn mut` (from a mutable place) to change it");
+            self.emit();
+        }
+        let v = self.read(r, ReadMode::Borrow);
+        return Some(Arg::Value(self.node(v)));
     }
 
     fn adjust_receiver(&mut self, r: Expr, rt: Ty, step: Ty, step_idx: usize, self_ty: Ty, mode: ParamMode, span: Span): Arg {
@@ -1522,6 +1578,16 @@ fn pretty_ty(p: &Program, id: Id::<ast::Ty>, out: &mut +String) {
         ast::TyKind::MacCall(m) => pretty_mac_call(p, m, out),
         ast::TyKind::ImplTrait(bounds) => {
             out.push_str("impl ");
+            let bs = p.ast.paths.list(bounds);
+            for i in 0..bs.len() {
+                if i > 0 {
+                    out.push_str(" + ");
+                }
+                pretty_bound(p, bs[i], out);
+            }
+        }
+        ast::TyKind::Dyn { is_mut, bounds } => {
+            out.push_str(if is_mut { "dyn mut " } else { "dyn " });
             let bs = p.ast.paths.list(bounds);
             for i in 0..bs.len() {
                 if i > 0 {

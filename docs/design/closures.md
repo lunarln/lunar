@@ -102,5 +102,7 @@ would return its own type), and nowhere else.
 ## Not decided yet
 
 * Stored closures in struct fields go through generics
-  (`struct Button::<F: Fn()> { on_click: F }`); trait objects (`dyn Fn`)
-  would need `Box` and are out of scope.
+  (`struct Button::<F: Fn()> { on_click: F }`). Trait objects exist as views
+  (`dyn Trait`, reference §7), but not for the closure traits yet: a `dyn
+  Fn` would need calls through the vtable for `Callee::Value`, and owned
+  closures behind `dyn` need owned trait objects.

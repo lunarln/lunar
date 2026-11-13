@@ -22,6 +22,9 @@ pub enum MethodImpl {
     /// A compiler-provided implementation (primitive operators, copies, ...),
     /// identified by the trait's lang name and the method name.
     Builtin { lang: Symbol, method: Symbol },
+    /// Through the vtable of a `dyn`: the function in word `index`
+    /// (`objects.ln`), called with the `dyn`'s data pointer as `self`.
+    Virtual { index: u32 },
 }
 
 /// The auto traits that follow a type's parts (`auto_rec`).
@@ -164,7 +167,7 @@ impl Program {
                 }
                 false
             }
-            TyKind::Str | TyKind::String | TyKind::FmtArgs | TyKind::Array(..) | TyKind::Grow(_) | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::Infer(_) => false,
+            TyKind::Str | TyKind::String | TyKind::FmtArgs | TyKind::Array(..) | TyKind::Grow(_) | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::Infer(_) | TyKind::Dyn(..) => false,
         };
     }
 
@@ -190,7 +193,7 @@ impl Program {
         }
         return match self.types.kind(ty) {
             TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Error => true,
-            TyKind::Str | TyKind::FmtArgs | TyKind::Ptr(..) | TyKind::FnPtr(..) => true,
+            TyKind::Str | TyKind::FmtArgs | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::Dyn(..) => true,
             TyKind::String => false,
             TyKind::Array(e, k) => !k.is_owner() && self.is_light_rec(e, env, depth + 1),
             TyKind::Grow(t) => self.is_light_rec(t, env, depth + 1),
@@ -286,6 +289,10 @@ impl Program {
                 ArrKind::SliceMut => false,
                 _ => self.auto_rec(e, env, k, depth + 1),
             },
+            // A view, like a slice: a shared one may cross threads when
+            // the value it views is Sync (known only from `+ Sync`); a
+            // `dyn mut` is copied freely, like `[T; &mut]`, so never.
+            TyKind::Dyn(_, _, flags) => k != AUTO_DETACHED && flags & DYN_MUT == 0 && flags & DYN_SYNC != 0,
             TyKind::Grow(t) => self.auto_rec(t, env, k, depth + 1),
             TyKind::Tuple(ts) => self.auto_all(ts, env, k, depth + 1),
             TyKind::Adt(id, args) => {
@@ -400,6 +407,16 @@ impl Program {
                 }
                 _ => self.auto_why_rec(e, env, k, out, depth + 1),
             },
+            TyKind::Dyn(_, _, flags) => {
+                if k == AUTO_DETACHED {
+                    m.write("`{ts}` is a view: it points into a value it does not own");
+                } else if flags & DYN_MUT != 0 {
+                    m.write("`{ts}` changes the value it views and is copied freely, so two threads could change it at once; share data through a `Mutex` or atomics instead");
+                } else {
+                    m.write("`{ts}` is a shared view, so every thread holding a copy reads the value it views: write `+ Sync` after the trait so only Sync values can be viewed");
+                }
+                self.auto_note(out, m.as_str());
+            }
             TyKind::Grow(t) => self.auto_why_rec(t, env, k, out, depth + 1),
             TyKind::Tuple(ts2) => {
                 for i in 0..ts2.len() {
@@ -781,6 +798,7 @@ impl Program {
             (TyKind::Ptr(a, m1), TyKind::Ptr(b, m2)) => m1 == m2 && self.match_ty(a, b, out),
             (TyKind::Grow(a), TyKind::Grow(b)) => self.match_ty(a, b, out),
             (TyKind::FnPtr(a, m1, r1), TyKind::FnPtr(b, m2, r2)) => m1 == m2 && self.match_list(a, b, out) && self.match_ty(r1, r2, out),
+            (TyKind::Dyn(a, xs, f1), TyKind::Dyn(b, ys, f2)) => a == b && f1 == f2 && self.match_list(xs, ys, out),
             _ => pat == ty,
         };
     }
@@ -885,6 +903,13 @@ impl Program {
                 }
             }
         }
+        // `dyn Trait`: its traits (`objects.ln`), and whatever impls
+        // (blanket ones) cover it.
+        if let TyKind::Dyn(d, dargs, flags) = k {
+            if self.dyn_implements(TraitRef { trait_id: d, args: dargs }, flags & DYN_MUT != 0, tr) {
+                return true;
+            }
+        }
         // `impl Trait`: only what its bounds promise.
         if let TyKind::Opaque(def, i, args) = k {
             let mut el: [Pred; ..+] = [];
@@ -937,6 +962,16 @@ impl Program {
     pub fn resolve_method(&mut +self, tr: TraitRef, self_ty: Ty, method: Symbol, method_args: TyList): Option::<MethodImpl> {
         let trait_data = self.trait_data(tr.trait_id);
         let none: [Pred; 0] = [];
+        // A trait of a `dyn`: through its vtable, or a default body with
+        // `Self` being the `dyn` itself.
+        if let TyKind::Dyn(d, dargs, _) = self.types.kind(self_ty) {
+            let principal = TraitRef { trait_id: d, args: dargs };
+            if self.dyn_has_trait(principal, tr) {
+                if let Some(index) = self.vtable_method_index(principal, tr, method) {
+                    return Some(MethodImpl::Virtual { index });
+                }
+            }
+        }
         if let Some(lang) = self.defs[tr.trait_id.index()].attrs.lang {
             if self.builtin_impl(self_ty, tr.trait_id, none[..]) && !is_auto_lang(self.text(lang)) {
                 return Some(MethodImpl::Builtin { lang, method });
@@ -1105,7 +1140,7 @@ impl Program {
             return false;
         }
         return match self.types.kind(ty) {
-            TyKind::Str | TyKind::String | TyKind::FmtArgs | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::Array(..) => true,
+            TyKind::Str | TyKind::String | TyKind::FmtArgs | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::Array(..) | TyKind::Dyn(..) => true,
             TyKind::Grow(t) => self.robustly_pointy(t, krate, depth + 1),
             TyKind::Tuple(ts) => {
                 for i in 0..ts.len() {
@@ -1169,6 +1204,10 @@ fn resolve(types: &mut +Types, t: Ty, s: &HashMap::<u32, Ty>): Ty {
             let r = resolve(types, ret, s);
             types.mk(TyKind::FnPtr(l, modes, r))
         }
+        TyKind::Dyn(d, args, f) => {
+            let l = resolve_list(types, args, s);
+            types.mk(TyKind::Dyn(d, l, f))
+        }
         _ => t,
     };
 }
@@ -1205,6 +1244,7 @@ fn unify(types: &mut +Types, a: Ty, b: Ty, s: &mut HashMap::<u32, Ty>): bool {
         (TyKind::Grow(x), TyKind::Grow(y)) => unify(types, x, y, s),
         (TyKind::Ptr(x, m1), TyKind::Ptr(y, m2)) => m1 == m2 && unify(types, x, y, s),
         (TyKind::FnPtr(p1, m1, r1), TyKind::FnPtr(p2, m2, r2)) => m1 == m2 && unify_list(types, p1, p2, s) && unify(types, r1, r2, s),
+        (TyKind::Dyn(d1, x, f1), TyKind::Dyn(d2, y, f2)) => d1 == d2 && f1 == f2 && unify_list(types, x, y, s),
         _ => false,
     };
 }

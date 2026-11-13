@@ -352,6 +352,8 @@ pub enum TyKind {
     Infer,
     MacCall(MacCall),
     ImplTrait(List::<Path>),
+    /// `dyn Trait + Send`, `dyn mut Trait`: a trait object (a view).
+    Dyn { is_mut: bool, bounds: List::<Path> },
 }
 
 pub struct FnTyParam {
@@ -1170,6 +1172,12 @@ fn ty(a: &Ast, o: &mut String, d: usize, id: Id::<Ty>) {
         TyKind::ImplTrait(bs) => {
             o.write("ty impl {sp}\n");
             for b in a.paths.list(bs) {
+                path(a, o, d + 1, b);
+            }
+        }
+        TyKind::Dyn { is_mut, bounds } => {
+            o.write("ty dyn{flag(is_mut, MUT)} {sp}\n");
+            for b in a.paths.list(bounds) {
                 path(a, o, d + 1, b);
             }
         }

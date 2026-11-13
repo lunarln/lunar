@@ -325,6 +325,16 @@ impl Cg {
                         }
                         result = Some(self.builtin(p, p.text(lang), p.text(method), vs[..], st, ret, span));
                     }
+                    // Through the vtable of the `dyn` whose address is the
+                    // receiver (a `&self` or `&mut self` parameter).
+                    Some(MethodImpl::Virtual { index }) => {
+                        let Some(fty) = self.virtual_fn_ty(p, tr, st, method, margs) else {
+                            self.ice(p, "a virtual call of an unknown method");
+                            return None;
+                        };
+                        let sret = self.ret_slot(p, ret, dest);
+                        result = self.call_virtual(vals[0], index, fty, vals[1..], sret);
+                    }
                     None => {
                         let s = p.ty_str(st);
                         let tn = p.name(tr.trait_id);
@@ -1061,6 +1071,13 @@ impl Cg {
                             }
                             let call_args = [recv, out];
                             self.call(callee, call_args[..]);
+                        }
+                        Some(MethodImpl::Virtual { index }) => {
+                            let Some(fty) = self.virtual_fn_ty(p, tr, t, msym, List::empty()) else {
+                                return Err(String::from("a virtual call of an unknown method"));
+                            };
+                            let rest = [out];
+                            self.call_virtual(fp, index, fty, rest[..], null());
                         }
                         _ => {
                             let ts = p.ty_str(t);

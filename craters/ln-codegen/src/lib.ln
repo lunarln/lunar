@@ -24,6 +24,7 @@ pub mod llvm;
 mod init;
 mod func;
 mod ops;
+mod vtable;
 mod debug;
 #[cfg(test)]
 mod smoke;
@@ -40,7 +41,7 @@ use ln_sema::defs::{Abi, ConstVal, DefData, DefId};
 use ln_sema::diag::is_dummy;
 use ln_sema::program::Program;
 use ln_sema::thir::{Body, LoopId};
-use ln_sema::ty::{ArrKind, FloatTy, IntTy, Ty, TyKind, TyList};
+use ln_sema::ty::{ArrKind, FloatTy, IntTy, TraitRef, Ty, TyKind, TyList};
 use crater::llvm::*;
 
 /// How much debug information to generate (`debug.ln`).
@@ -195,6 +196,7 @@ fn generate(p: &mut +Program, opts: Options): Result::<Generated, String> {
         statics: HashMap::new(),
         strs: HashMap::new(),
         glue: HashMap::new(),
+        vtables: HashMap::new(),
         externs: HashMap::new(),
         counter: 0,
         mem: HashMap::new(),
@@ -299,6 +301,8 @@ pub struct Cg {
     strs: HashMap::<Symbol, ValueRef>,
     /// Drop glue functions per type.
     glue: HashMap::<Ty, ValueRef>,
+    /// Vtables, per (type, trait of the `dyn`).
+    vtables: HashMap::<(Ty, TraitRef), ValueRef>,
     /// libc helpers (memcmp, atoi), by name.
     externs: HashMap::<Symbol, ValueRef>,
     counter: u32,
@@ -531,8 +535,15 @@ impl Cg {
                 let r = p.reveal(t);
                 self.llty(p, r)
             }
+            TyKind::Dyn(..) => self.dyn_ty(),
             TyKind::Never | TyKind::Error | TyKind::Param(..) | TyKind::Infer(_) => self.unit_ty(),
         };
+    }
+
+    /// A `dyn Trait`: `{ data, vtable }`.
+    pub fn dyn_ty(&self): TypeRef {
+        let fields = [self.ptr_ty(), self.ptr_ty()];
+        return self.struct_ty(fields[..]);
     }
 
     /// The named struct of a struct or enum instance.
