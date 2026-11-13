@@ -49,6 +49,17 @@ mod geo {
     }
 }
 
+struct Line {
+    len: i32,
+}
+
+impl Line {
+    pub fn norm(&self): i32 {
+        let doubled = self.len * 2;
+        return doubled;
+    }
+}
+
 fn add(a: i32, b: i32): i32 {
     return a + b;
 }

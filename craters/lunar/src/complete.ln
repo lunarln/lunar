@@ -250,7 +250,7 @@ fn anchor(old: str, text: str, cursor: u32): u32 {
     }
     // The innermost brace whose header is a function's.
     let mut found: Option::<(usize, usize)> = None;
-    while let Some(open) = enclosing(toks[..], k, Token::LBrace) {
+    while let Some(open) = enclosing_brace(toks[..], k) {
         let mut h = open;
         while h > 0 {
             let t = toks[h - 1].token;
@@ -277,12 +277,25 @@ fn anchor(old: str, text: str, cursor: u32): u32 {
     let name = text[toks[name_tok].range.start..toks[name_tok].range.end];
     let mut needle = String::from("fn ");
     needle.push_str(name);
+    // The functions of that name before this one (methods of several
+    // impls share names): the same one in the old text.
+    let mut nth: usize = 0;
+    for j in 0..name_tok {
+        if toks[j].token == Token::Ident && j > 0 && toks[j - 1].token == Token::Fn && text[toks[j].range.start..toks[j].range.end] == name {
+            nth += 1;
+        }
+    }
     let ob = old.as_bytes();
     let mut from: usize = 0;
+    let mut seen: usize = 0;
     while let Some(i) = old[from..].find(needle.as_str()) {
         let at = from + i + needle.len();
         from = at;
         if at < ob.len() && ln_sema::program::is_ident_byte(ob[at]) {
+            continue;
+        }
+        if seen < nth {
+            seen += 1;
             continue;
         }
         let brace = match old[at..].find("{") {
@@ -1326,6 +1339,34 @@ fn enclosing(toks: [Spanned; &], before: usize, open: Token): Option::<usize> {
         }
     }
     return None;
+}
+
+/// The innermost unclosed `{` before token `before`, past unclosed
+/// parentheses and brackets.
+fn enclosing_brace(toks: [Spanned; &], before: usize): Option::<usize> {
+    let mut k = before;
+    loop {
+        let mut depth: usize = 0;
+        let mut open: Option::<usize> = None;
+        while k > 0 {
+            k -= 1;
+            let t = toks[k].token;
+            if t == Token::RParen || t == Token::RBracket || t == Token::RBrace {
+                depth += 1;
+            } else if t == Token::LParen || t == Token::LBracket || t == Token::LBrace {
+                if depth == 0 {
+                    open = Some(k);
+                    break;
+                }
+                depth -= 1;
+            }
+        }
+        let o = open?;
+        if toks[o].token == Token::LBrace {
+            return Some(o);
+        }
+        k = o;
+    }
 }
 
 /// The path segments (name tokens) ending just before token `sep` (a `::`
