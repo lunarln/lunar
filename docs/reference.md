@@ -35,6 +35,9 @@ enum Shape { Circle(f64), Rect { w: f64, h: f64 }, Empty }
 trait Show: Display { fn show(&self): str; fn twice(&self) { ... } }
 impl::<T: Dull> Show for Pair::<T> { ... }
 impl Point { fn new(): Point { ... } }
+trait Source { type Item: Light; const SIZE: usize; fn get(&mut self): Option::<Self::Item>; }
+impl Source for Bytes { type Item = u8; const SIZE: usize = 1; ... }
+fn sum::<I: Iterator::<Item = u64>>(it: I): u64 { ... }
 
 use std::io::{print, println as say};
 use crater::shapes::*;
@@ -462,7 +465,8 @@ let kind = match shape { Shape::Circle(r) => r, _ => 0.0 };
 let v = loop { if done() { break 42; } };
 for i in 0..10 { }       // integer ranges, also `a..=b`
 for x in array { }       // arrays and slices (by value, Dull items)
-for c in s.chars() { }   // anything implementing Iterator::<T>
+for c in s.chars() { }   // anything implementing Iterator (its Items)
+for (i, w) in s.split(" ").filter(|w| w.len() > 1).enumerate() { }
 while let Some(x) = it.next() { }
 if let Some(v) = maybe { }
 let Some(v) = maybe else { return; };  // `v` is bound for the rest of the block
@@ -492,7 +496,8 @@ let size = match shape { Shape::Circle(r) | Shape::Square(r) => r, _ => 0.0 };
   `char`, and between pointers and `usize`. `x as dyn Trait` views `x` as a
   trait object (§7).
 * Operators on user types go through the traits in `core::ops` and
-  `core::cmp` (`Add`, `Sub`, ..., `Eq` for `==`, `Ord` for `<`).
+  `core::cmp` (`Add`, `Sub`, ..., `Eq` for `==`, `Ord` for `<`); the
+  arithmetic traits' `Output` is the result's type (§7).
 * Integer overflow panics in debug builds and wraps in `--release`.
   Division by zero always panics.
 
@@ -623,6 +628,66 @@ take their parameters exactly as the trait declares, `+` included: an
 `err(trait::signature)`. Trait method calls are resolved
 statically and monomorphized, except through trait objects.
 
+### Associated types and constants
+
+A trait may declare types and constants that each impl gives:
+
+```lunar
+trait Source {
+    type Item;                       // each impl says what it is
+    type Raw: Light + Debug;         // with bounds every impl's type meets
+    type Label = str;                // with a default an impl may keep
+    const SIZE: usize;               // each impl gives a value
+    const NAME: str = "source";      // or keeps the default
+    fn get(&mut self): Option::<Self::Item>;
+}
+
+impl Source for Counter {
+    type Item = u32;
+    type Raw = u64;
+    const SIZE: usize = 4;
+    fn get(&mut self): Option::<u32> { ... }
+}
+```
+
+* An impl gives every associated type and constant the trait declares
+  without a default (`err(trait::missing_item)`), and no other
+  (`err(trait::extra_item)`). Its types meet the trait's bounds
+  (`err(type::unsatisfied_bound)`); its constants have the declared type
+  (`err(trait::signature)`). Associated types take no generic parameters.
+  Outside a trait, a constant needs its value and a type alias its type
+  (`err(syntax::missing_value)`). An inherent impl may have constants
+  (`impl Limits { const MAX: usize = 16; }`), not types.
+* `T::Item` and `Self::Item` name the associated type of a generic
+  parameter or `Self` through its bounds (and their supertraits): a
+  *projection*. If no bound has one, it is `err(name::no_assoc)`; if two do,
+  `err(trait::ambiguous_assoc)`. `<T as Trait>::Item` names the trait, and
+  works for any type (`<Counter as Source>::Item` is `u32`); `Counter::Item`
+  is not allowed, as several traits could give it one. Inside an impl of a
+  trait, `Self::Item` is the impl's own type.
+* Constraints say what associated types are, after a trait's arguments:
+  `I: Iterator::<Item = u64>`, `C: Convert::<u8, Out = u16>`, `impl
+  Iterator::<Item = str>` (a result), `dyn Iterator::<Item = u8>` (§ Trait
+  objects) and supertraits (`trait Int: Add::<Output = Self>`, which every
+  impl of `Int` must meet). A constraint is a parameter of the caller's
+  choosing: `fn f::<K, V, I: Iterator::<Item = (K, V)>>(it: I)` learns `K`
+  and `V` from the iterator given. A type that does not meet one is
+  `err(type::assoc_mismatch)`.
+* A projection is the type it stands for as soon as that is known: from a
+  constraint in scope, an `impl Trait`'s or `dyn`'s constraints, or the
+  impl for a known type. Otherwise (`I::Item` for a generic `I` without a
+  constraint) it is a type of its own, like a generic parameter, which the
+  trait's bounds on it describe: `type Item: Light;` makes `I::Item` Light.
+* `T::N`, `Self::N`, `Type::N` and `<T as Trait>::N` read an associated
+  constant: in generic code, the value for each instance. They can be used
+  in the initializers of constants and statics and in array lengths when
+  the type is known there (`const BOTH: u32 = Square::SIDES + <Tri as
+  Shape>::SIDES;`, `[0u8; Limits::MAX]`). A trait's default value cannot
+  depend on `Self`.
+* The operator traits (`core::ops::Add`, ...) have `type Output`, the type
+  of `a + b`; `a += b` needs `Output` to be `a`'s type. `core::str::FromStr`
+  has `type Err`, what `parse` gives on failure.
+
 ### Trait objects
 
 `dyn Trait` is a view of a value of any type implementing `Trait`: a
@@ -665,8 +730,15 @@ for s in shapes { total += s.area(); }
   `+ Sync` may be dropped implicitly. `d as dyn Super` views a `dyn Sub` as
   one of its supertraits (upcasting).
 * The supertraits' methods can be called through a `dyn`, and generic
-  traits take their arguments: `dyn Iterator::<u8>`. Format holes call
+  traits take their arguments: `dyn Convert::<u8>`. Format holes call
   `Display` and `Debug`, so `{x}` works for `x: dyn Display`.
+* A `dyn` names every associated type of its trait and its supertraits:
+  `dyn Iterator::<Item = u8>` (`dyn Iterator` alone is `err(type::bad_dyn)`).
+  The value viewed must have those (`err(type::assoc_mismatch)`).
+* Associated constants are read from the value a `dyn` views, through its
+  vtable: `d.SIDES`, like a field (a `dyn` has no fields), for the constants
+  of its trait and supertraits. `<dyn Shape>::SIDES` cannot work, since each
+  value viewed may have its own.
 * `dyn Trait` implements `Trait` and its supertraits, so it can be passed
   to generic code; a shared `dyn Trait` implements only traits whose
   vtable methods (with their supertraits') all take `&self`, so generic
@@ -681,7 +753,9 @@ for s in shapes { total += s.area(); }
 A trait can be used as `dyn` (is *dyn compatible*) when every method of it
 and of its supertraits without a default body takes `&self`, `&mut self` or
 `&mut +self`, has no generic parameters, and mentions `Self` nowhere else in
-its signature; and its supertraits do not take `Self` as an argument
+its signature (other than as `Self::Item`, which the `dyn` type names);
+its supertraits do not take `Self` as an argument; and its associated
+constants' types do not mention `Self`
 (`err(trait::not_dyn_compatible)`). Methods with a default body that break
 these rules are not in the vtable: calling one on a `dyn` runs the default
 body with `Self` being the `dyn` type itself (which needs `dyn Trait` to
@@ -691,8 +765,9 @@ The vtable of a type for a trait is one constant per program (shared by all
 craters): a null slot reserved for drop glue (for future owned trait
 objects), the type's size and alignment, the vtables of the supertraits
 (for upcasting), then the methods, trait by trait (the trait itself, then
-its supertraits depth first), each in declaration order. Associated
-constants will come after the methods.
+its supertraits depth first), each in declaration order, then the
+associated constants in the same order, each word a pointer to the
+constant's value for the type.
 
 Method calls *autoslice*: a method called on `[T; -..+]` also finds the
 methods of `[T; ..+]`, `[T]`, `[T; &mut]` and `[T; &]`, in that order, and a
@@ -725,9 +800,14 @@ alone lists every code. The explanations are the files in
 * `core::ptr::Dull`, `core::ops`, `core::cmp::{Eq, Ord, Ordering, min, max,
   Reverse}`, `core::clone::Clone`, `core::default::Default`,
   `core::fmt::{Display, Debug, write, format}`, `core::option::Option`,
-  `core::result::Result`, `core::iter::Iterator`, `core::num::{Int, Float}`,
+  `core::result::Result`, `core::num::{Int, Float}`,
   `core::mem::{size_of, align_of, swap}`, `core::intrinsics` (including
   the atomic operations `std::sync::atomic` is built on).
+* `core::iter::Iterator`: `type Item`, `next`, and the adapters `map`,
+  `filter`, `enumerate`, `take`, `skip` (lazy: they give new iterators,
+  `core::iter::{Map, Filter, Enumerate, Take, Skip}`) and `count`. Every
+  iterator of the standard library has them: `s.split(" ").map(|w|
+  w.len()).filter(|n| n > 2).count()`.
 * `core::marker::{Send, Sync, Detached}` and `core::cell::UnsafeCell` (§3).
 * `core::ops::{Fn, FnMut, FnOnce}` (see Closures).
 * `core::hash::{Hash, Hasher, hash_of}`: one fixed fast hasher, `Hash` for
@@ -772,11 +852,12 @@ alone lists every code. The explanations are the files in
 * `String`: `new`, `from`, `from_utf8`, `from_utf8_lossy`, `push`,
   `push_str`, `write`, `as_str`, `len`, `clear`, `truncate`, `pop`,
   `insert`, `insert_str`, `remove`, `retain(|c| ..)`, `split_off`.
-* Parsing: `core::str::FromStr` (`fn from_str(s: str): Result::<Self,
-  ParseError>`) for every integer and float type, `bool`, `char` and the
-  `std::net` addresses; `s.parse::<T>()` calls it. `core::num::ParseError`
-  says why (`kind()`: `Empty`, `InvalidDigit`, `PosOverflow`,
-  `NegOverflow`, `Invalid`).
+* Parsing: `core::str::FromStr` (`type Err; fn from_str(s: str):
+  Result::<Self, Self::Err>`) for every integer and float type, `bool`,
+  `char` and the `std::net` addresses, all with `Err = ParseError`;
+  `s.parse::<T>()` calls it, giving `Result::<T, T::Err>`.
+  `core::num::ParseError` says why (`kind()`: `Empty`, `InvalidDigit`,
+  `PosOverflow`, `NegOverflow`, `Invalid`).
 * Integer methods, on every width: `checked_`, `wrapping_` and
   `saturating_` `add`, `sub`, `mul`, `pow` (and checked `div`, `rem`,
   `neg`), `pow`, `abs`, `unsigned_abs`, `abs_diff`, `signum`,
