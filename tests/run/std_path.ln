@@ -1,0 +1,137 @@
+// std::path: names, stems and extensions, parents, components, joining,
+// normalizing, and Windows prefixes.
+
+use std::path::{self, Path, PathBuf, Component};
+
+#[test]
+fn names_and_extensions() {
+    let p = Path::new("dir/sub/archive.tar.gz");
+    assert_eq!(p.file_name(), Some("archive.tar.gz"));
+    assert_eq!(p.file_stem(), Some("archive.tar"));
+    assert_eq!(p.extension(), Some("gz"));
+    assert_eq!(Path::new(".bashrc").file_stem(), Some(".bashrc"));
+    assert_eq!(Path::new(".bashrc").extension(), None);
+    assert_eq!(Path::new("noext").extension(), None);
+    assert_eq!(Path::new("a/b/").file_name(), Some("b"));
+    assert_eq!(Path::new("a/b/.").file_name(), Some("b"));
+    assert_eq!(Path::new("a/..").file_name(), None);
+    assert_eq!(Path::new("/").file_name(), None);
+    assert_eq!(Path::new("").file_name(), None);
+}
+
+#[test]
+fn parents() {
+    assert_eq!(Path::new("a/b/c").parent().unwrap().as_str(), "a/b");
+    assert_eq!(Path::new("a/b/c/").parent().unwrap().as_str(), "a/b");
+    assert_eq!(Path::new("a").parent().unwrap().as_str(), "");
+    assert_eq!(Path::new("/a").parent().unwrap().as_str(), "/");
+    assert!(Path::new("/").parent().is_none());
+    assert!(Path::new("").parent().is_none());
+    assert_eq!(Path::new("./x").parent().unwrap().as_str(), ".");
+}
+
+#[test]
+fn components() {
+    let mut out = String::new();
+    for c in Path::new("./a//b/./../c/").components() {
+        out.write("{c:?} ");
+    }
+    assert_eq!(out, String::from("CurDir Normal(\"a\") Normal(\"b\") ParentDir Normal(\"c\") "));
+    let mut abs = String::new();
+    for c in Path::new("/usr/lib").components() {
+        abs.write("{c:?} ");
+    }
+    assert_eq!(abs, String::from("RootDir Normal(\"usr\") Normal(\"lib\") "));
+    assert!(Path::new("a//b/") == Path::new("a/b"));
+    assert!(Path::new("a/b") != Path::new("a/c"));
+}
+
+#[test]
+fn prefixes_and_suffixes() {
+    let p = Path::new("a/b/c/d");
+    assert!(p.starts_with("a/b"));
+    assert!(p.starts_with("a/b/"));
+    assert!(!p.starts_with("a/bc"));
+    assert!(p.ends_with("c/d"));
+    assert!(!p.ends_with("bc/d"));
+    assert_eq!(p.strip_prefix("a/b").unwrap().as_str(), "c/d");
+    assert!(p.strip_prefix("x").is_none());
+    assert_eq!(p.strip_prefix("a/b/c/d").unwrap().as_str(), "");
+}
+
+#[test]
+fn joining_and_changing() {
+    let sep = path::MAIN_SEPARATOR_STR;
+    let mut expect = String::from("a");
+    expect.push_str(sep);
+    expect.push_str("b");
+    assert_eq!(Path::new("a").join("b").into_string(), expect);
+    assert_eq!(Path::new("a/").join("b").into_string(), String::from("a/b"));
+    assert_eq!(Path::new("").join("b").into_string(), String::from("b"));
+    assert_eq!(Path::new("a").join("/abs").into_string(), String::from("/abs"));
+    assert_eq!(Path::new("x/file.txt").with_extension("md").into_string(), String::from("x/file.md"));
+    assert_eq!(Path::new("x/file.txt").with_extension("").into_string(), String::from("x/file"));
+    // Joined with `MAIN_SEPARATOR`; paths compare by components.
+    assert_eq!(Path::new("x/file.txt").with_file_name("other.rs"), PathBuf::from("x/other.rs"));
+    let mut b = PathBuf::from("root/");
+    b.push("dir");
+    b.set_extension("d");
+    assert_eq!(b.file_name(), Some("dir.d"));
+    assert!(b.pop());
+    assert_eq!(b.as_str(), "root");
+    assert!(b.pop());
+    assert_eq!(b.as_str(), "");
+    assert!(!b.pop());
+}
+
+#[test]
+fn normalize() {
+    assert_eq!(Path::new("a/./b/../c").normalize(), PathBuf::from("a/c"));
+    assert_eq!(Path::new("../x/../../y").normalize(), PathBuf::from("../../y"));
+    assert_eq!(Path::new("/../a").normalize(), PathBuf::from("/a"));
+    assert_eq!(Path::new("a/..").normalize(), PathBuf::from("."));
+    assert_eq!(Path::new("").normalize(), PathBuf::from("."));
+}
+
+#[test]
+fn absolute_paths() {
+    let abs = path::absolute("some/rel").unwrap();
+    assert!(abs.is_absolute());
+    assert!(abs.as_path().ends_with("some/rel"));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_paths() {
+    assert!(Path::new("C:\\x").is_absolute());
+    assert!(!Path::new("C:x").is_absolute());
+    assert!(!Path::new("\\x").is_absolute());
+    assert!(Path::new("\\x").has_root());
+    assert!(Path::new("\\\\server\\share\\f").is_absolute());
+    assert!(Path::new("\\\\?\\C:\\f").is_absolute());
+    assert_eq!(Path::new("C:\\dir\\f.txt").parent().unwrap().as_str(), "C:\\dir");
+    assert_eq!(Path::new("C:\\f.txt").parent().unwrap().as_str(), "C:\\");
+    assert!(Path::new("C:\\").parent().is_none());
+    assert_eq!(Path::new("a\\b/c").file_name(), Some("c"));
+    let mut out = String::new();
+    for c in Path::new("\\\\server\\share\\dir").components() {
+        out.write("{c:?} ");
+    }
+    assert_eq!(out, String::from("Prefix(\"\\\\\\\\server\\\\share\") RootDir Normal(\"dir\") "));
+    assert_eq!(Path::new("C:").join("a").into_string(), String::from("C:a"));
+    assert_eq!(Path::new("C:\\x").join("\\y").into_string(), String::from("C:\\y"));
+    assert_eq!(Path::new("C:\\x").join("D:\\y").into_string(), String::from("D:\\y"));
+    assert_eq!(Path::new("C:/a/./b/../c").normalize().into_string(), String::from("C:\\a\\c"));
+    assert_eq!(Path::new("a/b/c").to_native().into_string(), String::from("a\\b\\c"));
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_paths() {
+    assert!(Path::new("/x").is_absolute());
+    assert!(!Path::new("x").is_absolute());
+    // `\` is an ordinary character.
+    assert_eq!(Path::new("a\\b").file_name(), Some("a\\b"));
+    assert_eq!(Path::new("C:\\x").parent().unwrap().as_str(), "");
+    assert_eq!(Path::new("a/b").to_native().into_string(), String::from("a/b"));
+}
