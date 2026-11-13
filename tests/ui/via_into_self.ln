@@ -1,0 +1,22 @@
+// error: borrow::escapes_via_return
+// once: borrow::escapes_via_return
+// `via self` lets the result point only where `self`'s views point, never
+// into `self`'s own data: callers keep the result across calls that shrink
+// `self`.
+struct Lines {
+    text: str,
+    buf: String,
+}
+
+impl Lines {
+    fn next_line(&mut self): str via self {
+        self.buf.clear();
+        self.buf.push_str(self.text);
+        return self.buf.as_str();
+    }
+}
+
+fn main() {
+    let mut l = Lines { text: "a", buf: String::new() };
+    println("{l.next_line()}");
+}

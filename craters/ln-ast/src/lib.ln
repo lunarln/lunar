@@ -193,6 +193,10 @@ pub struct FnDecl {
     /// point into (`self` for the receiver, `static` alone for none).
     /// Empty without the clause.
     pub ret_from: List::<Ident>,
+    /// `via c, d` after the return type (and after `from ..`, if any):
+    /// the parameters whose views the result may point where, but not into
+    /// the parameters' own data. Empty without the clause.
+    pub ret_via: List::<Ident>,
     pub body: Option::<Id::<Block>>,
     pub is_unsafe: bool,
     /// `const fn`: callable in the initializers of constants and statics.
@@ -1010,6 +1014,10 @@ fn item_kind(a: &Ast, o: &mut String, d: usize, k: ItemKind) {
             for i in a.idents.list(f.ret_from) {
                 ind(o, d + 1);
                 o.write("from {ident(a, i)}\n");
+            }
+            for i in a.idents.list(f.ret_via) {
+                ind(o, d + 1);
+                o.write("via {ident(a, i)}\n");
             }
             if let Some(b) = f.body {
                 block(a, o, d + 1, b);

@@ -192,10 +192,13 @@ pub struct Param {
 
 /// Which parameters a function's result may point into, from its
 /// signature: bit `i` of `set` for parameter `i` (parameters from the 64th
-/// on always count). `span` covers the names of the `from` clause, and is
-/// dummy when there is none and the set follows from the parameters.
+/// on always count), into its own data and wherever its views point; bit
+/// `i` of `via` for parameter `i`, only where its views point (`via p`).
+/// `span` covers the names of the `from` and `via` clauses, and is dummy
+/// when there are none and the set follows from the parameters.
 pub struct RetFrom {
     pub set: u64,
+    pub via: u64,
     pub span: Span,
 }
 

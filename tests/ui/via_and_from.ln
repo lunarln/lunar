@@ -1,0 +1,16 @@
+// error: name::duplicate
+// once: name::duplicate
+// A parameter is either in `from` (into its data, and where its views point)
+// or in `via` (only where its views point), not both.
+struct Words {
+    text: str,
+}
+
+fn first(w: &Words): str from w via w {
+    return w.text;
+}
+
+fn main() {
+    let w = Words { text: "a b" };
+    println("{first(&w)}");
+}

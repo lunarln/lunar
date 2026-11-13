@@ -335,20 +335,42 @@ impl Parser {
                 let t = self.expect(T::Static)?;
                 ret_from.push(self.tok_ident(t));
             } else {
-                loop {
-                    let t = if self.at(T::SelfValue) { self.expect(T::SelfValue)? } else { self.expect(T::Ident)? };
-                    ret_from.push(self.tok_ident(t));
-                    if !self.eat(T::Comma) {
-                        break;
-                    }
-                }
+                self.ret_names(&mut ret_from)?;
             }
         }
+        // `: T via c, d` (where `c`'s and `d`'s views point, not into them),
+        // after `from ..` or alone. `via` is a word only here too.
+        let mut ret_via: [Ident; ..+] = [];
+        let via_word = match self.current() {
+            Some(t) => t.kind == T::Ident && tok_text(self.src, self.base, t) == "via",
+            None => false,
+        };
+        let via_clause = via_word && match self.nth(1) {
+            Some(T::Ident | T::SelfValue) => true,
+            _ => false,
+        };
+        if ret.is_some() && via_clause {
+            self.bump();
+            self.ret_names(&mut ret_via)?;
+        }
         let ret_from = self.ast.idents.add_list(ret_from[..]);
+        let ret_via = self.ast.idents.add_list(ret_via[..]);
         let sig_span = self.span_from(sig_start);
         let body = if self.eat(T::Semi) { None } else { Some(self.block()?) };
         let params = self.ast.params.add_list(params[..]);
-        return Ok(FnDecl { name, generics, params, ret, ret_from, body, is_unsafe, is_const, variadic, sig_span });
+        return Ok(FnDecl { name, generics, params, ret, ret_from, ret_via, body, is_unsafe, is_const, variadic, sig_span });
+    }
+
+    /// The names of a `from` or `via` clause: `a, self, b`.
+    fn ret_names(&mut self, out: &mut [Ident; ..+]): PResult::<()> {
+        loop {
+            let t = if self.at(T::SelfValue) { self.expect(T::SelfValue)? } else { self.expect(T::Ident)? };
+            out.push(self.tok_ident(t));
+            if !self.eat(T::Comma) {
+                break;
+            }
+        }
+        return Ok(());
     }
 
     fn param(&mut self): PResult::<Param> {

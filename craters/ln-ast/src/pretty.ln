@@ -289,6 +289,23 @@ pub fn param(a: &Ast, src: str, p: Param): String {
     return out;
 }
 
+/// What a function's result points into, after its return type:
+/// ` from a, b via c`, ` via self`, or nothing.
+pub fn ret_clause(a: &Ast, f: FnDecl): String {
+    let mut out = String::new();
+    let from = a.idents.list(f.ret_from);
+    for i in 0..from.len() {
+        out.push_str(if i == 0 { " from " } else { ", " });
+        out.push_str(a.text(from[i].name));
+    }
+    let via = a.idents.list(f.ret_via);
+    for i in 0..via.len() {
+        out.push_str(if i == 0 { " via " } else { ", " });
+        out.push_str(a.text(via[i].name));
+    }
+    return out;
+}
+
 /// `unsafe fn name::<T: Ord>(a: T, b: &T): T from b`, without `pub`.
 pub fn fn_sig(a: &Ast, src: str, f: FnDecl): String {
     let mut out = String::new();
@@ -316,11 +333,7 @@ pub fn fn_sig(a: &Ast, src: str, f: FnDecl): String {
     if let Some(r) = f.ret {
         out.write(": {ty(a, src, r)}");
     }
-    let from = a.idents.list(f.ret_from);
-    for i in 0..from.len() {
-        out.push_str(if i == 0 { " from " } else { ", " });
-        out.push_str(a.text(from[i].name));
-    }
+    out.push_str(ret_clause(a, f).as_str());
     return out;
 }
 

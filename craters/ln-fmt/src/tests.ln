@@ -298,6 +298,23 @@ fn parameter_modes() {
         "fn view(&self):str from self;",
         "fn view(&self): str from self;\n",
     );
+    // `via` after the return type, alone or after `from`.
+    check(
+        "fn next_item(&mut self):Option::<str> via self;",
+        "fn next_item(&mut self): Option::<str> via self;\n",
+    );
+    check(
+        "fn pick(a:&String,t:&Tokens,u:&Tokens):str from a via t,u{a.as_str()}",
+        "fn pick(a: &String, t: &Tokens, u: &Tokens): str from a via t, u {\n    a.as_str()\n}\n",
+    );
+    check(
+        "fn pick(t:&Tokens):str from static via t;",
+        "fn pick(t: &Tokens): str from static via t;\n",
+    );
+    // Comments stay where they are.
+    keep("fn pick(t: &Tokens): str via /* the views */ t;\n");
+    // `via` is a name everywhere else.
+    keep("fn via(via: &String): str from via {\n    via.as_str()\n}\n");
 }
 
 #[test]

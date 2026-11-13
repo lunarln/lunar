@@ -1,0 +1,21 @@
+// error: type::from_without_views
+// `via` names a parameter whose views the result points through: a
+// `&String` holds none (name it in `from` to point into its data), nor does
+// a `usize`. A result that holds no views needs no clause at all.
+fn tail(s: &String, n: usize): str via s, n {
+    return s.as_str()[n..];
+}
+
+struct Words {
+    text: str,
+}
+
+fn count(w: &Words): usize via w {
+    return w.text.len();
+}
+
+fn main() {
+    let x = String::from("hello");
+    let w = Words { text: "a b" };
+    println("{tail(&x, 1)} {count(&w)}");
+}

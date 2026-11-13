@@ -461,7 +461,8 @@ fn unreachable_expr(p: &mut +Program, e: Id::<Expr>, out: &mut +Diags) {
 /// of `into` if into parameter `i`'s own storage (and wherever its views
 /// point), bit `i` of `through` if only where its views point. Parameters
 /// from the 64th on always count as `into`. A named function's comes from
-/// its signature (`Program::ret_from`, all `into`); a closure's is inferred
+/// its signature (`Program::ret_from`: `from` is `into`, `via` is
+/// `through`); a closure's is inferred
 /// from its body (`infer_closure_ret_points`).
 pub struct RetPoints {
     pub into: u64,
@@ -641,6 +642,42 @@ pub fn from_names(p: &Program, def: DefId, set: u64): [str; ..+] {
     return out;
 }
 
+/// Where a result declared `rf` (of function `def`) points, after
+/// "points": `into no parameter`, `only into `a``, `only where `t`'s views
+/// point`, `only into `a`, or where `t`'s views point`.
+pub fn declared_points(p: &Program, def: DefId, rf: RetFrom): String {
+    let into = from_names(p, def, rf.set);
+    let via = from_names(p, def, rf.via);
+    let mut out = String::new();
+    if into.len() == 0 && via.len() == 0 {
+        out.push_str("into no parameter");
+        return out;
+    }
+    out.push_str("only ");
+    if into.len() > 0 {
+        out.write("into {quoted_list(into[..])}");
+        if via.len() > 0 {
+            out.push_str(", or ");
+        }
+    }
+    if via.len() > 0 {
+        out.write("where {views_of(via[..])} views point");
+    }
+    return out;
+}
+
+/// `` `t`'s ``, `` `t`'s and `u`'s ``.
+fn views_of(names: [str; &]): String {
+    let mut out = String::new();
+    for i in 0..names.len() {
+        if i > 0 {
+            out.push_str(if i + 1 == names.len() { " and " } else { ", " });
+        }
+        out.write("`{names[i]}`'s");
+    }
+    return out;
+}
+
 /// Whether values of `t` point into storage they do not own, where the
 /// generic parameters have the bounds `env`.
 pub fn ty_has_view(p: &mut +Program, env: [Pred; &], t: Ty, depth: u32): bool {
@@ -769,8 +806,10 @@ struct Cx {
 /// values its body returns.
 struct FromCheck {
     declared: RetFrom,
-    /// The declared parameters and every one a returned value points into.
+    /// The declared parameters and every one a returned value points into
+    /// (`from`), and those only pointed through (`via`, not in `wanted`).
     wanted: u64,
+    wanted_via: u64,
 }
 
 impl Cx {
@@ -1425,7 +1464,7 @@ impl Cx {
     fn callee_ret_points(&self, p: &mut +Program, c: Callee): Option::<RetPoints> {
         let Some(def) = callee_def(p, c) else { return None; };
         if let Some(rf) = p.ret_from.get(def) {
-            return Some(RetPoints { into: rf.set, through: 0 });
+            return Some(RetPoints { into: rf.set, through: rf.via });
         }
         return p.ret_points.get(def);
     }
@@ -2200,21 +2239,28 @@ impl Cx {
     fn declared_from(&self, p: &mut +Program): Option::<FromCheck> {
         let Some(declared) = p.ret_from.get(self.body.def) else { return None; };
         let mut wanted = declared.set;
+        let mut wanted_via = declared.via;
         let roots = self.returned_roots(p);
         for r in roots {
-            if let Some((i, _)) = self.returned_param(p, r) {
+            if let Some((i, _, through)) = self.returned_param(p, r) {
                 if i < 64 {
-                    wanted = wanted | (1u64 << i as u64);
+                    if through {
+                        wanted_via = wanted_via | (1u64 << i as u64);
+                    } else {
+                        wanted = wanted | (1u64 << i as u64);
+                    }
                 }
             }
         }
-        return Some(FromCheck { declared, wanted });
+        wanted_via = wanted_via & !wanted;
+        return Some(FromCheck { declared, wanted, wanted_via });
     }
 
     /// The parameter (index and local) a returned value with root `r`
-    /// points into: a borrowed parameter's own data, or where a
-    /// parameter's views point.
-    fn returned_param(&self, p: &Program, r: Root): Option::<(u32, LocalId)> {
+    /// points into, and whether only where its views point (`through`):
+    /// a borrowed parameter's own data, or where a parameter's views
+    /// point.
+    fn returned_param(&self, p: &Program, r: Root): Option::<(u32, LocalId, bool)> {
         let (l, arg) = match r {
             Root::Local(x) => (x, false),
             Root::Arg(x) => (x, true),
@@ -2224,7 +2270,7 @@ impl Cx {
         };
         if let LocalKind::Param { index, owned, .. } = self.local(p, l).kind {
             if !owned || arg {
-                return Some((index, l));
+                return Some((index, l, arg));
             }
         }
         return None;
@@ -2257,8 +2303,13 @@ impl Cx {
                 let span = p.thir.expr(v).span;
                 let roots = self.value_roots(p, v);
                 for r in roots {
-                    let Some((i, l)) = self.returned_param(p, r) else { continue; };
+                    let Some((i, l, through)) = self.returned_param(p, r) else { continue; };
                     if i >= 64 || (fc.declared.set >> i as u64) & 1 == 1 {
+                        continue;
+                    }
+                    // `via p`: where `p`'s views point, not into `p`.
+                    let via = (fc.declared.via >> i as u64) & 1 == 1;
+                    if through && via {
                         continue;
                     }
                     if !self.report(span, 10) {
@@ -2267,18 +2318,19 @@ impl Cx {
                     let def = self.body.def;
                     let fname = p.text(p.defs[def.index()].name);
                     let n = p.text(self.local(p, l).name);
-                    let m = say(p, "`{fname}` returns a view from `{n}`, but its signature does not say so");
+                    let m = if via {
+                        say(p, "`{fname}` returns a view into `{n}`'s own data, but its signature says only where `{n}`'s views point")
+                    } else {
+                        say(p, "`{fname}` returns a view from `{n}`, but its signature does not say so")
+                    };
                     p.diags.error(codes::borrow::ESCAPES_VIA_RETURN(), span, m);
                     let sig = p.fn_data(def).sig;
                     let ps = p.params.list(sig.params);
                     let self_first = ps.len() > 0 && ps[0].is_self;
                     let names = from_names(p, def, fc.declared.set);
                     let only = quoted_list(names[..]);
-                    if !is_dummy(fc.declared.span) && fc.declared.set == 0 {
-                        let t = say(p, "the result is declared to point into no parameter");
-                        p.diags.secondary(fc.declared.span, t);
-                    } else if !is_dummy(fc.declared.span) {
-                        let t = say(p, "the result is declared to point only into {only}");
+                    if !is_dummy(fc.declared.span) {
+                        let t = say(p, "the result is declared to point {declared_points(p, def, fc.declared)}");
                         p.diags.secondary(fc.declared.span, t);
                     } else if self_first && fc.declared.set == 1 {
                         let t = say(p, "without a `from` clause, a method's result points only into `self`");
@@ -2290,19 +2342,27 @@ impl Cx {
                         let t = say(p, "without a `from` clause, the result points only into {only}");
                         p.diags.secondary(sig.ret_span, t);
                     }
-                    let wanted = from_names(p, def, fc.wanted);
+                    // `from a, b via c`: `via` for the parameters only
+                    // pointed through.
                     let mut w = String::new();
+                    let wanted = from_names(p, def, fc.wanted);
                     for j in 0..wanted.len() {
-                        if j > 0 {
-                            w.push_str(", ");
-                        }
+                        w.push_str(if j == 0 { "from " } else { ", " });
                         w.push_str(wanted[j]);
                     }
-                    p.diags.help(say(p, "say every parameter the result may point into: `from {w}`"));
-                    if !is_dummy(fc.declared.span) {
-                        p.diags.suggest(fc.declared.span, say(p, "{w}"), say(p, "Declare `from {w}`"));
-                    } else if !is_dummy(sig.ret_span) {
-                        p.diags.suggest(Span::new(sig.ret_span.hi, sig.ret_span.hi), say(p, " from {w}"), say(p, "Declare `from {w}`"));
+                    let wanted_via = from_names(p, def, fc.wanted_via);
+                    for j in 0..wanted_via.len() {
+                        if j == 0 && w.len() > 0 {
+                            w.push(' ');
+                        }
+                        w.push_str(if j == 0 { "via " } else { ", " });
+                        w.push_str(wanted_via[j]);
+                    }
+                    p.diags.help(say(p, "say every parameter the result may point into: `{w}`"));
+                    if !is_dummy(sig.ret_span) {
+                        // The whole clause, after the return type.
+                        let hi = if is_dummy(fc.declared.span) { sig.ret_span.hi } else { fc.declared.span.hi };
+                        p.diags.suggest(Span::new(sig.ret_span.hi, hi), say(p, " {w}"), say(p, "Declare `{w}`"));
                     }
                     p.diags.finish();
                     return;

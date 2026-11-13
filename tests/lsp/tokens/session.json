@@ -1,5 +1,5 @@
 {
-  "about": "Semantic tokens: what each name is (types, functions, methods, macros, locals, parameters, fields, variants, traits, modules), the declaration, mutable, readonly and defaultLibrary modifiers, names inside a macro's arguments and a format string, comments, strings and numbers; ranges and deltas.",
+  "about": "Semantic tokens: what each name is (types, functions, methods, macros, locals, parameters, fields, variants, traits, modules), the declaration, mutable, readonly and defaultLibrary modifiers, names inside a macro's arguments and a format string, comments, strings and numbers, the words `from` and `via` after a return type (and the same names elsewhere); a hover showing them; ranges and deltas.",
   "steps": [
     { "open": "main.ln" },
     { "request": "textDocument/semanticTokens/full",
@@ -42,8 +42,16 @@
         ["main.ln", "\"x\"", 0, 0, "string"],
         ["main.ln", "3;", 0, 0, "number"],
         ["main.ln", "return", 0, 0, "keyword"],
-        ["main.ln", "self)", 0, 0, "keyword"]
+        ["main.ln", "self)", 0, 0, "keyword"],
+        ["main.ln", "from from via", 0, 0, "keyword"],
+        ["main.ln", "from via w", 0, 0, "none"],
+        ["main.ln", "via w", 0, 0, "keyword"],
+        ["main.ln", "from: &String", 0, 0, "parameter", ["declaration"]],
+        ["main.ln", "via =", 0, 0, "variable", ["declaration"]]
       ] },
+    { "request": "textDocument/hover",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "pick(", 0, 0] },
+      "expect": ["fn pick(w: &Words, from: &String): str from from via w"] },
     { "request": "textDocument/semanticTokens/range",
       "params": { "textDocument": { "uri": "$uri:main.ln" }, "range": { "start": { "line": 22, "character": 0 }, "end": { "line": 23, "character": 0 } } },
       "absent": ["resultId"],

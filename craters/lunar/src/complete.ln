@@ -2334,11 +2334,7 @@ fn signature_of(s: &mut Sema, d: DefId): Option::<Signature> {
                 if let Some(r) = f.ret {
                     sig.label.write(": {pretty::ty(&s.p.ast, src, r)}");
                 }
-                let from = s.p.ast.idents.list(f.ret_from);
-                for i in 0..from.len() {
-                    sig.label.push_str(if i == 0 { " from " } else { ", " });
-                    sig.label.push_str(s.p.text(from[i].name));
-                }
+                sig.label.push_str(pretty::ret_clause(&s.p.ast, f).as_str());
             } else if let ItemKind::Struct(x) = item.kind {
                 if let ln_ast::VariantData::Tuple(fs) = x.kind {
                     sig.label.write("{s.p.text(x.name.name)}(");
