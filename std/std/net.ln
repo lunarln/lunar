@@ -1,0 +1,1067 @@
+// Networking: IP and socket addresses (parsed from and shown as text),
+// name lookup, TCP (`TcpListener`, `TcpStream`) and UDP (`UdpSocket`).
+//
+// I/O blocks, with optional timeouts and a non-blocking mode. Sockets are
+// closed when they are freed. On Windows, Winsock is started the first
+// time a socket is made or a name is looked up.
+
+use crater::io::{Error, ErrorKind, Read, Write};
+use crater::rt;
+use crater::sys;
+use crater::time::Duration;
+use core::num::{ParseError, ParseErrorKind};
+use core::str::FromStr;
+
+fn invalid::<T>(): Result::<T, ParseError> {
+    return Err(ParseError::new(ParseErrorKind::Invalid));
+}
+
+// ===================================================================== IPv4
+
+/// An IPv4 address, such as `127.0.0.1`.
+#[derive(Eq, Ord, Hash)]
+pub struct Ipv4Addr {
+    /// The four octets, the first in the high byte.
+    bits: u32,
+}
+
+impl Ipv4Addr {
+    pub fn new(a: u8, b: u8, c: u8, d: u8): Ipv4Addr {
+        return Ipv4Addr { bits: ((a as u32) << 24) | ((b as u32) << 16) | ((c as u32) << 8) | (d as u32) };
+    }
+
+    /// `127.0.0.1`.
+    pub fn localhost(): Ipv4Addr {
+        return Ipv4Addr::new(127, 0, 0, 1);
+    }
+
+    /// `0.0.0.0`: any address of this machine, for binding.
+    pub fn unspecified(): Ipv4Addr {
+        return Ipv4Addr { bits: 0 };
+    }
+
+    /// `255.255.255.255`.
+    pub fn broadcast(): Ipv4Addr {
+        return Ipv4Addr { bits: 4294967295 };
+    }
+
+    /// The address with these 32 bits (the first octet highest).
+    pub fn from_bits(bits: u32): Ipv4Addr {
+        return Ipv4Addr { bits };
+    }
+
+    pub fn to_bits(self): u32 {
+        return self.bits;
+    }
+
+    pub fn octets(self): [u8; 4] {
+        return [(self.bits >> 24) as u8, (self.bits >> 16) as u8, (self.bits >> 8) as u8, self.bits as u8];
+    }
+
+    /// `127.0.0.0/8`.
+    pub fn is_loopback(self): bool {
+        return (self.bits >> 24) == 127;
+    }
+
+    pub fn is_unspecified(self): bool {
+        return self.bits == 0;
+    }
+
+    /// `10.0.0.0/8`, `172.16.0.0/12` or `192.168.0.0/16`.
+    pub fn is_private(self): bool {
+        let a = self.bits >> 24;
+        let b = (self.bits >> 16) & 255;
+        return a == 10 || (a == 172 && b >= 16 && b < 32) || (a == 192 && b == 168);
+    }
+
+    /// `169.254.0.0/16`.
+    pub fn is_link_local(self): bool {
+        return (self.bits >> 16) == 43518;
+    }
+
+    /// `224.0.0.0/4`.
+    pub fn is_multicast(self): bool {
+        return (self.bits >> 28) == 14;
+    }
+
+    pub fn is_broadcast(self): bool {
+        return self.bits == 4294967295;
+    }
+
+    /// The IPv4-mapped IPv6 address `::ffff:a.b.c.d`.
+    pub fn to_ipv6_mapped(self): Ipv6Addr {
+        return Ipv6Addr { hi: 0, lo: 281470681743360 | (self.bits as u64) };
+    }
+}
+
+impl Display for Ipv4Addr {
+    fn fmt(&self, out: &mut +String) {
+        let o = self.octets();
+        out.write("{o[0]}.{o[1]}.{o[2]}.{o[3]}");
+    }
+}
+
+impl Debug for Ipv4Addr {
+    fn debug(&self, out: &mut +String) {
+        self.fmt(out);
+    }
+}
+
+impl FromStr for Ipv4Addr {
+    /// Four decimal octets separated by `.`, without leading zeros.
+    fn from_str(s: str): Result::<Ipv4Addr, ParseError> {
+        let mut bits: u32 = 0;
+        let mut n = 0;
+        for part in s.split(".") {
+            if n == 4 {
+                return invalid();
+            }
+            let b = part.as_bytes();
+            if b.len() == 0 || b.len() > 3 || (b.len() > 1 && b[0] == b'0') {
+                return invalid();
+            }
+            let mut v: u32 = 0;
+            for c in b {
+                if c < b'0' || c > b'9' {
+                    return invalid();
+                }
+                v = v * 10 + (c - b'0') as u32;
+            }
+            if v > 255 {
+                return invalid();
+            }
+            bits = (bits << 8) | v;
+            n += 1;
+        }
+        if n != 4 {
+            return invalid();
+        }
+        return Ok(Ipv4Addr { bits });
+    }
+}
+
+// ===================================================================== IPv6
+
+/// An IPv6 address, such as `::1` or `2001:db8::8a2e:370:7334`.
+#[derive(Eq, Ord, Hash)]
+pub struct Ipv6Addr {
+    /// The 128 bits, the first segment highest.
+    hi: u64,
+    lo: u64,
+}
+
+impl Ipv6Addr {
+    /// The address with these eight 16-bit segments.
+    pub fn new(a: u16, b: u16, c: u16, d: u16, e: u16, f: u16, g: u16, h: u16): Ipv6Addr {
+        let hi = ((a as u64) << 48) | ((b as u64) << 32) | ((c as u64) << 16) | (d as u64);
+        let lo = ((e as u64) << 48) | ((f as u64) << 32) | ((g as u64) << 16) | (h as u64);
+        return Ipv6Addr { hi, lo };
+    }
+
+    /// `::1`.
+    pub fn localhost(): Ipv6Addr {
+        return Ipv6Addr { hi: 0, lo: 1 };
+    }
+
+    /// `::`: any address of this machine, for binding.
+    pub fn unspecified(): Ipv6Addr {
+        return Ipv6Addr { hi: 0, lo: 0 };
+    }
+
+    /// Segment `i` (0 to 7).
+    pub fn segment(self, i: usize): u16 {
+        let word = if i < 4 { self.hi } else { self.lo };
+        return (word >> (((3 - (i % 4)) * 16) as u64)) as u16;
+    }
+
+    pub fn segments(self): [u16; 8] {
+        let mut s: [u16; 8] = [0; 8];
+        for i in 0..8 {
+            s[i] = self.segment(i);
+        }
+        return s;
+    }
+
+    pub fn octets(self): [u8; 16] {
+        let mut o: [u8; 16] = [0; 16];
+        for i in 0..8 {
+            let seg = self.segment(i);
+            o[2 * i] = (seg >> 8) as u8;
+            o[2 * i + 1] = seg as u8;
+        }
+        return o;
+    }
+
+    /// The address with these 16 octets.
+    pub fn from_octets(o: [u8; 16]): Ipv6Addr {
+        let mut hi: u64 = 0;
+        let mut lo: u64 = 0;
+        for i in 0..8 {
+            hi = (hi << 8) | (o[i] as u64);
+            lo = (lo << 8) | (o[i + 8] as u64);
+        }
+        return Ipv6Addr { hi, lo };
+    }
+
+    pub fn is_loopback(self): bool {
+        return self.hi == 0 && self.lo == 1;
+    }
+
+    pub fn is_unspecified(self): bool {
+        return self.hi == 0 && self.lo == 0;
+    }
+
+    /// `ff00::/8`.
+    pub fn is_multicast(self): bool {
+        return (self.hi >> 56) == 255;
+    }
+
+    /// `fe80::/10`.
+    pub fn is_unicast_link_local(self): bool {
+        return (self.hi >> 54) == 1018;
+    }
+
+    /// The IPv4 address in an IPv4-mapped address (`::ffff:a.b.c.d`).
+    pub fn to_ipv4_mapped(self): Option::<Ipv4Addr> {
+        if self.hi == 0 && (self.lo >> 32) == 65535 {
+            return Some(Ipv4Addr { bits: self.lo as u32 });
+        }
+        return None;
+    }
+}
+
+impl Display for Ipv6Addr {
+    /// The RFC 5952 form: lowercase hexadecimal, the longest run of two or
+    /// more zero segments as `::`, and IPv4-mapped addresses as
+    /// `::ffff:1.2.3.4`.
+    fn fmt(&self, out: &mut +String) {
+        if let Some(v4) = self.to_ipv4_mapped() {
+            out.write("::ffff:{v4}");
+            return;
+        }
+        let s = self.segments();
+        // The longest run of zeros (the first, on a tie).
+        let mut best_start: usize = 8;
+        let mut best_len: usize = 0;
+        let mut i: usize = 0;
+        while i < 8 {
+            if s[i] == 0 {
+                let start = i;
+                while i < 8 && s[i] == 0 {
+                    i += 1;
+                }
+                if i - start > best_len {
+                    best_start = start;
+                    best_len = i - start;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if best_len < 2 {
+            best_start = 8;
+        }
+        let mut j: usize = 0;
+        while j < 8 {
+            if j == best_start {
+                out.push_str("::");
+                j += best_len;
+                continue;
+            }
+            if j > 0 && j != best_start + best_len {
+                out.push(':');
+            }
+            core::fmt::write_radix(out, s[j] as u64, 16);
+            j += 1;
+        }
+    }
+}
+
+impl Debug for Ipv6Addr {
+    fn debug(&self, out: &mut +String) {
+        self.fmt(out);
+    }
+}
+
+/// Up to `max` hexadecimal groups separated by `:` from `s` (which may
+/// end in an IPv4 address taking two groups, if `v4_ok`) onto `out`; how
+/// many groups.
+fn hex_groups(s: str, out: [u16; &mut], max: usize, v4_ok: bool): Result::<usize, ParseError> {
+    if s.is_empty() {
+        return Ok(0);
+    }
+    let mut n: usize = 0;
+    let mut parts = s.split(":");
+    let mut rest = s;
+    loop {
+        let part = match parts.next() {
+            Some(p) => p,
+            None => break,
+        };
+        let is_last = rest.len() == part.len();
+        if is_last && v4_ok && part.contains(".") {
+            if n + 2 > max {
+                return invalid();
+            }
+            let v4 = Ipv4Addr::from_str(part)?;
+            out[n] = (v4.bits >> 16) as u16;
+            out[n + 1] = v4.bits as u16;
+            return Ok(n + 2);
+        }
+        if n == max || part.is_empty() || part.len() > 4 {
+            return invalid();
+        }
+        let v = match u16::from_str_radix(part, 16) {
+            Ok(v) => v,
+            Err(_) => return invalid(),
+        };
+        if part.starts_with("+") {
+            return invalid();
+        }
+        out[n] = v;
+        n += 1;
+        if !is_last {
+            rest = rest[part.len() + 1..];
+        }
+    }
+    return Ok(n);
+}
+
+impl FromStr for Ipv6Addr {
+    /// Eight hexadecimal groups separated by `:`, with at most one `::`
+    /// standing for a run of zero groups, and optionally an IPv4 address
+    /// for the last two (`::ffff:1.2.3.4`).
+    fn from_str(s: str): Result::<Ipv6Addr, ParseError> {
+        let mut seg: [u16; 8] = [0; 8];
+        match s.split_once("::") {
+            Some((head, tail)) => {
+                if tail.contains("::") {
+                    return invalid();
+                }
+                let mut front: [u16; 8] = [0; 8];
+                let mut back: [u16; 8] = [0; 8];
+                let nf = hex_groups(head, front[..], 7, false)?;
+                let nb = hex_groups(tail, back[..], 7 - nf, true)?;
+                for i in 0..nf {
+                    seg[i] = front[i];
+                }
+                for i in 0..nb {
+                    seg[8 - nb + i] = back[i];
+                }
+            }
+            None => {
+                let n = hex_groups(s, seg[..], 8, true)?;
+                if n != 8 {
+                    return invalid();
+                }
+            }
+        }
+        return Ok(Ipv6Addr::new(seg[0], seg[1], seg[2], seg[3], seg[4], seg[5], seg[6], seg[7]));
+    }
+}
+
+// ===================================================================== IpAddr
+
+/// An IPv4 or IPv6 address.
+#[derive(Eq, Ord, Hash)]
+pub enum IpAddr {
+    V4(Ipv4Addr),
+    V6(Ipv6Addr),
+}
+
+impl IpAddr {
+    pub fn is_ipv4(self): bool {
+        return match self {
+            IpAddr::V4(_) => true,
+            IpAddr::V6(_) => false,
+        };
+    }
+
+    pub fn is_ipv6(self): bool {
+        return !self.is_ipv4();
+    }
+
+    pub fn is_loopback(self): bool {
+        return match self {
+            IpAddr::V4(a) => a.is_loopback(),
+            IpAddr::V6(a) => a.is_loopback(),
+        };
+    }
+
+    pub fn is_unspecified(self): bool {
+        return match self {
+            IpAddr::V4(a) => a.is_unspecified(),
+            IpAddr::V6(a) => a.is_unspecified(),
+        };
+    }
+
+    pub fn is_multicast(self): bool {
+        return match self {
+            IpAddr::V4(a) => a.is_multicast(),
+            IpAddr::V6(a) => a.is_multicast(),
+        };
+    }
+}
+
+impl Display for IpAddr {
+    fn fmt(&self, out: &mut +String) {
+        match self {
+            IpAddr::V4(a) => a.fmt(out),
+            IpAddr::V6(a) => a.fmt(out),
+        }
+    }
+}
+
+impl Debug for IpAddr {
+    fn debug(&self, out: &mut +String) {
+        self.fmt(out);
+    }
+}
+
+impl FromStr for IpAddr {
+    /// An IPv4 address, else an IPv6 one.
+    fn from_str(s: str): Result::<IpAddr, ParseError> {
+        if let Ok(a) = Ipv4Addr::from_str(s) {
+            return Ok(IpAddr::V4(a));
+        }
+        let a = Ipv6Addr::from_str(s)?;
+        return Ok(IpAddr::V6(a));
+    }
+}
+
+// ===================================================================== SocketAddr
+
+/// An IP address and a port: `127.0.0.1:8080` or `[::1]:8080`. IPv6
+/// addresses may also carry a scope (the interface, `[fe80::1%2]:80`) and
+/// flow information.
+#[derive(Eq, Ord, Hash)]
+pub struct SocketAddr {
+    ip: IpAddr,
+    port: u16,
+    flowinfo: u32,
+    scope_id: u32,
+}
+
+impl SocketAddr {
+    pub fn new(ip: IpAddr, port: u16): SocketAddr {
+        return SocketAddr { ip, port, flowinfo: 0, scope_id: 0 };
+    }
+
+    /// An IPv4 socket address.
+    pub fn v4(ip: Ipv4Addr, port: u16): SocketAddr {
+        return SocketAddr::new(IpAddr::V4(ip), port);
+    }
+
+    /// An IPv6 socket address with a scope (0 for none).
+    pub fn v6(ip: Ipv6Addr, port: u16, scope_id: u32): SocketAddr {
+        return SocketAddr { ip: IpAddr::V6(ip), port, flowinfo: 0, scope_id };
+    }
+
+    pub fn ip(self): IpAddr {
+        return self.ip;
+    }
+
+    pub fn port(self): u16 {
+        return self.port;
+    }
+
+    /// The same address with port `port`.
+    pub fn with_port(self, port: u16): SocketAddr {
+        return SocketAddr { ip: self.ip, port, flowinfo: self.flowinfo, scope_id: self.scope_id };
+    }
+
+    pub fn is_ipv4(self): bool {
+        return self.ip.is_ipv4();
+    }
+
+    pub fn is_ipv6(self): bool {
+        return self.ip.is_ipv6();
+    }
+
+    /// The IPv6 scope (interface index), 0 for none or IPv4.
+    pub fn scope_id(self): u32 {
+        return self.scope_id;
+    }
+
+    fn to_raw(self): sys::RawAddr {
+        let mut r = sys::RawAddr::new();
+        r.port = self.port;
+        match self.ip {
+            IpAddr::V4(a) => {
+                let o = a.octets();
+                for i in 0..4 {
+                    r.ip[i] = o[i];
+                }
+            }
+            IpAddr::V6(a) => {
+                r.v6 = true;
+                let o = a.octets();
+                for i in 0..16 {
+                    r.ip[i] = o[i];
+                }
+                r.flowinfo = self.flowinfo;
+                r.scope_id = self.scope_id;
+            }
+        }
+        return r;
+    }
+
+    fn from_raw(r: sys::RawAddr): SocketAddr {
+        if r.v6 {
+            let mut o: [u8; 16] = [0; 16];
+            for i in 0..16 {
+                o[i] = r.ip[i];
+            }
+            return SocketAddr { ip: IpAddr::V6(Ipv6Addr::from_octets(o)), port: r.port, flowinfo: r.flowinfo, scope_id: r.scope_id };
+        }
+        return SocketAddr::v4(Ipv4Addr::new(r.ip[0], r.ip[1], r.ip[2], r.ip[3]), r.port);
+    }
+}
+
+impl Display for SocketAddr {
+    /// `1.2.3.4:80`, `[::1]:80`, `[fe80::1%2]:80`.
+    fn fmt(&self, out: &mut +String) {
+        match self.ip {
+            IpAddr::V4(a) => out.write("{a}:{self.port}"),
+            IpAddr::V6(a) => {
+                if self.scope_id != 0 {
+                    out.write("[{a}%{self.scope_id}]:{self.port}");
+                } else {
+                    out.write("[{a}]:{self.port}");
+                }
+            }
+        }
+    }
+}
+
+impl Debug for SocketAddr {
+    fn debug(&self, out: &mut +String) {
+        self.fmt(out);
+    }
+}
+
+impl FromStr for SocketAddr {
+    /// `1.2.3.4:80`, or `[v6]:80` with an optional `%scope` (a number).
+    fn from_str(s: str): Result::<SocketAddr, ParseError> {
+        if s.starts_with("[") {
+            let (inside, port) = match s[1..].split_once("]:") {
+                Some(p) => p,
+                None => return invalid(),
+            };
+            let (ip, scope) = match inside.split_once("%") {
+                Some((ip, scope)) => {
+                    let id = match u32::from_str(scope) {
+                        Ok(id) => id,
+                        Err(_) => return invalid(),
+                    };
+                    (ip, id)
+                }
+                None => (inside, 0u32),
+            };
+            let a = Ipv6Addr::from_str(ip)?;
+            let p = parse_port(port)?;
+            return Ok(SocketAddr::v6(a, p, scope));
+        }
+        let (ip, port) = match s.rsplit_once(":") {
+            Some(p) => p,
+            None => return invalid(),
+        };
+        let a = Ipv4Addr::from_str(ip)?;
+        let p = parse_port(port)?;
+        return Ok(SocketAddr::v4(a, p));
+    }
+}
+
+fn parse_port(s: str): Result::<u16, ParseError> {
+    if s.starts_with("+") {
+        return invalid();
+    }
+    return match u16::from_str(s) {
+        Ok(p) => Ok(p),
+        Err(_) => invalid(),
+    };
+}
+
+// ===================================================================== lookup
+
+fn lookup_error(): Error {
+    return unsafe { Error::with_static(ErrorKind::Other, "failed to look up address information") };
+}
+
+fn bad_address(): Error {
+    return unsafe { Error::with_static(ErrorKind::InvalidInput, "invalid socket address (expected host:port)") };
+}
+
+/// The addresses of `host`: a name looked up in DNS (and the hosts file),
+/// or an address written out (`127.0.0.1`, `::1`).
+pub fn lookup_host(host: str): Result::<[IpAddr; -..+], Error> {
+    let mut out: [IpAddr; -..+] = [];
+    if let Ok(a) = IpAddr::from_str(host) {
+        out.push(a);
+        return Ok(out);
+    }
+    if host.is_empty() || host.contains("\0") {
+        return Err(Error::new(ErrorKind::InvalidInput));
+    }
+    let mut raw: [sys::RawAddr; ..+] = [];
+    if sys::lookup(host, &mut raw) != 0 {
+        return Err(lookup_error());
+    }
+    for r in raw {
+        out.push(SocketAddr::from_raw(r).ip);
+    }
+    return Ok(out);
+}
+
+/// The socket addresses `addr` stands for: `host:port` (with a name to
+/// look up, `localhost:8080`) or an address (`[::1]:80`).
+pub fn resolve(addr: str): Result::<[SocketAddr; -..+], Error> {
+    let mut out: [SocketAddr; -..+] = [];
+    if let Ok(a) = SocketAddr::from_str(addr) {
+        out.push(a);
+        return Ok(out);
+    }
+    let (host, port_text) = match addr.rsplit_once(":") {
+        Some(p) => p,
+        None => return Err(bad_address()),
+    };
+    let port = match parse_port(port_text) {
+        Ok(p) => p,
+        Err(_) => return Err(bad_address()),
+    };
+    // `[name]:port` is allowed too.
+    let name = if host.starts_with("[") && host.ends_with("]") { host[1..host.len() - 1] } else { host };
+    for ip in lookup_host(name)? {
+        out.push(SocketAddr::new(ip, port));
+    }
+    return Ok(out);
+}
+
+/// Try `f` on each address `addr` stands for; the first success, or the
+/// last error.
+fn each_addr::<T, F: FnMut(SocketAddr): Result::<T, Error>>(addr: str, mut f: F): Result::<T, Error> {
+    let addrs = resolve(addr)?;
+    let mut last = unsafe { Error::with_static(ErrorKind::InvalidInput, "could not resolve to any addresses") };
+    for a in addrs {
+        match f(a) {
+            Ok(v) => return Ok(v),
+            Err(e) => last = e,
+        }
+    }
+    return Err(last);
+}
+
+// ===================================================================== sockets
+
+/// A socket of the kind for `a`, closed when it is freed.
+fn new_socket(a: SocketAddr, stream: bool): Result::<rt::OwnedHandle, Error> {
+    let s = sys::socket(a.is_ipv6(), stream);
+    if s < 0 {
+        return Err(net_error());
+    }
+    return Ok(rt::OwnedHandle::new(s, rt::HANDLE_SOCKET));
+}
+
+fn net_error(): Error {
+    return Error::from_os(sys::net_error());
+}
+
+fn check(ok: bool): Result::<(), Error> {
+    if !ok {
+        return Err(net_error());
+    }
+    return Ok(());
+}
+
+fn socket_name(h: i64, peer: bool): Result::<SocketAddr, Error> {
+    let mut r = sys::RawAddr::new();
+    check(sys::sock_name(h, peer, &mut r))?;
+    return Ok(SocketAddr::from_raw(r));
+}
+
+/// A timeout as milliseconds for `sys` (0: none). A zero duration is an
+/// error, as it would mean no timeout.
+fn timeout_ms(t: Option::<Duration>): Result::<u64, Error> {
+    return match t {
+        None => Ok(0),
+        Some(d) => {
+            if d.is_zero() {
+                return Err(unsafe { Error::with_static(ErrorKind::InvalidInput, "cannot set a zero timeout") });
+            }
+            // Round up, so that a short timeout is not none.
+            let ms = d.as_millis();
+            Ok(if d.subsec_nanos() % 1000000 != 0 { ms + 1 } else { ms })
+        }
+    };
+}
+
+fn get_timeout(h: i64, write: bool): Result::<Option::<Duration>, Error> {
+    let ms = sys::sock_timeout(h, write);
+    if ms < 0 {
+        return Err(net_error());
+    }
+    if ms == 0 {
+        return Ok(None);
+    }
+    return Ok(Some(Duration::from_millis(ms as u64)));
+}
+
+fn get_flag(h: i64, flag: i32): Result::<bool, Error> {
+    let v = sys::sock_flag(h, flag);
+    if v < 0 {
+        return Err(net_error());
+    }
+    return Ok(v == 1);
+}
+
+fn recv(h: i64, buf: [u8; &mut], peek: bool): Result::<usize, Error> {
+    let n = sys::sock_recv(h, buf, peek);
+    if n < 0 {
+        return Err(net_error());
+    }
+    return Ok(n as usize);
+}
+
+fn send(h: i64, bytes: [u8; &]): Result::<usize, Error> {
+    let n = sys::sock_send(h, bytes);
+    if n < 0 {
+        return Err(net_error());
+    }
+    return Ok(n as usize);
+}
+
+/// Which directions `TcpStream::shutdown` closes.
+pub enum Shutdown {
+    /// No more reading (later reads see the end).
+    Read,
+    /// No more writing (the peer's reads see the end).
+    Write,
+    Both,
+}
+
+// ===================================================================== TCP
+
+/// A TCP server socket, listening for connections.
+/// `let l = TcpListener::bind("127.0.0.1:8080")?; let (s, peer) = l.accept()?;`
+pub struct TcpListener {
+    h: rt::OwnedHandle,
+}
+
+impl TcpListener {
+    /// Listen on `addr` (`host:port`; port 0 picks a free one, see
+    /// `local_addr`), trying each address it resolves to.
+    pub fn bind(addr: str): Result::<TcpListener, Error> {
+        return each_addr(addr, |a| TcpListener::bind_addr(a));
+    }
+
+    /// Listen on the socket address `a`.
+    pub fn bind_addr(a: SocketAddr): Result::<TcpListener, Error> {
+        let h = new_socket(a, true)?;
+        // On Unix, allow binding while old connections linger in
+        // TIME_WAIT (on Windows the option means something else).
+        if !WINDOWS {
+            sys::sock_set_flag(h.raw(), sys::FLAG_REUSEADDR, true);
+        }
+        check(sys::sock_bind(h.raw(), a.to_raw()))?;
+        check(sys::sock_listen(h.raw(), 128))?;
+        return Ok(TcpListener { h });
+    }
+
+    /// Wait for a connection: the stream, and the peer's address.
+    pub fn accept(&self): Result::<(TcpStream, SocketAddr), Error> {
+        let mut peer = sys::RawAddr::new();
+        let s = sys::sock_accept(self.h.raw(), &mut peer);
+        if s < 0 {
+            return Err(net_error());
+        }
+        let stream = TcpStream { h: rt::OwnedHandle::new(s, rt::HANDLE_SOCKET) };
+        return Ok((stream, SocketAddr::from_raw(peer)));
+    }
+
+    /// The address it listens on.
+    pub fn local_addr(&self): Result::<SocketAddr, Error> {
+        return socket_name(self.h.raw(), false);
+    }
+
+    /// In non-blocking mode, `accept` fails with `WouldBlock` instead of
+    /// waiting when no connection is pending.
+    pub fn set_nonblocking(&self, on: bool): Result::<(), Error> {
+        return check(sys::sock_set_nonblocking(self.h.raw(), on));
+    }
+
+    /// Close the socket now, reporting failure.
+    pub fn close(self): Result::<(), Error> {
+        return check(self.h.close());
+    }
+
+    /// The operating system's socket, still owned by this listener.
+    pub fn raw_handle(&self): i64 {
+        return self.h.raw();
+    }
+}
+
+#[cfg(windows)]
+const WINDOWS: bool = true;
+#[cfg(not(windows))]
+const WINDOWS: bool = false;
+
+/// A TCP connection. Reads and writes go straight to the socket (wrap it
+/// in a `BufReader` or `BufWriter` for many small ones).
+pub struct TcpStream {
+    h: rt::OwnedHandle,
+}
+
+impl TcpStream {
+    /// Connect to `addr` (`host:port`), trying each address it resolves
+    /// to.
+    pub fn connect(addr: str): Result::<TcpStream, Error> {
+        return each_addr(addr, |a| TcpStream::connect_addr(a));
+    }
+
+    /// Connect to the socket address `a`.
+    pub fn connect_addr(a: SocketAddr): Result::<TcpStream, Error> {
+        let h = new_socket(a, true)?;
+        check(sys::sock_connect(h.raw(), a.to_raw()))?;
+        return Ok(TcpStream { h });
+    }
+
+    /// Connect to `a`, giving up with `TimedOut` after `timeout`.
+    pub fn connect_timeout(a: SocketAddr, timeout: Duration): Result::<TcpStream, Error> {
+        let ms = timeout_ms(Some(timeout))?;
+        let h = new_socket(a, true)?;
+        check(sys::sock_set_nonblocking(h.raw(), true))?;
+        if !sys::sock_connect(h.raw(), a.to_raw()) {
+            let e = net_error();
+            // In progress: EINPROGRESS on Unix (Linux 115, macOS 36),
+            // WSAEWOULDBLOCK on Windows.
+            let code = e.os_code();
+            if code != 115 && code != 36 && code != 10035 {
+                return Err(e);
+            }
+            let wait: i32 = if ms > 2147483647 { 2147483647 } else { ms as i32 };
+            let r = sys::sock_poll(h.raw(), true, wait);
+            if r < 0 {
+                return Err(net_error());
+            }
+            if r == 0 {
+                return Err(Error::new(ErrorKind::TimedOut));
+            }
+            let pending = sys::sock_error(h.raw());
+            if pending < 0 {
+                return Err(net_error());
+            }
+            if pending != 0 {
+                return Err(Error::from_os(pending));
+            }
+        }
+        check(sys::sock_set_nonblocking(h.raw(), false))?;
+        return Ok(TcpStream { h });
+    }
+
+    /// The address of the other end.
+    pub fn peer_addr(&self): Result::<SocketAddr, Error> {
+        return socket_name(self.h.raw(), true);
+    }
+
+    /// The address of this end.
+    pub fn local_addr(&self): Result::<SocketAddr, Error> {
+        return socket_name(self.h.raw(), false);
+    }
+
+    /// Close reading, writing or both (the socket stays open until it is
+    /// freed).
+    pub fn shutdown(&self, how: Shutdown): Result::<(), Error> {
+        let n = match how {
+            Shutdown::Read => 0,
+            Shutdown::Write => 1,
+            Shutdown::Both => 2,
+        };
+        return check(sys::sock_shutdown(self.h.raw(), n));
+    }
+
+    /// Send small writes at once rather than gathering them (turning off
+    /// Nagle's algorithm).
+    pub fn set_nodelay(&self, on: bool): Result::<(), Error> {
+        return check(sys::sock_set_flag(self.h.raw(), sys::FLAG_NODELAY, on));
+    }
+
+    pub fn nodelay(&self): Result::<bool, Error> {
+        return get_flag(self.h.raw(), sys::FLAG_NODELAY);
+    }
+
+    /// Make reads that wait longer than `t` fail (`TimedOut` on Windows,
+    /// `WouldBlock` on Unix); `None` waits forever.
+    pub fn set_read_timeout(&self, t: Option::<Duration>): Result::<(), Error> {
+        let ms = timeout_ms(t)?;
+        return check(sys::sock_set_timeout(self.h.raw(), false, ms));
+    }
+
+    /// Make writes that wait longer than `t` fail; `None` waits forever.
+    pub fn set_write_timeout(&self, t: Option::<Duration>): Result::<(), Error> {
+        let ms = timeout_ms(t)?;
+        return check(sys::sock_set_timeout(self.h.raw(), true, ms));
+    }
+
+    pub fn read_timeout(&self): Result::<Option::<Duration>, Error> {
+        return get_timeout(self.h.raw(), false);
+    }
+
+    pub fn write_timeout(&self): Result::<Option::<Duration>, Error> {
+        return get_timeout(self.h.raw(), true);
+    }
+
+    /// In non-blocking mode, reads and writes that would wait fail with
+    /// `WouldBlock` instead.
+    pub fn set_nonblocking(&self, on: bool): Result::<(), Error> {
+        return check(sys::sock_set_nonblocking(self.h.raw(), on));
+    }
+
+    /// Read without taking the bytes: the next read sees them again.
+    pub fn peek(&self, buf: [u8; &mut]): Result::<usize, Error> {
+        return recv(self.h.raw(), buf, true);
+    }
+
+    /// Close the connection now, reporting failure.
+    pub fn close(self): Result::<(), Error> {
+        return check(self.h.close());
+    }
+
+    /// The operating system's socket, still owned by this stream.
+    pub fn raw_handle(&self): i64 {
+        return self.h.raw();
+    }
+}
+
+impl Read for TcpStream {
+    /// Bytes from the peer: 0 once it has shut down its writing.
+    fn read(&mut self, buf: [u8; &mut]): Result::<usize, Error> {
+        return recv(self.h.raw(), buf, false);
+    }
+}
+
+impl Write for TcpStream {
+    fn write(&mut self, bytes: [u8; &]): Result::<usize, Error> {
+        return send(self.h.raw(), bytes);
+    }
+
+    /// Nothing to do: the stream buffers nothing.
+    fn flush(&mut self): Result::<(), Error> {
+        return Ok(());
+    }
+
+    fn os_target(&self): (usize, i64) {
+        return (rt::FLUSH_SOCKET, self.h.raw());
+    }
+}
+
+// ===================================================================== UDP
+
+/// A UDP socket: datagrams to and from any address, or, once
+/// `connect`ed, one peer.
+pub struct UdpSocket {
+    h: rt::OwnedHandle,
+}
+
+impl UdpSocket {
+    /// A socket bound to `addr` (`host:port`; port 0 picks a free one).
+    pub fn bind(addr: str): Result::<UdpSocket, Error> {
+        return each_addr(addr, |a| UdpSocket::bind_addr(a));
+    }
+
+    pub fn bind_addr(a: SocketAddr): Result::<UdpSocket, Error> {
+        let h = new_socket(a, false)?;
+        check(sys::sock_bind(h.raw(), a.to_raw()))?;
+        return Ok(UdpSocket { h });
+    }
+
+    /// Send `bytes` as one datagram to `to`: how many were sent.
+    pub fn send_to(&self, bytes: [u8; &], to: SocketAddr): Result::<usize, Error> {
+        let n = sys::sock_send_to(self.h.raw(), bytes, to.to_raw());
+        if n < 0 {
+            return Err(net_error());
+        }
+        return Ok(n as usize);
+    }
+
+    /// Receive one datagram into `buf` (the rest of a longer one is lost):
+    /// its length and sender.
+    pub fn recv_from(&self, buf: [u8; &mut]): Result::<(usize, SocketAddr), Error> {
+        return recv_from(self.h.raw(), buf, false);
+    }
+
+    /// As `recv_from`, but the datagram stays queued.
+    pub fn peek_from(&self, buf: [u8; &mut]): Result::<(usize, SocketAddr), Error> {
+        return recv_from(self.h.raw(), buf, true);
+    }
+
+    /// Send to and receive from only `addr` (`host:port`).
+    pub fn connect(&self, addr: str): Result::<(), Error> {
+        let h = self.h.raw();
+        return each_addr(addr, |a| check(sys::sock_connect(h, a.to_raw())));
+    }
+
+    /// Send `bytes` to the connected peer.
+    pub fn send(&self, bytes: [u8; &]): Result::<usize, Error> {
+        return send(self.h.raw(), bytes);
+    }
+
+    /// Receive a datagram from the connected peer.
+    pub fn recv(&self, buf: [u8; &mut]): Result::<usize, Error> {
+        return recv(self.h.raw(), buf, false);
+    }
+
+    pub fn local_addr(&self): Result::<SocketAddr, Error> {
+        return socket_name(self.h.raw(), false);
+    }
+
+    /// The connected peer's address.
+    pub fn peer_addr(&self): Result::<SocketAddr, Error> {
+        return socket_name(self.h.raw(), true);
+    }
+
+    /// Allow sending to broadcast addresses.
+    pub fn set_broadcast(&self, on: bool): Result::<(), Error> {
+        return check(sys::sock_set_flag(self.h.raw(), sys::FLAG_BROADCAST, on));
+    }
+
+    pub fn broadcast(&self): Result::<bool, Error> {
+        return get_flag(self.h.raw(), sys::FLAG_BROADCAST);
+    }
+
+    pub fn set_read_timeout(&self, t: Option::<Duration>): Result::<(), Error> {
+        let ms = timeout_ms(t)?;
+        return check(sys::sock_set_timeout(self.h.raw(), false, ms));
+    }
+
+    pub fn set_write_timeout(&self, t: Option::<Duration>): Result::<(), Error> {
+        let ms = timeout_ms(t)?;
+        return check(sys::sock_set_timeout(self.h.raw(), true, ms));
+    }
+
+    pub fn read_timeout(&self): Result::<Option::<Duration>, Error> {
+        return get_timeout(self.h.raw(), false);
+    }
+
+    pub fn set_nonblocking(&self, on: bool): Result::<(), Error> {
+        return check(sys::sock_set_nonblocking(self.h.raw(), on));
+    }
+
+    /// Close the socket now, reporting failure.
+    pub fn close(self): Result::<(), Error> {
+        return check(self.h.close());
+    }
+
+    /// The operating system's socket, still owned by this socket.
+    pub fn raw_handle(&self): i64 {
+        return self.h.raw();
+    }
+}
+
+fn recv_from(h: i64, buf: [u8; &mut], peek: bool): Result::<(usize, SocketAddr), Error> {
+    let mut from = sys::RawAddr::new();
+    let n = sys::sock_recv_from(h, buf, peek, &mut from);
+    if n < 0 {
+        return Err(net_error());
+    }
+    return Ok((n as usize, SocketAddr::from_raw(from)));
+}
