@@ -1,0 +1,27 @@
+// error: borrow::outlives_root
+// An iterator that owns its text: what `next` returns may point into it,
+// so it cannot outlive the temporary iterator.
+struct Lines {
+    text: String,
+    done: bool,
+}
+
+impl Iterator for Lines {
+    type Item = str;
+    fn next(&mut self): Option::<str> {
+        if self.done {
+            return None;
+        }
+        self.done = true;
+        return Some(self.text.as_str());
+    }
+}
+
+fn lines(s: str): Lines {
+    return Lines { text: String::from(s), done: false };
+}
+
+fn main() {
+    let first = lines("a").next();
+    println("{first:?}");
+}

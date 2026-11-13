@@ -1,0 +1,42 @@
+// error: borrow::shrink_while_borrowed
+// What `next` returns points into the iterator, and through it into the
+// container it views (`iter` borrows `self`): shrinking the container
+// ends it, even when the iterator was a temporary.
+struct Names {
+    items: [str; -..+],
+}
+
+struct NamesIter {
+    items: [str; &],
+    i: usize,
+}
+
+impl Iterator for NamesIter {
+    type Item = str;
+    fn next(&mut self): Option::<str> {
+        if self.i >= self.items.len() {
+            return None;
+        }
+        self.i += 1;
+        return Some(self.items[self.i - 1]);
+    }
+}
+
+impl Names {
+    fn drop_last(&mut self) {
+        self.items.pop();
+    }
+
+    fn iter(&self): impl Iterator::<Item = str> {
+        return NamesIter { items: self.items[..], i: 0 };
+    }
+}
+
+fn main() {
+    let mut n = Names { items: ["a", "b"] };
+    let Some(g) = n.iter().next() else {
+        return;
+    };
+    n.drop_last();
+    println("{g}");
+}

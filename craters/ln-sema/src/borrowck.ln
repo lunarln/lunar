@@ -970,8 +970,11 @@ impl Cx {
                 r = self.value_roots(p, inner);
                 // Slicing a temporary view (`s.as_bytes()[0..2]`) points
                 // wherever that view points; only a temporary owner or
-                // fixed array holds the data itself.
-                if !self.is_view_container(p, pe.ty) {
+                // fixed array holds the data itself. A temporary without
+                // storage of its own (an iterator holding only views, as
+                // in `s.split(" ").next()`) can only be pointed through,
+                // like such a local.
+                if !self.is_view_container(p, pe.ty) && self.has_storage(p, pe.ty, 0) {
                     roots_insert(&mut r, Root::Temp);
                 }
             }
@@ -1160,12 +1163,22 @@ impl Cx {
         let mut r: Roots = [];
         match self.place_root(p, place) {
             Some(Root::Local(l)) => return self.local_roots(l),
-            Some(Root::Temp) => match p.thir.expr(place).kind {
-                ExprKind::Temp(inner) => return self.value_roots(p, inner),
-                _ => {
-                    r.push(Root::Temp);
+            Some(Root::Temp) => {
+                // A value stored in a temporary, or in a field or item of
+                // one (`make().text`, `c.pair().0`), points wherever the
+                // temporary's views point: it is a copy, not a view into
+                // the temporary.
+                let mut x = place;
+                loop {
+                    match p.thir.expr(x).kind {
+                        ExprKind::Temp(inner) => return self.value_roots(p, inner),
+                        ExprKind::Field { base, .. } => x = base,
+                        ExprKind::Index { base, .. } => x = base,
+                        _ => break,
+                    }
                 }
-            },
+                r.push(Root::Temp);
+            }
             _ => {}
         }
         return r;

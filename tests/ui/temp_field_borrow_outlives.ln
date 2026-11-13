@@ -1,0 +1,15 @@
+// error: borrow::outlives_root
+// A view of an owner inside a temporary points into the temporary (a view
+// stored in one does not: it is copied out).
+struct Named {
+    name: String,
+}
+
+fn named(): Named {
+    return Named { name: String::from("n") };
+}
+
+fn main() {
+    let n = named().name.as_str();
+    println("{n}");
+}
