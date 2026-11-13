@@ -83,3 +83,28 @@ is comparing integers) and a source span (for diagnostics):
   `remove`, `len`, iteration, and `update(k, |v| ...)` for changing a
   value in place. One-element views (`get_mut`) and `m[k]` place sugar
   were considered and rejected.
+
+(Keys and values have since been relaxed to Light, like array items, so
+`str` keys work, borrowing what they point into.)
+
+## More collections (2026-11-12)
+
+`HashSet`, `SortedMap`, `Deque` and `BinaryHeap` follow the same rules
+and API, each one array (or one `HashMap`):
+
+* `HashSet::<T>` is a `HashMap::<T, ()>`.
+* `SortedMap::<K, V>` is a sorted array of entries, not a B-tree. A
+  B-tree's nodes would be arena items holding fixed arrays of keys, with
+  placeholder items in the empty places; a sorted array is one data
+  stack, searches in O(log n), iterates in order with no pointer chasing,
+  and costs O(n) moves per insert, which suits maps read more than
+  written or built in order. A B-tree in an arena can come later behind
+  the same API.
+* `Deque::<T>` is a ring buffer. Items cannot be made from nothing, so the
+  ring has no uninitialized room: when it grows, the spare places are
+  filled with copies of the item being pushed (Light, so the copies need
+  no freeing).
+* `BinaryHeap::<T: Ord>` is a max-heap in an array; `cmp::Reverse` makes
+  it a min-heap. A comparator closure would need the heap to own a
+  closure type parameter; `Reverse` or a wrapper with its own `Ord` covers
+  it without one.
