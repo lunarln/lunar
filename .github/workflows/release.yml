@@ -1,0 +1,220 @@
+name: Release
+
+# Pushing a tag `vX.Y.Z` (the version in craters/lunar/lunar.toml) builds
+# the compiler on every platform, checks that it reproduces itself,
+# packages it with its standard library and LLVM, tries the packages out on
+# clean machines and publishes them as a GitHub release.
+#
+# Run by hand (workflow_dispatch) on a branch, or on a pull request that
+# changes how releases are made, it does all of that but publishing: the
+# archives are uploaded as workflow artifacts.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/actions/**
+      - tools/**
+      - install.sh
+      - install.ps1
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/llvm
+
+      - name: Install patchelf
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y -q patchelf
+
+      # Stage 0: the released compiler named in craters/stage0.txt or, while
+      # the repository still has it, the Rust compiler in crates/ (which
+      # builds the first release).
+      - name: Stage 0 from the Rust compiler
+        if: hashFiles('Cargo.toml') != ''
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get install -y -q libpolly-20-dev zlib1g-dev libzstd-dev
+          fi
+          rustup toolchain install stable --profile minimal
+          cargo +stable build --release -p ln-driver
+          echo "STAGE0=$PWD/target/release/lunar" >> "$GITHUB_ENV"
+
+      - name: Stage 0 from a release
+        if: hashFiles('Cargo.toml') == ''
+        uses: ./.github/actions/stage0
+
+      - name: Bootstrap (stage 2 == stage 3)
+        run: tools/bootstrap.sh "$STAGE0" target/bootstrap
+
+      - name: Check the version
+        run: |
+          version=$(target/bootstrap/stage2/lunar --version | awk '{print $2}')
+          echo "lunar --version: $version"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::the tag $GITHUB_REF_NAME does not match the version in craters/lunar/lunar.toml ($version)"
+            exit 1
+          fi
+
+      - name: Package
+        run: tools/package.sh target/bootstrap/stage2/lunar ${{ matrix.target }} target/dist
+
+      # Kept for a week: the packages of a run by hand are not published.
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lunar-${{ matrix.target }}
+          path: target/dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # The packages on machines without LLVM or a Lunar toolchain: unpacked
+  # anywhere, `lunar` must start, find its standard library and build
+  # programs with the system's linker.
+  verify:
+    name: verify ${{ matrix.target }} on ${{ matrix.os }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: examples
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: lunar-${{ matrix.target }}
+          path: dist
+
+      # On Windows, programs are linked by MSVC's link.exe from a developer
+      # environment; the preinstalled LLVM leaves PATH so that only the
+      # LLVM-C.dll in the package can be loaded.
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+
+      - name: Unpack and try out
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          cd dist
+          if [ "$RUNNER_OS" = macOS ]; then
+            shasum -a 256 -c ./*.tar.gz.sha256
+          else
+            sha256sum -c ./*.tar.gz.sha256
+          fi
+          tar -xzf ./*.tar.gz
+          lunar=$(echo "$PWD"/lunar-*-${{ matrix.target }}/bin/lunar)
+          "$lunar" --version
+          cd "$RUNNER_TEMP"
+          "$lunar" run "$GITHUB_WORKSPACE/examples/hello.ln"
+          "$lunar" run "$GITHUB_WORKSPACE/examples/tour.ln" > tour.out
+          diff tour.out "$GITHUB_WORKSPACE/examples/tour.out"
+          "$lunar" new hello
+          cd hello
+          "$lunar" run
+          "$lunar" test
+
+      - name: Unpack and try out (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'llvm' }) -join ';'
+          if (Get-Command clang -ErrorAction SilentlyContinue) { throw "clang is still on PATH" }
+          Set-Location dist
+          $zip = Get-Item *.zip
+          $want = (Get-Content "$($zip.Name).sha256").Split(' ')[0]
+          $got = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($want -ne $got) { throw "checksum mismatch: $got, expected $want" }
+          Expand-Archive $zip -DestinationPath .
+          $lunar = (Get-Item "lunar-*-${{ matrix.target }}\bin\lunar.exe").FullName
+          & $lunar --version
+          Set-Location $env:RUNNER_TEMP
+          & $lunar run "$env:GITHUB_WORKSPACE\examples\hello.ln"
+          & $lunar run "$env:GITHUB_WORKSPACE\examples\tour.ln" > tour.out
+          if (Compare-Object (Get-Content tour.out) (Get-Content "$env:GITHUB_WORKSPACE\examples\tour.out")) { throw "tour.ln printed something else" }
+          & $lunar new hello
+          Set-Location hello
+          & $lunar run
+          & $lunar test
+
+  publish:
+    name: publish
+    needs: [build, verify]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: lunar-*
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Install on Linux or macOS:
+
+              curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/install.sh | sh
+
+          Install on Windows (PowerShell):
+
+              irm https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/install.ps1 | iex
+
+          Or download the archive for your platform, check it against its \`.sha256\`
+          and unpack it anywhere; \`bin/lunar\` finds its standard library and LLVM
+          next to itself. Building programs needs a linker: a C toolchain (\`cc\`)
+          on Linux and macOS, LLVM \`clang\` or the MSVC build tools on Windows.
+          EOF
+          gh release create "${{ github.ref_name }}" dist/* \
+            --title "Lunar ${{ github.ref_name }}" \
+            --notes-file notes.md \
+            --generate-notes \
+            --verify-tag
