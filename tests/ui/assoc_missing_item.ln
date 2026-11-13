@@ -1,0 +1,21 @@
+// error: trait::missing_item
+// once: trait::missing_item
+// An impl must give every associated type and constant the trait declares
+// without a default: here the constant `SIZE` (`NAME` has a default).
+trait Source {
+    type Item;
+    const SIZE: usize;
+    const NAME: str = "source";
+    fn get(&mut self): Option::<Self::Item>;
+}
+
+struct Empty;
+
+impl Source for Empty {
+    type Item = u8;
+    fn get(&mut self): Option::<u8> {
+        return None;
+    }
+}
+
+fn main() {}

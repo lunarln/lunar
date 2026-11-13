@@ -1,0 +1,11 @@
+// error: type::assoc_mismatch
+// The function promises an iterator of `u8`, but returns one of `char`s.
+fn letters(s: str): impl Iterator::<Item = u8> {
+    return s.chars();
+}
+
+fn main() {
+    for b in letters("ab") {
+        println("{b}");
+    }
+}

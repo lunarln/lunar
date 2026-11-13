@@ -1,0 +1,11 @@
+// error: type::bad_dyn
+// A `dyn Iterator` must say what its items are: `dyn Iterator::<Item = u8>`.
+fn drain(it: dyn mut Iterator): usize {
+    let mut n: usize = 0;
+    while let Some(_) = it.next() {
+        n += 1;
+    }
+    return n;
+}
+
+fn main() {}

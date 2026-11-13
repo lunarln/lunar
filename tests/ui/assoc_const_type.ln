@@ -1,0 +1,13 @@
+// error: trait::signature
+// An impl's constant has the type the trait declares.
+trait Shape {
+    const SIDES: u32;
+}
+
+struct Square;
+
+impl Shape for Square {
+    const SIDES: u8 = 4;
+}
+
+fn main() {}

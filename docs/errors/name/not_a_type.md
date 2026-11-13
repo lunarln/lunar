@@ -6,10 +6,10 @@ is expected. This is reported for:
 * a module or trait used as a type, as in `fn f(s: Shape)` where `Shape` is
   a trait. Lunar has no trait objects; take a generic parameter bounded by
   the trait instead;
-* a path into a type used as a type, such as `Point::Item`, `T::Item` on a
-  generic parameter or `Self::Item` (associated types are not supported;
-  make the type a generic parameter of the trait instead, as
-  `Iterator::<T>` does);
+* an associated type of a type that is not a generic parameter or `Self`,
+  such as `Point::Item`: which trait's `Item` is meant depends on the trait,
+  so write `<Point as Trait>::Item` (for a generic parameter, `T::Item` is
+  found through its bounds; see `name::no_assoc`);
 * a path through something that is not a type, trait or module, such as
   `std::io::println::Item`;
 * a struct literal or struct pattern whose path does not name a struct or an

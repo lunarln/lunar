@@ -2,7 +2,7 @@
 // case mapping, and editing a `String` in place.
 
 /// The pieces an iterator of views gives, joined with `|`.
-fn joined::<I: Iterator::<str>>(it: I): String {
+fn joined::<I: Iterator::<Item = str>>(it: I): String {
     let mut out = String::new();
     let mut first = true;
     for piece in it {

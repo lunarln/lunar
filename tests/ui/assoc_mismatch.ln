@@ -1,0 +1,14 @@
+// error: type::assoc_mismatch
+// The bound requires an iterator of `u64`; `chars()` gives `char`s.
+fn total::<I: Iterator::<Item = u64>>(it: I): u64 {
+    let mut t: u64 = 0;
+    for x in it {
+        t += x;
+    }
+    return t;
+}
+
+fn main() {
+    let n = total("abc".chars());
+    println("{n}");
+}

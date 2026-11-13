@@ -331,8 +331,28 @@ fn types() {
         "fn g(x: &mut +String, y: [str; ..+]) {}\n",
     );
     check(
-        "fn d(a:dyn  Show,b:dyn mut  io::Write+Send,c:[dyn Iterator::<u8>+Send+Sync;&]):dyn Show from a{a as dyn  Show}",
-        "fn d(\n    a: dyn Show,\n    b: dyn mut io::Write + Send,\n    c: [dyn Iterator::<u8> + Send + Sync; &],\n): dyn Show from a {\n    a as dyn Show\n}\n",
+        "fn d(a:dyn  Show,b:dyn mut  io::Write+Send,c:[dyn Iterator::<Item=u8>+Send+Sync;&]):dyn Show from a{a as dyn  Show}",
+        "fn d(\n    a: dyn Show,\n    b: dyn mut io::Write + Send,\n    c: [dyn Iterator::<Item = u8> + Send + Sync; &],\n): dyn Show from a {\n    a as dyn Show\n}\n",
+    );
+}
+
+#[test]
+fn associated_items() {
+    check(
+        "trait Source{type Item:Light+Debug;type Raw;const N:usize;const NAME:str=\"s\";fn get(&mut self):Option::<Self::Item>;}",
+        "trait Source {\n    type Item: Light + Debug;\n    type Raw;\n    const N: usize;\n    const NAME: str = \"s\";\n    fn get(&mut self): Option::<Self::Item>;\n}\n",
+    );
+    check(
+        "impl Source for Bytes{type Item=u8;type Raw=[u8;&];const N:usize=4;}",
+        "impl Source for Bytes {\n    type Item = u8;\n    type Raw = [u8; &];\n    const N: usize = 4;\n}\n",
+    );
+    check(
+        "fn f::<I:Iterator::<Item=u64>,T:Tr::<A,Out=B>>(i:I):<T as Tr::<A>>::Out{<T as Tr::<A>>::N}",
+        "fn f::<I: Iterator::<Item = u64>, T: Tr::<A, Out = B>>(i: I): <T as Tr::<A>>::Out {\n    <T as Tr::<A>>::N\n}\n",
+    );
+    check(
+        "fn g():impl Iterator::<Item=str>{let x=<u8 as Default>::default();T::Item::new()}",
+        "fn g(): impl Iterator::<Item = str> {\n    let x = <u8 as Default>::default();\n    T::Item::new()\n}\n",
     );
 }
 

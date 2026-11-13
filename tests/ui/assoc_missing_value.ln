@@ -1,0 +1,15 @@
+// error: syntax::missing_value
+// Only a trait may declare a constant (or type) without a value.
+trait Shape {
+    const SIDES: u32;
+}
+
+struct Square;
+
+impl Shape for Square {
+    const SIDES: u32;
+}
+
+const LIMIT: usize;
+
+fn main() {}

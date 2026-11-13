@@ -31,7 +31,9 @@ struct Countdown {
     n: u32,
 }
 
-impl Iterator::<u32> for Countdown {
+impl Iterator for Countdown {
+    type Item = u32;
+
     fn next(&mut self): Option::<u32> {
         if self.n == 0 {
             return None;

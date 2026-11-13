@@ -799,7 +799,13 @@ impl Sema {
         if !unknown {
             // A closure's signature is still being inferred: select the
             // impl here, with the variables.
-            if !self.p.types.has_infer(s) && !has_closure(&self.p.types, s) {
+            // `impl Trait` and `dyn` types say what their items are
+            // whatever their arguments.
+            let own_info = match self.p.types.kind(s) {
+                TyKind::Opaque(..) | TyKind::Dyn(..) => true,
+                _ => false,
+            };
+            if own_info || (!self.p.types.has_infer(s) && !has_closure(&self.p.types, s)) {
                 let env = self.fcx.env.clone();
                 if let Some(r) = self.p.project(item, args, env[..]) {
                     out = r;

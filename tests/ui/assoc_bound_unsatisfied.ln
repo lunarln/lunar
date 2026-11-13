@@ -1,0 +1,17 @@
+// error: type::unsatisfied_bound
+// The trait requires its items to be Light; `String` owns its text.
+trait Source {
+    type Item: Light;
+    fn get(&mut self): Option::<Self::Item>;
+}
+
+struct Names;
+
+impl Source for Names {
+    type Item = String;
+    fn get(&mut self): Option::<String> {
+        return None;
+    }
+}
+
+fn main() {}

@@ -2292,7 +2292,8 @@ impl Sema {
             let want0 = self.p.types.subst(tp.ty, al);
             let want = self.p.normalize(want0, env[..]);
             let got = self.p.normalize(ip.ty, env[..]);
-            if want != got || tp.mode != ip.mode {
+            // (An associated type the impl leaves out is reported apart.)
+            if (want != got && !self.p.types.has_error(want)) || tp.mode != ip.mode {
                 same = false;
                 let (w, g) = (self.p.ty_str(want), self.p.ty_str(ip.ty));
                 let (wm, gm) = (mode_prefix(tp.mode), mode_prefix(ip.mode));
@@ -2311,7 +2312,7 @@ impl Sema {
         let want_ret0 = self.p.types.subst(tf.sig.ret, al);
         let want_ret = self.p.normalize(want_ret0, env[..]);
         let got_ret = self.p.normalize(imf.sig.ret, env[..]);
-        if want_ret != got_ret {
+        if want_ret != got_ret && !self.p.types.has_error(want_ret) {
             let (w, g) = (self.p.ty_str(want_ret), self.p.ty_str(got_ret));
             self.error(codes::trait_::SIGNATURE(), imf.sig.ret_span, "return type mismatch with trait: expected `{w}`, found `{g}`");
             self.emit();
