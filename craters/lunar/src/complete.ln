@@ -90,13 +90,15 @@ pub struct Items {
     pub incomplete: bool,
     /// What is typed of the name, to filter by.
     prefix_text: String,
+    /// Only types (and modules) fit here.
+    types_only: bool,
     /// The declarations of the analysis, to describe items.
     pub idx: ide::DeclIndex,
 }
 
 impl Items {
     pub fn new(): Items {
-        return Items { list: [], text: String::new(), replace_lo: 0, replace_hi: 0, incomplete: false, prefix_text: String::new(), idx: ide::DeclIndex::new() };
+        return Items { list: [], text: String::new(), replace_lo: 0, replace_hi: 0, incomplete: false, prefix_text: String::new(), types_only: false, idx: ide::DeclIndex::new() };
     }
 
     fn part(&self, lo: u32, hi: u32): str {
@@ -133,6 +135,9 @@ impl Items {
     /// is typed).
     fn add(&mut +self, label: str, kind: u32, detail: str, insert: str, snippet: bool, doc: str, sort: u8, def: u32) {
         if label.len() == 0 || label.contains("#") || label.starts_with("<") {
+            return;
+        }
+        if self.types_only && (kind == CK_FUNCTION || kind == CK_METHOD || kind == CK_CONSTANT || kind == CK_ENUM_MEMBER || kind == CK_VARIABLE || kind == CK_FIELD) {
             return;
         }
         if !symbols::fuzzy(self.prefix_text.as_str(), label) {
@@ -1265,7 +1270,10 @@ pub fn complete(s: &mut Sema, cx: Cx, text: str, out: &mut +Items) {
             }
         }
     }
-    let type_pos = prev_tok == Some(Token::Colon) && !in_struct_value(toks[..], before) || prev_tok == Some(Token::As);
+    // Types: after `:` (not a struct literal's), `as`, or `::<`.
+    let generic_args = prev_tok == Some(Token::LAngle) && before >= 2 && toks[before - 2].token == Token::PathSep;
+    let type_pos = prev_tok == Some(Token::Colon) && !in_struct_value(toks[..], before) || prev_tok == Some(Token::As) || generic_args;
+    out.types_only = type_pos;
     complete_scope(s, cx, text, toks[..], before, type_pos, next_is_paren, out);
 }
 
