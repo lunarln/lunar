@@ -104,6 +104,14 @@ pub struct LitCheck {
     pub span: Span,
 }
 
+/// A format hole with a spec (`{x:>+8.2}`), whose parts must suit the
+/// value's type once it is known: the value's type and span.
+pub struct FmtCheck {
+    pub ty: Ty,
+    pub id: Id::<ast::FmtFormat>,
+    pub span: Span,
+}
+
 /// An `impl Trait` of this function's return type, and the variable
 /// standing for it inside the body.
 pub struct OpaqueVar {
@@ -170,6 +178,8 @@ pub struct FnCtx {
     pub dull_checks: [(Ty, Span); -..+],
     /// Integer literals to range-check once their type is known.
     pub lit_checks: [LitCheck; -..+],
+    /// Format specs to check against their values' types.
+    pub fmt_checks: [FmtCheck; -..+],
     pub reported_annotations: bool,
     /// Closures written in this function, finished with it.
     pub closures: [PendingClosure; -..+],
@@ -214,6 +224,7 @@ impl FnCtx {
             proj_depth: 0,
             dull_checks: [],
             lit_checks: [],
+            fmt_checks: [],
             reported_annotations: false,
             closures: [],
             opaque_vars: [],
@@ -1795,6 +1806,7 @@ impl Sema {
             }
         }
         self.fcx.lit_checks.clear();
+        self.check_fmt_specs();
         for i in 0..self.fcx.vars.len() {
             if let Var::Unbound(VarKind::General, span) = self.fcx.vars[i] {
                 self.annotations_needed(span);

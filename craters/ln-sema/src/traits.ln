@@ -7,6 +7,7 @@
 // arguments interns types, which only grows the program, so views into it
 // (an environment of predicates from `Program::preds`) stay valid.
 
+use core::arena::List;
 use core::collections::HashMap;
 use core::intern::Symbol;
 use crater::assoc::proj_depth;
@@ -831,6 +832,12 @@ impl Program {
             "ord" => int || float || is_char || is_str,
             "clone" => self.is_copy(ty, env) && !is_param,
             "default" => int || float || is_bool || is_char || is_str || unit,
+            // `[T; N]` shows as `[1, 2, 3]`, through its slice's impl
+            // (std cannot write impls for every length).
+            "debug" => match k {
+                TyKind::Array(e, ArrKind::Fixed(_)) => self.implements(e, TraitRef { trait_id, args: List::empty() }, env),
+                _ => false,
+            },
             _ => false,
         };
     }

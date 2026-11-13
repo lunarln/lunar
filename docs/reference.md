@@ -564,7 +564,53 @@ expression: brackets balance up to a matching `}`, and each `"` inside
 comes where an operand can begin (after an operator, `(`, `[`, `{` or `,`,
 not first in the hole) and closes on the same line. Otherwise the `{` is
 text, so plain strings such as `"{"`, `"} else {"` and `"{\"k\": 1}"` mean
-what they always did.
+what they always did. A `:` outside brackets (not part of `::`) starts the
+hole's spec, which runs to the next `}` on the line.
+
+#### Format specs
+
+After the value, a hole may have a format spec in Rust's syntax:
+
+```text
+{value:[[fill]align][sign]['#']['0'][width]['.' precision][type]}
+```
+
+| Part | Meaning |
+|---|---|
+| `fill` | any character but `{`, `}` and `:` (which would read as `::`), before an `align` (default a space); `"` and `\` are written `\"` and `\\` |
+| `align` | `<` left, `^` centered (an odd pad puts the extra one on the right), `>` right. The default is right for numbers and left for anything else |
+| `+` | a sign on non-negative numbers too: `+5`, `+0`, `+inf` (never `+NaN`). `-` is accepted and means nothing, as in Rust |
+| `#` | with `x`, `X`, `o` and `b`: the prefix `0x`, `0o` or `0b` (`0x` with `X` too) |
+| `0` | pad numbers with zeros after their sign and prefix: `{n:+08}` is `+0000042`, `{n:#010x}` is `0x0000002a`; overrides `fill` and `align` |
+| `width` | the least number of characters (Unicode scalar values, not bytes) to show; a number, or `name$` for a `usize` variable `name` |
+| `.precision` | for floats, the digits after the point, rounded correctly (ties to even on the exact value, as in Rust: `{0.125:.2}` is `0.12`); for a `str`, `String`, `char` or `bool` shown with `Display`, how many characters to keep; ignored for integers. A number, or `.name$` |
+| `type` | none: `Display`; `?`: `Debug`; `x` and `X`: hexadecimal; `o`: octal; `b`: binary; `e` and `E`: scientific (`1.2345e3`) |
+
+```lunar
+let n = -42;
+let pi = 3.14159265;
+let w: usize = 10;
+println("[{n:>6}] [{n:*^7}] [{n:+}] [{n:#010x}] [{pi:.2}] [{pi:>w$.3}] [{pi:e}]");
+// [   -42] [**-42**] [-42] [0xffffffd6] [3.14] [     3.142] [3.14159265e0]
+```
+
+`x`, `X`, `o` and `b` take integers, shown as the bits of their own
+width (`{-1i8:x}` is `ff`), and `e` and `E` take floats; `+` and `0` are
+for numbers, and a precision for floats and (with `Display`) text. Each
+other use is `err(type::bad_format_spec)`, at the part of the spec that
+does not fit; a malformed spec (an unknown type, a positional `1$` or `.*`,
+`{x:#?}`, which is not supported) is `err(syntax::bad_format)`. A spec with
+a fill and alignment but no width is a plain hole, and so is `{x:}`.
+
+The value is written first, with `Display` or `Debug` as usual (or by the
+compiler, for the radix and exponent types and float precision), and then
+padded in place: a width pads the whole text a value writes, whatever its
+type, so `{p:>10}` pads a `Point`'s `(1, 2)` and `{v:>12?}` pads the whole
+`[1, 2, 3]`. (Rust instead leaves width to each implementation, which may
+ignore it or, for `Debug` of collections, apply it to each element.) The
+`Display` and `Debug` traits do not see the spec, so a precision cannot
+reach the fields of a struct or the elements of an array. A hole without
+a spec compiles to exactly the call it always did.
 
 ## 6. Unsafe code
 
@@ -1008,8 +1054,10 @@ alone lists every code. The explanations are the files in
   names, and the macro `env!`.
 * Format strings: `{x}` uses `Display`, `{x:?}` uses `Debug` (strings and
   characters quoted and escaped, arrays as `[1, 2]`, tuples as `(1, 2)`,
-  derived types as `Point { x: 1, y: 2 }`). Fixed arrays (`[T; 4]`) have no
-  impls of their own (there are no const generics): `{a[..]:?}` shows one.
+  derived types as `Point { x: 1, y: 2 }`), and format specs such as
+  `{x:>8.2}` (see [Format specs](#format-specs)). Fixed arrays (`[T; 4]`)
+  implement `Debug` when their items do, built in (there are no const
+  generics for an impl in `core`), the way their slices show: `[1, 2, 3]`.
 * Derives in `core`: `#[derive(Eq, Ord, Debug, Clone, Default, Hash)]` on structs
   and enums (`Default` uses the variant marked `#[default]`), and
   `#[derive(Display)]` on enums whose variants have no fields. They are

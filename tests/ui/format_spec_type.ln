@@ -1,0 +1,33 @@
+// error: type::bad_format_spec
+// absent: syntax::bad_format
+// Format specs that do not suit the value's type.
+struct Point {
+    x: i32,
+}
+
+impl core::fmt::Display for Point {
+    fn fmt(&self, out: &mut +String) {
+        out.write("({self.x})");
+    }
+}
+
+fn show::<T: core::fmt::Display>(t: T) {
+    println("{t:>8}");
+    println("{t:x}");
+    println("{t:.2}");
+}
+
+fn main() {
+    let f = 0.5;
+    let n = 7;
+    let s = "text";
+    let p = Point { x: 1 };
+    println("{f:x}");
+    println("{f:#b}");
+    println("{n:e}");
+    println("{s:+}");
+    println("{s:08}");
+    println("{p:.3}");
+    println("{s:.3?}");
+    show(1);
+}

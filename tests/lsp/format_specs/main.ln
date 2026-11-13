@@ -1,0 +1,12 @@
+/// How wide a column is.
+fn column(): usize {
+    return 12;
+}
+
+fn main() {
+    let total = 41 + 1;
+    let w: usize = column();
+    let prec: usize = 2;
+    let ratio = 0.125;
+    println("[{total:>w$}] [{ratio:^w$.prec$}] [{total:#010x}] [{ratio:e}] [{column():*<6}]");
+}

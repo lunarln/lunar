@@ -1,0 +1,165 @@
+// Format specs, in Rust's syntax: `{x:[[fill]align][sign]['#']['0'][width]
+// ['.' precision][type]}`. The first part prints what Rust prints for the
+// same specs; the last part is what Lunar does where it differs (a width
+// pads the whole value, `Debug` included) or has more (fixed arrays).
+
+use core::fmt::Display;
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+impl Display for Point {
+    fn fmt(&self, out: &mut +String) {
+        out.write("({self.x}, {self.y})");
+    }
+}
+
+#[derive(Debug)]
+struct Grid {
+    cells: [u8; 3],
+    rows: [[i32; 2]; 2],
+}
+
+fn boxed::<T: Display>(x: T): String {
+    return core::fmt::format("[{x:^9}]");
+}
+
+fn main() {
+    // Fill and alignment: numbers go right by default, the rest left.
+    let s = "ab";
+    let n = 42;
+    let m = -42;
+    println("[{s:<6}] [{s:>6}] [{s:^6}] [{s:^7}] [{s:*^7}] [{s:6}] [{s:1}]");
+    println("[{n:<6}] [{n:>6}] [{n:^6}] [{n:^7}] [{n:*^7}] [{n:6}] [{n:1}]");
+    println("[{s:<<6}] [{s:>>6}] [{s:^^6}] [{s:'^6}] [{s:(>6}] [{s:]<6}] [{s:\"<4}]");
+
+    // Sign and alternate forms.
+    let z = 0;
+    println("[{n:+}] [{m:+}] [{z:+}] [{n:<+6}] [{m:^+7}] [{n:-}]");
+    println("{n:x} {n:X} {n:o} {n:b} {n:#x} {n:#X} {n:#o} {n:#b}");
+    let h = 0xbeefu32;
+    println("{h:x} {h:X} {h:#X} {h:>8x} {h:<#8x}| {h:^#12b}|");
+
+    // Zero padding goes after the sign and the prefix, and overrides the
+    // fill and alignment.
+    println("[{n:08}] [{m:08}] [{n:+08}] [{z:+05}] [{n:#010x}] [{n:#010b}] [{m:#010x}] [{n:#06o}]");
+    println("[{n:^08}] [{m:<05}] [{n:*>08}] [{n:#04x}] [{n:#03x}]");
+    let ff = 255;
+    println("[{n:>+#010x}] [{n:+#010x}] [{ff:#010X}] [{ff:+010o}]");
+
+    // Width and precision from variables.
+    let w: usize = 10;
+    let p: usize = 3;
+    let pi = 3.14159265;
+    println("[{pi:w$}] [{pi:.p$}] [{pi:>w$.p$}] [{pi:>+10.3}] [{s:>w$}] [{n:*>w$}] [{s:^w$.1}]");
+    let w0: usize = 0;
+    println("[{s:w0$}] [{pi:.w0$}]");
+
+    // Precision on floats: digits after the point, rounded correctly (ties
+    // to even, on the exact value: 0.125 is exact, 1.005 is a bit less).
+    println("{pi:.0} {pi:.1} {pi:.2} {pi:.10} {pi:.20}");
+    let a = 0.125;
+    let b = 0.375;
+    let c = 2.5;
+    let d = 1.5;
+    let e = 0.5;
+    let f = -0.5;
+    let g = 1.005;
+    let hh = 0.25;
+    let ii = 0.35;
+    println("{a:.2} {b:.2} {c:.0} {d:.0} {e:.0} {f:.0} {g:.2} {hh:.1} {ii:.1}");
+    let big = 1e20;
+    let tiny = 1e-10;
+    let one = 1.0;
+    println("{big:.2} {tiny:.3} {one:.3} {one:+.1} {pi:08.2} {pi:+08.2} {f:08.2}");
+    let x32 = 0.1f32;
+    println("{x32:.3} {x32:.10} {x32:e}");
+
+    // Precision on strings keeps that many characters.
+    let hello = "hello";
+    let accent = "héllo";
+    let empty = "";
+    println("[{hello:.3}] [{accent:.2}] [{hello:>6.2}] [{hello:.0}] [{hello:.10}] [{hello:.p$}] [{hello:2}]");
+    println("[{empty}] [{empty:5}] [{empty:-^5}] [{empty:.2}]");
+    let ch = 'é';
+    let t = true;
+    println("[{ch:>3}] [{ch:.0}] [{ch:-<4}] [{t:>6}] [{t:.2}] [{t:^7}]");
+    let owned = String::from("owned");
+    println("[{owned:>8}] [{owned:.3}] [{owned:^9.4}]");
+
+    // Scientific notation.
+    let k = 1234.5;
+    let k0 = 0.0;
+    let small = 1e-7;
+    let huge = "1e300".parse::<f64>().unwrap();
+    let m2 = -2.5;
+    println("{k:e} {k:E} {k:.2e} {k:.0e} {k0:e} {small:e} {huge:e} {one:e} {m2:e}");
+    let fifteen = 1500.0;
+    let twentyfive = 2500.0;
+    println("{fifteen:.0e} {twentyfive:.0e} [{k:12.3e}] [{k:012.3e}] [{k:+e}] [{k:<12E}] [{k0:.3e}]");
+
+    // `Debug` of numbers takes the same flags.
+    println("[{n:+05?}] [{pi:.2?}] [{m:08?}] [{pi:>8.1?}]");
+
+    // Extremes.
+    let min: i64 = -9223372036854775808;
+    let max: u64 = 18446744073709551615;
+    println("{min} {min:+} {min:x} {min:#b} {min:025}");
+    println("{max} {max:x} {max:#X} {max:o} {max:+} {max:#024x}");
+    let i8m: i8 = -1;
+    let i16m: i16 = -1;
+    let i32m: i32 = -1;
+    let u8v: u8 = 200;
+    let u8s: u8 = 5;
+    let isz: isize = -2;
+    let usz: usize = 255;
+    let u16v: u16 = 65535;
+    println("{i8m:x} {i16m:x} {i32m:x} {u8v:x} {u8s:#04x} {isz:x} {usz:#b} {u16v:o} {i8m:#b} {i8m:+x}");
+    let pz = 0.0;
+    let nz = -0.0;
+    println("{pz} {nz} {pz:+} {nz:+} {pz:.2} {nz:.2} {pz:e} {nz:e} [{pz:08.3}] [{nz:08.3}] [{nz:+}]");
+    let nan = pz / pz;
+    let inf = 1.0 / pz;
+    let ninf = -1.0 / pz;
+    println("[{nan:>6}] [{inf:>6}] [{ninf:<6}] [{inf:+}] [{nan:+}] [{nan:.2}] [{inf:.2}] [{ninf:^8}] [{nan:e}] [{inf:e}]");
+    println("[{nan:06}] [{inf:06}] [{ninf:06}] [{inf:+06}]");
+
+    // Unicode fill, and widths in characters.
+    let jp = "日本";
+    println("[{s:é^9}] [{s:🌙>5}] [{accent:8}] [{jp:>6}] [{jp:.1}] [{n:é>5}] [{accent:é^9.3}]");
+
+    // Escaped braces, and empty specs.
+    println("{{n}} {{{n}}} {{:>5}} }}{n:>3}{{");
+    println("[{n:}] [{s:}]");
+
+    // ----- Lunar's own: a width pads the whole value, whatever its type.
+    let v: [i32; ..+] = [1, 2, 3];
+    println("[{v:>12?}] [{v:<12?}] [{v:^12?}] [{v:?}] [{s:?}] [{s:>8?}] [{ch:?}] [{ch:>5?}]");
+    let o: Option::<i32> = Some(5);
+    println("[{o:>9?}] [{o:-<9?}] [{empty:>3?}]");
+    let pt = Point { x: 1, y: -2 };
+    println("[{pt:>10}] [{pt:_<10}] [{pt:^10}] {boxed(7)} {boxed("seven")} {boxed(pt)}");
+
+    // Fixed arrays show with `Debug`, as slices and arrays do.
+    let arr = [1, 2, 3];
+    let nested = [[1, 2], [3, 4]];
+    let none: [i32; 0] = [];
+    let strs = ["a", "b\"c"];
+    println("{arr:?} {nested:?} {none:?} {strs:?} {arr[..]:?} {arr[1..]:?} [{arr:>11?}]");
+    let grid = Grid { cells: [7, 8, 9], rows: [[1, 2], [3, 4]] };
+    println("{grid:?}");
+    let shown = arr as dyn core::fmt::Debug;
+    println("{shown:?}");
+
+    // Holes are expressions, specs included.
+    println("[{n * 2:>6}] [{s.len():03}] [{pi * 2.0:.3}] [{[n, m]:?}] [{if n > 0 { "pos" } else { "neg" }:^7}]");
+
+    // A closure captures what its specs name.
+    let cols: usize = 7;
+    let digits: usize = 1;
+    let row = |x: f64| core::fmt::format("|{x:>cols$.digits$}|");
+    let later = move || core::fmt::format("|{n:^cols$}|");
+    println("{row(2.25)} {row(-0.05)} {later()}");
+}

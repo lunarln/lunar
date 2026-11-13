@@ -1,0 +1,19 @@
+// error: syntax::bad_format
+// absent: type::bad_format_spec
+// Malformed format specs: each is reported at the part that is wrong.
+fn main() {
+    let x = 3;
+    let w: usize = 4;
+    println("{x:z}");
+    println("{x:>8.}");
+    println("{x:#?}");
+    println("{x:#}");
+    println("{x:1$}");
+    println("{x:.*}");
+    println("{x:x?}");
+    println("{x:5.2.1}");
+    println("{x:99999}");
+    println("{x:fn$}");
+    println("{:w$}");
+    println("{x:\\q<4}");
+}

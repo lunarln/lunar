@@ -196,6 +196,7 @@ fn generate(p: &mut +Program, opts: Options): Result::<Generated, String> {
         statics: HashMap::new(),
         strs: HashMap::new(),
         glue: HashMap::new(),
+        array_debug: HashMap::new(),
         vtables: HashMap::new(),
         externs: HashMap::new(),
         counter: 0,
@@ -301,6 +302,8 @@ pub struct Cg {
     strs: HashMap::<Symbol, ValueRef>,
     /// Drop glue functions per type.
     glue: HashMap::<Ty, ValueRef>,
+    /// `Debug` for fixed arrays (through their slices) per array type.
+    array_debug: HashMap::<Ty, ValueRef>,
     /// Vtables, per (type, trait of the `dyn`).
     vtables: HashMap::<(Ty, TraitRef), ValueRef>,
     /// libc helpers (memcmp, atoi), by name.

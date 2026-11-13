@@ -579,8 +579,114 @@ pub enum FmtPiece {
 
 #[derive(Eq, Hash, Debug)]
 pub enum FmtSpec {
+    /// `{x}`: `Display`.
     Show,
+    /// `{x:?}`: `Debug`.
     Debugged,
+    /// Any other spec (`{x:>8.3}`, `{n:#x}`), in `Ast::fmt_formats`.
+    Full(Id::<FmtFormat>),
+    /// Never written by the parser: in a checked format string, a `name$`
+    /// width or precision, computed with the values for the `Full` hole
+    /// that comes next (its width first).
+    Count,
+}
+
+/// A format spec in Rust's syntax:
+/// `[[fill]align][sign]['#']['0'][width]['.' precision][type]`.
+pub struct FmtFormat {
+    pub kind: FmtKind,
+    pub fill: char,
+    pub align: FmtAlign,
+    /// `+`: a sign on non-negative numbers too.
+    pub plus: bool,
+    /// `#`: the `0x`, `0o` or `0b` prefix.
+    pub alt: bool,
+    /// `0`: pad with zeros after the sign and prefix.
+    pub zero: bool,
+    pub width: FmtCount,
+    pub precision: FmtCount,
+    /// Where the parts are in the file: the whole spec (after the `:`),
+    /// the type, the precision (with its `.`), the `+` and the `0` (empty
+    /// spans where a part is absent).
+    pub span: Span,
+    pub kind_span: Span,
+    pub prec_span: Span,
+    pub plus_span: Span,
+    pub zero_span: Span,
+}
+
+/// How a spec shows its value: through `Display` (no type), `Debug` (`?`),
+/// in a radix (`x`, `X`, `o`, `b`) or in scientific notation (`e`, `E`).
+#[derive(Eq, Debug)]
+pub enum FmtKind {
+    Display,
+    Debug,
+    LowerHex,
+    UpperHex,
+    Octal,
+    Binary,
+    LowerExp,
+    UpperExp,
+}
+
+impl FmtKind {
+    /// The radix of `x`, `X`, `o` and `b`, else 0.
+    pub fn radix(self): u64 {
+        return match self {
+            FmtKind::LowerHex | FmtKind::UpperHex => 16,
+            FmtKind::Octal => 8,
+            FmtKind::Binary => 2,
+            _ => 0,
+        };
+    }
+
+    pub fn is_exp(self): bool {
+        return match self {
+            FmtKind::LowerExp | FmtKind::UpperExp => true,
+            _ => false,
+        };
+    }
+
+    /// The type as written in the spec.
+    pub fn text(self): str {
+        return match self {
+            FmtKind::Display => "",
+            FmtKind::Debug => "?",
+            FmtKind::LowerHex => "x",
+            FmtKind::UpperHex => "X",
+            FmtKind::Octal => "o",
+            FmtKind::Binary => "b",
+            FmtKind::LowerExp => "e",
+            FmtKind::UpperExp => "E",
+        };
+    }
+}
+
+/// Where padding goes: `<`, `^`, `>`, or (`Auto`) the type's default,
+/// right for numbers and left for anything else.
+#[derive(Eq, Debug)]
+pub enum FmtAlign {
+    Auto,
+    Left,
+    Center,
+    Right,
+}
+
+/// A width or precision: none, a number, or `name$`, the value of a
+/// `usize` expression (the name, parsed in place).
+pub enum FmtCount {
+    None,
+    Lit(u64),
+    Arg(Id::<Expr>),
+}
+
+impl FmtCount {
+    pub fn is_none(self): bool {
+        return match self {
+            FmtCount::None => true,
+            _ => false,
+        };
+    }
 }
 
 // ===================================================================== patterns
@@ -642,6 +748,7 @@ pub struct Ast {
     pub field_pats: Arena::<FieldPat>,
     pub closure_params: Arena::<ClosureParam>,
     pub fmt_pieces: Arena::<FmtPiece>,
+    pub fmt_formats: Arena::<FmtFormat>,
     pub tokens: Arena::<TokenTree>,
     pub macro_rules: Arena::<MacroRule>,
     /// The file's items.
@@ -680,6 +787,7 @@ impl Ast {
             field_pats: Arena::new(),
             closure_params: Arena::new(),
             fmt_pieces: Arena::new(),
+            fmt_formats: Arena::new(),
             tokens: Arena::new(),
             macro_rules: Arena::new(),
             file: List::empty(),
@@ -1307,11 +1415,33 @@ fn lit(a: &Ast, o: &mut String, d: usize, l: Lit) {
                         match p {
                             FmtPiece::Text(t) => o.write("text {escape(a.text(t))}\n"),
                             FmtPiece::Hole(e, spec) => {
-                                let s = match spec {
-                                    FmtSpec::Debugged => "debug",
-                                    FmtSpec::Show => "display",
-                                };
-                                o.write("hole {s}\n");
+                                match spec {
+                                    FmtSpec::Debugged => o.write("hole debug\n"),
+                                    FmtSpec::Show | FmtSpec::Count => o.write("hole display\n"),
+                                    FmtSpec::Full(id) => {
+                                        let f = a.fmt_formats.get(id);
+                                        let mut flags = String::new();
+                                        if f.plus {
+                                            flags.push('+');
+                                        }
+                                        if f.alt {
+                                            flags.push('#');
+                                        }
+                                        if f.zero {
+                                            flags.push('0');
+                                        }
+                                        let fill = f.fill as u32;
+                                        let al = match f.align {
+                                            FmtAlign::Auto => "auto",
+                                            FmtAlign::Left => "left",
+                                            FmtAlign::Center => "center",
+                                            FmtAlign::Right => "right",
+                                        };
+                                        o.write("hole spec `{f.kind.text()}` fill {fill} {al} flags `{flags}` {at(f.span)}\n");
+                                        fmt_count(a, o, d + 2, "width", f.width);
+                                        fmt_count(a, o, d + 2, "precision", f.precision);
+                                    }
+                                }
                                 expr(a, o, d + 2, e);
                             }
                         }
@@ -1332,6 +1462,21 @@ fn opt(a: &Ast, o: &mut String, d: usize, label: str, e: Option::<Id::<Expr>>) {
         o.push_str(label);
         o.push('\n');
         expr(a, o, d + 1, x);
+    }
+}
+
+fn fmt_count(a: &Ast, o: &mut String, d: usize, label: str, c: FmtCount) {
+    match c {
+        FmtCount::None => {}
+        FmtCount::Lit(n) => {
+            ind(o, d);
+            o.write("{label} {n}\n");
+        }
+        FmtCount::Arg(x) => {
+            ind(o, d);
+            o.write("{label}\n");
+            expr(a, o, d + 1, x);
+        }
     }
 }
 

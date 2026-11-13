@@ -66,6 +66,164 @@ pub fn write_radix(out: &mut +String, value: u64, radix: u64) {
     out.push_str(unsafe { intrinsics::str_from_bytes(buf[i..]) });
 }
 
+// ===================================================================== format specs
+//
+// A hole with a spec (`{x:>+10.3}`, `{n:#010x}`) is compiled to: remember
+// where the value starts in `out`, write the value (with `Display`,
+// `Debug`, `fmt_radix` or `std::fmt::fmt_float`), then `fmt_pad` it in
+// place. A hole without one calls `Display::fmt` or `Debug::debug` alone.
+
+/// `fmt_radix` flags: `X` rather than `x`, and `#` (the prefix).
+const RADIX_UPPER: u32 = 1;
+const RADIX_PREFIX: u32 = 2;
+
+/// `{n:x}`, `{n:#X}`, `{n:o}`, `{n:b}`: the bits of an integer (negative
+/// ones in two's complement of their own width, which the compiler has
+/// zero-extended into `value`), in base 16, 8 or 2.
+#[lang = "fmt_radix"]
+fn fmt_radix(out: &mut +String, value: u64, radix: u64, flags: u32) {
+    if flags & RADIX_PREFIX != 0 {
+        out.push_str(if radix == 16 { "0x" } else if radix == 8 { "0o" } else { "0b" });
+    }
+    let mut buf: [u8; 64] = [0; 64];
+    let mut i: usize = 64;
+    let mut v = value;
+    let letters: u8 = if flags & RADIX_UPPER != 0 { 65 } else { 97 };
+    loop {
+        i -= 1;
+        let d = (v % radix) as u8;
+        buf[i] = if d < 10 { d + 48 } else { d - 10 + letters };
+        v /= radix;
+        if v == 0 {
+            break;
+        }
+    }
+    out.push_str(unsafe { intrinsics::str_from_bytes(buf[i..]) });
+}
+
+/// `fmt_pad` flags. The alignment is resolved by the compiler: right for
+/// numbers and left for the rest unless the spec says otherwise.
+const PAD_WIDTH: u32 = 1;
+const PAD_PLUS: u32 = 2;
+const PAD_ZERO: u32 = 4;
+const PAD_PREFIX: u32 = 8;
+const PAD_TRUNCATE: u32 = 16;
+const PAD_CENTER: u32 = 32;
+const PAD_RIGHT: u32 = 64;
+
+/// The number of characters in `b`, which is UTF-8.
+fn char_count(b: [u8; &]): usize {
+    let mut n: usize = 0;
+    for c in b {
+        if c & 0xC0 != 0x80 {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// Reverse the bytes `lo..hi` at `p`.
+unsafe fn reverse_bytes(p: *mut u8, lo: usize, hi: usize) {
+    let mut i = lo;
+    let mut j = hi;
+    while i + 1 < j {
+        j -= 1;
+        let a = intrinsics::ptr_offset_mut(p, i as isize);
+        let b = intrinsics::ptr_offset_mut(p, j as isize);
+        unsafe {
+            let t = intrinsics::ptr_read(a as *u8);
+            intrinsics::ptr_write(a, intrinsics::ptr_read(b as *u8));
+            intrinsics::ptr_write(b, t);
+        }
+        i += 1;
+    }
+}
+
+/// Insert `n` copies of `c` into `out` at byte `at`, in place: they are
+/// pushed at the end, then rotated into place.
+fn insert_chars(out: &mut +String, at: usize, c: char, n: usize) {
+    if n == 0 {
+        return;
+    }
+    let old = out.len();
+    for _ in 0..n {
+        out.push(c);
+    }
+    let end = out.len();
+    unsafe {
+        let p = (intrinsics::slice_ptr(out.as_bytes()) as usize) as *mut u8;
+        reverse_bytes(p, at, old);
+        reverse_bytes(p, old, end);
+        reverse_bytes(p, at, end);
+    }
+}
+
+/// Finish a value written to `out` from byte `start` on, as its spec
+/// says: keep `precision` characters of it (`PAD_TRUNCATE`, for strings),
+/// put `+` before a number that has no sign (`PAD_PLUS`; not before `NaN`),
+/// and pad it to `width` characters (`PAD_WIDTH`) with `fill` on the left,
+/// both sides or the right, or (`PAD_ZERO`) with zeros after its sign and,
+/// with `PAD_PREFIX`, its `0x`, `0o` or `0b`.
+#[lang = "fmt_pad"]
+fn fmt_pad(out: &mut +String, start: usize, width: usize, precision: usize, fill: u32, flags: u32) {
+    if flags & PAD_TRUNCATE != 0 {
+        let b = out.as_bytes();
+        let mut n: usize = 0;
+        let mut i = start;
+        while i < b.len() {
+            if b[i] & 0xC0 != 0x80 {
+                if n == precision {
+                    break;
+                }
+                n += 1;
+            }
+            i += 1;
+        }
+        // Only the value just written is cut, after anything the caller
+        // can hold a view into: `out` still only grows as far as they can
+        // tell (so this is not `truncate`, which a `+` parameter forbids).
+        unsafe {
+            let h = (intrinsics::addr_of(out) as usize) as *mut usize;
+            intrinsics::ptr_write(intrinsics::ptr_offset_mut(h, 1), i);
+        }
+    }
+    if flags & PAD_PLUS != 0 {
+        let s = out.as_str()[start..];
+        if !s.starts_with("-") && s != "NaN" {
+            insert_chars(out, start, '+', 1);
+        }
+    }
+    if flags & PAD_WIDTH == 0 {
+        return;
+    }
+    let len = char_count(out.as_bytes()[start..]);
+    if len >= width {
+        return;
+    }
+    let pad = width - len;
+    if flags & PAD_ZERO != 0 {
+        let b = out.as_bytes();
+        let mut at = start;
+        if at < b.len() && (b[at] == b'+' || b[at] == b'-') {
+            at += 1;
+        }
+        if flags & PAD_PREFIX != 0 {
+            at += 2;
+        }
+        insert_chars(out, at, '0', pad);
+        return;
+    }
+    let c = match char::from_u32(fill) {
+        Some(c) => c,
+        None => ' ',
+    };
+    let left = if flags & PAD_RIGHT != 0 { pad } else if flags & PAD_CENTER != 0 { pad / 2 } else { 0 };
+    insert_chars(out, start, c, left);
+    for _ in 0..pad - left {
+        out.push(c);
+    }
+}
+
 impl Display for u8 { fn fmt(&self, out: &mut +String) { write_u64(out, self as u64); } }
 impl Display for u16 { fn fmt(&self, out: &mut +String) { write_u64(out, self as u64); } }
 impl Display for u32 { fn fmt(&self, out: &mut +String) { write_u64(out, self as u64); } }
