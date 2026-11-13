@@ -982,6 +982,13 @@ impl Sema {
         return out;
     }
 
+    fn is_slice_mut(&mut self, t: Ty): bool {
+        return match self.p.types.kind(t) {
+            TyKind::Array(_, ArrKind::SliceMut) => true,
+            _ => false,
+        };
+    }
+
     fn pick_method(&mut self, step: Ty, name: Symbol, span: Span): Option::<MethodPick> {
         if let Some(found) = self.inherent_method(step, name, true) {
             let (def, args) = found;
@@ -1047,11 +1054,27 @@ impl Sema {
             return self.error_expr(span);
         }
         let steps = self.method_steps(rt);
+        // An array that is not a mutable place autoslices past `[T; &mut]`
+        // first: a method `[T; &]` has too (such as `Debug::debug`, which
+        // `#[derive(Debug)]` calls on a fixed-array field of `&self`) is
+        // found there instead of failing with `type::immutable`. Only if no
+        // other step has the method are the `[T; &mut]` steps tried, for
+        // that error.
+        let recv_mutable = self.is_mutable_place(r);
         let mut picked: Option::<(usize, Ty, MethodPick)> = None;
-        for i in 0..steps.len() {
-            let st = steps[i];
-            if let Some(p) = self.pick_method(st, name.name, name.span) {
-                picked = Some((i, st, p));
+        for pass in 0..2 {
+            for i in 0..steps.len() {
+                let st = steps[i];
+                let deferred = i > 0 && !recv_mutable && self.is_slice_mut(st);
+                if deferred != (pass == 1) {
+                    continue;
+                }
+                if let Some(p) = self.pick_method(st, name.name, name.span) {
+                    picked = Some((i, st, p));
+                    break;
+                }
+            }
+            if picked.is_some() {
                 break;
             }
         }

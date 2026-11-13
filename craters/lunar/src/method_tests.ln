@@ -1,0 +1,69 @@
+// Method calls that autoslice a fixed array that is not a mutable place:
+// a method that `[T; &]` has is found there, not on `[T; &mut]` (which
+// would need the array to be mutable).
+
+use std::env;
+use std::fs;
+use std::process;
+use crater::compile::{analyze_file, check_main};
+
+const PROGRAM: str = "#[derive(Debug)]
+struct Grid {
+    cells: [i32; 3],
+    name: str,
+}
+
+fn show(g: &Grid): String {
+    let mut out = String::new();
+    g.debug(&mut out);
+    // A borrowed fixed array, through `[T; &]`'s `Debug`.
+    g.cells.debug(&mut out);
+    return out;
+}
+
+fn main() {
+    let g = Grid { cells: [1, 2, 3], name: \"g\" };
+    let fixed: [i32; 2] = [4, 5];
+    let mut out = show(&g);
+    fixed.debug(&mut out);
+    println(\"{out}\");
+}
+";
+
+/// A program that calls `fill` (only `[T; &mut]` has it) on an array that
+/// is not mutable: still `type::immutable`.
+const IMMUTABLE: str = "fn main() {
+    let a = [1, 2, 3];
+    a.fill(0);
+}
+";
+
+fn write_program(test: str, text: str): String {
+    let mut dir = env::temp_dir();
+    dir.write("/lunar-method-{test}-{process::id()}");
+    let _ = fs::create_dir_all(dir.as_str());
+    let mut file = String::from(dir.as_str());
+    file.push_str("/demo.ln");
+    match fs::write(file.as_str(), text.as_bytes()) {
+        Ok(()) => {}
+        Err(e) => panic("could not write {file}: {e}"),
+    }
+    return file;
+}
+
+#[test]
+fn derive_debug_on_fixed_array_field() {
+    let file = write_program("derive", PROGRAM);
+    let mut s = analyze_file(file.as_str(), false, None);
+    check_main(&mut s, file.as_str(), false);
+    assert!(!s.p.diags.has_errors());
+    let _ = fs::remove_dir_all(file.as_str()[..file.len() - 8]);
+}
+
+#[test]
+fn mutating_method_on_immutable_array_still_fails() {
+    let file = write_program("immutable", IMMUTABLE);
+    let s = analyze_file(file.as_str(), false, None);
+    assert_eq!(s.p.diags.error_count(), 1);
+    let _ = fs::remove_dir_all(file.as_str()[..file.len() - 8]);
+}
