@@ -47,3 +47,26 @@
 // ----- control -----
 #[intrinsic] pub fn abort(): !;
 #[intrinsic] pub unsafe fn unreachable(): !;
+
+// ----- atomics -----
+// `p` must be aligned and valid for the access. Orderings are LLVM's
+// numbers (`std::sync::atomic::Ordering` maps to them): 2 relaxed,
+// 4 acquire, 5 release, 6 acquire-release, 7 sequentially consistent; they
+// must be constants at the call (anything else is sequentially
+// consistent). `T` is an integer or a raw pointer.
+/// The address of a borrowed place.
+#[intrinsic] pub fn addr_of::<T>(place: &T): *T;
+#[intrinsic] pub unsafe fn atomic_load::<T>(p: *T, order: u32): T;
+#[intrinsic] pub unsafe fn atomic_store::<T>(p: *mut T, value: T, order: u32);
+#[intrinsic] pub unsafe fn atomic_swap::<T>(p: *mut T, value: T, order: u32): T;
+/// Store `new` if the value is `old`; returns the value before either way.
+#[intrinsic] pub unsafe fn atomic_cas::<T>(p: *mut T, old: T, new: T, order: u32): T;
+#[intrinsic] pub unsafe fn atomic_add::<T>(p: *mut T, value: T, order: u32): T;
+#[intrinsic] pub unsafe fn atomic_sub::<T>(p: *mut T, value: T, order: u32): T;
+#[intrinsic] pub unsafe fn atomic_and::<T>(p: *mut T, value: T, order: u32): T;
+#[intrinsic] pub unsafe fn atomic_nand::<T>(p: *mut T, value: T, order: u32): T;
+#[intrinsic] pub unsafe fn atomic_or::<T>(p: *mut T, value: T, order: u32): T;
+#[intrinsic] pub unsafe fn atomic_xor::<T>(p: *mut T, value: T, order: u32): T;
+#[intrinsic] pub unsafe fn atomic_max::<T>(p: *mut T, value: T, order: u32): T;
+#[intrinsic] pub unsafe fn atomic_min::<T>(p: *mut T, value: T, order: u32): T;
+#[intrinsic] pub fn atomic_fence(order: u32);

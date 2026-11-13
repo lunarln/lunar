@@ -1,4 +1,4 @@
-# trait::dull_impl: `Dull` or `Light` implemented or `!`implemented by hand
+# trait::dull_impl: `Dull`, `Light` or `Detached` implemented or `!`implemented by hand
 
 An `impl Dull for T`, `impl Light for T`, or a negative impl of either was
 written. `core::ptr::Dull` and `core::ptr::Light` are implemented by the
@@ -14,6 +14,12 @@ owners.
 
 Removing `Dull` from a type with `impl !Dull` is not allowed either: whether
 a type is Dull is a fact about its layout, not a choice.
+
+The same goes for `core::marker::Detached` (the type holds no views): it
+follows from the fields, and claiming it for a type holding a `str` would let
+that view outlive the text it points into. (`Send` and `Sync` are different:
+a type may promise them with `unsafe impl`, or give them up with a negative
+impl.)
 
 ## Erroneous example
 

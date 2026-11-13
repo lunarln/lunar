@@ -1,0 +1,309 @@
+// The locks every type in `std::sync` is built from, on the operating
+// system's futex (a word threads can sleep on until another thread wakes
+// them): Linux `futex`, Windows `WaitOnAddress`, macOS `__ulock_wait2`.
+// All of them start out as zeros, so they work in statics.
+//
+// It also keeps track of the locks each thread holds, so that a thread that
+// panics while holding one can poison it and let it go (see
+// `poison_held_locks`).
+
+use core::intrinsics;
+use crater::rt;
+use crater::sys;
+use crater::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+
+/// No timeout, for `RawCondvar::wait`.
+pub const FOREVER: u64 = 18446744073709551615;
+
+/// A lock with no data. 0 unlocked, 1 locked, 2 locked with threads
+/// (possibly) waiting.
+pub struct RawMutex {
+    state: AtomicU32,
+}
+
+impl RawMutex {
+    pub const fn new(): RawMutex {
+        return RawMutex { state: AtomicU32::new(0) };
+    }
+
+    pub fn lock(&self) {
+        if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            return;
+        }
+        self.lock_contended();
+    }
+
+    fn lock_contended(&self) {
+        // Spin a little while the holder may be about to let go.
+        let mut spins: u32 = 0;
+        while spins < 100 {
+            let s = self.state.load(Ordering::Relaxed);
+            if s == 0 {
+                if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    return;
+                }
+            } else if s == 2 {
+                break;
+            }
+            spins += 1;
+        }
+        // Mark the lock contended (so the holder wakes someone) and sleep.
+        loop {
+            if self.state.swap(2, Ordering::Acquire) == 0 {
+                return;
+            }
+            sys::futex_wait(self.state.as_ptr() as *u32, 2, FOREVER);
+        }
+    }
+
+    /// Take the lock if it is free.
+    pub fn try_lock(&self): bool {
+        return self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok();
+    }
+
+    pub fn unlock(&self) {
+        if self.state.swap(0, Ordering::Release) == 2 {
+            sys::futex_wake(self.state.as_ptr() as *u32, false);
+        }
+    }
+}
+
+/// Threads waiting for a change under a `RawMutex`. A count of
+/// notifications, which waiters sleep on.
+pub struct RawCondvar {
+    seq: AtomicU32,
+}
+
+impl RawCondvar {
+    pub const fn new(): RawCondvar {
+        return RawCondvar { seq: AtomicU32::new(0) };
+    }
+
+    /// Let go of `m` (which the caller holds), sleep until notified or
+    /// `timeout_ns` passed (`FOREVER`: no limit), then take `m` again.
+    /// False if the time ran out. May also return early for no reason:
+    /// callers check their condition again.
+    pub fn wait(&self, m: &RawMutex, timeout_ns: u64): bool {
+        let s = self.seq.load(Ordering::Relaxed);
+        m.unlock();
+        let ok = sys::futex_wait(self.seq.as_ptr() as *u32, s, timeout_ns);
+        m.lock();
+        return ok;
+    }
+
+    pub fn notify_one(&self) {
+        self.seq.fetch_add(1, Ordering::Release);
+        sys::futex_wake(self.seq.as_ptr() as *u32, false);
+    }
+
+    pub fn notify_all(&self) {
+        self.seq.fetch_add(1, Ordering::Release);
+        sys::futex_wake(self.seq.as_ptr() as *u32, true);
+    }
+}
+
+/// What a `Mutex` and an `RwLock` have in common at their start: the lock,
+/// and whether a thread panicked while holding it.
+pub struct LockCore {
+    pub raw: RawMutex,
+    pub poisoned: AtomicU8,
+}
+
+impl LockCore {
+    pub const fn new(): LockCore {
+        return LockCore { raw: RawMutex::new(), poisoned: AtomicU8::new(0) };
+    }
+
+    pub fn is_poisoned(&self): bool {
+        return self.poisoned.load(Ordering::Acquire) != 0;
+    }
+}
+
+/// Kinds of held locks.
+pub const HELD_MUTEX: usize = 0;
+pub const HELD_WRITE: usize = 1;
+pub const HELD_READ: usize = 2;
+pub const HELD_ONCE: usize = 3;
+
+/// The locks this thread holds, innermost last: each one's address with
+/// its kind in the low two bits.
+#[thread_local]
+static mut HELD: [usize; 64] = [0; 64];
+#[thread_local]
+static mut HELD_LEN: usize = 0;
+
+/// Record that this thread now holds the lock at `addr` (a `LockCore`, an
+/// `RwCore` or a `Once`). Past 64 nested locks, the innermost are not
+/// recorded (and not poisoned if the thread panics).
+pub fn hold(addr: usize, kind: usize) {
+    unsafe {
+        if HELD_LEN < 64 {
+            HELD[HELD_LEN] = addr | kind;
+        }
+        HELD_LEN += 1;
+    }
+}
+
+/// This thread let go of the lock it took last.
+pub fn unhold() {
+    unsafe {
+        if HELD_LEN > 0 {
+            HELD_LEN -= 1;
+        }
+    }
+}
+
+/// For a thread that panicked: poison every lock it holds (a write lock of
+/// an `RwLock` too, not a read lock) and let it go, innermost first, so
+/// that threads waiting for them see the panic instead of waiting forever.
+/// A `Once` whose initializer panicked becomes poisoned.
+pub fn poison_held_locks() {
+    unsafe {
+        let mut n = HELD_LEN;
+        if n > 64 {
+            n = 64;
+        }
+        while n > 0 {
+            n -= 1;
+            let entry = HELD[n];
+            let addr = entry & !3;
+            let kind = entry & 3;
+            if kind == HELD_MUTEX {
+                crater::sync::poison_mutex(addr);
+            } else if kind == HELD_ONCE {
+                crater::sync::poison_once(addr);
+            } else {
+                crater::sync::poison_rwlock(addr, kind == HELD_WRITE);
+            }
+        }
+        HELD_LEN = 0;
+    }
+}
+
+// ===================================================================== queues
+
+const MAX_USIZE: usize = 18446744073709551615;
+
+/// Bytes before the first item of a queue's block: `head`, `len`, `cap`.
+const META: usize = 64;
+
+/// A first-in first-out queue of values of any type, owners included (an
+/// array cannot hold owners). The items are in a ring buffer in a block of
+/// their own, which owns them: when the queue is freed, the items still in
+/// it are dropped. Moving an item moves its bits (owning arrays never move
+/// their elements). Growing moves the items to a block twice the size.
+/// (Used by the channels and `thread::Group`.)
+pub struct Queue::<T> {
+    buf: [u8; ..+],
+}
+
+/// Drop the items still in the queue block at `p`.
+fn drop_queue::<T>(p: *mut u8) {
+    let mut q = QueueRaw::<T> { base: p as usize };
+    while q.len() > 0 {
+        let v = q.pop_raw();
+        let _ = v;
+    }
+}
+
+/// A queue's block, by address.
+struct QueueRaw::<T> {
+    base: usize,
+}
+
+impl::<T> QueueRaw::<T> {
+    fn get(&self, i: usize): usize {
+        return unsafe { intrinsics::ptr_read((self.base + i * 8) as *usize) };
+    }
+
+    fn set(&self, i: usize, v: usize) {
+        unsafe {
+            intrinsics::ptr_write((self.base + i * 8) as *mut usize, v);
+        }
+    }
+
+    fn len(&self): usize {
+        return self.get(1);
+    }
+
+    fn cap(&self): usize {
+        return self.get(2);
+    }
+
+    fn slot(&self, i: usize): *mut T {
+        let size = core::mem::size_of::<T>();
+        return (self.base + META + i * size) as *mut T;
+    }
+
+    fn pop_raw(&mut self): T {
+        let head = self.get(0);
+        let v = unsafe { intrinsics::ptr_read(self.slot(head) as *T) };
+        let cap = self.cap();
+        self.set(0, if head + 1 == cap { 0 } else { head + 1 });
+        self.set(1, self.len() - 1);
+        return v;
+    }
+
+    fn push_raw(&mut self, v: T) {
+        let cap = self.cap();
+        let mut at = self.get(0) + self.len();
+        if at >= cap {
+            at -= cap;
+        }
+        unsafe {
+            intrinsics::ptr_write(self.slot(at), v);
+        }
+        self.set(1, self.len() + 1);
+    }
+}
+
+fn new_block::<T>(cap: usize): [u8; ..+] {
+    let size = core::mem::size_of::<T>();
+    let drop: fn(*mut u8) = drop_queue::<T>;
+    let buf = rt::block_new(META + cap * size, drop);
+    let q = QueueRaw::<T> { base: buf[..].as_ptr() as usize };
+    q.set(0, 0);
+    q.set(1, 0);
+    q.set(2, cap);
+    return buf;
+}
+
+impl::<T> Queue::<T> {
+    pub fn new(): Queue::<T> {
+        // Zero-sized items take no room: the count is all there is.
+        let cap = if core::mem::size_of::<T>() == 0 { MAX_USIZE } else { 8 };
+        return Queue { buf: new_block::<T>(cap) };
+    }
+
+    fn raw(&self): QueueRaw::<T> {
+        return QueueRaw::<T> { base: self.buf[..].as_ptr() as usize };
+    }
+
+    pub fn len(&self): usize {
+        return self.raw().len();
+    }
+
+    pub fn push(&mut self, v: T) {
+        let mut q = self.raw();
+        if q.len() == q.cap() {
+            // Twice the room, the items moved over in order.
+            let bigger = new_block::<T>(q.cap() * 2);
+            let mut nq = QueueRaw::<T> { base: bigger[..].as_ptr() as usize };
+            while q.len() > 0 {
+                nq.push_raw(q.pop_raw());
+            }
+            self.buf = bigger;
+            q = nq;
+        }
+        q.push_raw(v);
+    }
+
+    pub fn pop(&mut self): Option::<T> {
+        let mut q = self.raw();
+        if q.len() == 0 {
+            return None;
+        }
+        return Some(q.pop_raw());
+    }
+}
+

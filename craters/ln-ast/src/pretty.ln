@@ -270,6 +270,9 @@ pub fn fn_sig(a: &Ast, src: str, f: FnDecl): String {
     if f.is_unsafe {
         out.push_str("unsafe ");
     }
+    if f.is_const {
+        out.push_str("const ");
+    }
     out.write("fn {a.text(f.name.name)}{generics(a, src, f.generics)}(");
     let ps = a.params.list(f.params);
     for i in 0..ps.len() {
@@ -394,6 +397,9 @@ pub fn item(a: &Ast, src: str, it: Item, extern_abi: Option::<str>): String {
             }
         }
         ItemKind::Impl(i) => {
+            if i.is_unsafe {
+                out.push_str("unsafe ");
+            }
             out.push_str("impl");
             if i.generics.params.len() > 0 {
                 out.push_str("::<");

@@ -1,0 +1,163 @@
+// std::sync::atomic: every operation, statics, and counters, flags and
+// compare-and-swap loops under contention.
+
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering, fence};
+use std::thread;
+
+static HITS: AtomicU64 = AtomicU64::new(0);
+static READY: AtomicBool = AtomicBool::new(false);
+
+#[test]
+fn operations() {
+    let a = AtomicU32::new(5);
+    assert_eq!(a.load(Ordering::Relaxed), 5u32);
+    a.store(7, Ordering::Release);
+    assert_eq!(a.load(Ordering::Acquire), 7u32);
+    assert_eq!(a.swap(9, Ordering::AcqRel), 7u32);
+    assert_eq!(a.fetch_add(1, Ordering::SeqCst), 9u32);
+    assert_eq!(a.fetch_sub(4, Ordering::SeqCst), 10u32);
+    assert_eq!(a.fetch_and(4, Ordering::SeqCst), 6u32);
+    assert_eq!(a.fetch_or(3, Ordering::SeqCst), 4u32);
+    assert_eq!(a.fetch_xor(1, Ordering::SeqCst), 7u32);
+    assert_eq!(a.fetch_nand(3, Ordering::SeqCst), 6u32);
+    assert_eq!(a.load(Ordering::SeqCst), 4294967293u32);
+    assert_eq!(a.compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst), Err(4294967293u32));
+    assert_eq!(a.compare_exchange(4294967293, 2, Ordering::SeqCst, Ordering::Relaxed), Ok(4294967293u32));
+    assert_eq!(a.fetch_max(10, Ordering::SeqCst), 2u32);
+    assert_eq!(a.fetch_min(3, Ordering::SeqCst), 10u32);
+    assert_eq!(a.into_inner(), 3u32);
+    // Overflow wraps.
+    let b = AtomicU8::new(250);
+    assert_eq!(b.fetch_add(10, Ordering::Relaxed), 250u8);
+    assert_eq!(b.load(Ordering::Relaxed), 4u8);
+}
+
+#[test]
+fn signed_max_and_min() {
+    let a = AtomicI32::new(-5);
+    assert_eq!(a.fetch_max(-7, Ordering::SeqCst), -5);
+    assert_eq!(a.fetch_max(3, Ordering::SeqCst), -5);
+    assert_eq!(a.fetch_min(-100, Ordering::SeqCst), 3);
+    assert_eq!(a.load(Ordering::SeqCst), -100);
+    let b = AtomicI64::new(-1);
+    assert_eq!(b.fetch_add(-1, Ordering::SeqCst), -1i64);
+    assert_eq!(b.load(Ordering::SeqCst), -2i64);
+}
+
+#[test]
+fn fetch_update() {
+    let a = AtomicUsize::new(10);
+    assert_eq!(a.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| if x < 20 { Some(x * 2) } else { None }), Ok(10usize));
+    assert_eq!(a.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| if x < 20 { Some(x * 2) } else { None }), Err(20usize));
+    assert_eq!(a.load(Ordering::SeqCst), 20usize);
+}
+
+#[test]
+fn booleans() {
+    let f = AtomicBool::new(false);
+    assert!(!f.load(Ordering::SeqCst));
+    assert!(!f.swap(true, Ordering::SeqCst));
+    assert_eq!(f.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst), Err(true));
+    assert_eq!(f.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst), Ok(true));
+    assert!(!f.fetch_or(true, Ordering::SeqCst));
+    assert!(f.fetch_and(false, Ordering::SeqCst));
+    assert!(!f.fetch_xor(true, Ordering::SeqCst));
+    assert!(f.fetch_not(Ordering::SeqCst));
+    assert!(!f.into_inner());
+}
+
+#[test]
+fn pointers() {
+    let mut x: u64 = 1;
+    let mut y: u64 = 2;
+    let px = core::intrinsics::addr_of_mut(&mut x);
+    let py = core::intrinsics::addr_of_mut(&mut y);
+    let p = AtomicPtr::new(px);
+    assert!((p.load(Ordering::SeqCst) as usize) == (px as usize));
+    let old = p.swap(py, Ordering::SeqCst);
+    assert!((old as usize) == (px as usize));
+    assert!(p.compare_exchange(px, px, Ordering::SeqCst, Ordering::SeqCst).is_err());
+    assert!(p.compare_exchange(py, px, Ordering::SeqCst, Ordering::SeqCst).is_ok());
+    assert_eq!(unsafe { core::intrinsics::ptr_read(p.load(Ordering::SeqCst) as *u64) }, 1u64);
+}
+
+#[test]
+fn counters_under_contention() {
+    let mut g = thread::Group::<()>::new();
+    for _ in 0..8 {
+        g.spawn(move || {
+            for _ in 0..10000 {
+                HITS.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+    while let Some(r) = g.join_next() {
+        r.unwrap();
+    }
+    assert_eq!(HITS.load(Ordering::SeqCst), 80000);
+}
+
+#[test]
+fn compare_exchange_loop() {
+    // Every thread doubles-and-adds through a CAS loop; no update is lost.
+    let total = AtomicU64::new(0);
+    thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                for _ in 0..5000 {
+                    let mut cur = total.load(Ordering::Relaxed);
+                    loop {
+                        match total.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                            Ok(_) => break,
+                            Err(seen) => cur = seen,
+                        }
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(total.load(Ordering::SeqCst), 20000);
+}
+
+static mut MESSAGE: u64 = 0;
+
+#[test]
+fn release_and_acquire() {
+    // A store before a release store is seen after an acquire load of it.
+    let h = thread::spawn(move || {
+        unsafe {
+            MESSAGE = 42;
+        }
+        fence(Ordering::Release);
+        READY.store(true, Ordering::Relaxed);
+    });
+    while !READY.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+    assert_eq!(unsafe { MESSAGE }, 42);
+    h.join().unwrap();
+}
+
+#[test]
+fn spin_lock() {
+    let locked = AtomicBool::new(false);
+    let mut counter: u64 = 0;
+    let cp = core::intrinsics::addr_of_mut(&mut counter) as usize;
+    thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                for _ in 0..2000 {
+                    while locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                        thread::yield_now();
+                    }
+                    unsafe {
+                        let p = cp as *mut u64;
+                        core::intrinsics::ptr_write(p, core::intrinsics::ptr_read(p as *u64) + 1);
+                    }
+                    locked.store(false, Ordering::Release);
+                }
+            });
+        }
+    });
+    assert_eq!(counter, 8000);
+}

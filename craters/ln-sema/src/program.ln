@@ -357,7 +357,13 @@ impl Program {
         if p.inout {
             return true;
         }
-        return p.mode == ParamMode::Borrow && fd.abi == Abi::Lunar && !self.defs[def.index()].attrs.intrinsic;
+        if p.mode != ParamMode::Borrow || fd.abi != Abi::Lunar {
+            return false;
+        }
+        // Intrinsics take borrowed arguments by value, except `addr_of`,
+        // which gives the address of what it borrows.
+        let info = self.defs[def.index()];
+        return !info.attrs.intrinsic || self.text(info.name) == "addr_of";
     }
 
     pub fn lang_item(&self, name: str): Option::<DefId> {

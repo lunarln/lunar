@@ -9,6 +9,7 @@
 // only building the closure's value and calling it are special.
 
 use core::arena::{Id, List};
+use core::intern::Symbol;
 use crater::codes;
 use crater::defs::*;
 use crater::diag::{Code, dummy_span};
@@ -462,6 +463,42 @@ impl Sema {
             out.push(Body { def: c.def, locals: ll, params: pl, block, span });
         }
         self.fcx.closures.clear();
+    }
+
+    /// An unsatisfied `Send`, `Sync` or `Detached` bound, with what in the
+    /// type is the reason. Starts the diagnostic (the caller finishes it)
+    /// and returns true, or returns false for other traits.
+    pub fn auto_bound_diag(&mut self, t: Ty, tr: TraitRef, span: Span): bool {
+        let Some(lang) = self.p.lang_name(tr.trait_id) else { return false; };
+        let lang = lang.to_string();
+        let (code, tn, what) = if lang.as_str() == "send" {
+            (codes::ty::NOT_SEND(), "Send", "cannot be sent to another thread")
+        } else if lang.as_str() == "sync" {
+            (codes::ty::NOT_SYNC(), "Sync", "cannot be shared between threads")
+        } else if lang.as_str() == "detached" {
+            (codes::ty::NOT_DETACHED(), "Detached", "holds views, so it cannot outlive what it points into")
+        } else {
+            return false;
+        };
+        let ts = self.p.ty_str(t);
+        let mut m = String::new();
+        m.write("`{ts}` {what}");
+        self.error_at(code, span, m.as_str());
+        let mut l = String::new();
+        l.write("`{ts}` is not `{tn}`");
+        self.with_label(l.as_str());
+        let mut why: [Symbol; ..+] = [];
+        self.p.auto_why(t, self.fcx.env[..], lang.as_str(), &mut why);
+        for s in why {
+            let n = self.p.text(s).to_string();
+            self.with_note(n.as_str());
+        }
+        if let TyKind::Param(_, n) = self.p.types.kind(t) {
+            let mut h = String::new();
+            h.write("add {tn} to {self.p.text(n)}'s bounds: `{self.p.text(n)}: {tn}`");
+            self.with_help(h.as_str());
+        }
+        return true;
     }
 
     /// Why a closure does not satisfy an `Fn`, `FnMut` or `FnOnce` bound:

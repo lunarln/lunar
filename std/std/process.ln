@@ -1,13 +1,13 @@
 use crater::sys;
 
-/// Stop the program with a message. Exits with status 101.
+/// Stop the program with a message. Exits with status 101. On a thread
+/// started by `std::thread`, only that thread stops: whoever joins it gets
+/// the message (see `std::thread::Panic`).
 #[lang = "panic_fmt"]
 pub fn panic(args: FmtArgs): ! {
-    let mut s = String::from("panicked: ");
+    let mut s = String::new();
     core::fmt::write(&mut s, args);
-    s.push('\n');
-    sys::write(2, s.as_bytes());
-    sys::exit(101);
+    crater::rt::panicked(s, String::new());
 }
 
 /// Exit the process with `code`.
@@ -121,10 +121,8 @@ pub fn output(program: str, args: [str; &]): Result::<Output, crater::io::Error>
     all.extend(args);
     // The output goes through two temporary files, which, unlike pipes,
     // cannot fill up while the other one is being read.
-    let n = unsafe { OUTPUTS };
-    unsafe {
-        OUTPUTS = n + 1;
-    }
+    // Threads may run commands at the same time: each takes its own number.
+    let n = unsafe { core::intrinsics::atomic_add(core::intrinsics::addr_of_mut(&mut OUTPUTS), 1, 2) };
     let mut dir = String::new();
     sys::temp_dir(&mut dir);
     let mut out_path = String::new();
@@ -144,10 +142,8 @@ pub fn output(program: str, args: [str; &]): Result::<Output, crater::io::Error>
 
 /// A unique path in the temporary directory, ending in `ext`.
 fn temp_path(ext: str): String {
-    let n = unsafe { OUTPUTS };
-    unsafe {
-        OUTPUTS = n + 1;
-    }
+    // Threads may run commands at the same time: each takes its own number.
+    let n = unsafe { core::intrinsics::atomic_add(core::intrinsics::addr_of_mut(&mut OUTPUTS), 1, 2) };
     let mut dir = String::new();
     sys::temp_dir(&mut dir);
     let mut p = String::new();

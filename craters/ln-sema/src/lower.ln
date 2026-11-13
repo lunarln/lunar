@@ -304,7 +304,7 @@ impl Sema {
             };
             self.p.defs[i].data = data;
         }
-        let langs = ["dull", "light"];
+        let langs = ["dull", "light", "send", "sync", "detached"];
         for lang in langs {
             if let Some(d) = self.p.lang_item(lang) {
                 if let DefData::Trait(t) = self.p.defs[d.index()].data {
@@ -370,6 +370,14 @@ impl Sema {
         self.check_overlapping_impls();
         self.check_duplicate_methods();
         self.check_main();
+        for i in 0..n {
+            let d = self.p.defs[i];
+            if d.attrs.thread_local && d.kind != DefKind::Static {
+                self.error(codes::syntax::BAD_ATTRIBUTE(), d.span, "`#[thread_local]` only applies to statics");
+                self.note("it gives every thread its own copy of a static");
+                self.emit();
+            }
+        }
     }
 
     /// Two inherent impls that can apply to the same type may not both
@@ -872,6 +880,24 @@ impl Sema {
             let sp = self.p.ast.tys.get(s.ty).span;
             self.error(codes::ty::CONST_EVAL(), sp, "a static cannot own data, but `{t}` {what}");
             self.note("statics are not on any data stack, so they cannot hold an owning array, a `String`, or a type containing one");
+            self.emit();
+        }
+        // Every thread sees the same static, so one that is not `mut` (and
+        // so needs no `unsafe` to use) must be safe to share. A thread-local
+        // static belongs to one thread.
+        let none: [Pred; 0] = [];
+        let tls = self.p.defs[id.index()].attrs.thread_local;
+        if !s.is_mut && !tls && !self.p.types.is_error(ty) && !self.p.is_sync(ty, none[..]) {
+            let t = self.p.ty_str(ty);
+            let sp = self.p.ast.tys.get(s.ty).span;
+            self.error(codes::ty::NOT_SYNC(), sp, "`{t}` cannot be shared between threads, so it cannot be the type of a static");
+            let mut why: [Symbol; ..+] = [];
+            self.p.auto_why(ty, none[..], "sync", &mut why);
+            for w in why {
+                let n = self.p.text(w).to_string();
+                self.note("{n}");
+            }
+            self.help("make it `#[thread_local]` to give each thread its own, or wrap the value in a `Mutex`");
             self.emit();
         }
         let value = self.eval_const(cx.module, s.value, ty);
@@ -1420,6 +1446,12 @@ impl Sema {
         let tr = match data.trait_ref {
             Some(t) => t,
             None => {
+                if im.is_unsafe {
+                    self.error(codes::trait_::UNSAFE_IMPL(), self_span, "an inherent impl cannot be `unsafe`");
+                    self.note("`unsafe impl` is for implementing `Send` and `Sync`, whose promises the compiler cannot check");
+                    self.help("remove `unsafe`; mark the methods that need it `unsafe fn` instead");
+                    self.emit();
+                }
                 // Inherent impl.
                 let ok = match self.p.types.kind(data.self_ty) {
                     TyKind::Adt(d, _) => self.p.mod_data(self.p.defs[d.index()].module).krate == krate,
@@ -1457,9 +1489,55 @@ impl Sema {
             self.emit();
             return;
         }
+        if self.p.is_lang(tr.trait_id, "detached") {
+            if data.negative {
+                self.error(codes::trait_::DULL_IMPL(), tr_span, "`Detached` cannot be negated: whether a type is Detached is decided by the compiler");
+            } else {
+                self.error(codes::trait_::DULL_IMPL(), tr_span, "`Detached` cannot be implemented manually: the compiler implements it");
+            }
+            self.note("the compiler implements `core::marker::Detached` automatically for every type that holds no views (no `str`, slice or borrowing closure)");
+            self.emit();
+            return;
+        }
+        if self.p.is_lang(tr.trait_id, "send") || self.p.is_lang(tr.trait_id, "sync") {
+            let own = match self.p.types.kind(data.self_ty) {
+                TyKind::Adt(d, _) => self.p.mod_data(self.p.defs[d.index()].module).krate == krate,
+                TyKind::Error => true,
+                _ => false,
+            };
+            if !own {
+                let s = self.p.ty_str(data.self_ty);
+                self.error(codes::trait_::AUTO_IMPL(), self_span, "`{tname}` can only be implemented for a struct or enum of this crater, not `{s}`");
+                self.note("whether other types are `{tname}` follows from their parts, and only the crater that defines a type may change that");
+                self.emit();
+                return;
+            }
+            if data.negative && im.is_unsafe {
+                self.error(codes::trait_::UNSAFE_IMPL(), tr_span, "a negative impl is not `unsafe`");
+                self.note("`impl !{tname}` only takes a promise away, which is always safe");
+                self.help("remove `unsafe`");
+                self.emit();
+            } else if !data.negative && !im.is_unsafe {
+                self.error(codes::trait_::UNSAFE_IMPL(), tr_span, "implementing `{tname}` is unsafe: write `unsafe impl`");
+                if self.p.is_lang(tr.trait_id, "send") {
+                    self.note("`Send` promises that a value can move to another thread; the compiler cannot check that for a type that holds raw pointers or cells");
+                } else {
+                    self.note("`Sync` promises that threads can share views of a value; the compiler cannot check that for a type that changes through shared views");
+                }
+                self.help("if the promise holds, write `unsafe impl {tname} for ...`");
+                self.emit();
+            }
+            return;
+        }
+        if im.is_unsafe {
+            self.error(codes::trait_::UNSAFE_IMPL(), tr_span, "`{tname}` is not an unsafe trait, so its impls are not `unsafe`");
+            self.note("only `Send` and `Sync` are implemented with `unsafe impl`");
+            self.help("remove `unsafe`");
+            self.emit();
+        }
         if data.negative {
             self.error(codes::trait_::NEGATIVE_IMPL(), tr_span, "`{tname}` is not an auto trait, so it cannot have a negative impl");
-            self.note("negative impls are only meaningful for auto traits, and Lunar's only auto trait is `Dull`, which cannot be negated either");
+            self.note("negative impls are only meaningful for the auto traits `Send` and `Sync`");
             self.help("a type without an `impl {tname}` already does not implement `{tname}`; remove this impl");
             self.emit();
             return;
@@ -1738,7 +1816,8 @@ impl Sema {
 
     /// Evaluate a constant expression of (expected) type `ty`.
     pub fn eval_const(&mut self, module: DefId, e: Id::<Expr>, ty: Ty): Option::<ConstVal> {
-        return match self.eval_const_inner(module, e, ty) {
+        let mut env = ConstEnv::new();
+        return match self.eval_const_inner(module, e, ty, &mut env) {
             Ok(v) => Some(v),
             Err(msg) => {
                 let sp = self.p.ast.exprs.get(e).span;
@@ -1749,7 +1828,7 @@ impl Sema {
         };
     }
 
-    fn eval_const_inner(&mut self, module: DefId, e: Id::<Expr>, ty: Ty): Result::<ConstVal, String> {
+    fn eval_const_inner(&mut self, module: DefId, e: Id::<Expr>, ty: Ty, env: &mut ConstEnv): Result::<ConstVal, String> {
         let ex = self.p.ast.exprs.get(e);
         match ex.kind {
             ExprKind::Lit(l) => {
@@ -1767,9 +1846,9 @@ impl Sema {
                     Lit::Str { value, .. } => ConstVal::Str(value),
                 });
             }
-            ExprKind::Paren(x) => return self.eval_const_inner(module, x, ty),
+            ExprKind::Paren(x) => return self.eval_const_inner(module, x, ty, env),
             ExprKind::Unary(op, x) => {
-                let v = self.eval_const_inner(module, x, ty)?;
+                let v = self.eval_const_inner(module, x, ty, env)?;
                 return match op {
                     UnOp::Neg => match v {
                         ConstVal::Int(i) => Ok(ConstVal::Int(Wide::of(i).neg().to_const())),
@@ -1785,13 +1864,13 @@ impl Sema {
                 };
             }
             ExprKind::Binary(op, a, b) => {
-                let x = self.eval_const_inner(module, a, ty)?;
-                let y = self.eval_const_inner(module, b, ty)?;
+                let x = self.eval_const_inner(module, a, ty, env)?;
+                let y = self.eval_const_inner(module, b, ty, env)?;
                 return const_binary(op, x, y);
             }
             ExprKind::Cast(x, _) => {
                 let err = self.p.types.error();
-                let v = self.eval_const_inner(module, x, err)?;
+                let v = self.eval_const_inner(module, x, err, env)?;
                 return Ok(match v {
                     ConstVal::Int(i) => match self.p.types.kind(ty) {
                         TyKind::Float(_) => ConstVal::Float(int_to_f64(i)),
@@ -1808,27 +1887,180 @@ impl Sema {
                 let mut idents: [Ident; ..+] = [];
                 self.path_idents(p, &mut idents);
                 let shown = self.p.ast.path_text(p);
-                return match self.resolve_prefix(module, idents[..], Ns::Value) {
-                    Some(Prefix { res: ModRes::Def(d), used }) => {
-                        if used != idents.len() {
-                            return Err(core::fmt::format("cannot find constant `{shown}`"));
-                        }
-                        match self.ast(d) {
-                            AstRef::Const(c) => {
-                                if let DefData::Const(cd) = self.p.defs[d.index()].data {
-                                    if let Some(v) = cd.value {
-                                        return Ok(v);
-                                    }
-                                }
-                                let m = self.p.defs[d.index()].module;
-                                let cx = LowerCx::new(m);
-                                let cty = self.lower_ty(cx, c.ty, TyPos::Other);
-                                self.eval_const_inner(m, c.value, cty)
+                // A parameter or `let` of the `const fn` being evaluated.
+                if idents.len() == 1 {
+                    if let Some(v) = env.lookup(idents[0].name) {
+                        return Ok(v);
+                    }
+                }
+                let Some((d, used)) = self.const_resolve(module, idents[..], Ns::Value, env) else {
+                    return Err(core::fmt::format("cannot find constant `{shown}`"));
+                };
+                if used + 1 == idents.len() {
+                    // `Type::function`, as a function pointer.
+                    if let Some(f) = self.inherent_fn(d, idents[used].name) {
+                        return Ok(ConstVal::Fn(f));
+                    }
+                }
+                if used != idents.len() {
+                    return Err(core::fmt::format("cannot find constant `{shown}`"));
+                }
+                return match self.ast(d) {
+                    AstRef::Const(c) => {
+                        if let DefData::Const(cd) = self.p.defs[d.index()].data {
+                            if let Some(v) = cd.value {
+                                return Ok(v);
                             }
-                            _ => Err(core::fmt::format("`{shown}` is not a constant")),
+                        }
+                        let m = self.p.defs[d.index()].module;
+                        let cx = LowerCx::new(m);
+                        let cty = self.lower_ty(cx, c.ty, TyPos::Other);
+                        let mut fresh = ConstEnv::new();
+                        fresh.calls = env.calls;
+                        self.eval_const_inner(m, c.value, cty, &mut fresh)
+                    }
+                    AstRef::Fn(..) => Ok(ConstVal::Fn(d)),
+                    _ => {
+                        // A unit struct or enum variant.
+                        match self.const_ctor(d) {
+                            Some((index, fields, ctor)) => {
+                                if ctor != CtorKind::Unit || fields.len() != 0 {
+                                    return Err(core::fmt::format("`{shown}` has fields, so it is not a value by itself"));
+                                }
+                                Ok(ConstVal::Adt(index, List::empty()))
+                            }
+                            None => Err(core::fmt::format("`{shown}` is not a constant")),
                         }
                     }
-                    _ => Err(core::fmt::format("cannot find constant `{shown}`")),
+                };
+            }
+            ExprKind::Call(callee, args) => {
+                let ExprKind::Path(p) = self.p.ast.exprs.get(callee).kind else {
+                    return Err(String::from("only functions and enum variants can be called in constants"));
+                };
+                let mut idents: [Ident; ..+] = [];
+                self.path_idents(p, &mut idents);
+                let shown = self.p.ast.path_text(p);
+                let Some((d, used)) = self.const_resolve(module, idents[..], Ns::Value, env) else {
+                    return Err(core::fmt::format("cannot find `{shown}`"));
+                };
+                if used + 1 == idents.len() {
+                    let Some(f) = self.inherent_fn(d, idents[used].name) else {
+                        return Err(core::fmt::format("cannot find `{shown}`"));
+                    };
+                    return self.const_call(module, f, args, env);
+                }
+                if used != idents.len() {
+                    return Err(core::fmt::format("cannot find `{shown}`"));
+                }
+                if let DefData::Fn(_) = self.p.defs[d.index()].data {
+                    return self.const_call(module, d, args, env);
+                }
+                // A tuple struct or variant.
+                let Some((index, fields, ctor)) = self.const_ctor(d) else {
+                    return Err(core::fmt::format("`{shown}` cannot be called in a constant"));
+                };
+                if ctor != CtorKind::Tuple || fields.len() != args.len() {
+                    return Err(core::fmt::format("`{shown}` takes {fields.len()} fields here"));
+                }
+                let mut out: [ConstVal; ..+] = [];
+                for i in 0..args.len() {
+                    let x = self.p.ast.expr_ids.list(args)[i];
+                    let ft = self.p.fields.list(fields)[i].ty;
+                    out.push(self.eval_const_inner(module, x, ft, env)?);
+                }
+                return Ok(ConstVal::Adt(index, self.p.consts.add_list(out[..])));
+            }
+            ExprKind::StructLit { path, fields: inits } => {
+                let mut idents: [Ident; ..+] = [];
+                self.path_idents(path, &mut idents);
+                let shown = self.p.ast.path_text(path);
+                let Some((d, used)) = self.const_resolve(module, idents[..], Ns::Type, env) else {
+                    return Err(core::fmt::format("cannot find `{shown}`"));
+                };
+                if used != idents.len() {
+                    return Err(core::fmt::format("cannot find `{shown}`"));
+                }
+                let Some((index, fields, _)) = self.const_ctor(d) else {
+                    return Err(core::fmt::format("`{shown}` is not a struct or variant"));
+                };
+                let mut out: [ConstVal; ..+] = [];
+                for f in self.p.fields.list(fields) {
+                    let mut value: Option::<ConstVal> = None;
+                    for init in self.p.ast.field_inits.list(inits) {
+                        if init.name.name != f.name {
+                            continue;
+                        }
+                        value = Some(match init.value {
+                            Some(x) => self.eval_const_inner(module, x, f.ty, env)?,
+                            None => match env.lookup(f.name) {
+                                Some(v) => v,
+                                None => {
+                                    let n = self.p.text(f.name);
+                                    return Err(core::fmt::format("cannot find `{n}` in this constant"));
+                                }
+                            },
+                        });
+                    }
+                    match value {
+                        Some(v) => out.push(v),
+                        None => {
+                            let n = self.p.text(f.name);
+                            return Err(core::fmt::format("missing field `{n}` in `{shown}`"));
+                        }
+                    }
+                }
+                return Ok(ConstVal::Adt(index, self.p.consts.add_list(out[..])));
+            }
+            ExprKind::Block(b) | ExprKind::Unsafe(b) => return self.const_block(module, b, ty, env),
+            ExprKind::TupleField(base, i, _) => {
+                let err = self.p.types.error();
+                let v = self.eval_const_inner(module, base, err, env)?;
+                let fields = match v {
+                    ConstVal::Tuple(l) => l,
+                    ConstVal::Adt(_, l) => l,
+                    _ => return Err(String::from("`.0` in a constant needs a tuple or tuple struct")),
+                };
+                if (i as usize) >= fields.len() {
+                    return Err(core::fmt::format("no field `{i}` here"));
+                }
+                return Ok(self.p.consts.list(fields)[i as usize]);
+            }
+            ExprKind::Field(base, name) => {
+                let err = self.p.types.error();
+                let v = self.eval_const_inner(module, base, err, env)?;
+                let bt = self.const_expr_ty(module, base, env);
+                let fname = self.p.text(name.name).to_string();
+                let TyKind::Adt(adt_id, _) = self.p.types.kind(bt) else {
+                    return Err(core::fmt::format("cannot tell the type of the value whose field `{fname}` is read in this constant"));
+                };
+                let ConstVal::Adt(vi, fields) = v else {
+                    return Err(core::fmt::format("no field `{fname}` here"));
+                };
+                let adt = self.p.adt(adt_id);
+                if (vi as usize) >= adt.variants.len() {
+                    return Err(core::fmt::format("no field `{fname}` here"));
+                }
+                let var = self.p.variants.list(adt.variants)[vi as usize];
+                for k in 0..var.fields.len() {
+                    if self.p.fields.list(var.fields)[k].name == name.name && k < fields.len() {
+                        return Ok(self.p.consts.list(fields)[k]);
+                    }
+                }
+                return Err(core::fmt::format("no field `{fname}` here"));
+            }
+            ExprKind::If { cond, then, else_ } => {
+                let bool_ty = self.p.types.mk(TyKind::Bool);
+                let c = match self.eval_const_inner(module, cond, bool_ty, env)? {
+                    ConstVal::Bool(b) => b,
+                    _ => return Err(String::from("the condition of an `if` in a constant must be a `bool`")),
+                };
+                if c {
+                    return self.const_block(module, then, ty, env);
+                }
+                return match else_ {
+                    Some(x) => self.eval_const_inner(module, x, ty, env),
+                    None => Ok(ConstVal::Unit),
                 };
             }
             ExprKind::Array(es) => {
@@ -1839,7 +2071,7 @@ impl Sema {
                 let mut out: [ConstVal; ..+] = [];
                 for i in 0..es.len() {
                     let x = self.p.ast.expr_ids.list(es)[i];
-                    out.push(self.eval_const_inner(module, x, et)?);
+                    out.push(self.eval_const_inner(module, x, et, env)?);
                 }
                 return Ok(ConstVal::Array(self.p.consts.add_list(out[..])));
             }
@@ -1848,9 +2080,9 @@ impl Sema {
                     TyKind::Array(e, _) => e,
                     _ => self.p.types.error(),
                 };
-                let v = self.eval_const_inner(module, v, et)?;
+                let v = self.eval_const_inner(module, v, et, env)?;
                 let usize_ty = self.p.types.usize();
-                let count = match self.eval_const_inner(module, n, usize_ty)? {
+                let count = match self.eval_const_inner(module, n, usize_ty, env)? {
                     ConstVal::Int(c) => if c.neg { 0 } else { c.mag },
                     _ => return Err(String::from("array repeat count must be an integer")),
                 };
@@ -1871,12 +2103,289 @@ impl Sema {
                         _ => self.p.types.error(),
                     };
                     let x = self.p.ast.expr_ids.list(es)[i];
-                    out.push(self.eval_const_inner(module, x, t)?);
+                    out.push(self.eval_const_inner(module, x, t, env)?);
                 }
                 return Ok(ConstVal::Tuple(self.p.consts.add_list(out[..])));
             }
             _ => return Err(String::from("this expression is not supported in constants")),
         }
+    }
+
+    /// Resolve a path in a constant: `Self` (inside a `const fn` method),
+    /// or the longest prefix that names an item. The item and how many
+    /// segments it used.
+    fn const_resolve(&mut self, module: DefId, idents: [Ident; &], ns: Ns, env: &ConstEnv): Option::<(DefId, usize)> {
+        if self.p.text(idents[0].name) == "Self" {
+            return match env.self_def() {
+                Some(d) => Some((d, 1)),
+                None => None,
+            };
+        }
+        return match self.resolve_prefix(module, idents, ns) {
+            Some(Prefix { res: ModRes::Def(d), used }) => {
+                // A type alias of a struct or enum stands for it.
+                if let DefData::Alias(a) = self.p.defs[d.index()].data {
+                    if let Some(t) = a.ty {
+                        if let TyKind::Adt(adt, _) = self.p.types.kind(t) {
+                            return Some((adt, used));
+                        }
+                    }
+                }
+                Some((d, used))
+            }
+            _ => None,
+        };
+    }
+
+    /// The function `name` of an inherent impl of struct or enum `adt`.
+    fn inherent_fn(&self, adt: DefId, name: Symbol): Option::<DefId> {
+        for imp in self.p.impls {
+            let DefData::Impl(d) = self.p.defs[imp.index()].data else { continue; };
+            if d.trait_ref.is_some() {
+                continue;
+            }
+            let TyKind::Adt(head, _) = self.p.types.kind(d.self_ty) else { continue; };
+            if head != adt {
+                continue;
+            }
+            if let Some(f) = self.p.impl_methods.get((imp, name)) {
+                return Some(f);
+            }
+        }
+        return None;
+    }
+
+    /// For a struct or enum variant: its variant index, fields and kind.
+    fn const_ctor(&self, d: DefId): Option::<(u32, List::<FieldDef>, CtorKind)> {
+        return match self.p.defs[d.index()].data {
+            DefData::Adt(a) => {
+                if a.is_enum || a.variants.len() == 0 {
+                    return None;
+                }
+                let v = self.p.variants.list(a.variants)[0];
+                Some((0, v.fields, v.ctor))
+            }
+            DefData::Variant { enum_id, index } => {
+                let a = self.p.adt(enum_id);
+                let v = self.p.variants.list(a.variants)[index as usize];
+                Some((index, v.fields, v.ctor))
+            }
+            _ => None,
+        };
+    }
+
+    /// Evaluate a call of `const fn` `f` with the arguments `args` (in
+    /// `module`): its body with its parameters bound.
+    fn const_call(&mut self, module: DefId, f: DefId, args: List::<Id::<Expr>>, env: &mut ConstEnv): Result::<ConstVal, String> {
+        let AstRef::Fn(fd, _) = self.ast(f) else {
+            return Err(String::from("only functions can be called in constants"));
+        };
+        let name = self.p.text(self.p.defs[f.index()].name).to_string();
+        if !fd.is_const {
+            return Err(core::fmt::format("`{name}` is not a `const fn`, so it cannot be called in a constant"));
+        }
+        let Some(body) = fd.body else {
+            return Err(core::fmt::format("`{name}` has no body"));
+        };
+        if env.calls >= 64 {
+            return Err(String::from("too many nested `const fn` calls (the limit is 64)"));
+        }
+        let mut names: [Option::<Symbol>; ..+] = [];
+        for prm in self.p.ast.params.list(fd.params) {
+            names.push(match prm.kind {
+                ParamKind::Named(id) => Some(id.name),
+                _ => None,
+            });
+        }
+        if names.len() != args.len() {
+            return Err(core::fmt::format("`{name}` takes {names.len()} arguments but {args.len()} were given"));
+        }
+        let sig = self.p.fn_data(f).sig;
+        let mut vals: [ConstVal; ..+] = [];
+        for i in 0..args.len() {
+            let x = self.p.ast.expr_ids.list(args)[i];
+            let pt = if i < sig.params.len() { self.p.params.list(sig.params)[i].ty } else { self.p.types.error() };
+            vals.push(self.eval_const_inner(module, x, pt, env)?);
+        }
+        // `Self` in a method is its impl's self type.
+        let mut self_def: Option::<DefId> = None;
+        if let Some(parent) = self.p.defs[f.index()].parent {
+            if let DefData::Impl(im) = self.p.defs[parent.index()].data {
+                if let TyKind::Adt(a, _) = self.p.types.kind(im.self_ty) {
+                    self_def = Some(a);
+                }
+            }
+        }
+        let saved = env.enter(self_def);
+        for i in 0..names.len() {
+            if let Some(n) = names[i] {
+                let pt = if i < sig.params.len() { self.p.params.list(sig.params)[i].ty } else { self.p.types.error() };
+                env.bind(n, vals[i], pt);
+            }
+        }
+        let fm = self.p.defs[f.index()].module;
+        let r = self.const_block(fm, body, sig.ret, env);
+        env.leave(saved);
+        return r;
+    }
+
+    /// The type of a constant expression, as far as field access needs it:
+    /// a binding's, a struct literal's, a `const fn` call's result, or the
+    /// error type.
+    fn const_expr_ty(&mut self, module: DefId, e: Id::<Expr>, env: &ConstEnv): Ty {
+        let err = self.p.types.error();
+        match self.p.ast.exprs.get(e).kind {
+            ExprKind::Paren(x) => return self.const_expr_ty(module, x, env),
+            ExprKind::Path(p) => {
+                let mut idents: [Ident; ..+] = [];
+                self.path_idents(p, &mut idents);
+                if idents.len() == 1 {
+                    if let Some(t) = env.type_of(idents[0].name) {
+                        return t;
+                    }
+                }
+            }
+            ExprKind::StructLit { path, .. } => {
+                let mut idents: [Ident; ..+] = [];
+                self.path_idents(path, &mut idents);
+                if let Some((d, used)) = self.const_resolve(module, idents[..], Ns::Type, env) {
+                    if used == idents.len() {
+                        if let DefData::Adt(_) = self.p.defs[d.index()].data {
+                            return self.p.types.mk(TyKind::Adt(d, List::empty()));
+                        }
+                    }
+                }
+            }
+            ExprKind::Call(callee, _) => {
+                if let ExprKind::Path(p) = self.p.ast.exprs.get(callee).kind {
+                    let mut idents: [Ident; ..+] = [];
+                    self.path_idents(p, &mut idents);
+                    if let Some((d, used)) = self.const_resolve(module, idents[..], Ns::Value, env) {
+                        let f = if used + 1 == idents.len() { self.inherent_fn(d, idents[used].name) } else if used == idents.len() { Some(d) } else { None };
+                        if let Some(f) = f {
+                            if let DefData::Fn(fd) = self.p.defs[f.index()].data {
+                                return fd.sig.ret;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        return err;
+    }
+
+    /// Evaluate the block of a `const fn` (or a block in a constant): `let`s
+    /// of single names, then a `return` or a final expression.
+    fn const_block(&mut self, module: DefId, b: Id::<ln_ast::Block>, ty: Ty, env: &mut ConstEnv): Result::<ConstVal, String> {
+        let blk = self.p.ast.blocks.get(b);
+        let err = self.p.types.error();
+        for s in self.p.ast.stmts.list(blk.stmts) {
+            match s.kind {
+                ln_ast::StmtKind::Let { pat, init: Some(init), else_: None, .. } => {
+                    let ln_ast::PatKind::Binding { name, .. } = self.p.ast.pats.get(pat).kind else {
+                        return Err(String::from("only `let name = value;` is supported in a `const fn`"));
+                    };
+                    let v = self.eval_const_inner(module, init, err, env)?;
+                    let t = self.const_expr_ty(module, init, env);
+                    env.bind(name.name, v, t);
+                }
+                ln_ast::StmtKind::Expr(x) => {
+                    if let ExprKind::Return(r) = self.p.ast.exprs.get(x).kind {
+                        return match r {
+                            Some(v) => self.eval_const_inner(module, v, ty, env),
+                            None => Ok(ConstVal::Unit),
+                        };
+                    }
+                    return Err(String::from("only `let`s and a `return` are supported in a `const fn`"));
+                }
+                _ => return Err(String::from("only `let`s and a `return` are supported in a `const fn`")),
+            }
+        }
+        return match blk.tail {
+            Some(t) => {
+                if let ExprKind::Return(Some(v)) = self.p.ast.exprs.get(t).kind {
+                    return self.eval_const_inner(module, v, ty, env);
+                }
+                self.eval_const_inner(module, t, ty, env)
+            }
+            None => Ok(ConstVal::Unit),
+        };
+    }
+}
+
+/// The bindings of the `const fn` calls being evaluated: parameters and
+/// `let`s, innermost last. Names are looked up from `start` (the current
+/// call's first) on.
+struct ConstEnv {
+    names: [Symbol; -..+],
+    values: [ConstVal; -..+],
+    /// The type of each binding, as far as it is known (for field access).
+    tys: [Ty; -..+],
+    start: usize,
+    /// The struct or enum `Self` names in each call (`None` outside impls).
+    selfs: [Option::<DefId>; -..+],
+    calls: u32,
+}
+
+impl ConstEnv {
+    fn new(): ConstEnv {
+        return ConstEnv { names: [], values: [], tys: [], start: 0, selfs: [], calls: 0 };
+    }
+
+    fn lookup(&self, name: Symbol): Option::<ConstVal> {
+        let mut i = self.names.len();
+        while i > self.start {
+            i -= 1;
+            if self.names[i] == name {
+                return Some(self.values[i]);
+            }
+        }
+        return None;
+    }
+
+    fn bind(&mut self, name: Symbol, v: ConstVal, ty: Ty) {
+        self.names.push(name);
+        self.values.push(v);
+        self.tys.push(ty);
+    }
+
+    /// The type of a binding, as far as it is known.
+    fn type_of(&self, name: Symbol): Option::<Ty> {
+        let mut i = self.names.len();
+        while i > self.start {
+            i -= 1;
+            if self.names[i] == name {
+                return Some(self.tys[i]);
+            }
+        }
+        return None;
+    }
+
+    fn self_def(&self): Option::<DefId> {
+        return match self.selfs.last() {
+            Some(s) => s,
+            None => None,
+        };
+    }
+
+    /// Start a call; returns what `leave` restores.
+    fn enter(&mut self, self_def: Option::<DefId>): (usize, usize) {
+        let saved = (self.start, self.names.len());
+        self.start = self.names.len();
+        self.selfs.push(self_def);
+        self.calls += 1;
+        return saved;
+    }
+
+    fn leave(&mut self, saved: (usize, usize)) {
+        let (start, len) = saved;
+        self.names.truncate(len);
+        self.values.truncate(len);
+        self.tys.truncate(len);
+        self.start = start;
+        self.selfs.pop();
+        self.calls -= 1;
     }
 }
 

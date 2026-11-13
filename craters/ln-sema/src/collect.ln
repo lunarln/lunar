@@ -254,6 +254,9 @@ impl Sema {
                     } else if name == "inline" {
                         out.inline = true;
                         true
+                    } else if name == "thread_local" {
+                        out.thread_local = true;
+                        true
                     } else if name == "derive_macro" {
                         out.derive_macro = true;
                         true
@@ -297,6 +300,8 @@ impl Sema {
                 "#[derive_macro]"
             } else if name == "export" {
                 "#[export]"
+            } else if name == "thread_local" {
+                "#[thread_local]"
             } else {
                 ""
             };
@@ -305,7 +310,7 @@ impl Sema {
                 self.help("write it as `{usage}`");
             } else {
                 self.error(codes::syntax::BAD_ATTRIBUTE(), a.span, "unknown attribute `{name}`");
-                self.note("known attributes: cfg, test, inline, lang, intrinsic, link_name, allow, doc, derive, derive_macro, export");
+                self.note("known attributes: cfg, test, inline, lang, intrinsic, link_name, allow, doc, derive, derive_macro, export, thread_local");
             }
             self.emit();
         }

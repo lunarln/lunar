@@ -78,11 +78,13 @@ pub struct ItemAttrs {
     pub derive_macro: bool,
     /// `#[export]`: an item a macro defines is visible where it is invoked.
     pub export: bool,
+    /// `#[thread_local]` on a static: every thread has its own copy.
+    pub thread_local: bool,
 }
 
 impl ItemAttrs {
     pub fn none(): ItemAttrs {
-        return ItemAttrs { lang: None, intrinsic: false, test: false, inline: false, link_name: None, derive: List::empty(), derive_macro: false, export: false };
+        return ItemAttrs { lang: None, intrinsic: false, test: false, inline: false, link_name: None, derive: List::empty(), derive_macro: false, export: false, thread_local: false };
     }
 }
 
@@ -305,6 +307,8 @@ pub enum ConstVal {
     /// Struct / enum variant: (variant index, fields).
     Adt(u32, List::<ConstVal>),
     Array(List::<ConstVal>),
+    /// A function, as a function pointer (a `const fn` may store one).
+    Fn(DefId),
 }
 
 pub struct ConstData {

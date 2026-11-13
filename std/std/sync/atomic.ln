@@ -1,0 +1,323 @@
+// Atomic integers, booleans and pointers: values threads change without a
+// lock, each change happening all at once.
+//
+// ```lunar
+// use std::sync::atomic::{AtomicU64, Ordering};
+//
+// static HITS: AtomicU64 = AtomicU64::new(0);
+//
+// fn hit(): u64 {
+//     return HITS.fetch_add(1, Ordering::Relaxed) + 1;
+// }
+// ```
+//
+// The orderings are C++'s (and Rust's): `Relaxed` makes only the access
+// itself atomic; a `Release` store and an `Acquire` load of the value it
+// stored order everything the storing thread did before the store before
+// everything the loading thread does after the load; `AcqRel` is both, for
+// operations that read and write; `SeqCst` adds one order of all `SeqCst`
+// operations that every thread agrees on. A load cannot release and a
+// store cannot acquire: those parts of an ordering are ignored there.
+//
+// Atomics are built on `core::cell::UnsafeCell`, so they are moved rather
+// than copied and cannot be array items; their `new` is a `const fn`, so
+// they can be statics.
+
+use core::cell::UnsafeCell;
+use core::intrinsics;
+use core::num::Int;
+
+/// How an atomic access is ordered with the other memory accesses of its
+/// thread.
+#[derive(Eq, Debug, Display)]
+pub enum Ordering {
+    Relaxed,
+    Release,
+    Acquire,
+    AcqRel,
+    SeqCst,
+}
+
+/// `intrinsics::$f($a..., order)` with `$o`'s ordering as the constant the
+/// intrinsic needs.
+macro ordered($o:expr, $f:ident, $($a:expr),*) {
+    match $o {
+        Ordering::Relaxed => intrinsics::$f($($a),*, 2),
+        Ordering::Acquire => intrinsics::$f($($a),*, 4),
+        Ordering::Release => intrinsics::$f($($a),*, 5),
+        Ordering::AcqRel => intrinsics::$f($($a),*, 6),
+        Ordering::SeqCst => intrinsics::$f($($a),*, 7),
+    }
+}
+
+/// A fence: orders the memory accesses before it with those after it, as
+/// `order` says, without an atomic of its own. A `Release` fence followed
+/// by any atomic store, and an atomic load followed by an `Acquire` fence,
+/// synchronize like a `Release` store and an `Acquire` load would.
+pub fn fence(order: Ordering) {
+    match order {
+        Ordering::Relaxed => {}
+        Ordering::Acquire => intrinsics::atomic_fence(4),
+        Ordering::Release => intrinsics::atomic_fence(5),
+        Ordering::AcqRel => intrinsics::atomic_fence(6),
+        Ordering::SeqCst => intrinsics::atomic_fence(7),
+    }
+}
+
+/// An atomic integer: `AtomicU64`, `AtomicI32`, ... name its instances.
+pub struct Atomic::<T> {
+    v: UnsafeCell::<T>,
+}
+
+unsafe impl::<T> Send for Atomic::<T> {}
+unsafe impl::<T> Sync for Atomic::<T> {}
+
+pub type AtomicU8 = Atomic::<u8>;
+pub type AtomicU16 = Atomic::<u16>;
+pub type AtomicU32 = Atomic::<u32>;
+pub type AtomicU64 = Atomic::<u64>;
+pub type AtomicUsize = Atomic::<usize>;
+pub type AtomicI8 = Atomic::<i8>;
+pub type AtomicI16 = Atomic::<i16>;
+pub type AtomicI32 = Atomic::<i32>;
+pub type AtomicI64 = Atomic::<i64>;
+pub type AtomicIsize = Atomic::<isize>;
+
+impl::<T: Int> Atomic::<T> {
+    pub const fn new(v: T): Atomic::<T> {
+        return Atomic { v: UnsafeCell::new(v) };
+    }
+
+    /// The value.
+    pub fn load(&self, order: Ordering): T {
+        let p = self.v.get() as *T;
+        return unsafe { ordered!(order, atomic_load, p) };
+    }
+
+    /// Set the value.
+    pub fn store(&self, v: T, order: Ordering) {
+        let p = self.v.get();
+        unsafe { ordered!(order, atomic_store, p, v) };
+    }
+
+    /// Set the value; the one before.
+    pub fn swap(&self, v: T, order: Ordering): T {
+        let p = self.v.get();
+        return unsafe { ordered!(order, atomic_swap, p, v) };
+    }
+
+    /// Set the value to `new` if it is `current`: `Ok` with the value
+    /// before if it was, else `Err` with the value found. `failure` orders
+    /// the load when it fails; the load is never weaker than it says.
+    pub fn compare_exchange(&self, current: T, new: T, success: Ordering, failure: Ordering): Result::<T, T> {
+        let _ = failure;
+        let p = self.v.get();
+        let old = unsafe { ordered!(success, atomic_cas, p, current, new) };
+        return if old == current { Ok(old) } else { Err(old) };
+    }
+
+    /// `compare_exchange`, which may also fail when the value is `current`
+    /// (it never does here), for use in a loop.
+    pub fn compare_exchange_weak(&self, current: T, new: T, success: Ordering, failure: Ordering): Result::<T, T> {
+        return self.compare_exchange(current, new, success, failure);
+    }
+
+    /// Add `v` (wrapping around); the value before.
+    pub fn fetch_add(&self, v: T, order: Ordering): T {
+        let p = self.v.get();
+        return unsafe { ordered!(order, atomic_add, p, v) };
+    }
+
+    /// Subtract `v` (wrapping around); the value before.
+    pub fn fetch_sub(&self, v: T, order: Ordering): T {
+        let p = self.v.get();
+        return unsafe { ordered!(order, atomic_sub, p, v) };
+    }
+
+    /// Bitwise and with `v`; the value before.
+    pub fn fetch_and(&self, v: T, order: Ordering): T {
+        let p = self.v.get();
+        return unsafe { ordered!(order, atomic_and, p, v) };
+    }
+
+    /// Bitwise not-and with `v`; the value before.
+    pub fn fetch_nand(&self, v: T, order: Ordering): T {
+        let p = self.v.get();
+        return unsafe { ordered!(order, atomic_nand, p, v) };
+    }
+
+    /// Bitwise or with `v`; the value before.
+    pub fn fetch_or(&self, v: T, order: Ordering): T {
+        let p = self.v.get();
+        return unsafe { ordered!(order, atomic_or, p, v) };
+    }
+
+    /// Bitwise exclusive or with `v`; the value before.
+    pub fn fetch_xor(&self, v: T, order: Ordering): T {
+        let p = self.v.get();
+        return unsafe { ordered!(order, atomic_xor, p, v) };
+    }
+
+    /// Set the value to the larger of it and `v`; the value before.
+    pub fn fetch_max(&self, v: T, order: Ordering): T {
+        let p = self.v.get();
+        return unsafe { ordered!(order, atomic_max, p, v) };
+    }
+
+    /// Set the value to the smaller of it and `v`; the value before.
+    pub fn fetch_min(&self, v: T, order: Ordering): T {
+        let p = self.v.get();
+        return unsafe { ordered!(order, atomic_min, p, v) };
+    }
+
+    /// Replace the value with `f(value)` until no other thread changed it
+    /// in between: `Ok` with the value before, or `Err` with the last value
+    /// seen if `f` returned `None`.
+    pub fn fetch_update::<F: FnMut(T): Option::<T>>(&self, set: Ordering, fetch: Ordering, mut f: F): Result::<T, T> {
+        let mut cur = self.load(fetch);
+        loop {
+            let Some(new) = f(cur) else { return Err(cur); };
+            match self.compare_exchange(cur, new, set, fetch) {
+                Ok(old) => return Ok(old),
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+
+    /// The value, taking the atomic apart.
+    pub fn into_inner(self): T {
+        return self.v.into_inner();
+    }
+
+    /// A pointer to the value, for code that accesses it atomically
+    /// itself.
+    pub fn as_ptr(&self): *mut T {
+        return self.v.get();
+    }
+}
+
+/// An atomic `bool`.
+pub struct AtomicBool {
+    v: UnsafeCell::<u8>,
+}
+
+unsafe impl Sync for AtomicBool {}
+
+impl AtomicBool {
+    pub const fn new(v: bool): AtomicBool {
+        return AtomicBool { v: UnsafeCell::new(if v { 1 } else { 0 }) };
+    }
+
+    /// The value.
+    pub fn load(&self, order: Ordering): bool {
+        let p = self.v.get() as *u8;
+        return unsafe { ordered!(order, atomic_load, p) } != 0;
+    }
+
+    /// Set the value.
+    pub fn store(&self, v: bool, order: Ordering) {
+        let p = self.v.get();
+        let b = v as u8;
+        unsafe { ordered!(order, atomic_store, p, b) };
+    }
+
+    /// Set the value; the one before.
+    pub fn swap(&self, v: bool, order: Ordering): bool {
+        let p = self.v.get();
+        let b = v as u8;
+        return unsafe { ordered!(order, atomic_swap, p, b) } != 0;
+    }
+
+    /// Set the value to `new` if it is `current`: `Ok` with the value
+    /// before if it was, else `Err` with the value found.
+    pub fn compare_exchange(&self, current: bool, new: bool, success: Ordering, failure: Ordering): Result::<bool, bool> {
+        let _ = failure;
+        let p = self.v.get();
+        let c = current as u8;
+        let n = new as u8;
+        let old = unsafe { ordered!(success, atomic_cas, p, c, n) } != 0;
+        return if old == current { Ok(old) } else { Err(old) };
+    }
+
+    /// `compare_exchange`, for use in a loop.
+    pub fn compare_exchange_weak(&self, current: bool, new: bool, success: Ordering, failure: Ordering): Result::<bool, bool> {
+        return self.compare_exchange(current, new, success, failure);
+    }
+
+    /// Logical and with `v`; the value before.
+    pub fn fetch_and(&self, v: bool, order: Ordering): bool {
+        let p = self.v.get();
+        let b = v as u8;
+        return unsafe { ordered!(order, atomic_and, p, b) } != 0;
+    }
+
+    /// Logical or with `v`; the value before.
+    pub fn fetch_or(&self, v: bool, order: Ordering): bool {
+        let p = self.v.get();
+        let b = v as u8;
+        return unsafe { ordered!(order, atomic_or, p, b) } != 0;
+    }
+
+    /// Logical exclusive or with `v`; the value before.
+    pub fn fetch_xor(&self, v: bool, order: Ordering): bool {
+        let p = self.v.get();
+        let b = v as u8;
+        return unsafe { ordered!(order, atomic_xor, p, b) } != 0;
+    }
+
+    /// Flip the value; the value before.
+    pub fn fetch_not(&self, order: Ordering): bool {
+        return self.fetch_xor(true, order);
+    }
+
+    /// The value, taking the atomic apart.
+    pub fn into_inner(self): bool {
+        return self.v.into_inner() != 0;
+    }
+}
+
+/// An atomic raw pointer.
+pub struct AtomicPtr::<T> {
+    v: UnsafeCell::<*mut T>,
+}
+
+unsafe impl::<T> Send for AtomicPtr::<T> {}
+unsafe impl::<T> Sync for AtomicPtr::<T> {}
+
+impl::<T> AtomicPtr::<T> {
+    pub const fn new(p: *mut T): AtomicPtr::<T> {
+        return AtomicPtr { v: UnsafeCell::new(p) };
+    }
+
+    /// The pointer.
+    pub fn load(&self, order: Ordering): *mut T {
+        let p = self.v.get() as **mut T;
+        return unsafe { ordered!(order, atomic_load, p) };
+    }
+
+    /// Set the pointer.
+    pub fn store(&self, v: *mut T, order: Ordering) {
+        let p = self.v.get();
+        unsafe { ordered!(order, atomic_store, p, v) };
+    }
+
+    /// Set the pointer; the one before.
+    pub fn swap(&self, v: *mut T, order: Ordering): *mut T {
+        let p = self.v.get();
+        return unsafe { ordered!(order, atomic_swap, p, v) };
+    }
+
+    /// Set the pointer to `new` if it is `current`: `Ok` with the pointer
+    /// before if it was, else `Err` with the pointer found.
+    pub fn compare_exchange(&self, current: *mut T, new: *mut T, success: Ordering, failure: Ordering): Result::<*mut T, *mut T> {
+        let _ = failure;
+        let p = self.v.get();
+        let old = unsafe { ordered!(success, atomic_cas, p, current, new) };
+        return if (old as usize) == (current as usize) { Ok(old) } else { Err(old) };
+    }
+
+    /// The pointer, taking the atomic apart.
+    pub fn into_inner(self): *mut T {
+        return self.v.into_inner();
+    }
+}

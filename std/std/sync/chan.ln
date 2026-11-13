@@ -1,0 +1,244 @@
+// The channel behind `mpsc` and `mpmc`: a queue under a lock, with
+// condition variables for receivers (something arrived, or the senders are
+// gone) and senders (room was made, or the receivers are gone).
+//
+// The senders share one block (`token`), and so do the receivers; when the
+// last sender (or receiver) is freed, its block's drop function marks the
+// channel disconnected on that side and wakes the other side. Every block
+// holds a `Shared` reference to the channel, which is freed with the last
+// of them, dropping what is still queued.
+
+use core::cell::UnsafeCell;
+use core::intrinsics;
+use crater::rt;
+use crater::sync::Shared;
+use crater::sync::raw::{Queue, RawCondvar, RawMutex, FOREVER};
+use crater::time::{Duration, Instant};
+
+const MAX_USIZE: usize = 18446744073709551615;
+
+/// The state of a channel, changed under `Chan::lock`.
+struct State::<T> {
+    queue: Queue::<T>,
+    /// Items the queue holds at most: `MAX_USIZE` unbounded; 0 a
+    /// rendezvous (a sender waits until its item is received).
+    cap: usize,
+    senders: bool,
+    receivers: bool,
+    /// Items sent and received so far (for rendezvous senders).
+    sent: u64,
+    received: u64,
+}
+
+pub struct Chan::<T> {
+    lock: RawMutex,
+    /// Receivers wait here: an item arrived, or the senders are gone.
+    arrived: RawCondvar,
+    /// Senders wait here: an item was taken, or the receivers are gone.
+    taken: RawCondvar,
+    state: UnsafeCell::<State::<T>>,
+}
+
+unsafe impl::<T: Send> Send for Chan::<T> {}
+unsafe impl::<T: Send> Sync for Chan::<T> {}
+
+/// Why a send failed: the value comes back.
+pub enum SendFail::<T> {
+    Full(T),
+    Disconnected(T),
+    Timeout(T),
+}
+
+/// Why a receive failed.
+#[derive(Eq, Debug)]
+pub enum RecvFail {
+    Empty,
+    Disconnected,
+    Timeout,
+}
+
+/// One side's handle: a reference to the side's shared block, and the
+/// channel (which the block keeps alive).
+pub struct End::<T> {
+    token: [u8; ..+],
+    chan: *mut Chan::<T>,
+}
+
+unsafe impl::<T: Send> Send for End::<T> {}
+unsafe impl::<T: Send> Sync for End::<T> {}
+
+/// The drop function of the senders' block: the senders are gone.
+fn senders_gone::<T>(p: *mut u8) {
+    let chan: Shared::<Chan::<T>> = unsafe { intrinsics::ptr_read(p as *Shared::<Chan::<T>>) };
+    let c = chan.as_ptr();
+    unsafe {
+        (*c).lock.lock();
+        (*(*c).state.get()).senders = false;
+        (*c).arrived.notify_all();
+        (*c).lock.unlock();
+    }
+}
+
+/// The drop function of the receivers' block: the receivers are gone.
+fn receivers_gone::<T>(p: *mut u8) {
+    let chan: Shared::<Chan::<T>> = unsafe { intrinsics::ptr_read(p as *Shared::<Chan::<T>>) };
+    let c = chan.as_ptr();
+    unsafe {
+        (*c).lock.lock();
+        (*(*c).state.get()).receivers = false;
+        (*c).taken.notify_all();
+        (*c).lock.unlock();
+    }
+}
+
+/// A block holding a reference to `chan`, with drop function `drop`.
+fn token::<T>(chan: &Shared::<Chan::<T>>, drop: fn(*mut u8)): [u8; ..+] {
+    let size = core::mem::size_of::<Shared::<Chan::<T>>>();
+    let t = rt::block_new(size, drop);
+    unsafe {
+        intrinsics::ptr_write((t[..].as_ptr() as usize) as *mut Shared::<Chan::<T>>, chan.clone());
+    }
+    return t;
+}
+
+/// A new channel holding at most `cap` items (`usize::MAX`: unbounded; 0:
+/// rendezvous): its sending and receiving ends.
+pub fn pair::<T>(cap: usize): (End::<T>, End::<T>) {
+    let state = State::<T> { queue: Queue::new(), cap, senders: true, receivers: true, sent: 0, received: 0 };
+    let chan = unsafe { Shared::new_unchecked(Chan { lock: RawMutex::new(), arrived: RawCondvar::new(), taken: RawCondvar::new(), state: UnsafeCell::new(state) }) };
+    let c = chan.as_ptr() as *mut Chan::<T>;
+    let sg: fn(*mut u8) = senders_gone::<T>;
+    let rg: fn(*mut u8) = receivers_gone::<T>;
+    let tx = End { token: token(&chan, sg), chan: c };
+    let rx = End { token: token(&chan, rg), chan: c };
+    return (tx, rx);
+}
+
+/// Time left until `timeout` after `start`, in nanoseconds (0 if it ran
+/// out).
+fn left(start: Instant, timeout: Duration): u64 {
+    let spent = start.elapsed();
+    if spent >= timeout {
+        return 0;
+    }
+    return (timeout - spent).as_nanos();
+}
+
+impl::<T> End::<T> {
+    /// Another handle on the same side.
+    pub fn dup(&self): End::<T> {
+        return End { token: rt::block_dup(&self.token), chan: self.chan };
+    }
+
+    /// Send `v`, waiting for room (and, for a rendezvous, for a receiver)
+    /// if `wait`, at most `timeout` (`None`: no limit).
+    pub fn send(&self, v: T, wait: bool, timeout: Option::<Duration>): Result::<(), SendFail::<T>> from v {
+        let c = self.chan;
+        let start = Instant::now();
+        unsafe {
+            (*c).lock.lock();
+            let st = (*c).state.get();
+            loop {
+                if !(*st).receivers {
+                    (*c).lock.unlock();
+                    return Err(SendFail::Disconnected(v));
+                }
+                let room = if (*st).cap == 0 { 1 } else { (*st).cap };
+                if (*st).queue.len() < room {
+                    break;
+                }
+                if !wait {
+                    (*c).lock.unlock();
+                    return Err(SendFail::Full(v));
+                }
+                let ns = match timeout {
+                    Some(d) => left(start, d),
+                    None => FOREVER,
+                };
+                if ns == 0 {
+                    (*c).lock.unlock();
+                    return Err(SendFail::Timeout(v));
+                }
+                (*c).taken.wait(&(*c).lock, ns);
+            }
+            (*st).queue.push(v);
+            (*st).sent += 1;
+            let ticket = (*st).sent;
+            (*c).arrived.notify_one();
+            if (*st).cap == 0 {
+                // A rendezvous: wait until a receiver took it (or all are
+                // gone; it is then dropped with the channel).
+                while (*st).received < ticket && (*st).receivers {
+                    (*c).taken.wait(&(*c).lock, FOREVER);
+                }
+            }
+            (*c).lock.unlock();
+        }
+        return Ok(());
+    }
+
+    /// Receive an item, waiting for one if `wait`, at most `timeout`
+    /// (`None`: no limit).
+    pub fn recv(&self, wait: bool, timeout: Option::<Duration>): Result::<T, RecvFail> {
+        let c = self.chan;
+        let start = Instant::now();
+        unsafe {
+            (*c).lock.lock();
+            let st = (*c).state.get();
+            loop {
+                if let Some(v) = (*st).queue.pop() {
+                    (*st).received += 1;
+                    // Room was made; a rendezvous sender may be waiting for
+                    // its own item, so wake them all then.
+                    if (*st).cap == 0 {
+                        (*c).taken.notify_all();
+                    } else {
+                        (*c).taken.notify_one();
+                    }
+                    (*c).lock.unlock();
+                    return Ok(v);
+                }
+                if !(*st).senders {
+                    (*c).lock.unlock();
+                    return Err(RecvFail::Disconnected);
+                }
+                if !wait {
+                    (*c).lock.unlock();
+                    return Err(RecvFail::Empty);
+                }
+                let ns = match timeout {
+                    Some(d) => left(start, d),
+                    None => FOREVER,
+                };
+                if ns == 0 {
+                    (*c).lock.unlock();
+                    return Err(RecvFail::Timeout);
+                }
+                (*c).arrived.wait(&(*c).lock, ns);
+            }
+        }
+    }
+
+    /// How many items are queued right now.
+    pub fn len(&self): usize {
+        let c = self.chan;
+        unsafe {
+            (*c).lock.lock();
+            let n = (*(*c).state.get()).queue.len();
+            (*c).lock.unlock();
+            return n;
+        }
+    }
+
+    /// Whether the other side is gone.
+    pub fn other_side_gone(&self, sending: bool): bool {
+        let c = self.chan;
+        unsafe {
+            (*c).lock.lock();
+            let st = (*c).state.get();
+            let gone = if sending { !(*st).receivers } else { !(*st).senders };
+            (*c).lock.unlock();
+            return gone;
+        }
+    }
+}

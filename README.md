@@ -49,6 +49,11 @@ fn main() {
   interpolated: `println("x = {x}")`.
 * **Traits** like Rust's: generic traits, supertraits, default methods,
   associated functions, blanket impls, operator traits.
+* **Threads**: `thread::spawn` and `thread::scope`, with the auto traits
+  `Send`, `Sync` and `Detached` (holds no views) checked by the compiler.
+  Locks are used through closures (`m.lock(|v| v += 1)`), so no view of
+  locked data outlives the lock; atomics, `Shared`, channels and statics
+  built by `const fn` (`static HITS: AtomicU64 = AtomicU64::new(0);`).
 * **Hard `unsafe` rules**: an `unsafe fn` body gets no implicit unsafe
   context. Unsafe operations always need an `unsafe { }` block.
 * **Scoped diagnostics** rendered with ariadne:

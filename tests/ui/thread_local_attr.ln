@@ -1,0 +1,11 @@
+// error: syntax::bad_attribute
+// `#[thread_local]` is for statics.
+#[thread_local]
+fn f() {}
+
+#[thread_local]
+static mut DEPTH: u32 = 0;
+
+fn main() {
+    f();
+}

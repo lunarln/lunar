@@ -1372,6 +1372,10 @@ impl Sema {
                     self.emit();
                     continue;
                 }
+                if self.auto_bound_diag(t, tr, o.span) {
+                    self.emit();
+                    continue;
+                }
                 let ts = self.p.ty_str(t);
                 let tn = self.p.name(tr.trait_id).to_string();
                 let mut m = String::new();

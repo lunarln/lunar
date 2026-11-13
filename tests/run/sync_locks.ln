@@ -1,0 +1,318 @@
+// std::sync: Mutex, RwLock, Condvar, poisoning, Once, OnceLock, LazyLock,
+// Barrier and Shared, used from several threads.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Barrier, Condvar, LazyLock, Mutex, Once, OnceLock, RwLock, Shared, TryLockError};
+use std::thread;
+use std::time::Duration;
+
+static COUNT: Mutex::<u64> = Mutex::new(0);
+
+#[test]
+fn mutex_counts_under_contention() {
+    let mut g = thread::Group::<()>::new();
+    for _ in 0..8 {
+        g.spawn(move || {
+            for _ in 0..2000 {
+                COUNT.lock(|c| c += 1);
+            }
+        });
+    }
+    while let Some(r) = g.join_next() {
+        r.unwrap();
+    }
+    assert_eq!(COUNT.lock(|c| c), 16000);
+}
+
+#[test]
+fn mutex_of_owned_data() {
+    let names = Mutex::new(String::new());
+    thread::scope(|s| {
+        for i in 0..4 {
+            s.spawn_with(i, |k| names.lock(|n| n.write("{k}")));
+        }
+    });
+    let text = names.lock(|n| n.clone());
+    assert_eq!(text.len(), 4);
+    for d in ["0", "1", "2", "3"] {
+        assert!(text.as_str().contains(d));
+    }
+    assert_eq!(names.into_inner().ok().unwrap().len(), 4);
+}
+
+#[test]
+fn try_lock_while_held() {
+    let m = Mutex::new(1u32);
+    let r = m.lock(|v| {
+        v += 1;
+        match m.try_lock(|w| w) {
+            Ok(_) => 0,
+            Err(TryLockError::WouldBlock) => 1,
+            Err(TryLockError::Poisoned) => 2,
+        }
+    });
+    assert_eq!(r, 1);
+    assert_eq!(m.try_lock(|v| v), Ok(2));
+}
+
+#[test]
+fn panics_poison_locks() {
+    let m = Shared::new(Mutex::new(10u64));
+    let m2 = m.clone();
+    let h = thread::spawn(move || {
+        m2.with(|mx| mx.lock(|v| {
+            v += 1;
+            if v > 0 {
+                panic("in the lock");
+            }
+        }));
+    });
+    assert!(h.join().is_err());
+    // The lock was let go, and is poisoned: the change may be half done.
+    assert!(m.with(|mx| mx.is_poisoned()));
+    let seen = m.with(|mx| match mx.lock_checked(|v| v) {
+        Ok(_) => 0,
+        Err(e) => e.into_inner(),
+    });
+    assert_eq!(seen, 11);
+    assert!(m.with(|mx| match mx.try_lock(|v| v) {
+        Err(TryLockError::Poisoned) => true,
+        _ => false,
+    }));
+    m.with(|mx| mx.clear_poison());
+    assert_eq!(m.with(|mx| mx.lock(|v| v)), 11);
+}
+
+#[test]
+fn rwlock_readers_and_writers() {
+    let l = RwLock::new(0u64);
+    let reads = AtomicU64::new(0);
+    thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                for _ in 0..500 {
+                    l.write(|v| v += 1);
+                }
+            });
+        }
+        for _ in 0..4 {
+            s.spawn(|| {
+                for _ in 0..500 {
+                    let v = l.read(|v| v);
+                    if v <= 2000 {
+                        reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(l.read(|v| v), 2000);
+    assert_eq!(reads.load(Ordering::Relaxed), 2000);
+    // Readers do not block each other.
+    let r = l.read(|a| l.try_read(|b| a + b));
+    assert_eq!(r, Ok(4000));
+    let w = l.read(|_| match l.try_write(|v| v) {
+        Err(TryLockError::WouldBlock) => true,
+        _ => false,
+    });
+    assert!(w);
+}
+
+#[test]
+fn rwlock_write_panics_poison() {
+    let l = Shared::new(RwLock::new(1u32));
+    let l2 = l.clone();
+    let h = thread::spawn(move || {
+        l2.with(|x| x.write(|v| {
+            v = 5;
+            if v == 5 {
+                panic("writer failed");
+            }
+        }));
+    });
+    assert!(h.join().is_err());
+    assert!(l.with(|x| x.is_poisoned()));
+    assert_eq!(l.with(|x| match x.read_checked(|v| v) {
+        Ok(_) => 0,
+        Err(e) => e.into_inner(),
+    }), 5);
+}
+
+#[test]
+fn condvar_waits_for_a_condition() {
+    let state = Shared::new((Mutex::new(0u64), Condvar::new()));
+    let mut g = thread::Group::<()>::new();
+    for _ in 0..4 {
+        let st = state.clone();
+        g.spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            st.with(|p| {
+                p.0.lock(|n| n += 1);
+                p.1.notify_all();
+            });
+        });
+    }
+    let n = state.with(|p| p.0.lock_when(&p.1, |n| n == 4, |n| n));
+    assert_eq!(n, 4);
+    while let Some(r) = g.join_next() {
+        r.unwrap();
+    }
+}
+
+#[test]
+fn condvar_timeout() {
+    let m = Mutex::new(false);
+    let cv = Condvar::new();
+    let r = m.lock_when_timeout(&cv, Duration::from_millis(20), |ready| ready, |_, ok| ok);
+    assert!(!r);
+    m.lock(|r| r = true);
+    let r = m.lock_when_timeout(&cv, Duration::from_millis(20), |ready| ready, |_, ok| ok);
+    assert!(r);
+}
+
+#[test]
+fn producer_consumer_with_condvar() {
+    let q = Mutex::new(0u64);
+    let produced = Condvar::new();
+    let total = thread::scope(|s| {
+        s.spawn(|| {
+            for _ in 0..100 {
+                q.lock(|n| n += 1);
+                produced.notify_one();
+            }
+        });
+        let mut got: u64 = 0;
+        while got < 100 {
+            got += q.lock_when(&produced, |n| n > 0, |n| {
+                let k = n;
+                n = 0;
+                k
+            });
+        }
+        got
+    });
+    assert_eq!(total, 100);
+}
+
+static INIT: Once = Once::new();
+static RUNS: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn once_runs_once() {
+    thread::scope(|s| {
+        for _ in 0..8 {
+            s.spawn(|| INIT.call_once(|| {
+                thread::sleep(Duration::from_millis(5));
+                RUNS.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+    });
+    assert!(INIT.is_completed());
+    assert_eq!(RUNS.load(Ordering::SeqCst), 1);
+}
+
+static PORT: OnceLock::<u16> = OnceLock::new();
+
+#[test]
+fn once_lock() {
+    assert!(!PORT.is_set());
+    assert_eq!(PORT.get(), None);
+    let ports = thread::scope(|s| {
+        let a = s.spawn(|| PORT.get_or_init(|| 8080));
+        let b = s.spawn(|| PORT.get_or_init(|| 9090));
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert_eq!(ports.0, ports.1);
+    assert_eq!(PORT.set(1), Err(1));
+    // A cell of owned text.
+    let cell = OnceLock::<String>::new();
+    assert!(cell.set(String::from("first")).is_ok());
+    let len = cell.with(|s| s.len());
+    assert_eq!(len, Some(5));
+    let again = cell.with_or_init(|| String::from("second"), |s| s.as_str() == "first");
+    assert!(again);
+}
+
+fn count_primes(): u64 {
+    let mut n: u64 = 0;
+    for i in 2..1000 {
+        let mut prime = true;
+        let mut d: u64 = 2;
+        while d * d <= i {
+            if i % d == 0 {
+                prime = false;
+                break;
+            }
+            d += 1;
+        }
+        if prime {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+static PRIMES: LazyLock::<u64> = LazyLock::new(count_primes);
+
+#[test]
+fn lazy_lock() {
+    assert!(!PRIMES.is_ready());
+    let both = thread::scope(|s| {
+        let a = s.spawn(|| PRIMES.get());
+        let b = s.spawn(|| PRIMES.get());
+        a.join().unwrap() + b.join().unwrap()
+    });
+    assert_eq!(both, 336);
+    assert!(PRIMES.is_ready());
+}
+
+#[test]
+fn barrier() {
+    let b = Barrier::new(4);
+    let before = AtomicU64::new(0);
+    let leaders = AtomicU64::new(0);
+    thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                before.fetch_add(1, Ordering::SeqCst);
+                if b.wait() {
+                    leaders.fetch_add(1, Ordering::SeqCst);
+                }
+                // Everyone arrived before anyone went on.
+                assert_eq!(before.load(Ordering::SeqCst), 4);
+            });
+        }
+    });
+    assert_eq!(leaders.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn shared_owners() {
+    let s = Shared::new(String::from("shared text"));
+    assert_eq!(s.count(), 1);
+    let mut g = thread::Group::<usize>::new();
+    for _ in 0..4 {
+        let mine = s.clone();
+        g.spawn(move || mine.with(|t| t.len()));
+    }
+    let mut sum: usize = 0;
+    while let Some(r) = g.join_next() {
+        sum += r.unwrap();
+    }
+    assert_eq!(sum, 44);
+    // The threads' clones were freed with them.
+    assert_eq!(s.count(), 1);
+    let t = s.clone();
+    assert!(t.same(&s));
+    assert_eq!(s.count(), 2);
+    let s = match s.try_unwrap() {
+        Ok(_) => panic("two owners"),
+        Err(s) => s,
+    };
+    let _ = t;
+    let text = match s.try_unwrap() {
+        Ok(v) => v,
+        Err(_) => panic("one owner"),
+    };
+    assert_eq!(text, String::from("shared text"));
+}

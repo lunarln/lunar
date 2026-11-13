@@ -1,0 +1,79 @@
+// Threads: a parallel sum over borrowed data with scoped threads, a
+// counter shared by spawned threads, and a pipeline over a channel.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::{Mutex, Shared};
+use std::thread;
+
+static WORDS: Mutex::<u64> = Mutex::new(0);
+
+fn main() {
+    // Scoped threads borrow `numbers`; each gets its own part with
+    // `spawn_with`, and all of them finish before `scope` returns.
+    let mut numbers: [u64; ..+] = [];
+    for i in 1..10001 {
+        numbers.push(i);
+    }
+    let total = AtomicU64::new(0);
+    thread::scope(|s| {
+        let mut start: usize = 0;
+        while start < numbers.len() {
+            let end = if start + 2500 < numbers.len() { start + 2500 } else { numbers.len() };
+            s.spawn_with(numbers[start..end], |part| {
+                let mut sum: u64 = 0;
+                for x in part {
+                    sum += x;
+                }
+                total.fetch_add(sum, Ordering::Relaxed);
+            });
+            start = end;
+        }
+    });
+    println("sum of 1..=10000: {total.load(Ordering::Relaxed)}");
+
+    // Spawned threads own what they use: a `Shared` counter, cloned for
+    // each of them.
+    let hits = Shared::new(AtomicU64::new(0));
+    let mut g = thread::Group::<()>::new();
+    for _ in 0..4 {
+        let mine = hits.clone();
+        g.spawn(move || {
+            for _ in 0..1000 {
+                mine.with(|h| h.fetch_add(1, Ordering::Relaxed));
+            }
+        });
+    }
+    while let Some(r) = g.join_next() {
+        r.unwrap();
+    }
+    println("hits: {hits.with(|h| h.load(Ordering::Relaxed))}");
+
+    // A pipeline: one thread sends lines, this one counts their words.
+    let (tx, rx) = mpsc::sync_channel::<String>(4);
+    let producer = thread::spawn(move || {
+        for line in ["the quick brown fox", "jumps over", "the lazy dog"] {
+            tx.send(String::from(line)).unwrap();
+        }
+    });
+    for line in rx {
+        let mut n: u64 = 0;
+        for _ in line.as_str().split_whitespace() {
+            n += 1;
+        }
+        WORDS.lock(|w| w += n);
+    }
+    producer.join().unwrap();
+    println("words: {WORDS.lock(|w| w)}");
+
+    // A panic stops only its thread.
+    let failing = thread::spawn(move || {
+        let parts: [u32; 2] = [1, 2];
+        let i = parts.len() + 1;
+        parts[i]
+    });
+    match failing.join() {
+        Ok(_) => println("no panic?"),
+        Err(p) => println("the thread panicked: {p.message()}"),
+    }
+}

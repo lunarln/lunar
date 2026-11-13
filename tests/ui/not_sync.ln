@@ -1,0 +1,11 @@
+// error: type::not_sync
+// A static every thread sees must be Sync; a cell is not.
+use core::cell::UnsafeCell;
+
+struct Counter {
+    n: UnsafeCell::<u64>,
+}
+
+static COUNT: Counter = Counter { n: UnsafeCell::new(0) };
+
+fn main() {}

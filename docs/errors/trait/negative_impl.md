@@ -8,9 +8,11 @@ automatically and which a negative impl could opt out of. For an ordinary
 trait a type implements it only if there is an `impl`, so not writing one
 already says everything a negative impl would.
 
-The only auto trait in Lunar is `Dull`, and it cannot be negated either
-(that is `err(trait::dull_impl)`), so in practice every negative impl is an
-error.
+The auto traits that can be negated are `Send` and `Sync`: `impl !Send for
+Handle {}` keeps a type from moving to another thread even though its fields
+could. `Dull`, `Light` and `Detached` are auto traits too, but whether a type
+has them is a fact about its fields and cannot be negated (that is
+`err(trait::dull_impl)`).
 
 ## Erroneous example
 

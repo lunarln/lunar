@@ -195,6 +195,8 @@ pub struct FnDecl {
     pub ret_from: List::<Ident>,
     pub body: Option::<Id::<Block>>,
     pub is_unsafe: bool,
+    /// `const fn`: callable in the initializers of constants and statics.
+    pub is_const: bool,
     pub variadic: bool,
     pub sig_span: Span,
 }
@@ -269,6 +271,9 @@ pub struct TraitDecl {
 
 pub struct ImplDecl {
     pub generics: Generics,
+    /// `unsafe impl`: required for (and only allowed on) implementations
+    /// of `Send` and `Sync`.
+    pub is_unsafe: bool,
     pub negative: bool,
     pub trait_ref: Option::<Path>,
     pub self_ty: Id::<Ty>,

@@ -1092,15 +1092,18 @@ static mut COUNTER_HZ: u64 = 0;
 /// Nanoseconds on a clock that never goes back, from some fixed point.
 pub fn monotonic_ns(): u64 {
     let mut c: i64 = 0;
+    // Threads may read it for the first time together: each stores the
+    // same value, atomically.
+    let mut hz = unsafe { intrinsics::atomic_load(intrinsics::addr_of_mut(&mut COUNTER_HZ) as *u64, 2) };
     unsafe {
         QueryPerformanceCounter(intrinsics::addr_of_mut(&mut c));
-        if COUNTER_HZ == 0 {
+        if hz == 0 {
             let mut f: i64 = 0;
             QueryPerformanceFrequency(intrinsics::addr_of_mut(&mut f));
-            COUNTER_HZ = f as u64;
+            hz = f as u64;
+            intrinsics::atomic_store(intrinsics::addr_of_mut(&mut COUNTER_HZ), hz, 2);
         }
     }
-    let hz = unsafe { COUNTER_HZ };
     let t = c as u64;
     // `t * 1e9 / hz` without overflowing.
     return (t / hz) * 1000000000 + (t % hz) * 1000000000 / hz;
@@ -1222,12 +1225,15 @@ extern "C" {
     fn FreeAddrInfoW(info: *mut u8);
 }
 
-/// Whether `WSAStartup` has run. Winsock is started the first time a
-/// socket is made or a name looked up, and stays up until exit.
-static mut WINSOCK_READY: bool = false;
+/// Whether `WSAStartup` has run (1). Winsock is started the first time a
+/// socket is made or a name looked up, and stays up until exit. Threads
+/// may get here together; `WSAStartup` counts its calls, so running it
+/// twice does no harm.
+static mut WINSOCK_READY: u32 = 0;
 
 fn net_init() {
-    if unsafe { WINSOCK_READY } {
+    // Acquire: what `WSAStartup` did is seen once the flag is.
+    if unsafe { intrinsics::atomic_load(intrinsics::addr_of_mut(&mut WINSOCK_READY) as *u32, 4) } != 0 {
         return;
     }
     // WSADATA is 408 bytes on 64-bit Windows.
@@ -1236,7 +1242,7 @@ fn net_init() {
     unsafe {
         // Version 2.2
         WSAStartup(514, p);
-        WINSOCK_READY = true;
+        intrinsics::atomic_store(intrinsics::addr_of_mut(&mut WINSOCK_READY), 1, 5);
     }
 }
 
@@ -1469,4 +1475,85 @@ pub fn lookup(host: str, out: &mut +[RawAddr; ..+]): i32 {
         FreeAddrInfoW(res);
     }
     return 0;
+}
+
+// ===================================================================== threads and waiting
+
+extern "C" {
+    fn CreateThread(attrs: *mut u8, stack: usize, start: fn(*mut u8): usize, arg: *mut u8, flags: u32, id: *mut u32): *mut u8;
+    fn ExitThread(code: u32): !;
+    fn SwitchToThread(): i32;
+    fn GetActiveProcessorCount(group: u16): u32;
+}
+
+#[link(name = "synchronization")]
+extern "C" {
+    fn WaitOnAddress(addr: *u8, compare: *u8, size: usize, ms: u32): i32;
+    fn WakeByAddressSingle(addr: *u8);
+    fn WakeByAddressAll(addr: *u8);
+}
+
+/// Start a thread running `entry(arg)` with a stack of `stack` bytes
+/// (reserved; 0 for the default), detached: nothing joins it, it ends when
+/// `entry` returns or calls `thread_exit`. False if it could not be
+/// started (see `last_error`).
+pub fn thread_spawn(entry: fn(*mut u8): usize, arg: *mut u8, stack: usize): bool {
+    // STACK_SIZE_PARAM_IS_A_RESERVATION
+    let h = unsafe { CreateThread(core::ptr::null_mut(), stack, entry, arg, 65536, core::ptr::null_mut()) };
+    if core::ptr::is_null(h as *u8) {
+        return false;
+    }
+    unsafe {
+        CloseHandle(h);
+    }
+    return true;
+}
+
+/// End the calling thread now.
+pub fn thread_exit(): ! {
+    unsafe { ExitThread(0) }
+}
+
+/// Let another thread run.
+pub fn yield_now() {
+    unsafe {
+        SwitchToThread();
+    }
+}
+
+/// How many processors the program may run on.
+pub fn cpu_count(): usize {
+    // ALL_PROCESSOR_GROUPS
+    let n = unsafe { GetActiveProcessorCount(65535) };
+    return if n == 0 { 1 } else { n as usize };
+}
+
+/// Wait while the `u32` at `addr` is `expected`, for at most `timeout_ns`
+/// (`u64::MAX`: no limit). False if the time ran out; true otherwise,
+/// which may also be a spurious wakeup.
+pub fn futex_wait(addr: *u32, expected: u32, timeout_ns: u64): bool {
+    let mut ms: u32 = 4294967295;
+    if timeout_ns != 18446744073709551615 {
+        let mut m = timeout_ns / 1000000;
+        if timeout_ns % 1000000 != 0 {
+            m += 1;
+        }
+        // INFINITE is 0xFFFFFFFF: stay just below it.
+        ms = if m > 4294967294 { 4294967294 } else { m as u32 };
+    }
+    let cmp = expected;
+    let ok = unsafe { WaitOnAddress(addr as *u8, (intrinsics::addr_of(&cmp) as usize) as *u8, 4, ms) };
+    // ERROR_TIMEOUT
+    return ok != 0 || last_error() != 1460;
+}
+
+/// Wake one thread (or every thread) waiting at `addr`.
+pub fn futex_wake(addr: *u32, all: bool) {
+    unsafe {
+        if all {
+            WakeByAddressAll(addr as *u8);
+        } else {
+            WakeByAddressSingle(addr as *u8);
+        }
+    }
 }

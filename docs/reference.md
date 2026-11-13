@@ -42,6 +42,9 @@ mod shapes;            // loads shapes.ln or shapes/mod.ln
 mod inline { ... }
 const N: usize = 4;
 static mut COUNT: u64 = 0;
+static HITS: AtomicU64 = AtomicU64::new(0);   // `new` is a `const fn`
+const fn square(x: u64): u64 { return x * x; }
+unsafe impl Send for Handle {}
 type Bytes = [u8; &];
 extern "C" { fn puts(s: *u8): i32; #[link_name = "write"] fn c_write(fd: i32, b: *u8, n: usize): isize; }
 ```
@@ -57,6 +60,26 @@ crater, `super::` at the parent module, and `self::` at the current one.
 Items are private to their module (and its children) unless marked `pub`.
 Struct fields are private unless `pub`.
 
+### Constants, statics and `const fn`
+
+`const` and `static` initializers are evaluated at compile time. They may
+use literals, arithmetic, casts, `if`, arrays, tuples, other constants,
+struct literals, enum variants, functions (as function pointers), field
+reads, and calls of `const fn`s. A `const fn` is an ordinary function that
+may also run at compile time; there its body may only bind `let name =
+value;` and `return` a value (or end in one), using the same expressions.
+That is how a type with private fields offers a constant:
+`static LOCK: Mutex::<u64> = Mutex::new(0);`. Calling a function that is
+not `const` in an initializer is `err(type::const_eval)`.
+
+Statics cannot own data (no `String` or owning array). Every thread sees
+the same statics, so a static that is not `mut` must be `Sync`
+(`err(type::not_sync)`); its uses need no `unsafe`, and it may still change
+through atomics or locks inside it. A `static mut` needs `unsafe` for every
+use, and keeping threads from racing on it is up to the program.
+`#[thread_local] static mut DEPTH: u32 = 0;` gives every thread its own
+copy, starting from the initializer.
+
 ### Attributes
 
 * `#[test]`: a test function, run by `lunar test`.
@@ -67,6 +90,7 @@ Struct fields are private unless `pub`.
   (`warn(lint::unknown_cfg)`), e.g. `#[cfg(linux)]` for
   `#[cfg(target_os = "linux")]`.
 * `#[link_name = "..."]` on extern functions.
+* `#[thread_local]` on statics (above).
 * `#[inline]`, `#[allow(...)]`, `#[doc = "..."]` are accepted.
 * `#[lang = "..."]` and `#[intrinsic]` are used by the standard library.
 * `#[derive(Name, ...)]` on a struct or enum runs those derive macros;
@@ -162,6 +186,43 @@ where the item points.
 
 Light values are copied implicitly. Owning values (owning arrays, `String`,
 and types containing them) are **moved**.
+
+`core::cell::UnsafeCell::<T>`, a value that may change behind a shared view
+(through the raw pointer `get` gives), is neither Dull nor Light: it and the
+types built on it (`Mutex`, the atomics) are moved, never copied, so no copy
+is ever read while another thread changes the original.
+
+### Send, Sync and Detached
+
+Three more traits are implemented by the compiler from a type's parts. They
+decide what may cross between threads (§6a):
+
+* `core::marker::Send`: a value may move to another thread. Everything is
+  Send except raw pointers, mutable slices (`[T; &mut]`: they are copied
+  freely, so two threads could write through the same one), `FmtArgs`,
+  shared slices `[T; &]` whose items are not Sync, closures that change a
+  variable they borrow, and types holding one of those.
+* `core::marker::Sync`: threads may share views of a value (read it at the
+  same time). Everything that is not Send is not Sync, and neither is
+  `UnsafeCell`.
+* `core::marker::Detached`: the value holds no views: no `str`, slice or
+  closure that borrows, at any depth. Owners, Dull values and raw pointers
+  are Detached. A Detached value points into nothing it does not own, so it
+  may outlive every local variable. A generic `T: Detached` holds no views
+  for the borrow checker either.
+
+A closure borrowing a variable is Send and Sync if the variable's type is
+Sync; one owning a capture is Send (Sync) if the capture is.
+
+A struct or enum may promise `Send` or `Sync` with `unsafe impl` (for raw
+pointers or cells it guards itself), or give them up with a negative impl
+(`impl !Send for Handle {}`). Its impls then decide alone, and its fields no
+longer count: `unsafe impl::<T: Send> Sync for Mutex::<T> {}`. Implementing
+either without `unsafe` is `err(trait::unsafe_impl)`, and only for a struct
+or enum of the same crater (`err(trait::auto_impl)`). `Detached`, like
+`Dull` and `Light`, cannot be implemented by hand. An unsatisfied bound on
+one of them is `err(type::not_send)`, `err(type::not_sync)` or
+`err(type::not_detached)`, with notes down to the part that is the reason.
 
 ## 4. Memory model: data stacks
 
@@ -505,12 +566,48 @@ other data, or appear to work. In particular, arrays sit next to each other
 in memory and the space past an array's length is not guaranteed to fault,
 so an overrun is not reliably caught at run time.
 
+`unsafe impl Send for T {}` and `unsafe impl Sync for T {}` are promises the
+compiler cannot check (§3); no other impl may be `unsafe`.
+
+## 6a. Threads
+
+`std::thread` starts threads of the operating system. Lunar's rules keep
+them from racing on data and from viewing memory that is gone:
+
+* `thread::spawn(f)` runs `f` on a new thread that may outlive its caller,
+  so `f` and its result must be `Send` and `Detached`: a `move` closure of
+  owned values. Borrowing closures and views are `err(type::not_detached)`.
+  `h.join()` waits for it: `Result::<T, Panic>`.
+* `thread::scope(|s| { s.spawn(|| ...); })` starts threads that may borrow
+  from the caller: all of them finish before `scope` returns. The closure
+  given to `scope` runs alongside its threads, so it must be `Fn` (it may
+  not change what it captures) and `Sync`; each thread's closure must be
+  `Send`, so what it borrows must be `Sync`. A thread may borrow what the
+  scope's closure borrows, not that closure's own variables, which are
+  freed before the threads are waited for
+  (`err(borrow::scoped_thread_borrow)`). `s.spawn_with(arg, |a| ..)` moves
+  `arg` (a slice of the work, say) into the thread.
+* Data threads share is changed only through locks and atomics, which are
+  used through closures, since Lunar has no references to keep a lock held:
+  `m.lock(|v| v += 1)`. A lock's closure gets the value in-out (`&mut T`) and
+  its result, which must be `Detached`, is what `lock` returns, so no view of
+  locked data outlives the lock. The values in locks and cells are
+  `Detached` too.
+* A panic on a thread other than the main thread ends only that thread, on
+  the spot (no unwinding: what it owned stays allocated). It prints its
+  message like the main thread does, `join` returns it as an `Err`, and the
+  locks it held are poisoned: `lock` then panics, `lock_checked` gives the
+  value with a `PoisonError`. A panic on the main thread ends the program.
+* The runtime is thread-safe: arrays may be made on one thread and freed on
+  another.
+
 ## 7. Traits
 
 Traits work like Rust's: `trait Name::<Params>: Supertraits { fn m(self); }`
 with default methods, static functions (`T::default()`), generic and blanket
 impls (`impl::<T: Dull> Clone for [T; ..+]`), and negative impls only for
-auto traits (and `Dull` cannot be negated). An implementation's methods
+the auto traits `Send` and `Sync` (`Dull`, `Light` and `Detached` cannot be
+negated). An implementation's methods
 take their parameters exactly as the trait declares, `+` included: an
 `out: &mut String` where the trait says `out: &mut +String` is
 `err(trait::signature)`. Trait method calls are resolved
@@ -548,7 +645,9 @@ alone lists every code. The explanations are the files in
   Reverse}`, `core::clone::Clone`, `core::default::Default`,
   `core::fmt::{Display, Debug, write, format}`, `core::option::Option`,
   `core::result::Result`, `core::iter::Iterator`, `core::num::{Int, Float}`,
-  `core::mem::{size_of, align_of, swap}`, `core::intrinsics`.
+  `core::mem::{size_of, align_of, swap}`, `core::intrinsics` (including
+  the atomic operations `std::sync::atomic` is built on).
+* `core::marker::{Send, Sync, Detached}` and `core::cell::UnsafeCell` (§3).
 * `core::ops::{Fn, FnMut, FnOnce}` (see Closures).
 * `core::hash::{Hash, Hasher, hash_of}`: one fixed fast hasher, `Hash` for
   the primitives, `str`, `String`, tuples, `Option` and slices, and
@@ -664,8 +763,50 @@ alone lists every code. The explanations are the files in
   ..., `+`, `-`, `checked_`/`saturating_` arithmetic, `Display` such as
   `1.5s`), `Instant` (monotonic: `now`, `elapsed`, `duration_since`,
   `checked_add`), `SystemTime` (`now`, `duration_since`, `elapsed`,
-  `time::unix_epoch()`), and `sleep(d)` (here, not in a `thread` module:
-  there are no threads yet).
+  `time::unix_epoch()`), and `sleep(d)` (also `thread::sleep`).
+* `std::thread` (§6a): `spawn(f)` and `Builder::new().name(..).stack_size(..)
+  .spawn(f)` give a `JoinHandle::<T>` (`join`: `Result::<T, Panic>`,
+  `is_finished`, `id`); `Panic` has the `message()` and the `location()`
+  of a failed check. Arrays cannot hold handles (they own their thread's
+  record), so `Group::<T>` keeps any number of threads (`spawn`, `len`,
+  `join_next`). `scope(|s| ..)` with `Scope::spawn` and `spawn_with` for
+  threads that borrow (`ScopedJoinHandle`). `sleep`, `yield_now`,
+  `current_id()` (a `ThreadId`; the main thread's is 1), `current_name()`
+  (`"main"` on the main thread) and `available_parallelism()`.
+* `std::sync`: locks used through closures, all with `const fn new` (so
+  they can be statics):
+  * `Mutex::<T>`: `lock(|v| ..)` (panics if poisoned), `lock_checked`
+    (`Err(PoisonError)` with the closure's result if poisoned), `try_lock`
+    (`TryLockError::WouldBlock` or `Poisoned`), `lock_when(&cv, |v| ready,
+    |v| ..)` waits on a `Condvar` until a condition holds, and
+    `lock_when_timeout(&cv, d, ready, |v, ready| ..)`; `is_poisoned`,
+    `clear_poison`, `get_mut`, `into_inner`.
+  * `RwLock::<T>`: `read(|v| ..)` (many at once), `write(|v| ..)`, and the
+    `_checked` and `try_` forms; writers go before new readers.
+  * `Condvar`: `notify_one`, `notify_all` (waiting is `Mutex::lock_when`).
+  * `Once` (`call_once`, `is_completed`), `OnceLock::<T>` (`set`, `with`,
+    `with_or_init`, and for Light values `get`, `get_or_init`) and
+    `LazyLock::<T>` (`LazyLock::new(f)` with a function `f`; `with`, `get`).
+  * `Barrier::new(n)` (`wait`; true for one leader).
+  * `Shared::<T>`: a value with several owners across threads, freed with
+    the last (`new`, `clone`, `with(|v| ..)`, `count`, `same`,
+    `try_unwrap`); `T` must be `Send + Sync + Detached`.
+  * `atomic`: `AtomicBool`, `AtomicU8`..`AtomicU64`, `AtomicUsize`,
+    `AtomicI8`..`AtomicI64`, `AtomicIsize` (all `Atomic::<T>`) and
+    `AtomicPtr::<T>`, with `load`, `store`, `swap`, `compare_exchange`
+    (`_weak`), `fetch_add`, `fetch_sub`, `fetch_and`, `fetch_or`,
+    `fetch_xor`, `fetch_nand`, `fetch_max`, `fetch_min`, `fetch_update`,
+    `into_inner`; `Ordering` (`Relaxed`, `Release`, `Acquire`, `AcqRel`,
+    `SeqCst`, as in C++) and `fence(order)`.
+  * `mpsc::channel()` (unbounded) and `mpsc::sync_channel(n)` (bounded; 0
+    is a rendezvous): `Sender` (`Clone`), `SyncSender` (`send` waits for
+    room, `try_send`), `Receiver` (`recv`, `try_recv`, `recv_timeout`, and
+    iteration until every sender is gone). `mpmc::channel()` and
+    `mpmc::bounded(n)` with both ends `Clone` and `send_timeout`. Sending
+    fails, giving the value back, once every receiver is gone. Messages are
+    `Send + Detached`.
+  * `raw`: `RawMutex`, `RawCondvar` (on the system's futex) and `Queue::<T>`,
+    a first-in first-out queue of any values, owners included.
 * `std::random`: `fill(buf)` and `entropy_u64()` from the operating
   system's secure source, and `Rng`, a xoshiro256** generator
   (`Rng::new()` seeded from the system, `Rng::seeded(n)` repeatable):
@@ -692,7 +833,8 @@ alone lists every code. The explanations are the files in
   `LUNAR_PKG_VERSION` are the name and version of the package being built
   (from `lunar.toml`); other names come from the compiler's environment.
   An undefined variable is `err(macro::error)`.
-* The prelude provides `Dull`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`,
+* The prelude provides `Dull`, `Light`, `Send`, `Sync`, `Detached`,
+  `Option`/`Some`/`None`, `Result`/`Ok`/`Err`,
   `Eq`, `Ord`, `Ordering`, `Clone`, `Default`, `Display`, `Debug`, `Hash`,
   `Iterator`, `Fn`, `FnMut`, `FnOnce`, `print`, `println`, `eprint`,
   `eprintln`, `panic`, `assert`,

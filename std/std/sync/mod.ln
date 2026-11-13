@@ -1,0 +1,806 @@
+// Sharing data between threads.
+//
+// Lunar has no references to keep a lock held, so every lock here is used
+// through a closure: `m.lock(|v| v += 1)` takes the lock, lends the value
+// to the closure (in-out, `&mut T`) and lets the lock go when the closure
+// returns, giving back what the closure returned. Views never escape a
+// lock: results must be `Detached` (hold no views), and so must the values
+// a lock or cell holds, so nothing inside can point into a local variable
+// that dies before it.
+//
+// * `Mutex::<T>`: one thread at a time; `lock_when` waits on a `Condvar`
+//   until a condition on the value holds.
+// * `RwLock::<T>`: many readers or one writer.
+// * `Condvar`: threads waiting for a change under a `Mutex`.
+// * `Once`, `OnceLock::<T>` and `LazyLock::<T>`: one-time initialization.
+// * `Shared::<T>`: a value owned by several threads, freed with its last
+//   owner (like Rust's `Arc`); read through `with`. Put a `Mutex` or
+//   atomics in it to change it.
+// * `Barrier`: threads waiting for each other.
+// * `atomic`: atomic integers, booleans and pointers; `mpsc` and `mpmc`:
+//   channels.
+//
+// `Mutex`, `RwLock`, `Condvar`, `Once`, `OnceLock`, `LazyLock` and the
+// atomics have `const fn` constructors, so they can be statics:
+// `static COUNT: Mutex::<u64> = Mutex::new(0);`.
+//
+// Poisoning: a thread that panics while it holds a `Mutex` (or the write
+// lock of an `RwLock`) stops on the spot without letting the lock go, so
+// the runtime lets it go for it and marks it poisoned: the data may be half
+// changed. `lock`, `read` and `write` then panic (like Rust's
+// `lock().unwrap()`); `lock_checked`, `read_checked` and `write_checked`
+// run the closure anyway and say so with a `PoisonError`; `clear_poison`
+// declares the data fine again. A panic on the main thread ends the
+// program, so it poisons nothing.
+
+pub mod atomic;
+pub mod raw;
+pub mod mpsc;
+pub mod mpmc;
+mod chan;
+
+use core::cell::UnsafeCell;
+use core::intrinsics;
+use crater::rt;
+use crater::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use crater::sync::raw::{LockCore, RawCondvar, RawMutex, FOREVER, HELD_MUTEX, HELD_ONCE, HELD_READ, HELD_WRITE, hold, unhold};
+use crater::time::{Duration, Instant};
+
+/// The value of a lock a thread panicked while holding (a result computed
+/// anyway, or the lock's data).
+pub struct PoisonError::<T> {
+    value: T,
+}
+
+impl::<T> PoisonError::<T> {
+    pub fn new(value: T): PoisonError::<T> {
+        return PoisonError { value };
+    }
+
+    /// What the closure returned (or the data), though the lock was
+    /// poisoned.
+    pub fn into_inner(self): T {
+        return self.value;
+    }
+}
+
+impl::<T> core::fmt::Display for PoisonError::<T> {
+    fn fmt(&self, out: &mut +String) {
+        out.push_str("poisoned lock: another thread panicked while holding it");
+    }
+}
+
+/// Why `try_lock`, `try_read` or `try_write` did not run the closure.
+#[derive(Eq, Debug)]
+pub enum TryLockError {
+    /// Another thread holds the lock.
+    WouldBlock,
+    /// A thread panicked while holding it.
+    Poisoned,
+}
+
+impl core::fmt::Display for TryLockError {
+    fn fmt(&self, out: &mut +String) {
+        match self {
+            TryLockError::WouldBlock => out.push_str("the lock is held by another thread"),
+            TryLockError::Poisoned => out.push_str("poisoned lock: another thread panicked while holding it"),
+        }
+    }
+}
+
+fn poisoned_panic(): ! {
+    panic("poisoned lock: another thread panicked while holding it");
+}
+
+/// The value of the `Some` at `p` (Lunar lays an enum out as an `i32` tag
+/// with the fields from byte 8).
+fn some_ptr::<T>(p: *mut Option::<T>): *mut T {
+    return ((p as usize) + 8) as *mut T;
+}
+
+// ===================================================================== Mutex
+
+/// A value one thread at a time may use: `m.lock(|v| ..)`.
+///
+/// ```lunar
+/// static TOTAL: Mutex::<u64> = Mutex::new(0);
+///
+/// fn add(n: u64): u64 {
+///     return TOTAL.lock(|t| { t += n; t });
+/// }
+/// ```
+pub struct Mutex::<T> {
+    core: LockCore,
+    data: UnsafeCell::<T>,
+}
+
+unsafe impl::<T: Send> Send for Mutex::<T> {}
+unsafe impl::<T: Send> Sync for Mutex::<T> {}
+
+impl::<T: Detached> Mutex::<T> {
+    pub const fn new(value: T): Mutex::<T> {
+        return Mutex { core: LockCore::new(), data: UnsafeCell::new(value) };
+    }
+
+    fn enter(&self) {
+        self.core.raw.lock();
+        hold(intrinsics::addr_of(&self.core) as usize, HELD_MUTEX);
+    }
+
+    fn leave(&self) {
+        unhold();
+        self.core.raw.unlock();
+    }
+
+    /// Lock, run `f` on the value, unlock: what `f` returned. Waits while
+    /// another thread holds the lock. Panics if the lock is poisoned.
+    /// Locking a mutex the same thread already holds waits forever.
+    pub fn lock::<R: Detached, F: FnOnce(&mut T): R>(&self, f: F): R {
+        self.enter();
+        if self.core.is_poisoned() {
+            self.leave();
+            poisoned_panic();
+        }
+        let r = unsafe { f(&mut *self.data.get()) };
+        self.leave();
+        return r;
+    }
+
+    /// `lock`, which runs `f` even if the lock is poisoned: then its
+    /// result comes as a `PoisonError`.
+    pub fn lock_checked::<R: Detached, F: FnOnce(&mut T): R>(&self, f: F): Result::<R, PoisonError::<R>> {
+        self.enter();
+        let poisoned = self.core.is_poisoned();
+        let r = unsafe { f(&mut *self.data.get()) };
+        self.leave();
+        return if poisoned { Err(PoisonError::new(r)) } else { Ok(r) };
+    }
+
+    /// `lock` if no other thread holds the lock; else `WouldBlock`, without
+    /// waiting. `Poisoned` (without running `f`) if it is poisoned.
+    pub fn try_lock::<R: Detached, F: FnOnce(&mut T): R>(&self, f: F): Result::<R, TryLockError> {
+        if !self.core.raw.try_lock() {
+            return Err(TryLockError::WouldBlock);
+        }
+        hold(intrinsics::addr_of(&self.core) as usize, HELD_MUTEX);
+        if self.core.is_poisoned() {
+            self.leave();
+            return Err(TryLockError::Poisoned);
+        }
+        let r = unsafe { f(&mut *self.data.get()) };
+        self.leave();
+        return Ok(r);
+    }
+
+    /// Lock, wait on `cv` until `ready` holds for the value, then run `f`
+    /// on it, still locked. While it waits, the lock is free for the threads
+    /// that will make `ready` true and notify `cv`.
+    ///
+    /// ```lunar
+    /// let item = queue.lock_when(&not_empty, |q| q.len() > 0, |q| q.pop_front());
+    /// ```
+    pub fn lock_when::<R: Detached, P: FnMut(&T): bool, F: FnOnce(&mut T): R>(&self, cv: &Condvar, mut ready: P, f: F): R {
+        self.enter();
+        loop {
+            if self.core.is_poisoned() {
+                self.leave();
+                poisoned_panic();
+            }
+            if unsafe { ready(&*self.data.get()) } {
+                break;
+            }
+            cv.raw.wait(&self.core.raw, FOREVER);
+        }
+        let r = unsafe { f(&mut *self.data.get()) };
+        self.leave();
+        return r;
+    }
+
+    /// `lock_when`, waiting at most `timeout`: `f` then runs on the value
+    /// with whether `ready` held (false: the time ran out).
+    pub fn lock_when_timeout::<R: Detached, P: FnMut(&T): bool, F: FnOnce(&mut T, bool): R>(&self, cv: &Condvar, timeout: Duration, mut ready: P, f: F): R {
+        let start = Instant::now();
+        self.enter();
+        let mut ok = false;
+        loop {
+            if self.core.is_poisoned() {
+                self.leave();
+                poisoned_panic();
+            }
+            if unsafe { ready(&*self.data.get()) } {
+                ok = true;
+                break;
+            }
+            let spent = start.elapsed();
+            if spent >= timeout {
+                break;
+            }
+            cv.raw.wait(&self.core.raw, (timeout - spent).as_nanos());
+        }
+        let r = unsafe { f(&mut *self.data.get(), ok) };
+        self.leave();
+        return r;
+    }
+
+    /// Whether a thread panicked while holding the lock.
+    pub fn is_poisoned(&self): bool {
+        return self.core.is_poisoned();
+    }
+
+    /// Declare the value fine after a panic: the lock is no longer
+    /// poisoned.
+    pub fn clear_poison(&self) {
+        self.core.poisoned.store(0, Ordering::Release);
+    }
+
+    /// Use the value without locking: nobody else can hold a mutex the
+    /// caller may change.
+    pub fn get_mut::<R, F: FnOnce(&mut T): R>(&mut self, f: F): R from self, f {
+        return unsafe { f(&mut *self.data.get()) };
+    }
+
+    /// The value, taking the mutex apart: `Err` if it was poisoned.
+    pub fn into_inner(self): Result::<T, PoisonError::<T>> {
+        let poisoned = self.core.is_poisoned();
+        let Mutex { core, data } = self;
+        let _ = core;
+        let v = data.into_inner();
+        return if poisoned { Err(PoisonError::new(v)) } else { Ok(v) };
+    }
+}
+
+/// For a thread that panicked holding the `Mutex` whose `LockCore` is at
+/// `addr` (see `raw::poison_held_locks`).
+pub fn poison_mutex(addr: usize) {
+    let c = addr as *LockCore;
+    unsafe {
+        (*c).poisoned.store(1, Ordering::Release);
+        (*c).raw.unlock();
+    }
+}
+
+// ===================================================================== Condvar
+
+/// Threads waiting for a change to the value of a `Mutex`: see
+/// `Mutex::lock_when`. Change the value under the lock, then notify:
+///
+/// ```lunar
+/// queue.lock(|q| q.push_back(job));
+/// not_empty.notify_one();
+/// ```
+pub struct Condvar {
+    raw: RawCondvar,
+}
+
+impl Condvar {
+    pub const fn new(): Condvar {
+        return Condvar { raw: RawCondvar::new() };
+    }
+
+    /// Wake one thread waiting on this condition variable.
+    pub fn notify_one(&self) {
+        self.raw.notify_one();
+    }
+
+    /// Wake every thread waiting on it.
+    pub fn notify_all(&self) {
+        self.raw.notify_all();
+    }
+}
+
+// ===================================================================== RwLock
+
+/// The state of an `RwLock`, changed under its `LockCore`'s lock. Writers
+/// go first: while one waits, new readers wait too.
+pub struct RwCore {
+    core: LockCore,
+    readers: AtomicU32,
+    writing: AtomicU32,
+    waiting_writers: AtomicU32,
+    changed: RawCondvar,
+}
+
+impl RwCore {
+    const fn new(): RwCore {
+        return RwCore { core: LockCore::new(), readers: AtomicU32::new(0), writing: AtomicU32::new(0), waiting_writers: AtomicU32::new(0), changed: RawCondvar::new() };
+    }
+
+    fn read_lock(&self) {
+        self.core.raw.lock();
+        while self.writing.load(Ordering::Relaxed) != 0 || self.waiting_writers.load(Ordering::Relaxed) != 0 {
+            self.changed.wait(&self.core.raw, FOREVER);
+        }
+        self.readers.fetch_add(1, Ordering::Relaxed);
+        self.core.raw.unlock();
+    }
+
+    fn try_read_lock(&self): bool {
+        self.core.raw.lock();
+        let ok = self.writing.load(Ordering::Relaxed) == 0 && self.waiting_writers.load(Ordering::Relaxed) == 0;
+        if ok {
+            self.readers.fetch_add(1, Ordering::Relaxed);
+        }
+        self.core.raw.unlock();
+        return ok;
+    }
+
+    fn read_unlock(&self) {
+        self.core.raw.lock();
+        if self.readers.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.changed.notify_all();
+        }
+        self.core.raw.unlock();
+    }
+
+    fn write_lock(&self) {
+        self.core.raw.lock();
+        self.waiting_writers.fetch_add(1, Ordering::Relaxed);
+        while self.writing.load(Ordering::Relaxed) != 0 || self.readers.load(Ordering::Relaxed) != 0 {
+            self.changed.wait(&self.core.raw, FOREVER);
+        }
+        self.waiting_writers.fetch_sub(1, Ordering::Relaxed);
+        self.writing.store(1, Ordering::Relaxed);
+        self.core.raw.unlock();
+    }
+
+    fn try_write_lock(&self): bool {
+        self.core.raw.lock();
+        let ok = self.writing.load(Ordering::Relaxed) == 0 && self.readers.load(Ordering::Relaxed) == 0;
+        if ok {
+            self.writing.store(1, Ordering::Relaxed);
+        }
+        self.core.raw.unlock();
+        return ok;
+    }
+
+    fn write_unlock(&self) {
+        self.core.raw.lock();
+        self.writing.store(0, Ordering::Relaxed);
+        self.changed.notify_all();
+        self.core.raw.unlock();
+    }
+}
+
+/// For a thread that panicked holding the `RwLock` whose `RwCore` is at
+/// `addr`: a write lock is poisoned and let go, a read lock let go.
+pub fn poison_rwlock(addr: usize, write: bool) {
+    let c = addr as *RwCore;
+    unsafe {
+        if write {
+            (*c).core.poisoned.store(1, Ordering::Release);
+            (*c).write_unlock();
+        } else {
+            (*c).read_unlock();
+        }
+    }
+}
+
+/// A value many threads may read at once, or one thread change:
+/// `l.read(|v| ..)` and `l.write(|v| ..)`.
+pub struct RwLock::<T> {
+    core: RwCore,
+    data: UnsafeCell::<T>,
+}
+
+unsafe impl::<T: Send> Send for RwLock::<T> {}
+unsafe impl::<T: Send + Sync> Sync for RwLock::<T> {}
+
+impl::<T: Detached> RwLock::<T> {
+    pub const fn new(value: T): RwLock::<T> {
+        return RwLock { core: RwCore::new(), data: UnsafeCell::new(value) };
+    }
+
+    fn addr(&self): usize {
+        return intrinsics::addr_of(&self.core) as usize;
+    }
+
+    /// Run `f` on the value while no thread writes: what `f` returned.
+    /// Other readers may run at the same time. Panics if the lock is
+    /// poisoned.
+    pub fn read::<R: Detached, F: FnOnce(&T): R>(&self, f: F): R {
+        return match self.read_checked(f) {
+            Ok(r) => r,
+            Err(_) => poisoned_panic(),
+        };
+    }
+
+    /// `read`, which runs `f` even if the lock is poisoned: then its result
+    /// comes as a `PoisonError`.
+    pub fn read_checked::<R: Detached, F: FnOnce(&T): R>(&self, f: F): Result::<R, PoisonError::<R>> {
+        self.core.read_lock();
+        hold(self.addr(), HELD_READ);
+        let poisoned = self.core.core.is_poisoned();
+        let r = unsafe { f(&*self.data.get()) };
+        unhold();
+        self.core.read_unlock();
+        return if poisoned { Err(PoisonError::new(r)) } else { Ok(r) };
+    }
+
+    /// `read` if no thread writes or waits to; else `WouldBlock`.
+    pub fn try_read::<R: Detached, F: FnOnce(&T): R>(&self, f: F): Result::<R, TryLockError> {
+        if !self.core.try_read_lock() {
+            return Err(TryLockError::WouldBlock);
+        }
+        if self.core.core.is_poisoned() {
+            self.core.read_unlock();
+            return Err(TryLockError::Poisoned);
+        }
+        hold(self.addr(), HELD_READ);
+        let r = unsafe { f(&*self.data.get()) };
+        unhold();
+        self.core.read_unlock();
+        return Ok(r);
+    }
+
+    /// Run `f` on the value with no other thread reading or writing: what
+    /// `f` returned. Panics if the lock is poisoned.
+    pub fn write::<R: Detached, F: FnOnce(&mut T): R>(&self, f: F): R {
+        return match self.write_checked(f) {
+            Ok(r) => r,
+            Err(_) => poisoned_panic(),
+        };
+    }
+
+    /// `write`, which runs `f` even if the lock is poisoned: then its result
+    /// comes as a `PoisonError`.
+    pub fn write_checked::<R: Detached, F: FnOnce(&mut T): R>(&self, f: F): Result::<R, PoisonError::<R>> {
+        self.core.write_lock();
+        hold(self.addr(), HELD_WRITE);
+        let poisoned = self.core.core.is_poisoned();
+        let r = unsafe { f(&mut *self.data.get()) };
+        unhold();
+        self.core.write_unlock();
+        return if poisoned { Err(PoisonError::new(r)) } else { Ok(r) };
+    }
+
+    /// `write` if no thread reads or writes; else `WouldBlock`.
+    pub fn try_write::<R: Detached, F: FnOnce(&mut T): R>(&self, f: F): Result::<R, TryLockError> {
+        if !self.core.try_write_lock() {
+            return Err(TryLockError::WouldBlock);
+        }
+        if self.core.core.is_poisoned() {
+            self.core.write_unlock();
+            return Err(TryLockError::Poisoned);
+        }
+        hold(self.addr(), HELD_WRITE);
+        let r = unsafe { f(&mut *self.data.get()) };
+        unhold();
+        self.core.write_unlock();
+        return Ok(r);
+    }
+
+    /// Whether a thread panicked while writing.
+    pub fn is_poisoned(&self): bool {
+        return self.core.core.is_poisoned();
+    }
+
+    /// Declare the value fine after a panic.
+    pub fn clear_poison(&self) {
+        self.core.core.poisoned.store(0, Ordering::Release);
+    }
+
+    /// The value, taking the lock apart: `Err` if it was poisoned.
+    pub fn into_inner(self): Result::<T, PoisonError::<T>> {
+        let poisoned = self.core.core.is_poisoned();
+        let RwLock { core, data } = self;
+        let _ = core;
+        let v = data.into_inner();
+        return if poisoned { Err(PoisonError::new(v)) } else { Ok(v) };
+    }
+}
+
+// ===================================================================== Once
+
+const ONCE_NEW: u32 = 0;
+const ONCE_RUNNING: u32 = 1;
+const ONCE_WAITED: u32 = 2;
+const ONCE_DONE: u32 = 3;
+const ONCE_POISONED: u32 = 4;
+
+/// Something done once: the first `call_once` runs its closure, the others
+/// wait for it to finish and then do nothing.
+pub struct Once {
+    state: AtomicU32,
+}
+
+impl Once {
+    pub const fn new(): Once {
+        return Once { state: AtomicU32::new(ONCE_NEW) };
+    }
+
+    /// Run `f` if no `call_once` has yet; wait if one is running. Panics if
+    /// the closure of an earlier call panicked (the `Once` is poisoned).
+    pub fn call_once::<F: FnOnce()>(&self, f: F) {
+        if self.state.load(Ordering::Acquire) == ONCE_DONE {
+            return;
+        }
+        let p = self.state.as_ptr() as *u32;
+        loop {
+            let s = self.state.load(Ordering::Acquire);
+            if s == ONCE_DONE {
+                return;
+            }
+            if s == ONCE_POISONED {
+                panic("`Once` poisoned: its initializer panicked on another thread");
+            }
+            if s == ONCE_NEW {
+                if self.state.compare_exchange(ONCE_NEW, ONCE_RUNNING, Ordering::Acquire, Ordering::Acquire).is_err() {
+                    continue;
+                }
+                hold(intrinsics::addr_of(self) as usize, HELD_ONCE);
+                f();
+                unhold();
+                if self.state.swap(ONCE_DONE, Ordering::Release) == ONCE_WAITED {
+                    crater::sys::futex_wake(p, true);
+                }
+                return;
+            }
+            if s == ONCE_RUNNING {
+                if self.state.compare_exchange(ONCE_RUNNING, ONCE_WAITED, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+                    continue;
+                }
+            }
+            crater::sys::futex_wait(p, ONCE_WAITED, FOREVER);
+        }
+    }
+
+    /// Whether a `call_once` finished.
+    pub fn is_completed(&self): bool {
+        return self.state.load(Ordering::Acquire) == ONCE_DONE;
+    }
+}
+
+/// For a thread that panicked in the closure of the `Once` at `addr`.
+pub fn poison_once(addr: usize) {
+    let o = addr as *Once;
+    unsafe {
+        (*o).state.store(ONCE_POISONED, Ordering::Release);
+        crater::sys::futex_wake((*o).state.as_ptr() as *u32, true);
+    }
+}
+
+/// A value set once, then never changed: `with(|v| ..)` reads it. Views
+/// returned from `with` point into the cell, which is fine: the value
+/// stays as long as the cell.
+///
+/// ```lunar
+/// static PORT: OnceLock::<u16> = OnceLock::new();
+///
+/// fn port(): u16 {
+///     return PORT.get_or_init(|| read_port_from_config());
+/// }
+/// ```
+pub struct OnceLock::<T> {
+    once: Once,
+    value: UnsafeCell::<Option::<T>>,
+}
+
+unsafe impl::<T: Send> Send for OnceLock::<T> {}
+unsafe impl::<T: Send + Sync> Sync for OnceLock::<T> {}
+
+impl::<T: Detached> OnceLock::<T> {
+    pub const fn new(): OnceLock::<T> {
+        return OnceLock { once: Once::new(), value: UnsafeCell::new(None) };
+    }
+
+    /// Whether the value is set.
+    pub fn is_set(&self): bool {
+        return self.once.is_completed();
+    }
+
+    /// Set the value if it is not set yet: `Err` with `value` if it was.
+    pub fn set(&self, value: T): Result::<(), T> {
+        let mut slot: Option::<T> = Some(value);
+        let p = self.value.get();
+        let sp = intrinsics::addr_of_mut(&mut slot);
+        self.once.call_once(|| unsafe {
+            intrinsics::ptr_write(p, intrinsics::ptr_read(sp as *Option::<T>));
+            intrinsics::ptr_write(sp, None);
+        });
+        return match slot {
+            Some(v) => Err(v),
+            None => Ok(()),
+        };
+    }
+
+    /// Run `f` on the value, if it is set.
+    pub fn with::<R, F: FnOnce(&T): R>(&self, f: F): Option::<R> from self, f {
+        if !self.once.is_completed() {
+            return None;
+        }
+        return Some(unsafe { f(&*some_ptr(self.value.get())) });
+    }
+
+    /// Set the value to `init()` if it is not set (one thread runs `init`,
+    /// the others wait for it), then run `f` on it.
+    pub fn with_or_init::<R, I: FnOnce(): T, F: FnOnce(&T): R>(&self, init: I, f: F): R from self, f {
+        let p = self.value.get();
+        self.once.call_once(|| unsafe {
+            intrinsics::ptr_write(p, Some(init()));
+        });
+        return unsafe { f(&*some_ptr(p)) };
+    }
+
+    /// The value, taking the cell apart.
+    pub fn into_inner(self): Option::<T> {
+        let OnceLock { once, value } = self;
+        let _ = once;
+        return value.into_inner();
+    }
+}
+
+impl::<T: Light + Detached> OnceLock::<T> {
+    /// A copy of the value, if it is set.
+    pub fn get(&self): Option::<T> {
+        return self.with(|v| v);
+    }
+
+    /// A copy of the value, set to `init()` first if it is not set.
+    pub fn get_or_init::<I: FnOnce(): T>(&self, init: I): T {
+        return self.with_or_init(init, |v| v);
+    }
+}
+
+/// A value computed the first time it is used, by a function given up
+/// front: `static PRIMES: LazyLock::<u64> = LazyLock::new(count_primes);`.
+pub struct LazyLock::<T> {
+    cell: OnceLock::<T>,
+    init: fn(): T,
+}
+
+unsafe impl::<T: Send> Send for LazyLock::<T> {}
+unsafe impl::<T: Send + Sync> Sync for LazyLock::<T> {}
+
+impl::<T: Detached> LazyLock::<T> {
+    pub const fn new(init: fn(): T): LazyLock::<T> {
+        return LazyLock { cell: OnceLock::new(), init };
+    }
+
+    /// Run `f` on the value, computing it first if this is the first use.
+    pub fn with::<R, F: FnOnce(&T): R>(&self, f: F): R from self, f {
+        let init = self.init;
+        return self.cell.with_or_init(|| init(), f);
+    }
+
+    /// Whether the value was computed.
+    pub fn is_ready(&self): bool {
+        return self.cell.is_set();
+    }
+}
+
+impl::<T: Light + Detached> LazyLock::<T> {
+    /// A copy of the value, computing it first if this is the first use.
+    pub fn get(&self): T {
+        return self.with(|v| v);
+    }
+}
+
+// ===================================================================== Shared
+
+/// A value several threads own together; it is freed with its last owner.
+/// `clone` adds an owner (counted atomically), and the value is read with
+/// `with(|v| ..)`. It never changes: share a `Mutex`, an `RwLock` or
+/// atomics to change data.
+///
+/// ```lunar
+/// let hits = Shared::new(AtomicU64::new(0));
+/// let mine = hits.clone();
+/// let h = thread::spawn(move || mine.with(|n| n.fetch_add(1, Ordering::Relaxed)));
+/// ```
+///
+/// The value lives in a block of its own (a 64 KiB slot of address space),
+/// whose header counts the owners.
+pub struct Shared::<T> {
+    cell: [u8; ..+],
+    ptr: *mut T,
+}
+
+unsafe impl::<T: Send + Sync> Send for Shared::<T> {}
+unsafe impl::<T: Send + Sync> Sync for Shared::<T> {}
+
+/// Drop the `T` at `p` (the drop function of `Shared` blocks).
+fn drop_value::<T>(p: *mut u8) {
+    let v: T = unsafe { intrinsics::ptr_read(p as *T) };
+    let _ = v;
+}
+
+fn drop_nothing(p: *mut u8) {
+    let _ = p;
+}
+
+impl::<T: Send + Sync + Detached> Shared::<T> {
+    pub fn new(value: T): Shared::<T> {
+        return unsafe { Shared::new_unchecked(value) };
+    }
+}
+
+impl::<T> Shared::<T> {
+    /// `new` without its bounds: the caller makes sure sharing `value`
+    /// is safe (as `std::thread` does for its own records).
+    pub unsafe fn new_unchecked(value: T): Shared::<T> {
+        let drop: fn(*mut u8) = drop_value::<T>;
+        let cell = rt::block_new(core::mem::size_of::<T>(), drop);
+        let ptr = (cell[..].as_ptr() as usize) as *mut T;
+        unsafe {
+            intrinsics::ptr_write(ptr, value);
+        }
+        return Shared { cell, ptr };
+    }
+
+    /// Run `f` on the value: what `f` returned.
+    pub fn with::<R, F: FnOnce(&T): R>(&self, f: F): R from self, f {
+        return unsafe { f(&*self.ptr) };
+    }
+
+    /// How many owners the value has right now (other threads may change
+    /// that at any time).
+    pub fn count(&self): usize {
+        return rt::block_refs(self.cell[..].as_ptr());
+    }
+
+    /// Whether two `Shared`s own the same value.
+    pub fn same(&self, other: &Shared::<T>): bool {
+        return (self.ptr as usize) == (other.ptr as usize);
+    }
+
+    /// A pointer to the value, valid while an owner lives.
+    pub fn as_ptr(&self): *T {
+        return self.ptr as *T;
+    }
+
+    /// The value, if this is its only owner; else `Err` with this owner.
+    pub fn try_unwrap(self): Result::<T, Shared::<T>> {
+        if rt::block_refs(self.cell[..].as_ptr()) != 1 {
+            return Err(self);
+        }
+        let v = unsafe { intrinsics::ptr_read(self.ptr as *T) };
+        // The block is freed with `self`, without dropping the value again.
+        let none: fn(*mut u8) = drop_nothing;
+        rt::block_set_drop(self.cell[..].as_ptr(), none);
+        return Ok(v);
+    }
+}
+
+impl::<T> Clone for Shared::<T> {
+    fn clone(&self): Shared::<T> {
+        return Shared { cell: rt::block_dup(&self.cell), ptr: self.ptr };
+    }
+}
+
+// ===================================================================== Barrier
+
+/// Threads waiting for each other: `wait` returns once `n` threads called
+/// it, and then it can be used again.
+pub struct Barrier {
+    lock: RawMutex,
+    changed: RawCondvar,
+    n: usize,
+    count: AtomicUsize,
+    generation: AtomicUsize,
+}
+
+impl Barrier {
+    pub const fn new(n: usize): Barrier {
+        return Barrier { lock: RawMutex::new(), changed: RawCondvar::new(), n, count: AtomicUsize::new(0), generation: AtomicUsize::new(0) };
+    }
+
+    /// Wait until `n` threads are waiting. True for exactly one of them
+    /// (the last to arrive), the leader.
+    pub fn wait(&self): bool {
+        self.lock.lock();
+        let gen = self.generation.load(Ordering::Relaxed);
+        let arrived = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        if arrived >= self.n {
+            self.count.store(0, Ordering::Relaxed);
+            self.generation.store(gen + 1, Ordering::Relaxed);
+            self.changed.notify_all();
+            self.lock.unlock();
+            return true;
+        }
+        while self.generation.load(Ordering::Relaxed) == gen {
+            self.changed.wait(&self.lock, FOREVER);
+        }
+        self.lock.unlock();
+        return false;
+    }
+}

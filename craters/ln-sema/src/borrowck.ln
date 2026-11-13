@@ -671,7 +671,7 @@ pub fn ty_has_view(p: &mut +Program, env: [Pred; &], t: Ty, depth: u32): bool {
         }
         // Generic values may be instantiated with views, and `impl Trait`
         // may stand for one, unless bounded by `Dull`.
-        TyKind::Param(..) | TyKind::Opaque(..) => !p.is_dull(t, env),
+        TyKind::Param(..) | TyKind::Opaque(..) => !p.is_dull(t, env) && !p.is_detached(t, env),
         _ => false,
     };
 }
@@ -1666,9 +1666,31 @@ impl Cx {
                     p.diags.suggest(Span::new(lx.span.lo, lx.span.lo), say(p, "kept "), say(p, "Declare `{n}` `kept`"));
                 }
                 _ => {
-                    let m = say(p, "cannot store a view of a local value into parameter `{dn}`");
-                    p.diags.error(codes::borrow::ESCAPES_VIA_PARAM(), span, m);
-                    p.diags.note(say(p, "the caller's data may outlive the value being viewed"));
+                    // `std::thread::Scope`: a thread of the scope would
+                    // borrow a variable of the closure that started it.
+                    let dt = p.types.strip_grow(self.local(p, dest).ty);
+                    let is_scope = match p.types.kind(dt) {
+                        TyKind::Adt(d, _) => p.is_lang(d, "thread_scope"),
+                        _ => false,
+                    };
+                    if is_scope {
+                        let mut what = String::from("a temporary value");
+                        if let Some(x) = l {
+                            what = String::from("`");
+                            what.push_str(p.text(self.local(p, x).name));
+                            what.push('`');
+                        }
+                        let m = say(p, "a scoped thread cannot borrow {what}: it is freed before the thread finishes");
+                        p.diags.error(codes::borrow::SCOPED_THREAD_BORROW(), span, m);
+                        if let Some(x) = l {
+                            p.diags.secondary(self.local(p, x).span, say(p, "declared inside the closure given to `thread::scope`, which returns before the scope waits for its threads"));
+                        }
+                        p.diags.help(say(p, "declare it before `thread::scope`, or move it into the thread with a `move` closure"));
+                    } else {
+                        let m = say(p, "cannot store a view of a local value into parameter `{dn}`");
+                        p.diags.error(codes::borrow::ESCAPES_VIA_PARAM(), span, m);
+                        p.diags.note(say(p, "the caller's data may outlive the value being viewed"));
+                    }
                 }
             }
             p.diags.finish();
@@ -2310,15 +2332,16 @@ impl Cx {
         };
     }
 
-    /// Whether a closure value of type `t` may change what it captured when
-    /// called (conservatively yes, unless it is known to be an `Fn` closure).
-    fn may_change_captures(&self, p: &Program, t: Ty): bool {
+    /// Whether a value of type `t` may hold a closure that changes what it
+    /// captured when called (conservatively yes, unless it is known to be
+    /// an `Fn` closure or cannot hold a closure at all).
+    fn may_change_captures(&self, p: &mut +Program, t: Ty): bool {
         return match p.types.kind(t) {
             TyKind::Closure(d, _) => match p.closures.get(d) {
                 Some(c) => c.kind != ClosureKind::Fn,
                 None => true,
             },
-            _ => true,
+            _ => self.may_hold_closure(p, t, 0),
         };
     }
 

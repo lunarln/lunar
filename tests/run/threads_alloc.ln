@@ -1,0 +1,148 @@
+// The data stacks under many threads: arrays and strings made, grown,
+// moved between threads and freed at the same time, thread-local
+// statics, and constant statics built by `const fn`s.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread;
+
+#[test]
+fn many_threads_allocate() {
+    let mut g = thread::Group::<u64>::new();
+    for t in 0..16 {
+        g.spawn(move || {
+            let mut check: u64 = 0;
+            for round in 0..200 {
+                let mut a: [u64; ..+] = [];
+                for i in 0..(round % 50 + 1) {
+                    a.push(i * t);
+                }
+                let mut s = String::new();
+                s.write("{t}-{round}");
+                let mut sum: u64 = 0;
+                for x in a {
+                    sum += x;
+                }
+                check += sum + s.len() as u64;
+            }
+            check
+        });
+    }
+    let mut total: u64 = 0;
+    while let Some(r) = g.join_next() {
+        total += r.unwrap();
+    }
+    // Recompute on this thread.
+    let mut want: u64 = 0;
+    for t in 0..16 {
+        for round in 0..200 {
+            let n: u64 = round % 50 + 1;
+            want += t * n * (n - 1) / 2;
+            let mut s = String::new();
+            s.write("{t}-{round}");
+            want += s.len() as u64;
+        }
+    }
+    assert_eq!(total, want);
+}
+
+#[test]
+fn arrays_freed_on_other_threads() {
+    // Strings made on one thread are freed on another.
+    let (tx, rx) = mpsc::sync_channel::<String>(16);
+    let h = thread::spawn(move || {
+        for i in 0..2000 {
+            let mut s = String::from("payload ");
+            s.write("{i}");
+            tx.send(s).unwrap();
+        }
+    });
+    let mut n: usize = 0;
+    for s in rx {
+        n += s.len();
+    }
+    h.join().unwrap();
+    let mut want: usize = 0;
+    for i in 0..2000 {
+        want += 8 + core::fmt::format("{i}").len();
+    }
+    assert_eq!(n, want);
+}
+
+#[thread_local]
+static mut DEPTH: u64 = 0;
+
+fn bump(): u64 {
+    unsafe {
+        DEPTH += 1;
+        return DEPTH;
+    }
+}
+
+#[test]
+fn thread_local_statics() {
+    bump();
+    bump();
+    let others = AtomicU64::new(0);
+    thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                // Every thread starts from the initializer.
+                let mut last: u64 = 0;
+                for _ in 0..10 {
+                    last = bump();
+                }
+                others.fetch_add(last, Ordering::SeqCst);
+            });
+        }
+    });
+    assert_eq!(others.load(Ordering::SeqCst), 40);
+    assert_eq!(bump(), 3);
+}
+
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+const fn point(x: i64, y: i64): Point {
+    let p = Point { x, y };
+    return p;
+}
+
+const fn scaled(p: Point, k: i64): Point {
+    return point(p.x * k, p.y * k);
+}
+
+enum Shape {
+    Dot(Point),
+    Line { from: Point, to: Point },
+    Nothing,
+}
+
+static ORIGIN: Point = point(0, 0);
+static FAR: Point = scaled(point(3, -4), 10);
+static SHAPES: [Shape; 3] = [Shape::Dot(Point { x: 1, y: 2 }), Shape::Line { from: point(0, 0), to: point(5, 5) }, Shape::Nothing];
+static PICK: Option::<u32> = Some(7);
+const LIMIT: u64 = if 3 > 2 { 100 } else { 0 };
+
+#[test]
+fn const_fn_statics() {
+    assert_eq!(ORIGIN.x + ORIGIN.y, 0);
+    assert_eq!(FAR.x, 30);
+    assert_eq!(FAR.y, -40);
+    match SHAPES[0] {
+        Shape::Dot(p) => assert_eq!(p.x * 10 + p.y, 12),
+        _ => panic("not a dot"),
+    }
+    match SHAPES[1] {
+        Shape::Line { from, to } => assert_eq!(to.x - from.x + to.y, 10),
+        _ => panic("not a line"),
+    }
+    match SHAPES[2] {
+        Shape::Nothing => {}
+        _ => panic("not nothing"),
+    }
+    assert_eq!(PICK, Some(7u32));
+    assert_eq!(LIMIT, 100);
+}

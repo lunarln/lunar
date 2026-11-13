@@ -459,8 +459,10 @@ impl Cg {
             v = self.gep(lt, vals[0], vals[1], noname());
         } else if name == "ptr_null" || name == "ptr_null_mut" {
             v = unsafe { LLVMConstPointerNull(self.ptr_ty()) };
-        } else if name == "addr_of_mut" {
+        } else if name == "addr_of_mut" || name == "addr_of" {
             v = vals[0];
+        } else if name.starts_with("atomic_") {
+            return self.atomic(p, name, targs, vals);
         } else if name == "wrapping_add" {
             v = self.add(vals[0], vals[1], noname());
         } else if name == "wrapping_sub" {
@@ -488,6 +490,71 @@ impl Cg {
             return None;
         }
         return Some(v);
+    }
+
+    /// The atomic intrinsics of `core::intrinsics` on a pointer to an
+    /// integer or pointer. Their orderings are LLVM's numbers and must be
+    /// constants; anything else counts as sequentially consistent.
+    fn atomic(&mut self, p: &mut +Program, name: str, targs: TyList, vals: [ValueRef; &]): Option::<ValueRef> {
+        if name == "atomic_fence" {
+            let ord = order_of(vals[0]);
+            unsafe { LLVMBuildFence(self.b, ord, 0, noname()) };
+            return Some(self.unit());
+        }
+        let t = p.types.at(targs, 0);
+        let lt = self.llty(p, t);
+        let signed = match p.types.kind(t) {
+            TyKind::Int(i) => i.signed(),
+            _ => false,
+        };
+        if name == "atomic_load" {
+            // A load cannot release.
+            let ord = without_release(order_of(vals[1]));
+            let l = unsafe { LLVMBuildLoad2(self.b, lt, vals[0], noname()) };
+            unsafe { LLVMSetOrdering(l, ord) };
+            return Some(l);
+        }
+        if name == "atomic_store" {
+            // A store cannot acquire.
+            let o = order_of(vals[2]);
+            let ord = if o == ORDER_ACQUIRE { ORDER_RELAXED } else if o == ORDER_ACQ_REL { ORDER_RELEASE } else { o };
+            let s = unsafe { LLVMBuildStore(self.b, vals[1], vals[0]) };
+            unsafe { LLVMSetOrdering(s, ord) };
+            return Some(self.unit());
+        }
+        if name == "atomic_cas" {
+            let ord = order_of(vals[3]);
+            // The load of a failed exchange is as strong as it may be.
+            let fail = without_release(ord);
+            let r = unsafe { LLVMBuildAtomicCmpXchg(self.b, vals[0], vals[1], vals[2], ord, fail, 0) };
+            return Some(self.extract(r, 0, noname()));
+        }
+        let op: u32 = if name == "atomic_swap" {
+            0
+        } else if name == "atomic_add" {
+            1
+        } else if name == "atomic_sub" {
+            2
+        } else if name == "atomic_and" {
+            3
+        } else if name == "atomic_nand" {
+            4
+        } else if name == "atomic_or" {
+            5
+        } else if name == "atomic_xor" {
+            6
+        } else if name == "atomic_max" {
+            if signed { 7 } else { 9 }
+        } else if name == "atomic_min" {
+            if signed { 8 } else { 10 }
+        } else {
+            let mut msg = String::new();
+            msg.write("unknown intrinsic `{name}`");
+            self.ice(p, msg.as_str());
+            return None;
+        };
+        let ord = order_of(vals[2]);
+        return Some(unsafe { LLVMBuildAtomicRMW(self.b, op, vals[0], vals[1], ord, 0) });
     }
 
     /// Give the empty array behind handle `h` a slot for exactly `count`
@@ -1244,4 +1311,35 @@ impl Cg {
         self.call(f, args[..]);
         self.unreachable();
     }
+}
+
+/// LLVM's atomic orderings.
+const ORDER_RELAXED: u32 = 2;
+const ORDER_ACQUIRE: u32 = 4;
+const ORDER_RELEASE: u32 = 5;
+const ORDER_ACQ_REL: u32 = 6;
+const ORDER_SEQ_CST: u32 = 7;
+
+/// The ordering an atomic intrinsic was given: a constant LLVM ordering,
+/// or sequentially consistent for anything else.
+fn order_of(v: ValueRef): u32 {
+    if is_null(unsafe { LLVMIsAConstantInt(v) }) {
+        return ORDER_SEQ_CST;
+    }
+    let o = unsafe { LLVMConstIntGetZExtValue(v) } as u32;
+    if o == ORDER_RELAXED || o == ORDER_ACQUIRE || o == ORDER_RELEASE || o == ORDER_ACQ_REL || o == ORDER_SEQ_CST {
+        return o;
+    }
+    return ORDER_SEQ_CST;
+}
+
+/// `o` for an access that only reads: releasing turns into nothing.
+fn without_release(o: u32): u32 {
+    if o == ORDER_RELEASE {
+        return ORDER_RELAXED;
+    }
+    if o == ORDER_ACQ_REL {
+        return ORDER_ACQUIRE;
+    }
+    return o;
 }

@@ -1,0 +1,31 @@
+// The traits threads are checked with. Like `Dull` and `Light`, the
+// compiler implements them from a type's parts:
+//
+// * `Send`: a value may move to another thread. Everything is Send except
+//   raw pointers, mutable slices (`[T; &mut]`, which are copied freely, so
+//   two threads could write through the same one), `FmtArgs`, shared slices
+//   of items that are not Sync, closures that change a variable they
+//   borrow, and types holding one of those.
+// * `Sync`: threads may share views of a value. Everything is Sync except
+//   what is not Send and `core::cell::UnsafeCell` (whose value changes
+//   behind shared views), and types holding one of those.
+// * `Detached`: the value holds no views (no `str`, slice or closure that
+//   borrows), so nothing in it points into data it does not own and it may
+//   outlive every local variable. Owners, Dull values and raw pointers are
+//   Detached. A thread started by `std::thread::spawn` may run longer than
+//   the function that started it, so it takes only Detached values.
+//
+// A struct or enum may promise `Send` or `Sync` with `unsafe impl` (when it
+// holds raw pointers or cells and guards them itself, like
+// `std::sync::Mutex`), or take them away with a negative impl. Its impls
+// then decide alone; its fields no longer count. `Detached` cannot be
+// implemented by hand.
+
+#[lang = "send"]
+pub trait Send {}
+
+#[lang = "sync"]
+pub trait Sync {}
+
+#[lang = "detached"]
+pub trait Detached {}
