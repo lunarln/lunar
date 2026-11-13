@@ -152,7 +152,7 @@ fn ir_describes_functions_variables_and_types() {
     let t = ir.as_str();
     expect(t, "!\"Debug Info Version\", i32 3}");
     expect(t, "distinct !DICompileUnit(language: DW_LANG_C_plus_plus");
-    expect(t, "producer: \"lunar 0.1.0\"");
+    expect(t, "producer: \"lunar 0.2.0\"");
     expect(t, "emissionKind: FullDebug");
     expect(t, "!DIFile(filename: \"demo.ln\"");
     // Functions: in their namespaces, generic instances and closures
