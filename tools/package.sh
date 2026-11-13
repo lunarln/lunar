@@ -100,7 +100,7 @@ bundle_linux() {
     echo "needs glibc $(objdump -T "$bin" "$stage"/lib/*.so* | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1)" \
         "and libstdc++ $(objdump -T "$stage"/lib/*.so* | grep -o 'GLIBCXX_[0-9.]*' | sort -uV | tail -n 1)"
     # The packaged executable must find LLVM in the package.
-    if ! ldd "$bin" | grep libLLVM | grep -qF "$stage/lib/"; then
+    if ! ldd "$bin" | grep libLLVM | grep -qF "=> $stage/"; then
         echo "error: the packaged lunar does not load LLVM from the package:" >&2
         ldd "$bin" >&2
         exit 1
@@ -162,6 +162,9 @@ bundle_macos() {
     done
     echo "bundled:"; ls -l "$stage/lib"
     otool -L "$bin"
+    for f in "$bin" "$stage"/lib/*.dylib; do
+        echo "$(basename "$f") needs macOS $(otool -l "$f" | awk '/minos/ { print $2; exit }')"
+    done
 }
 
 case "$os" in
@@ -169,6 +172,7 @@ case "$os" in
     macos) bundle_macos ;;
     windows) cp "$LLVM_SHLIB_DIR/LLVM-C.dll" "$stage/bin/" ;;
 esac
+echo "licenses: $(ls "$stage/licenses" | tr '\n' ' ')"
 
 # Try the package out: no LUNAR_* variables, a fresh directory, and a
 # program to build, run and test.

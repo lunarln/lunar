@@ -95,8 +95,9 @@ LLVM comes with the compiler, so nothing else is needed to run it. To
 build programs it needs a linker, which you install yourself:
 
 * **Linux**: a C toolchain that provides `cc` (gcc or clang; on Debian and
-  Ubuntu, `build-essential`). The prebuilt compiler needs glibc 2.35 or
-  newer (Ubuntu 22.04, Debian 12, Fedora 36 and later).
+  Ubuntu, `build-essential`). The prebuilt compiler needs glibc 2.34 and
+  the C++ runtime of GCC 12 or newer (Ubuntu 22.04, Debian 12, Fedora 36
+  and later).
 * **macOS**: the Xcode command line tools (`xcode-select --install`).
 * **Windows**: the
   [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)

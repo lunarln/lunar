@@ -101,6 +101,8 @@ jobs:
   verify:
     name: verify ${{ matrix.target }} on ${{ matrix.os }}
     needs: build
+    # Each package that was built, even if another one failed.
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
