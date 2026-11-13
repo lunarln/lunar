@@ -7,6 +7,7 @@
 // file is its index in `p.sources.files`.
 
 use core::arena::{Id, List};
+use core::collections::HashMap;
 use core::intern::Symbol;
 use ln_ast::{Ast, FieldDecl, GenericParam, Generics, Item, ItemKind, Span, StmtKind, VariantData, VariantDecl};
 use ln_ast::pretty;
@@ -80,7 +81,7 @@ fn utf16_len(c: char): u32 {
 }
 
 /// Whether `s` is a real span in `file`.
-fn in_file(p: &Program, s: Span, file: u32): bool {
+pub fn in_file(p: &Program, s: Span, file: u32): bool {
     return !is_dummy(s) && p.sources.files.len() > 0 && p.sources.file_of(s.lo) == file;
 }
 
@@ -101,7 +102,7 @@ fn consider(b: &mut BestRef, p: &Program, file: u32, offset: u32, s: Span, t: Re
 
 /// The innermost recorded name at `offset` (global) in `file`: a use of a
 /// name, or the name in an item or field declaration.
-fn ref_at(p: &Program, file: u32, offset: u32): Option::<(Span, RefTarget)> {
+pub fn ref_at(p: &Program, file: u32, offset: u32): Option::<(Span, RefTarget)> {
     let mut b = BestRef { found: false, span: Span::new(0, 0), target: RefTarget::TyParam(Span::new(0, 0)) };
     for r in p.refs {
         consider(&mut b, p, file, offset, r.span, r.target);
@@ -153,7 +154,7 @@ pub fn definition(p: &Program, file: u32, offset: u32): Option::<Span> {
 // ===================================================================== declarations
 
 /// A declaration in the parsed source, found by the span of its name.
-enum Decl {
+pub enum Decl {
     /// An item, the `impl` or `trait` it is declared in, and whether it is
     /// in an `extern` block (and that block's ABI).
     Item { item: Item, parent: Option::<Item>, in_extern: bool, abi: Option::<Symbol> },
@@ -163,7 +164,7 @@ enum Decl {
 }
 
 /// Its documentation, from its `doc` attributes.
-fn decl_docs(a: &Ast, d: Decl): String {
+pub fn decl_docs(a: &Ast, d: Decl): String {
     return match d {
         Decl::Item { item, .. } => pretty::doc_text(a, item.attrs),
         Decl::Variant(v) => pretty::doc_text(a, v.attrs),
@@ -196,7 +197,7 @@ fn param_in(a: &Ast, g: Generics, name: Span): Option::<Decl> {
 
 /// The declaration whose name is at `name`, in the module source of its
 /// file (macro expansions have none).
-fn find_decl(cs: &Craters, p: &Program, name: Span): Option::<Decl> {
+pub fn find_decl(cs: &Craters, p: &Program, name: Span): Option::<Decl> {
     if is_dummy(name) || p.sources.files.len() == 0 {
         return None;
     }
@@ -210,6 +211,121 @@ fn find_decl(cs: &Craters, p: &Program, name: Span): Option::<Decl> {
         }
     }
     return None;
+}
+
+/// Every declaration of a program by the start of its name, for looking
+/// many up (completion lists).
+pub struct DeclIndex {
+    pub map: HashMap::<u32, Decl>,
+    pub built: bool,
+}
+
+impl DeclIndex {
+    pub fn new(): DeclIndex {
+        return DeclIndex { map: HashMap::new(), built: false };
+    }
+
+    /// The declaration whose name is at `name`.
+    pub fn get(&self, name: Span): Option::<Decl> {
+        if is_dummy(name) {
+            return None;
+        }
+        return self.map.get(name.lo);
+    }
+
+    /// Every module source of the program, indexed.
+    pub fn of(cs: &Craters, p: &Program): DeclIndex {
+        let mut idx = DeclIndex::new();
+        for m in cs.mods.items() {
+            if (m.file as usize) < p.sources.files.len() && p.sources.files[m.file as usize].expansion_site.is_none() {
+                index_items(&p.ast, m.items, None, false, None, &mut idx.map);
+            }
+        }
+        idx.built = true;
+        return idx;
+    }
+}
+
+fn index_items(a: &Ast, items: List::<Id::<Item>>, parent: Option::<Item>, in_extern: bool, abi: Option::<Symbol>, map: &mut HashMap::<u32, Decl>) {
+    for id in a.item_ids.list(items) {
+        index_item(a, id, parent, in_extern, abi, map);
+    }
+}
+
+fn index_params(a: &Ast, g: Generics, map: &mut HashMap::<u32, Decl>) {
+    for gp in a.generic_params.list(g.params) {
+        map.insert(gp.name.span.lo, Decl::Param(gp));
+    }
+}
+
+fn index_fields(a: &Ast, data: VariantData, map: &mut HashMap::<u32, Decl>) {
+    if let VariantData::Named(fs) = data {
+        for f in a.field_decls.list(fs) {
+            map.insert(f.name.span.lo, Decl::Field(f));
+        }
+    }
+}
+
+fn index_item(a: &Ast, id: Id::<Item>, parent: Option::<Item>, in_extern: bool, abi: Option::<Symbol>, map: &mut HashMap::<u32, Decl>) {
+    let item = a.items.get(id);
+    let here = Decl::Item { item, parent, in_extern, abi };
+    match item.kind {
+        ItemKind::Fn(f) => {
+            map.insert(f.name.span.lo, here);
+            index_params(a, f.generics, map);
+            if let Some(body) = f.body {
+                for s in a.stmts.list(a.blocks.get(body).stmts) {
+                    if let StmtKind::Item(i) = s.kind {
+                        index_item(a, i, None, false, None, map);
+                    }
+                }
+            }
+        }
+        ItemKind::Struct(s) => {
+            map.insert(s.name.span.lo, here);
+            index_params(a, s.generics, map);
+            index_fields(a, s.kind, map);
+        }
+        ItemKind::Enum(e) => {
+            map.insert(e.name.span.lo, here);
+            index_params(a, e.generics, map);
+            for v in a.variants.list(e.variants) {
+                map.insert(v.name.span.lo, Decl::Variant(v));
+                index_fields(a, v.data, map);
+            }
+        }
+        ItemKind::Trait(t) => {
+            map.insert(t.name.span.lo, here);
+            index_params(a, t.generics, map);
+            index_items(a, t.items, Some(item), false, None, map);
+        }
+        ItemKind::Impl(i) => {
+            index_params(a, i.generics, map);
+            index_items(a, i.items, Some(item), false, None, map);
+        }
+        ItemKind::Mod(m) => {
+            map.insert(m.name.span.lo, here);
+            if let Some(inner) = m.items {
+                index_items(a, inner, None, false, None, map);
+            }
+        }
+        ItemKind::Const(c) => {
+            map.insert(c.name.span.lo, here);
+        }
+        ItemKind::Static(s) => {
+            map.insert(s.name.span.lo, here);
+        }
+        ItemKind::TypeAlias(t) => {
+            map.insert(t.name.span.lo, here);
+            index_params(a, t.generics, map);
+        }
+        ItemKind::Extern(b) => index_items(a, b.items, None, true, b.abi, map),
+        ItemKind::Macro(m) => {
+            map.insert(m.name.span.lo, here);
+        }
+        ItemKind::Use(_) => {}
+        ItemKind::MacCall(_) => {}
+    }
 }
 
 fn decl_in_items(a: &Ast, items: List::<Id::<Item>>, name: Span, parent: Option::<Item>, in_extern: bool, abi: Option::<Symbol>): Option::<Decl> {
@@ -424,7 +540,7 @@ fn strip_grow(p: &Program, t: Ty): Ty {
 
 /// Declaration (printed from the syntax tree), container path and doc
 /// comments of a definition.
-fn describe_def(s: &mut +Sema, d: DefId): String {
+pub fn describe_def(s: &mut +Sema, d: DefId): String {
     let info = s.p.def(d);
     // Like rust-analyzer: the container path, then the declaration (with
     // the memory layout as a comment for types, and the enclosing `impl`
@@ -520,7 +636,7 @@ fn push_docs(out: &mut String, docs: str) {
     }
 }
 
-fn code_block(code: str): String {
+pub fn code_block(code: str): String {
     let mut out = String::new();
     out.write("```lunar\n{code}\n```");
     return out;
@@ -749,7 +865,7 @@ fn walk_expr(p: &Program, id: Id::<thir::Expr>, file: u32, offset: u32, best: &m
 
 // ===================================================================== keywords
 
-fn keyword_doc(word: str): Option::<str> {
+pub fn keyword_doc(word: str): Option::<str> {
     if word == "fn" {
         return Some("A function or function pointer.
 

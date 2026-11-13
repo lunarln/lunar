@@ -175,7 +175,7 @@ fn session(bin: &std::ffi::OsStr, tag: &str) -> Vec<Value> {
     }
     c.request("lunar/stdSource", json!({ "uri": "lunar-std:no::such" }));
     c.request("lunar/stdSource", json!({ "uri": "file:///x.ln" }));
-    c.request("textDocument/completion", json!({ "textDocument": { "uri": uri }, "position": { "line": 0, "character": 0 } }));
+    c.request("textDocument/formatting", json!({ "textDocument": { "uri": uri }, "options": { "tabSize": 4, "insertSpaces": true } }));
     c.request("textDocument/hover", json!({ "textDocument": { "uri": "file:///not/open.ln" }, "position": { "line": 0, "character": 0 } }));
     // Fix the error, then close the document.
     let fixed = SRC.replace("undefined_name", "total");
@@ -276,6 +276,20 @@ fn rust_and_lunar_servers_answer_alike() {
     }
     let mut diffs = Vec::new();
     for (id, r) in &responses {
+        // The server built from craters/ can do more than the Rust one: it
+        // must declare at least the Rust server's capabilities, alike.
+        if *id == 1 {
+            let (Some(rc), Some(lc)) = (r["result"]["capabilities"].as_object(), lunar_responses.get(id).and_then(|l| l["result"]["capabilities"].as_object())) else {
+                diffs.push(format!("response {id}: no capabilities"));
+                continue;
+            };
+            for (k, v) in rc {
+                if lc.get(k) != Some(v) {
+                    diffs.push(format!("capability {k}: rust {v}, lunar {:?}", lc.get(k)));
+                }
+            }
+            continue;
+        }
         match lunar_responses.get(id) {
             Some(l) if l == r => {}
             Some(l) => diffs.push(format!("response {id}:\n  rust:  {r}\n  lunar: {l}")),

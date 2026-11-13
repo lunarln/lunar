@@ -30,6 +30,7 @@
 mod cli;
 mod commands;
 mod compile;
+mod complete;
 mod explain;
 mod git;
 mod ide;
@@ -37,6 +38,8 @@ mod link;
 mod lsp;
 mod paths;
 mod project;
+mod refs;
+mod symbols;
 mod sysroot;
 mod testing;
 mod ui;

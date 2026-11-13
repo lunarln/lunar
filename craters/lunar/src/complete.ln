@@ -1,0 +1,2216 @@
+// Completion and signature help, while the code is being written.
+//
+// They answer from the document's current text and the last analysis of
+// its crate, which may be a few keystrokes old (re-analyzing a crate takes
+// a moment; typing should not wait for it). The text says where the cursor
+// is: after `.`, after a path's `::`, in a `use`, in a struct literal, or
+// among statements. The analysis says what names mean: offsets in the
+// unchanged text around the edit map to the analyzed text (`Cx::old`).
+//
+// What is approximate: the type of a receiver comes from the expression
+// the analysis typed at the same place, else from following the receiver's
+// tokens (`a.b.c()[i]?`: locals, paths, fields, method results, indexing,
+// `?`) with the declared types of fields and results. Generic results
+// whose arguments only inference knows stay generic, and a receiver the
+// analysis cannot follow (a closure's result, an expression in
+// parentheses with operators) gets no member completions. Locals are those
+// the analysis saw in scope; while the function being edited does not
+// parse, they come from its `let`s and parameters in the text, untyped.
+
+use core::arena::{Id, List};
+use core::intern::Symbol;
+use ln_ast::{Item, ItemKind, Span};
+use ln_ast::pretty;
+use ln_lexer::{Spanned, Token};
+use ln_sema::defs::{BindKey, Binding, DefData, DefId, DefKind, Ns};
+use ln_sema::diag::is_dummy;
+use ln_sema::program::Program;
+use ln_sema::query::MethodCand;
+use ln_sema::resolve::ModRes;
+use ln_sema::sema::Sema;
+use ln_sema::thir;
+use ln_sema::ty::{ArrKind, Ty, TyKind};
+use crater::ide;
+use crater::ide::Decl;
+use crater::symbols;
+
+// ===================================================================== completion items
+
+/// LSP completion item kinds.
+pub const CK_METHOD: u32 = 2;
+pub const CK_FUNCTION: u32 = 3;
+pub const CK_FIELD: u32 = 5;
+pub const CK_VARIABLE: u32 = 6;
+pub const CK_INTERFACE: u32 = 8;
+pub const CK_MODULE: u32 = 9;
+pub const CK_ENUM: u32 = 13;
+pub const CK_KEYWORD: u32 = 14;
+pub const CK_SNIPPET: u32 = 15;
+pub const CK_ENUM_MEMBER: u32 = 20;
+pub const CK_CONSTANT: u32 = 21;
+pub const CK_STRUCT: u32 = 22;
+pub const CK_TYPE_PARAMETER: u32 = 25;
+
+/// Sort groups, best first.
+const S_LOCAL: u8 = 0;
+const S_MEMBER: u8 = 1;
+const S_TRAIT_MEMBER: u8 = 2;
+const S_ITEM: u8 = 3;
+const S_PRELUDE: u8 = 4;
+const S_KEYWORD: u8 = 5;
+
+/// One completion; its texts are in `Items::text`.
+pub struct CItem {
+    label_lo: u32,
+    label_hi: u32,
+    detail_lo: u32,
+    detail_hi: u32,
+    insert_lo: u32,
+    insert_hi: u32,
+    doc_lo: u32,
+    doc_hi: u32,
+    pub kind: u32,
+    /// `insert` is a snippet (`name(${1:x})$0`).
+    pub snippet: bool,
+    pub sort: u8,
+    /// The definition it names, plus one (for `completionItem/resolve`).
+    pub def: u32,
+}
+
+/// The completions at a position.
+pub struct Items {
+    pub list: [CItem; ..+],
+    pub text: String,
+    /// What they replace: the identifier being typed (offsets in the
+    /// document's current text).
+    pub replace_lo: u32,
+    pub replace_hi: u32,
+    /// More would match if the client asked again (the list is filtered
+    /// by what is typed).
+    pub incomplete: bool,
+    /// What is typed of the name, to filter by.
+    prefix_text: String,
+    /// The declarations of the analysis, to describe items.
+    pub idx: ide::DeclIndex,
+}
+
+impl Items {
+    pub fn new(): Items {
+        return Items { list: [], text: String::new(), replace_lo: 0, replace_hi: 0, incomplete: false, prefix_text: String::new(), idx: ide::DeclIndex::new() };
+    }
+
+    fn part(&self, lo: u32, hi: u32): str {
+        return self.text.as_str()[lo as usize..hi as usize];
+    }
+
+    pub fn label(&self, i: usize): str {
+        return self.part(self.list[i].label_lo, self.list[i].label_hi);
+    }
+
+    pub fn detail(&self, i: usize): str {
+        return self.part(self.list[i].detail_lo, self.list[i].detail_hi);
+    }
+
+    pub fn insert(&self, i: usize): str {
+        return self.part(self.list[i].insert_lo, self.list[i].insert_hi);
+    }
+
+    pub fn doc(&self, i: usize): str {
+        return self.part(self.list[i].doc_lo, self.list[i].doc_hi);
+    }
+
+    /// Whether `label` is there already.
+    fn has(&self, label: str): bool {
+        for i in 0..self.list.len() {
+            if self.label(i) == label {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Add an item (unless one has its label, or it does not match what
+    /// is typed).
+    fn add(&mut +self, label: str, kind: u32, detail: str, insert: str, snippet: bool, doc: str, sort: u8, def: u32) {
+        if label.len() == 0 || label.contains("#") || label.starts_with("<") {
+            return;
+        }
+        if !symbols::fuzzy(self.prefix_text.as_str(), label) {
+            self.incomplete = true;
+            return;
+        }
+        if self.has(label) {
+            return;
+        }
+        let label_lo = self.text.len() as u32;
+        self.text.push_str(label);
+        let detail_lo = self.text.len() as u32;
+        self.text.push_str(detail);
+        let insert_lo = self.text.len() as u32;
+        self.text.push_str(insert);
+        let doc_lo = self.text.len() as u32;
+        self.text.push_str(doc);
+        let doc_hi = self.text.len() as u32;
+        self.list.push(CItem { label_lo, label_hi: detail_lo, detail_lo, detail_hi: insert_lo, insert_lo, insert_hi: doc_lo, doc_lo, doc_hi, kind, snippet, sort, def });
+    }
+}
+
+// ===================================================================== where the cursor is
+
+/// The analysis and the current text, side by side.
+pub struct Cx {
+    /// The document's file in the analysis.
+    pub file: u32,
+    /// Where it starts in the analysis' source map.
+    pub start: u32,
+    old_len: u32,
+    new_len: u32,
+    /// Bytes the texts share at their start and end.
+    pre: u32,
+    suf: u32,
+    /// The cursor, in the current text and (mapped) in the analysis.
+    pub cursor: u32,
+    pub old_cursor: u32,
+    /// The module and the body (function or closure) the cursor is in.
+    pub module: DefId,
+    pub body: Option::<DefId>,
+    /// The client takes snippets.
+    pub snippets: bool,
+}
+
+impl Cx {
+    /// Offset `o` of the current text in the analysis (global), if it is
+    /// outside the edited part.
+    pub fn old(self, o: u32): Option::<u32> {
+        if o <= self.pre {
+            return Some(self.start + o);
+        }
+        if o + self.suf >= self.new_len && o <= self.new_len {
+            return Some(self.start + o + self.old_len - self.new_len);
+        }
+        return None;
+    }
+
+    /// `old`, or where the edit starts.
+    pub fn old_near(self, o: u32): u32 {
+        return match self.old(o) {
+            Some(x) => x,
+            None => self.start + self.pre,
+        };
+    }
+}
+
+/// Set up the context for the cursor at `cursor` in `text`, the current
+/// text of file `file` of the analysis.
+pub fn context(s: &mut Sema, file: u32, text: str, cursor: u32, snippets: bool): Cx {
+    let old = s.p.sources.file_text(file);
+    let start = s.p.sources.files[file as usize].start;
+    let ob = old.as_bytes();
+    let nb = text.as_bytes();
+    let mut pre: usize = 0;
+    while pre < ob.len() && pre < nb.len() && ob[pre] == nb[pre] {
+        pre += 1;
+    }
+    let mut suf: usize = 0;
+    while suf < ob.len() - pre && suf < nb.len() - pre && ob[ob.len() - 1 - suf] == nb[nb.len() - 1 - suf] {
+        suf += 1;
+    }
+    let mut cx = Cx {
+        file,
+        start,
+        old_len: ob.len() as u32,
+        new_len: nb.len() as u32,
+        pre: pre as u32,
+        suf: suf as u32,
+        cursor,
+        old_cursor: 0,
+        module: DefId::new(0),
+        body: None,
+        snippets,
+    };
+    cx.old_cursor = cx.old_near(cursor);
+    cx.body = body_at(&s.p, file, cx.old_cursor);
+    cx.module = module_at(s, file, cx.old_cursor);
+    s.begin_query(cx.body);
+    return cx;
+}
+
+/// The innermost body (function or closure) around `at` in `file`.
+fn body_at(p: &Program, file: u32, at: u32): Option::<DefId> {
+    let mut best: Option::<(DefId, Span)> = None;
+    for b in p.bodies.values() {
+        if !ide::in_file(p, b.span, file) || at < b.span.lo || at > b.span.hi {
+            continue;
+        }
+        let better = match best {
+            Some(x) => {
+                let (_, s) = x;
+                b.span.hi - b.span.lo < s.hi - s.lo
+            }
+            None => true,
+        };
+        if better {
+            best = Some((b.def, b.span));
+        }
+    }
+    return match best {
+        Some(x) => {
+            let (d, _) = x;
+            Some(d)
+        }
+        None => None,
+    };
+}
+
+/// The module the code at `at` in `file` is in: a block's scope, an inline
+/// module, or the file's module.
+fn module_at(s: &Sema, file: u32, at: u32): DefId {
+    // Blocks that declare items have scopes of their own.
+    let mut best: Option::<DefId> = None;
+    let mut best_len: u32 = 4294967295;
+    for i in 0..s.p.defs.len() {
+        let d = s.p.defs[i];
+        if d.kind != DefKind::Mod || !ide::in_file(&s.p, d.span, file) || at < d.span.lo || at > d.span.hi {
+            continue;
+        }
+        if let DefData::Mod(md) = d.data {
+            if md.is_block && d.span.hi - d.span.lo < best_len {
+                best = Some(DefId::new(i));
+                best_len = d.span.hi - d.span.lo;
+            }
+        }
+    }
+    if let Some(b) = best {
+        return b;
+    }
+    // Inline modules, by the syntax tree.
+    for m in s.craters.mods.items() {
+        if m.file != file {
+            continue;
+        }
+        let mut inner: Option::<Span> = None;
+        let mut items = m.items;
+        let mut found = true;
+        while found {
+            found = false;
+            for id in s.p.ast.item_ids.list(items) {
+                let it = s.p.ast.items.get(id);
+                if let ItemKind::Mod(md) = it.kind {
+                    if let Some(sub) = md.items {
+                        if it.span.lo <= at && at <= it.span.hi {
+                            inner = Some(md.name.span);
+                            items = sub;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(name) = inner {
+            for i in 0..s.p.defs.len() {
+                if s.p.defs[i].kind == DefKind::Mod && s.p.defs[i].span == name {
+                    return DefId::new(i);
+                }
+            }
+        }
+        // The file's module: the module of any item declared at its top.
+        for id in s.p.ast.item_ids.list(m.items) {
+            let it = s.p.ast.items.get(id);
+            let name = match item_name(it) {
+                Some(n) => n,
+                None => continue,
+            };
+            for i in 0..s.p.defs.len() {
+                if s.p.defs[i].span == name {
+                    return s.p.defs[i].module;
+                }
+            }
+        }
+    }
+    // A crater root starts where its file does.
+    let start = s.p.sources.files[file as usize].start;
+    for r in s.p.crate_roots {
+        if s.p.def(r.def).span.lo == start {
+            return r.def;
+        }
+    }
+    return match s.p.crate_roots.len() {
+        0 => DefId::new(0),
+        _ => s.p.crate_roots[0].def,
+    };
+}
+
+/// The span of an item's name.
+fn item_name(it: Item): Option::<Span> {
+    return match it.kind {
+        ItemKind::Fn(f) => Some(f.name.span),
+        ItemKind::Struct(x) => Some(x.name.span),
+        ItemKind::Enum(x) => Some(x.name.span),
+        ItemKind::Trait(x) => Some(x.name.span),
+        ItemKind::Mod(x) => Some(x.name.span),
+        ItemKind::Const(x) => Some(x.name.span),
+        ItemKind::Static(x) => Some(x.name.span),
+        ItemKind::TypeAlias(x) => Some(x.name.span),
+        ItemKind::Macro(x) => Some(x.name.span),
+        _ => None,
+    };
+}
+
+// ===================================================================== locals in scope
+
+/// A local variable the cursor can see.
+struct Visible {
+    name: Symbol,
+    ty: Ty,
+    param: bool,
+    decl: u32,
+}
+
+/// Where each local of a body is in scope: (local, from, to).
+fn scopes(p: &Program, block: Id::<thir::Block>, out: &mut +[(u32, u32, u32); ..+]) {
+    let b = p.thir.block(block);
+    for l in p.thir.local_ids.list(b.locals) {
+        out.push((l.index, b.span.lo, b.span.hi));
+    }
+    for st in p.thir.stmts.list(b.stmts) {
+        match st {
+            thir::Stmt::Let { init, .. } => {
+                if let Some(e) = init {
+                    scopes_expr(p, e, out);
+                }
+            }
+            thir::Stmt::Expr(e) => scopes_expr(p, e, out),
+        }
+    }
+    if let Some(t) = b.tail {
+        scopes_expr(p, t, out);
+    }
+}
+
+fn pat_locals(p: &Program, id: Id::<thir::Pat>, lo: u32, hi: u32, out: &mut +[(u32, u32, u32); ..+]) {
+    let pt = p.thir.pat(id);
+    match pt.kind {
+        thir::PatKind::Binding { local, sub, .. } => {
+            out.push((local.index, lo, hi));
+            if let Some(x) = sub {
+                pat_locals(p, x, lo, hi, out);
+            }
+        }
+        thir::PatKind::Tuple(ps) => {
+            for q in p.thir.pat_ids.list(ps) {
+                pat_locals(p, q, lo, hi, out);
+            }
+        }
+        thir::PatKind::Adt { fields, .. } => {
+            for f in p.thir.field_pats.list(fields) {
+                pat_locals(p, f.pat, lo, hi, out);
+            }
+        }
+        thir::PatKind::Or(ps) => {
+            for q in p.thir.pat_ids.list(ps) {
+                pat_locals(p, q, lo, hi, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scopes_expr(p: &Program, id: Id::<thir::Expr>, out: &mut +[(u32, u32, u32); ..+]) {
+    let e = p.thir.expr(id);
+    match e.kind {
+        thir::ExprKind::Block(b) => scopes(p, b, out),
+        thir::ExprKind::Loop { body, .. } => scopes(p, body, out),
+        thir::ExprKind::While { cond, body, .. } => {
+            scopes_expr(p, cond, out);
+            scopes(p, body, out);
+        }
+        thir::ExprKind::ForRange { var, body, .. } => {
+            let bs = p.thir.block(body).span;
+            out.push((var.index, bs.lo, bs.hi));
+            scopes(p, body, out);
+        }
+        thir::ExprKind::ForArray { pat, body, .. } => {
+            let bs = p.thir.block(body).span;
+            pat_locals(p, pat, bs.lo, bs.hi, out);
+            scopes(p, body, out);
+        }
+        thir::ExprKind::If { cond, then, else_ } => {
+            scopes_expr(p, cond, out);
+            scopes_expr(p, then, out);
+            if let Some(x) = else_ {
+                scopes_expr(p, x, out);
+            }
+        }
+        thir::ExprKind::Match { scrut, arms } => {
+            scopes_expr(p, scrut, out);
+            for a in p.thir.arms.list(arms) {
+                let ps = p.thir.pat(a.pat).span;
+                let bs = p.thir.expr(a.body).span;
+                pat_locals(p, a.pat, ps.lo, bs.hi, out);
+                if let Some(g) = a.guard {
+                    scopes_expr(p, g, out);
+                }
+                scopes_expr(p, a.body, out);
+            }
+        }
+        thir::ExprKind::Coerce { expr, .. } => scopes_expr(p, expr, out),
+        thir::ExprKind::Read { place, .. } => scopes_expr(p, place, out),
+        thir::ExprKind::Call { args, .. } => {
+            for a in p.thir.args.list(args) {
+                scopes_expr(p, a.expr(), out);
+            }
+        }
+        thir::ExprKind::Assign { value, .. } => scopes_expr(p, value, out),
+        thir::ExprKind::Return(Some(v)) => scopes_expr(p, v, out),
+        thir::ExprKind::Break { value: Some(v), .. } => scopes_expr(p, v, out),
+        _ => {}
+    }
+}
+
+/// The locals visible at the cursor, the innermost of each name last.
+fn visible_locals(p: &Program, cx: Cx, out: &mut +[Visible; ..+]) {
+    let at = cx.old_cursor;
+    // The cursor's body and the bodies around it (a closure's function).
+    let mut bodies: [thir::Body; ..+] = [];
+    for b in p.bodies.values() {
+        if ide::in_file(p, b.span, cx.file) && b.span.lo <= at && at <= b.span.hi {
+            bodies.push(b);
+        }
+    }
+    for b in bodies {
+        let mut sc: [(u32, u32, u32); ..+] = [];
+        scopes(p, b.block, &mut sc);
+        let locals = p.thir.locals.list(b.locals);
+        for i in 0..locals.len() {
+            let l = locals[i];
+            let name = p.text(l.name);
+            if l.kind == thir::LocalKind::Temp || !ident_like(name) || is_dummy(l.span) {
+                continue;
+            }
+            let param = match l.kind {
+                thir::LocalKind::Param { .. } => true,
+                _ => false,
+            };
+            // A closure's captures are the variables of its function.
+            if param && p.closures.get(b.def).is_some() {
+                if let Some(c) = p.closures.get(b.def) {
+                    if i < c.captures.len() {
+                        continue;
+                    }
+                }
+            }
+            let ns = p.name_span(l.span, name);
+            if !param && ns.hi > at {
+                continue;
+            }
+            let mut ok = param;
+            let mut scoped = false;
+            for x in sc[..] {
+                let (li, lo, hi) = x;
+                if li as usize == i {
+                    scoped = true;
+                    if lo <= at && at <= hi {
+                        ok = true;
+                    }
+                }
+            }
+            if !scoped && !param {
+                ok = true;
+            }
+            if ok {
+                out.push(Visible { name: l.name, ty: l.ty, param, decl: ns.lo });
+            }
+        }
+    }
+}
+
+/// The local named `name` the cursor sees (the innermost).
+fn local_named(p: &Program, cx: Cx, name: str): Option::<Ty> {
+    let mut vs: [Visible; ..+] = [];
+    visible_locals(p, cx, &mut vs);
+    let mut best: Option::<Visible> = None;
+    for v in vs {
+        if p.text(v.name) == name {
+            let better = match best {
+                Some(b) => v.decl >= b.decl,
+                None => true,
+            };
+            if better {
+                best = Some(v);
+            }
+        }
+    }
+    return match best {
+        Some(v) => Some(v.ty),
+        None => None,
+    };
+}
+
+fn ident_like(name: str): bool {
+    let b = name.as_bytes();
+    if b.len() == 0 {
+        return false;
+    }
+    for c in b {
+        let ok = (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'_';
+        if !ok {
+            return false;
+        }
+    }
+    return !(b[0] >= b'0' && b[0] <= b'9');
+}
+
+// ===================================================================== tokens
+
+fn is_name(t: Token): bool {
+    return t == Token::Ident || t == Token::SelfValue || t == Token::SelfType || t == Token::Crater || t == Token::Super;
+}
+
+/// The index of the token closing the group opened at `i` (or the end).
+fn close_of(toks: [Spanned; &], i: usize, end: usize): usize {
+    let mut depth: usize = 0;
+    let mut k = i;
+    while k < end {
+        let t = toks[k].token;
+        if t == Token::LParen || t == Token::LBracket || t == Token::LBrace {
+            depth += 1;
+        } else if t == Token::RParen || t == Token::RBracket || t == Token::RBrace {
+            depth -= 1;
+            if depth == 0 {
+                return k;
+            }
+        }
+        k += 1;
+    }
+    return end;
+}
+
+/// The index of the token opening the group closed at `i`, if any.
+fn open_of(toks: [Spanned; &], i: usize): Option::<usize> {
+    let mut depth: usize = 0;
+    let mut k = i + 1;
+    while k > 0 {
+        k -= 1;
+        let t = toks[k].token;
+        if t == Token::RParen || t == Token::RBracket || t == Token::RBrace {
+            depth += 1;
+        } else if t == Token::LParen || t == Token::LBracket || t == Token::LBrace {
+            depth -= 1;
+            if depth == 0 {
+                return Some(k);
+            }
+        }
+    }
+    return None;
+}
+
+/// The first token of the receiver chain ending just before token `end`
+/// (`a.b(c)[d]?` before a `.`).
+fn chain_start(toks: [Spanned; &], end: usize): Option::<usize> {
+    let mut k = end;
+    let mut start: Option::<usize> = None;
+    while k > 0 {
+        let t = toks[k - 1].token;
+        if t == Token::RParen || t == Token::RBracket {
+            let o = open_of(toks, k - 1)?;
+            k = o;
+            start = Some(o);
+            continue;
+        }
+        if is_name(t) || t == Token::Str || t == Token::Char {
+            k -= 1;
+            start = Some(k);
+            // Before a name: `.`, `::` or `?` continue the chain.
+            if k > 0 {
+                let b = toks[k - 1].token;
+                if b == Token::Dot || b == Token::PathSep {
+                    k -= 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        if let Token::Number(_) = t {
+            k -= 1;
+            start = Some(k);
+            if k > 0 && toks[k - 1].token == Token::Dot {
+                k -= 1;
+                continue;
+            }
+            break;
+        }
+        if t == Token::Question {
+            k -= 1;
+            continue;
+        }
+        if t == Token::RAngle {
+            // `::<T>` of a path.
+            let mut depth: usize = 0;
+            let mut j = k;
+            while j > 0 {
+                j -= 1;
+                let x = toks[j].token;
+                if x == Token::RAngle {
+                    depth += 1;
+                } else if x == Token::LAngle {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            if j > 0 && toks[j - 1].token == Token::PathSep {
+                k = j - 1;
+                continue;
+            }
+            break;
+        }
+        break;
+    }
+    return start;
+}
+
+// ===================================================================== types of expressions
+
+/// The type of the expression written as tokens `a..b` of the current
+/// text: the analysis' own, if it typed an expression right there, else
+/// followed along the tokens.
+pub fn expr_type(s: &mut Sema, cx: Cx, text: str, toks: [Spanned; &], a: usize, b: usize): Option::<Ty> {
+    if a >= b {
+        return None;
+    }
+    let lo = toks[a].range.start as u32;
+    let hi = toks[b - 1].range.end as u32;
+    if let Some(olo) = cx.old(lo) {
+        if let Some(ohi) = cx.old(hi) {
+            if let Some(t) = typed_at(&s.p, Span::new(olo, ohi)) {
+                return Some(t);
+            }
+        }
+    }
+    return eval_chain(s, cx, text, toks, a, b);
+}
+
+/// The type of an expression the analysis typed with exactly this span.
+fn typed_at(p: &Program, span: Span): Option::<Ty> {
+    let mut found: Option::<Ty> = None;
+    for e in p.thir.exprs.items() {
+        if e.span != span {
+            continue;
+        }
+        if let thir::ExprKind::Coerce { .. } = e.kind {
+            continue;
+        }
+        let bad = match p.types.kind(e.ty) {
+            TyKind::Error | TyKind::Infer(_) | TyKind::Never => true,
+            _ => p.types.has_error(e.ty),
+        };
+        if !bad {
+            found = Some(e.ty);
+        }
+    }
+    return found;
+}
+
+/// Follow the tokens `a..b`: a primary (a local, a path, a literal, a
+/// group), then fields, method calls, calls, indexing and `?`.
+fn eval_chain(s: &mut Sema, cx: Cx, text: str, toks: [Spanned; &], a: usize, b: usize): Option::<Ty> {
+    let mut i = a;
+    let t0 = toks[i].token;
+    let mut ty: Ty = s.p.types.error();
+    if is_name(t0) {
+        // A path: names separated by `::` (turbofish skipped).
+        let mut segs: [usize; ..+] = [i];
+        let mut j = i + 1;
+        while j + 1 < b && toks[j].token == Token::PathSep {
+            if is_name(toks[j + 1].token) {
+                segs.push(j + 1);
+                j += 2;
+            } else if toks[j + 1].token == Token::LAngle {
+                let mut depth: usize = 0;
+                let mut k = j + 1;
+                while k < b {
+                    if toks[k].token == Token::LAngle {
+                        depth += 1;
+                    } else if toks[k].token == Token::RAngle {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    k += 1;
+                }
+                j = k + 1;
+            } else {
+                break;
+            }
+        }
+        let called = j < b && toks[j].token == Token::LParen;
+        let first = text[toks[segs[0]].range.start..toks[segs[0]].range.end];
+        let mut done = false;
+        if segs.len() == 1 {
+            if let Some(t) = local_named(&s.p, cx, first) {
+                ty = t;
+                done = true;
+                if called {
+                    // A closure or a function pointer.
+                    ty = call_result(s, ty)?;
+                }
+            }
+        }
+        if !done {
+            ty = path_value_type(s, cx, text, toks, segs[..], called)?;
+        }
+        i = j;
+        if called {
+            i = close_of(toks, j, b) + 1;
+        }
+    } else if t0 == Token::Str {
+        ty = s.p.types.str();
+        i += 1;
+    } else if t0 == Token::Char {
+        ty = s.p.types.mk(TyKind::Char);
+        i += 1;
+    } else if let Token::Number(k) = t0 {
+        let word = text[toks[i].range.start..toks[i].range.end];
+        ty = number_type(s, k, word);
+        i += 1;
+    } else if t0 == Token::LParen {
+        let c = close_of(toks, i, b);
+        ty = expr_type(s, cx, text, toks, i + 1, c)?;
+        i = c + 1;
+    } else {
+        return None;
+    }
+    while i < b {
+        let t = toks[i].token;
+        if t == Token::Dot && i + 1 < b {
+            let nt = toks[i + 1].token;
+            let name = text[toks[i + 1].range.start..toks[i + 1].range.end];
+            if nt == Token::Ident {
+                if i + 2 < b && toks[i + 2].token == Token::LParen {
+                    ty = method_result(s, ty, name)?;
+                    i = close_of(toks, i + 2, b) + 1;
+                } else if i + 3 < b && toks[i + 2].token == Token::PathSep && toks[i + 3].token == Token::LAngle {
+                    // `.f::<T>(...)`.
+                    ty = method_result(s, ty, name)?;
+                    let mut k = i + 3;
+                    while k < b && toks[k].token != Token::LParen {
+                        k += 1;
+                    }
+                    i = close_of(toks, k, b) + 1;
+                } else {
+                    ty = field_type(s, ty, name)?;
+                    i += 2;
+                }
+                continue;
+            }
+            if let Token::Number(_) = nt {
+                // `t.0`, and `t.0.1` lexed as one number.
+                for part in name.split(".") {
+                    ty = field_type(s, ty, part)?;
+                }
+                i += 2;
+                continue;
+            }
+            return None;
+        }
+        if t == Token::LBracket {
+            let c = close_of(toks, i, b);
+            let mut range = false;
+            for k in i + 1..c {
+                let x = toks[k].token;
+                if x == Token::DotDot || x == Token::DotDotEq {
+                    range = true;
+                }
+            }
+            ty = index_type(s, ty, range)?;
+            i = c + 1;
+            continue;
+        }
+        if t == Token::Question {
+            ty = unwrap_type(s, ty)?;
+            i += 1;
+            continue;
+        }
+        if t == Token::LParen {
+            ty = call_result(s, ty)?;
+            i = close_of(toks, i, b) + 1;
+            continue;
+        }
+        return None;
+    }
+    return Some(ty);
+}
+
+fn number_type(s: &mut Sema, k: ln_lexer::NumKind, word: str): Ty {
+    let suffixes = ["i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize"];
+    for x in suffixes {
+        if word.ends_with(x) {
+            if let Some(i) = ln_sema::ty::IntTy::from_name(x) {
+                return s.p.types.int(i);
+            }
+        }
+    }
+    let float = match k {
+        ln_lexer::NumKind::Float => true,
+        _ => word.ends_with("f64") || word.ends_with("f32"),
+    };
+    if float {
+        if word.ends_with("f32") {
+            return s.p.types.mk(TyKind::Float(ln_sema::ty::FloatTy::F32));
+        }
+        return s.p.types.mk(TyKind::Float(ln_sema::ty::FloatTy::F64));
+    }
+    return s.p.types.int(ln_sema::ty::IntTy::I32);
+}
+
+/// What calling a value of type `t` gives.
+fn call_result(s: &mut Sema, t: Ty): Option::<Ty> {
+    return match s.p.types.kind(t) {
+        TyKind::FnPtr(_, _, r) => Some(r),
+        TyKind::Closure(d, args) => {
+            let r = s.p.fn_data(d).sig.ret;
+            Some(s.p.types.subst(r, args))
+        }
+        _ => None,
+    };
+}
+
+/// The type of field `name` (or tuple element) of a value of type `t`.
+fn field_type(s: &mut Sema, t: Ty, name: str): Option::<Ty> {
+    let t = s.p.types.strip_grow(t);
+    return match s.p.types.kind(t) {
+        TyKind::Adt(d, args) if !s.p.is_enum(d) => {
+            let fs = s.p.struct_fields(d);
+            for i in 0..fs.len() {
+                let f = fs[i];
+                let fname = s.p.text(f.name);
+                let tuple_index = match name.parse_i64() {
+                    Some(n) => n as usize == i && fname.len() > 0 && fname.as_bytes()[0] >= b'0' && fname.as_bytes()[0] <= b'9',
+                    None => false,
+                };
+                if fname == name || tuple_index {
+                    let ft = f.ty;
+                    return Some(s.p.types.subst(ft, args));
+                }
+            }
+            None
+        }
+        TyKind::Tuple(l) => {
+            let n = name.parse_i64()?;
+            if n < 0 || n as usize >= l.len() {
+                return None;
+            }
+            Some(s.p.types.at(l, n as usize))
+        }
+        _ => None,
+    };
+}
+
+/// The result of method `name` called on a value of type `t`.
+fn method_result(s: &mut Sema, t: Ty, name: str): Option::<Ty> {
+    let c = find_method(s, t, name, true)?;
+    return Some(s.cand_ret(c));
+}
+
+/// The function `name` of `t`: a method (`with_self`) or any associated
+/// function.
+fn find_method(s: &mut Sema, t: Ty, name: str, with_self: bool): Option::<MethodCand> {
+    let mut cands: [MethodCand; ..+] = [];
+    s.methods_of(t, with_self, &mut cands);
+    for c in cands {
+        if s.p.name(c.def) == name {
+            return Some(c);
+        }
+    }
+    return None;
+}
+
+/// The element of an array, slice or string (a range gives a slice).
+fn index_type(s: &mut Sema, t: Ty, range: bool): Option::<Ty> {
+    let t = s.p.types.strip_grow(t);
+    return match s.p.types.kind(t) {
+        TyKind::Array(e, _) => {
+            if range {
+                Some(s.p.types.array(e, ArrKind::Slice))
+            } else {
+                Some(e)
+            }
+        }
+        TyKind::Str | TyKind::String => {
+            if range {
+                Some(s.p.types.str())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+}
+
+/// What `?` gives from an `Option` or `Result`.
+fn unwrap_type(s: &mut Sema, t: Ty): Option::<Ty> {
+    return match s.p.types.kind(t) {
+        TyKind::Adt(_, args) => {
+            if args.len() == 0 {
+                return None;
+            }
+            Some(s.p.types.at(args, 0))
+        }
+        _ => None,
+    };
+}
+
+/// What a path names, resolved from the cursor's module: a module, a
+/// type, or a value.
+enum PathRes {
+    Def(DefId),
+    Ty(Ty),
+    /// An associated function of a type.
+    Assoc(MethodCand),
+}
+
+/// Resolve the path made of tokens `segs` (indices of name tokens) as far
+/// as it goes: the meaning of the whole path, if it has one.
+fn resolve_path(s: &mut Sema, cx: Cx, text: str, toks: [Spanned; &], segs: [usize; &]): Option::<PathRes> {
+    let mut cur = resolve_first(s, cx, text, toks, segs[0], segs.len() > 1)?;
+    for k in 1..segs.len() {
+        let name = text[toks[segs[k]].range.start..toks[segs[k]].range.end];
+        let sym = s.p.ast.names.get(name)?;
+        cur = match cur {
+            PathRes::Def(d) => {
+                let kind = s.p.def(d).kind;
+                if kind == DefKind::Mod || kind == DefKind::Enum {
+                    let b = match s.lookup_in(d, sym, Ns::Type) {
+                        Some(b) => Some(b),
+                        None => s.lookup_in(d, sym, Ns::Value),
+                    };
+                    match b {
+                        Some(b) => PathRes::Def(b.def),
+                        None => {
+                            if kind == DefKind::Enum {
+                                let t = type_of_def(s, d)?;
+                                PathRes::Assoc(find_method(s, t, name, false)?)
+                            } else {
+                                return None;
+                            }
+                        }
+                    }
+                } else if kind == DefKind::Trait {
+                    let td = s.p.trait_data(d);
+                    let mut found: Option::<DefId> = None;
+                    for m in s.p.trait_methods.list(td.methods) {
+                        if m.name == sym {
+                            found = Some(m.def);
+                        }
+                    }
+                    PathRes::Def(found?)
+                } else {
+                    let t = type_of_def(s, d)?;
+                    PathRes::Assoc(find_method(s, t, name, false)?)
+                }
+            }
+            PathRes::Ty(t) => PathRes::Assoc(find_method(s, t, name, false)?),
+            PathRes::Assoc(_) => return None,
+        };
+    }
+    return Some(cur);
+}
+
+/// The first segment of a path: `crater`, `self`, `super`, `Self`, or a
+/// name in scope (a type or module when more segments follow).
+fn resolve_first(s: &mut Sema, cx: Cx, text: str, toks: [Spanned; &], i: usize, more: bool): Option::<PathRes> {
+    let t = toks[i].token;
+    let m = cx.module;
+    if t == Token::Crater {
+        return Some(PathRes::Def(s.p.mod_data(m).krate));
+    }
+    if t == Token::SelfValue && more {
+        return Some(PathRes::Def(s.normal_module(m)));
+    }
+    if t == Token::Super {
+        let nm = s.normal_module(m);
+        return Some(PathRes::Def(s.p.mod_data(nm).parent?));
+    }
+    if t == Token::SelfType {
+        return Some(PathRes::Ty(self_type(s, cx)?));
+    }
+    let name = text[toks[i].range.start..toks[i].range.end];
+    let sym = s.p.ast.names.get(name)?;
+    let first_ns = if more { Ns::Type } else { Ns::Value };
+    let r = match s.lookup_unqualified(m, sym, first_ns) {
+        Some(r) => r,
+        None => {
+            let other = if more { Ns::Value } else { Ns::Type };
+            s.lookup_unqualified(m, sym, other)?
+        }
+    };
+    return match r {
+        ModRes::Def(d) => Some(PathRes::Def(d)),
+        ModRes::Prim(t) => Some(PathRes::Ty(t)),
+    };
+}
+
+/// `Self` where the cursor is: the type of the enclosing impl.
+fn self_type(s: &mut Sema, cx: Cx): Option::<Ty> {
+    let b = cx.body?;
+    let owner = match s.p.closures.get(b) {
+        Some(c) => c.parent,
+        None => b,
+    };
+    let par = s.p.def(owner).parent?;
+    return s.self_ty_of(par);
+}
+
+/// The type a type definition stands for (with its own generic
+/// parameters as arguments).
+fn type_of_def(s: &mut Sema, d: DefId): Option::<Ty> {
+    let info = s.p.def(d);
+    return match info.kind {
+        DefKind::Struct | DefKind::Enum => s.self_ty_of(d),
+        DefKind::TypeAlias => match info.data {
+            DefData::Alias(a) => a.ty,
+            _ => None,
+        },
+        DefKind::Variant => match info.data {
+            DefData::Variant { enum_id, .. } => s.self_ty_of(enum_id),
+            _ => None,
+        },
+        _ => None,
+    };
+}
+
+/// The type of the value a path names (called, if `called`).
+fn path_value_type(s: &mut Sema, cx: Cx, text: str, toks: [Spanned; &], segs: [usize; &], called: bool): Option::<Ty> {
+    let r = resolve_path(s, cx, text, toks, segs)?;
+    return match r {
+        PathRes::Def(d) => {
+            let info = s.p.def(d);
+            match info.data {
+                DefData::Fn(f) => if called { Some(f.sig.ret) } else { None },
+                DefData::Const(c) => Some(c.ty),
+                DefData::Static(x) => Some(x.ty),
+                DefData::Variant { enum_id, .. } => s.self_ty_of(enum_id),
+                DefData::Adt(_) => s.self_ty_of(d),
+                _ => None,
+            }
+        }
+        PathRes::Ty(_) => None,
+        PathRes::Assoc(c) => if called { Some(s.cand_ret(c)) } else { None },
+    };
+}
+
+// ===================================================================== completion
+
+/// The completions at `cx.cursor` in `text`.
+pub fn complete(s: &mut Sema, cx: Cx, text: str, out: &mut +Items) {
+    let (toks, _) = ln_lexer::lex(text);
+    let cur = cx.cursor as usize;
+    // `n`: the first token that ends after the cursor.
+    let mut n = 0;
+    while n < toks.len() && toks[n].range.end <= cur {
+        n += 1;
+    }
+    // The name being typed (the cursor at its end or inside it), and
+    // `before`, the index of its token (or of the next token).
+    let mut word_lo = cur;
+    let mut word_hi = cur;
+    let mut before = n;
+    if n > 0 && toks[n - 1].range.end == cur && is_word(toks[n - 1].token) {
+        word_lo = toks[n - 1].range.start;
+        before = n - 1;
+    } else if n < toks.len() && toks[n].range.start < cur {
+        if is_word(toks[n].token) {
+            word_lo = toks[n].range.start;
+            word_hi = toks[n].range.end;
+        } else if toks[n].token == Token::Str || toks[n].token == Token::Char || toks[n].token == Token::DocComment {
+            // Inside a literal.
+            return;
+        }
+    } else if n < toks.len() && toks[n].range.start == cur && is_word(toks[n].token) {
+        word_hi = toks[n].range.end;
+    }
+    // Inside a comment: nothing.
+    if in_comment(text, toks[..], cur) {
+        return;
+    }
+    out.replace_lo = word_lo as u32;
+    out.replace_hi = word_hi as u32;
+    out.prefix_text.push_str(text[word_lo..cur]);
+    let prev = if before > 0 { Some(before - 1) } else { None };
+    let prev_tok = match prev {
+        Some(k) => Some(toks[k].token),
+        None => None,
+    };
+    let next_is_paren = word_hi < text.len() && text.as_bytes()[word_hi] == b'(';
+
+    // `use` paths.
+    if let Some(path) = use_context(toks[..], before) {
+        complete_use(s, cx, text, toks[..], path[..], out);
+        return;
+    }
+    // After `.`: fields and methods.
+    if prev_tok == Some(Token::Dot) {
+        let dot = before - 1;
+        if let Some(a) = chain_start(toks[..], dot) {
+            if let Some(t) = expr_type(s, cx, text, toks[..], a, dot) {
+                complete_members(s, cx, t, next_is_paren, out);
+            } else {
+                out.incomplete = true;
+            }
+        }
+        return;
+    }
+    // After `::`: what the path before it holds.
+    if prev_tok == Some(Token::PathSep) {
+        let mut segs: [usize; ..+] = [];
+        if path_before(toks[..], before - 1, &mut segs) {
+            complete_path(s, cx, text, toks[..], segs[..], next_is_paren, false, out);
+        }
+        return;
+    }
+    // Naming something new: nothing to offer.
+    if let Some(k) = prev_tok {
+        if k == Token::Fn || k == Token::Struct || k == Token::Enum || k == Token::Trait || k == Token::Mod || k == Token::Type || k == Token::Macro || k == Token::Const || k == Token::Static {
+            return;
+        }
+        if k == Token::Let {
+            out.add("mut", CK_KEYWORD, "", "mut ", false, "", S_KEYWORD, 0);
+            return;
+        }
+    }
+    // A field of a struct literal or pattern.
+    if prev_tok == Some(Token::LBrace) || prev_tok == Some(Token::Comma) {
+        if let Some(open) = enclosing(toks[..], before, Token::LBrace) {
+            let mut segs: [usize; ..+] = [];
+            if struct_path_before(toks[..], open, &mut segs) {
+                complete_struct_fields(s, cx, text, toks[..], segs[..], open, before, out);
+                return;
+            }
+        }
+    }
+    let type_pos = prev_tok == Some(Token::Colon) && !in_struct_value(toks[..], before) || prev_tok == Some(Token::As);
+    complete_scope(s, cx, text, toks[..], before, type_pos, next_is_paren, out);
+}
+
+/// A name or keyword: what typing a name produces.
+fn is_word(t: Token): bool {
+    return is_name(t) || keyword_token(t);
+}
+
+fn keyword_token(t: Token): bool {
+    return match t {
+        Token::As | Token::Break | Token::Const | Token::Continue | Token::Crater | Token::Else | Token::Enum | Token::Extern => true,
+        Token::False | Token::Fn | Token::For | Token::If | Token::Impl | Token::In | Token::Let | Token::Loop | Token::Macro => true,
+        Token::Match | Token::Mod | Token::Move | Token::Mut | Token::Pub | Token::Return | Token::SelfValue | Token::SelfType => true,
+        Token::Static | Token::Struct | Token::Super | Token::Trait | Token::True | Token::Type | Token::Unsafe | Token::Use | Token::While => true,
+        _ => false,
+    };
+}
+
+/// Whether `at` is inside a comment (in a gap between tokens).
+fn in_comment(text: str, toks: [Spanned; &], at: usize): bool {
+    let mut gap_lo: usize = 0;
+    for t in toks {
+        if t.range.start >= at {
+            break;
+        }
+        gap_lo = t.range.end;
+    }
+    let b = text.as_bytes();
+    let mut i = gap_lo;
+    while i < at && i + 1 < b.len() {
+        if b[i] == b'/' && b[i + 1] == b'/' {
+            // A line comment, if the cursor is on its line.
+            let mut j = i;
+            while j < b.len() && b[j] != b'\n' {
+                j += 1;
+            }
+            if at <= j {
+                return true;
+            }
+            i = j;
+        } else if b[i] == b'/' && b[i + 1] == b'*' {
+            let mut j = i + 2;
+            while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                j += 1;
+            }
+            if at <= j + 1 {
+                return true;
+            }
+            i = j + 2;
+        } else {
+            i += 1;
+        }
+    }
+    return false;
+}
+
+/// The innermost unclosed `open` token before token `before`.
+fn enclosing(toks: [Spanned; &], before: usize, open: Token): Option::<usize> {
+    let mut depth: usize = 0;
+    let mut k = before;
+    while k > 0 {
+        k -= 1;
+        let t = toks[k].token;
+        if t == Token::RParen || t == Token::RBracket || t == Token::RBrace {
+            depth += 1;
+        } else if t == Token::LParen || t == Token::LBracket || t == Token::LBrace {
+            if depth == 0 {
+                return if t == open { Some(k) } else { None };
+            }
+            depth -= 1;
+        }
+    }
+    return None;
+}
+
+/// The path segments (name tokens) ending just before token `sep` (a `::`
+/// or the end of the path), into `out`; false if there are none.
+fn path_before(toks: [Spanned; &], sep: usize, out: &mut +[usize; ..+]): bool {
+    let mut rev: [usize; ..+] = [];
+    let mut k = sep;
+    loop {
+        if k == 0 {
+            break;
+        }
+        // Skip a turbofish `::<...>` before this `::`.
+        if toks[k - 1].token == Token::RAngle {
+            let mut depth: usize = 0;
+            let mut j = k;
+            while j > 0 {
+                j -= 1;
+                let x = toks[j].token;
+                if x == Token::RAngle {
+                    depth += 1;
+                } else if x == Token::LAngle {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            if j == 0 || toks[j - 1].token != Token::PathSep {
+                break;
+            }
+            k = j - 1;
+            continue;
+        }
+        if !is_name(toks[k - 1].token) {
+            break;
+        }
+        rev.push(k - 1);
+        if k >= 2 && toks[k - 2].token == Token::PathSep {
+            k -= 2;
+            continue;
+        }
+        break;
+    }
+    let mut i = rev.len();
+    while i > 0 {
+        i -= 1;
+        out.push(rev[i]);
+    }
+    return rev.len() > 0;
+}
+
+/// The path of a struct literal or pattern whose `{` is token `open`:
+/// a capitalized last segment, not after `if`, `while`, `match`, ...
+fn struct_path_before(toks: [Spanned; &], open: usize, out: &mut +[usize; ..+]): bool {
+    if !path_before(toks, open, out) {
+        return false;
+    }
+    let first = out[0];
+    let last = out[out.len() - 1];
+    let lt = toks[last].token;
+    if lt != Token::Ident && lt != Token::SelfType {
+        return false;
+    }
+    if first > 0 {
+        let b = toks[first - 1].token;
+        let bad = b == Token::If || b == Token::While || b == Token::Match || b == Token::For || b == Token::In || b == Token::Struct || b == Token::Enum || b == Token::Impl || b == Token::Trait || b == Token::Mod || b == Token::Fn || b == Token::Else || b == Token::Loop || b == Token::Unsafe || b == Token::RParen || b == Token::Colon || b == Token::Arrow || b == Token::For;
+        if bad {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether the cursor (before token `before`) is after a field name's
+/// `:` in a struct literal: a value, not a type.
+fn in_struct_value(toks: [Spanned; &], before: usize): bool {
+    if let Some(open) = enclosing(toks, before, Token::LBrace) {
+        let mut segs: [usize; ..+] = [];
+        return struct_path_before(toks, open, &mut segs);
+    }
+    return false;
+}
+
+/// If token `before` is in a `use` declaration: the path leading to the
+/// cursor (name tokens), from the `use` through the groups around it.
+fn use_context(toks: [Spanned; &], before: usize): Option::<[usize; ..+]> {
+    let mut path: [usize; ..+] = [];
+    // The segments right before the cursor: `a::b::`.
+    let mut k = before;
+    let mut tail: [usize; ..+] = [];
+    if k > 0 && toks[k - 1].token == Token::PathSep {
+        if !path_before(toks, k - 1, &mut tail) {
+            return None;
+        }
+        k = tail[0];
+    }
+    // Outward: groups `prefix::{ ... }`, until the `use`.
+    let mut groups: [usize; ..+] = [];
+    let mut depth: usize = 0;
+    while k > 0 {
+        k -= 1;
+        let t = toks[k].token;
+        if t == Token::Use {
+            if depth != 0 {
+                return None;
+            }
+            // The prefixes of the groups, outermost first.
+            let mut g = groups.len();
+            while g > 0 {
+                g -= 1;
+                let mut segs: [usize; ..+] = [];
+                if groups[g] > 0 && toks[groups[g] - 1].token == Token::PathSep {
+                    path_before(toks, groups[g] - 1, &mut segs);
+                }
+                path.extend(segs[..]);
+            }
+            path.extend(tail[..]);
+            return Some(path);
+        }
+        if t == Token::RBrace {
+            depth += 1;
+        } else if t == Token::LBrace {
+            if depth == 0 {
+                if k == 0 || toks[k - 1].token != Token::PathSep {
+                    return None;
+                }
+                groups.push(k);
+            } else {
+                depth -= 1;
+            }
+        } else if !(is_name(t) || t == Token::PathSep || t == Token::Comma || t == Token::Star || t == Token::As) {
+            return None;
+        }
+    }
+    return None;
+}
+
+/// The completions of a `use` path: what the path before the cursor
+/// holds, or at its start the craters and the module's names.
+fn complete_use(s: &mut Sema, cx: Cx, text: str, toks: [Spanned; &], path: [usize; &], out: &mut +Items) {
+    if path.len() > 0 {
+        complete_path(s, cx, text, toks, path, true, true, out);
+        out.add("self", CK_KEYWORD, "", "self", false, "", S_KEYWORD, 0);
+        return;
+    }
+    add_craters(s, cx, out);
+    for k in ["crater", "self", "super"] {
+        out.add(k, CK_KEYWORD, "", k, false, "", S_KEYWORD, 0);
+    }
+    add_scope_items(s, cx, true, false, true, out);
+}
+
+/// The fields and methods of a value of type `t`.
+fn complete_members(s: &mut Sema, cx: Cx, t: Ty, next_is_paren: bool, out: &mut +Items) {
+    let t0 = s.p.types.strip_grow(t);
+    match s.p.types.kind(t0) {
+        TyKind::Adt(d, args) if !s.p.is_enum(d) => {
+            let here = cx.module;
+            let owner = s.p.def(d).module;
+            let visible_private = s.is_ancestor_or_self(owner, here);
+            let n = s.p.struct_fields(d).len();
+            for i in 0..n {
+                let f = s.p.struct_fields(d)[i];
+                if !f.is_pub && !visible_private {
+                    continue;
+                }
+                let ft = s.p.types.subst(f.ty, args);
+                let tys = s.p.ty_str(ft);
+                let name = String::from(s.p.text(f.name));
+                let doc = match out.idx.get(f.span) {
+                    Some(dd) => ide::decl_docs(&s.p.ast, dd),
+                    None => String::new(),
+                };
+                out.add(name.as_str(), CK_FIELD, tys.as_str(), name.as_str(), false, doc.as_str(), S_MEMBER, 0);
+            }
+        }
+        TyKind::Tuple(l) => {
+            for i in 0..l.len() {
+                let et = s.p.types.at(l, i);
+                let tys = s.p.ty_str(et);
+                let name = core::fmt::format("{i}");
+                out.add(name.as_str(), CK_FIELD, tys.as_str(), name.as_str(), false, "", S_MEMBER, 0);
+            }
+        }
+        _ => {}
+    }
+    let mut cands: [MethodCand; ..+] = [];
+    s.methods_of(t0, true, &mut cands);
+    let here = cx.module;
+    for c in cands {
+        if !callable_from(s, c.def, here) {
+            continue;
+        }
+        let sort = if c.from_trait.is_some() { S_TRAIT_MEMBER } else { S_MEMBER };
+        add_fn(s, cx, c.def, CK_METHOD, true, next_is_paren, sort, out);
+    }
+}
+
+/// Whether code in module `here` may call `def` (a private method only
+/// from its module and below).
+fn callable_from(s: &Sema, def: DefId, here: DefId): bool {
+    let info = s.p.def(def);
+    if info.is_pub {
+        return true;
+    }
+    // Trait methods are as visible as the trait.
+    if let Some(par) = info.parent {
+        let pk = s.p.def(par).kind;
+        if pk == DefKind::Trait {
+            return true;
+        }
+        if pk == DefKind::Impl {
+            if let DefData::Impl(i) = s.p.def(par).data {
+                if i.trait_ref.is_some() {
+                    return true;
+                }
+            }
+        }
+    }
+    return s.is_ancestor_or_self(info.module, here);
+}
+
+/// The members of the path `segs`: a module's items, an enum's variants,
+/// a type's associated functions, a trait's methods.
+fn complete_path(s: &mut Sema, cx: Cx, text: str, toks: [Spanned; &], segs: [usize; &], next_is_paren: bool, in_use: bool, out: &mut +Items) {
+    let r = match resolve_path(s, cx, text, toks, segs) {
+        Some(r) => r,
+        None => return,
+    };
+    let t = match r {
+        PathRes::Def(d) => {
+            let info = s.p.def(d);
+            match info.kind {
+                DefKind::Mod => {
+                    let all = s.is_ancestor_or_self(d, cx.module);
+                    add_module_items(s, cx, d, all, in_use, next_is_paren, S_ITEM, out);
+                    return;
+                }
+                DefKind::Trait => {
+                    let td = s.p.trait_data(d);
+                    let mut ms: [DefId; ..+] = [];
+                    for m in s.p.trait_methods.list(td.methods) {
+                        ms.push(m.def);
+                    }
+                    for m in ms {
+                        add_fn(s, cx, m, CK_FUNCTION, false, next_is_paren || in_use, S_MEMBER, out);
+                    }
+                    return;
+                }
+                DefKind::Enum => {
+                    let adt = s.p.adt(d);
+                    let n = adt.variants.len();
+                    for i in 0..n {
+                        let v = s.p.variants.list(adt.variants)[i];
+                        add_def(s, cx, v.def, in_use, next_is_paren, S_MEMBER, out);
+                    }
+                    type_of_def(s, d)
+                }
+                _ => type_of_def(s, d),
+            }
+        }
+        PathRes::Ty(t) => Some(t),
+        PathRes::Assoc(_) => None,
+    };
+    if in_use {
+        return;
+    }
+    if let Some(t) = t {
+        let mut cands: [MethodCand; ..+] = [];
+        s.methods_of(t, false, &mut cands);
+        for c in cands {
+            if !callable_from(s, c.def, cx.module) {
+                continue;
+            }
+            let sort = if c.from_trait.is_some() { S_TRAIT_MEMBER } else { S_MEMBER };
+            let kind = if s.p.fn_data(c.def).has_self { CK_METHOD } else { CK_FUNCTION };
+            add_fn(s, cx, c.def, kind, false, next_is_paren, sort, out);
+        }
+    }
+}
+
+/// The fields of the struct (or variant) whose literal or pattern opens at
+/// token `open`, but those already written.
+fn complete_struct_fields(s: &mut Sema, cx: Cx, text: str, toks: [Spanned; &], segs: [usize; &], open: usize, before: usize, out: &mut +Items) {
+    let r = match resolve_path(s, cx, text, toks, segs) {
+        Some(r) => r,
+        None => return,
+    };
+    let d = match r {
+        PathRes::Def(d) => d,
+        PathRes::Ty(t) => match s.p.types.kind(t) {
+            TyKind::Adt(d, _) => d,
+            _ => return,
+        },
+        _ => return,
+    };
+    let (adt, vi) = match s.p.def(d).data {
+        DefData::Adt(a) => if a.is_enum { return; } else { (d, 0) },
+        DefData::Variant { enum_id, index } => (enum_id, index as usize),
+        DefData::Alias(a) => match a.ty {
+            Some(t) => match s.p.types.kind(t) {
+                TyKind::Adt(x, _) => (x, 0),
+                _ => return,
+            },
+            None => return,
+        },
+        _ => return,
+    };
+    // Names already given: `name:` or `name,` at the group's top level.
+    let close = close_of(toks, open, toks.len());
+    let mut given: [str; ..+] = [];
+    let mut k = open + 1;
+    while k < close {
+        let t = toks[k].token;
+        if t == Token::LParen || t == Token::LBracket || t == Token::LBrace {
+            k = close_of(toks, k, close) + 1;
+            continue;
+        }
+        if t == Token::Ident && k != before && (toks[k - 1].token == Token::LBrace || toks[k - 1].token == Token::Comma) {
+            given.push(text[toks[k].range.start..toks[k].range.end]);
+        }
+        k += 1;
+    }
+    let v = s.p.variants_of(s.p.adt(adt))[vi];
+    let fs = s.p.fields.list(v.fields).to_grow();
+    for f in fs[..] {
+        let name = String::from(s.p.text(f.name));
+        if given[..].contains(name.as_str()) || !ident_like(name.as_str()) || (name.as_bytes()[0] >= b'0' && name.as_bytes()[0] <= b'9') {
+            continue;
+        }
+        let tys = s.p.ty_str(f.ty);
+        let doc = match out.idx.get(f.span) {
+            Some(dd) => ide::decl_docs(&s.p.ast, dd),
+            None => String::new(),
+        };
+        let insert = if cx.snippets { core::fmt::format("{name}: $0") } else { core::fmt::format("{name}: ") };
+        out.add(name.as_str(), CK_FIELD, tys.as_str(), insert.as_str(), cx.snippets, doc.as_str(), S_MEMBER, 0);
+    }
+}
+
+/// Names in scope: locals, the module's items and imports, the prelude,
+/// the craters, and keywords for the place.
+fn complete_scope(s: &mut Sema, cx: Cx, text: str, toks: [Spanned; &], before: usize, type_pos: bool, next_is_paren: bool, out: &mut +Items) {
+    if !type_pos {
+        let mut vs: [Visible; ..+] = [];
+        visible_locals(&s.p, cx, &mut vs);
+        // Innermost first.
+        let mut i = vs.len();
+        while i > 0 {
+            i -= 1;
+            let v = vs[i];
+            let name = String::from(s.p.text(v.name));
+            let tys = s.p.ty_str(v.ty);
+            out.add(name.as_str(), CK_VARIABLE, tys.as_str(), name.as_str(), false, "", S_LOCAL, 0);
+        }
+        if vs.len() == 0 && cx.body.is_none() {
+            // The function does not parse: its `let`s and parameters, by
+            // their tokens.
+            text_locals(text, toks, before, out);
+        }
+    }
+    // The generic parameters of the function and its impl.
+    if let Some(b) = cx.body {
+        let owner = match s.p.closures.get(b) {
+            Some(c) => c.parent,
+            None => b,
+        };
+        let mut gs: [Symbol; ..+] = [];
+        if let DefData::Fn(f) = s.p.def(owner).data {
+            gs.extend(s.p.symbols.list(f.generics.names));
+            if let Some(par) = s.p.def(owner).parent {
+                if let Some(g) = s.generics(par) {
+                    gs.extend(s.p.symbols.list(g.names));
+                }
+            }
+        }
+        for g in gs {
+            let name = String::from(s.p.text(g));
+            out.add(name.as_str(), CK_TYPE_PARAMETER, "", name.as_str(), false, "", S_LOCAL, 0);
+        }
+    }
+    add_scope_items(s, cx, false, type_pos, next_is_paren, out);
+    add_craters(s, cx, out);
+    for prim in ["i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize", "f32", "f64", "bool", "char", "str", "String"] {
+        out.add(prim, CK_STRUCT, "", prim, false, "", S_PRELUDE, 0);
+    }
+    add_keywords(toks, before, type_pos, out);
+}
+
+/// `let` names and parameters of the function around token `before`, by
+/// the tokens (for a function that does not parse).
+fn text_locals(text: str, toks: [Spanned; &], before: usize, out: &mut +Items) {
+    // The last `fn` before the cursor.
+    let mut k = before;
+    let mut f: Option::<usize> = None;
+    while k > 0 {
+        k -= 1;
+        if toks[k].token == Token::Fn {
+            f = Some(k);
+            break;
+        }
+    }
+    let f = match f {
+        Some(x) => x,
+        None => return,
+    };
+    let mut i = f + 1;
+    // Parameters: `name:` inside the first parentheses.
+    while i < before && toks[i].token != Token::LParen {
+        i += 1;
+    }
+    let close = close_of(toks, i, before);
+    for j in i + 1..close {
+        if toks[j].token == Token::Ident && j + 1 < close && toks[j + 1].token == Token::Colon && (toks[j - 1].token == Token::LParen || toks[j - 1].token == Token::Comma || toks[j - 1].token == Token::Mut) {
+            let name = text[toks[j].range.start..toks[j].range.end];
+            out.add(name, CK_VARIABLE, "", name, false, "", S_LOCAL, 0);
+        }
+    }
+    for j in close..before {
+        if toks[j].token == Token::Let {
+            let mut q = j + 1;
+            if q < before && toks[q].token == Token::Mut {
+                q += 1;
+            }
+            if q < before && toks[q].token == Token::Ident {
+                let name = text[toks[q].range.start..toks[q].range.end];
+                out.add(name, CK_VARIABLE, "", name, false, "", S_LOCAL, 0);
+            }
+        }
+    }
+}
+
+/// The craters a path may start with.
+fn add_craters(s: &mut Sema, cx: Cx, out: &mut +Items) {
+    let krate = s.p.mod_data(cx.module).krate;
+    let mut names: [Symbol; ..+] = [];
+    if let Some(deps) = s.crater_deps.get(krate) {
+        for d in s.dep_roots.list(deps) {
+            names.push(d.name);
+        }
+    }
+    for n in names {
+        let name = String::from(s.p.text(n));
+        out.add(name.as_str(), CK_MODULE, "crater", name.as_str(), false, "", S_ITEM, 0);
+    }
+    out.add("core", CK_MODULE, "crater", "core", false, "", S_PRELUDE, 0);
+    out.add("std", CK_MODULE, "crater", "std", false, "", S_PRELUDE, 0);
+}
+
+/// The names the cursor's module sees: its own (and its block scopes'),
+/// its imports, its globs, and the prelude's.
+fn add_scope_items(s: &mut Sema, cx: Cx, in_use: bool, type_pos: bool, next_is_paren: bool, out: &mut +Items) {
+    // The scopes, innermost first, with whether private names count.
+    let mut mods: [(DefId, bool, u8); ..+] = [];
+    let mut m = cx.module;
+    loop {
+        mods.push((m, true, S_ITEM));
+        let md = s.p.mod_data(m);
+        if !md.is_block {
+            break;
+        }
+        m = match md.parent {
+            Some(x) => x,
+            None => break,
+        };
+    }
+    if let Some(pre) = s.prelude {
+        mods.push((pre, false, S_PRELUDE));
+    }
+    // Globs of those, transitively.
+    let mut k: usize = 0;
+    while k < mods.len() && k < 64 {
+        let (mm, _, sort) = mods[k];
+        k += 1;
+        let md = match s.p.def(mm).data {
+            DefData::Mod(md) => md,
+            _ => continue,
+        };
+        let mut g = md.first_glob;
+        while g != 0 {
+            let glob = s.p.globs[(g - 1) as usize];
+            let mut seen = false;
+            for x in mods[..] {
+                let (d, _, _) = x;
+                if d == glob.target {
+                    seen = true;
+                }
+            }
+            if !seen {
+                mods.push((glob.target, false, sort));
+            }
+            g = glob.next;
+        }
+    }
+    for x in mods[..] {
+        let (d, all, sort) = x;
+        if s.p.def(d).kind == DefKind::Enum {
+            let adt = s.p.adt(d);
+            for i in 0..adt.variants.len() {
+                let v = s.p.variants.list(adt.variants)[i];
+                if !type_pos {
+                    add_def(s, cx, v.def, in_use, next_is_paren, sort, out);
+                }
+            }
+            continue;
+        }
+        add_module_items(s, cx, d, all, in_use, next_is_paren, sort, out);
+    }
+    let _ = type_pos;
+}
+
+/// The names bound in module `m` (all of them, or the public ones).
+fn add_module_items(s: &mut Sema, cx: Cx, m: DefId, all: bool, in_use: bool, next_is_paren: bool, sort: u8, out: &mut +Items) {
+    let mut found: [(Symbol, DefId); ..+] = [];
+    for e in s.p.bindings.iter() {
+        let (key, b) = e;
+        if key.module != m || (!all && !b.is_pub) {
+            continue;
+        }
+        if key.ns == Ns::Macro && !in_use {
+            // Macros are offered as `name!` (derives only in `#[derive]`).
+            if s.p.def(b.def).attrs.derive_macro {
+                continue;
+            }
+            let name = core::fmt::format("{s.p.text(key.name)}!");
+            let insert = if cx.snippets && !next_is_paren { core::fmt::format("{s.p.text(key.name)}!($0)") } else { String::from(name.as_str()) };
+            let mut doc = String::new();
+            if let Some(dd) = out.idx.get(s.p.def(b.def).span) {
+                doc = ide::decl_docs(&s.p.ast, dd);
+            }
+            out.add(name.as_str(), CK_FUNCTION, "macro", insert.as_str(), cx.snippets && !next_is_paren, doc.as_str(), sort, b.def.index as u32 + 1);
+            continue;
+        }
+        found.push((key.name, b.def));
+    }
+    for x in found {
+        let (name, d) = x;
+        let n = String::from(s.p.text(name));
+        add_named(s, cx, n.as_str(), d, in_use, next_is_paren, sort, out);
+    }
+}
+
+/// A definition under its own name.
+fn add_def(s: &mut Sema, cx: Cx, d: DefId, in_use: bool, next_is_paren: bool, sort: u8, out: &mut +Items) {
+    let n = String::from(s.p.name(d));
+    add_named(s, cx, n.as_str(), d, in_use, next_is_paren, sort, out);
+}
+
+/// A definition, under the name a scope binds it to.
+fn add_named(s: &mut Sema, cx: Cx, name: str, d: DefId, in_use: bool, next_is_paren: bool, sort: u8, out: &mut +Items) {
+    let info = s.p.def(d);
+    if info.kind == DefKind::Fn {
+        if name == s.p.text(info.name) {
+            add_fn(s, cx, d, CK_FUNCTION, false, next_is_paren || in_use, sort, out);
+            return;
+        }
+    }
+    let kind = match info.kind {
+        DefKind::Mod => CK_MODULE,
+        DefKind::Fn => CK_FUNCTION,
+        DefKind::Struct => CK_STRUCT,
+        DefKind::Enum => CK_ENUM,
+        DefKind::Variant => CK_ENUM_MEMBER,
+        DefKind::Trait => CK_INTERFACE,
+        DefKind::Impl => return,
+        DefKind::Const => CK_CONSTANT,
+        DefKind::Static => CK_CONSTANT,
+        DefKind::TypeAlias => CK_STRUCT,
+        DefKind::Macro => CK_FUNCTION,
+    };
+    let (detail, doc) = describe(s, &out.idx, d);
+    let mut insert = String::from(name);
+    let mut snippet = false;
+    if info.kind == DefKind::Variant && !in_use && !next_is_paren && cx.snippets {
+        if let DefData::Variant { enum_id, index } = info.data {
+            let v = s.p.variants_of(s.p.adt(enum_id))[index as usize];
+            match v.ctor {
+                ln_sema::defs::CtorKind::Tuple => {
+                    insert.push_str("($0)");
+                    snippet = true;
+                }
+                ln_sema::defs::CtorKind::Named => {
+                    insert.push_str(" { $0 }");
+                    snippet = true;
+                }
+                ln_sema::defs::CtorKind::Unit => {}
+            }
+        }
+    }
+    out.add(name, kind, detail.as_str(), insert.as_str(), snippet, doc.as_str(), sort, d.index as u32 + 1);
+}
+
+/// A definition's declaration (as written) and its documentation.
+pub fn describe(s: &mut Sema, idx: &ide::DeclIndex, d: DefId): (String, String) {
+    let info = s.p.def(d);
+    if is_dummy(info.span) {
+        return (String::new(), String::new());
+    }
+    let src = s.p.sources.text.as_str();
+    let found = if idx.built { idx.get(info.span) } else { ide::find_decl(&s.craters, &s.p, info.span) };
+    return match found {
+        Some(dd) => {
+            let sig = match dd {
+                Decl::Item { item, .. } => match item.kind {
+                    ItemKind::Struct(x) => core::fmt::format("struct {s.p.text(x.name.name)}{pretty::generics(&s.p.ast, src, x.generics)}"),
+                    ItemKind::Enum(x) => core::fmt::format("enum {s.p.text(x.name.name)}{pretty::generics(&s.p.ast, src, x.generics)}"),
+                    ItemKind::Trait(x) => core::fmt::format("trait {s.p.text(x.name.name)}{pretty::generics(&s.p.ast, src, x.generics)}"),
+                    _ => pretty::item(&s.p.ast, src, item, None),
+                },
+                Decl::Variant(v) => pretty::variant(&s.p.ast, src, v),
+                Decl::Field(f) => core::fmt::format("{s.p.text(f.name.name)}: {pretty::ty(&s.p.ast, src, f.ty)}"),
+                Decl::Param(g) => pretty::generic_param(&s.p.ast, src, g),
+            };
+            (sig, ide::decl_docs(&s.p.ast, dd))
+        }
+        None => (String::new(), String::new()),
+    };
+}
+
+/// A function or method, with a snippet that fills in its parameters.
+fn add_fn(s: &mut Sema, cx: Cx, d: DefId, kind: u32, method: bool, plain: bool, sort: u8, out: &mut +Items) {
+    let name = String::from(s.p.name(d));
+    let (detail, doc) = describe(s, &out.idx, d);
+    let mut insert = String::from(name.as_str());
+    let mut snippet = false;
+    if !plain && cx.snippets {
+        insert.push('(');
+        let ps = s.p.fn_params(d).to_grow();
+        let mut k: u32 = 0;
+        for prm in ps[..] {
+            if prm.is_self && method {
+                continue;
+            }
+            if k > 0 {
+                insert.push_str(", ");
+            }
+            k += 1;
+            let pn = s.p.text(prm.name);
+            insert.write("${{{k}:{pn}}}");
+        }
+        insert.push_str(")$0");
+        snippet = true;
+    }
+    out.add(name.as_str(), kind, detail.as_str(), insert.as_str(), snippet, doc.as_str(), sort, d.index as u32 + 1);
+}
+
+/// Keywords for the place: items at the top of a module or in an impl,
+/// statements and expressions in a body, types after `:`.
+fn add_keywords(toks: [Spanned; &], before: usize, type_pos: bool, out: &mut +Items) {
+    if type_pos {
+        for k in ["Self", "crater", "self", "super", "fn", "impl"] {
+            out.add(k, CK_KEYWORD, "", k, false, "", S_KEYWORD, 0);
+        }
+        return;
+    }
+    let place = block_kind(toks, before);
+    let prev = if before > 0 { Some(toks[before - 1].token) } else { None };
+    let stmt_start = match prev {
+        None => true,
+        Some(t) => t == Token::Semi || t == Token::LBrace || t == Token::RBrace,
+    };
+    if place == 0 || place == 1 {
+        // Items: in a module (0) or an impl or trait (1).
+        let module_kws = ["fn", "struct", "enum", "trait", "impl", "use", "mod", "const", "static", "type", "extern", "pub", "unsafe", "macro"];
+        let impl_kws = ["fn", "pub", "const", "type", "unsafe"];
+        if stmt_start || prev == Some(Token::Pub) {
+            if place == 0 {
+                for k in module_kws {
+                    out.add(k, CK_KEYWORD, "", k, false, "", S_KEYWORD, 0);
+                }
+            } else {
+                for k in impl_kws {
+                    out.add(k, CK_KEYWORD, "", k, false, "", S_KEYWORD, 0);
+                }
+            }
+        }
+        return;
+    }
+    if place == 2 {
+        // Fields of a struct or enum: only `pub`.
+        out.add("pub", CK_KEYWORD, "", "pub", false, "", S_KEYWORD, 0);
+        return;
+    }
+    if stmt_start {
+        for k in ["let", "if", "match", "for", "while", "loop", "return", "break", "continue", "unsafe", "fn", "struct", "enum", "use", "const"] {
+            out.add(k, CK_KEYWORD, "", k, false, "", S_KEYWORD, 0);
+        }
+    }
+    for k in ["if", "match", "loop", "unsafe", "true", "false", "self", "Self", "move", "return", "crater", "super"] {
+        out.add(k, CK_KEYWORD, "", k, false, "", S_KEYWORD, 0);
+    }
+    if prev == Some(Token::RBrace) {
+        out.add("else", CK_KEYWORD, "", "else", false, "", S_KEYWORD, 0);
+    }
+    if let Some(t) = prev {
+        if t == Token::Ident {
+            out.add("in", CK_KEYWORD, "", "in", false, "", S_KEYWORD, 0);
+            out.add("as", CK_KEYWORD, "", "as", false, "", S_KEYWORD, 0);
+        }
+    }
+}
+
+/// What the braces around token `before` are: 0 a module (or none), 1 an
+/// impl or trait, 2 a struct or enum, 3 code.
+fn block_kind(toks: [Spanned; &], before: usize): u32 {
+    let open = match enclosing(toks, before, Token::LBrace) {
+        Some(o) => o,
+        None => return if enclosing_any(toks, before) { 3 } else { 0 },
+    };
+    // The tokens of the header before `{`, back to the previous `;`, `{`
+    // or `}`.
+    let mut k = open;
+    while k > 0 {
+        let t = toks[k - 1].token;
+        if t == Token::Semi || t == Token::LBrace || t == Token::RBrace {
+            break;
+        }
+        k -= 1;
+    }
+    let mut saw_fn = false;
+    for j in k..open {
+        let t = toks[j].token;
+        if t == Token::Fn {
+            saw_fn = true;
+        }
+        if !saw_fn {
+            if t == Token::Impl || t == Token::Trait {
+                return 1;
+            }
+            if t == Token::Struct || t == Token::Enum {
+                return 2;
+            }
+            if t == Token::Mod {
+                return 0;
+            }
+        }
+    }
+    if saw_fn {
+        return 3;
+    }
+    // A block inside code (`if`, `loop`, a closure, a plain block): code
+    // when it is inside a function.
+    return if k == open && k > 0 && toks[k - 1].token == Token::RBrace { block_kind(toks, k - 1) } else { 3 };
+}
+
+fn enclosing_any(toks: [Spanned; &], before: usize): bool {
+    return enclosing(toks, before, Token::LParen).is_some() || enclosing(toks, before, Token::LBracket).is_some();
+}
+
+// ===================================================================== signature help
+
+/// A signature: its label and the ranges of its parameters in it.
+pub struct Signature {
+    pub label: String,
+    pub doc: String,
+    pub params: [(u32, u32); ..+],
+    pub active: u32,
+}
+
+/// The signature of the call around the cursor, and which argument the
+/// cursor is in.
+pub fn signature_help(s: &mut Sema, cx: Cx, text: str): Option::<Signature> {
+    let (toks, _) = ln_lexer::lex(text);
+    let cur = cx.cursor as usize;
+    let mut n = 0;
+    while n < toks.len() && toks[n].range.start < cur {
+        n += 1;
+    }
+    // The unclosed `(` before the cursor, and the commas before it.
+    let mut depth: usize = 0;
+    let mut commas: u32 = 0;
+    let mut k = n;
+    let mut open: Option::<usize> = None;
+    while k > 0 {
+        k -= 1;
+        let t = toks[k].token;
+        if t == Token::RParen || t == Token::RBracket || t == Token::RBrace {
+            depth += 1;
+        } else if t == Token::LBracket || t == Token::LBrace {
+            if depth == 0 {
+                return None;
+            }
+            depth -= 1;
+        } else if t == Token::LParen {
+            if depth == 0 {
+                open = Some(k);
+                break;
+            }
+            depth -= 1;
+        } else if t == Token::Comma && depth == 0 {
+            commas += 1;
+        } else if t == Token::Semi && depth == 0 {
+            return None;
+        }
+    }
+    let open = open?;
+    if open == 0 {
+        return None;
+    }
+    // The callee: `name(`, `path::name(`, `recv.name(`, with a turbofish.
+    let mut e = open;
+    if toks[e - 1].token == Token::RAngle {
+        let mut d: usize = 0;
+        let mut j = e;
+        while j > 0 {
+            j -= 1;
+            if toks[j].token == Token::RAngle {
+                d += 1;
+            } else if toks[j].token == Token::LAngle {
+                d -= 1;
+                if d == 0 {
+                    break;
+                }
+            }
+        }
+        if j < 2 || toks[j - 1].token != Token::PathSep {
+            return None;
+        }
+        e = j - 1;
+    }
+    if e == 0 || !is_name(toks[e - 1].token) {
+        return None;
+    }
+    let name_tok = e - 1;
+    let name = text[toks[name_tok].range.start..toks[name_tok].range.end];
+    let mut method = false;
+    let def: DefId = if name_tok > 0 && toks[name_tok - 1].token == Token::Dot {
+        let dot = name_tok - 1;
+        let a = chain_start(toks[..], dot)?;
+        let t = expr_type(s, cx, text, toks[..], a, dot)?;
+        method = true;
+        find_method(s, t, name, true)?.def
+    } else {
+        let mut segs: [usize; ..+] = [];
+        if !path_before(toks[..], name_tok + 1, &mut segs) {
+            return None;
+        }
+        match resolve_path(s, cx, text, toks[..], segs[..])? {
+            PathRes::Def(d) => d,
+            PathRes::Assoc(c) => c.def,
+            PathRes::Ty(_) => return None,
+        }
+    };
+    let mut sig = signature_of(s, def)?;
+    let mut active = commas;
+    if method {
+        if let DefData::Fn(f) = s.p.def(def).data {
+            if f.has_self {
+                active += 1;
+            }
+        }
+    }
+    sig.active = active;
+    return Some(sig);
+}
+
+/// The signature of a function (as written, parameter modes and all), or
+/// of a tuple struct or variant's constructor.
+fn signature_of(s: &mut Sema, d: DefId): Option::<Signature> {
+    let info = s.p.def(d);
+    let src = s.p.sources.text.as_str();
+    let mut sig = Signature { label: String::new(), doc: String::new(), params: [], active: 0 };
+    let found = if is_dummy(info.span) { None } else { ide::find_decl(&s.craters, &s.p, info.span) };
+    match found {
+        Some(Decl::Item { item, .. }) => {
+            if let ItemKind::Fn(f) = item.kind {
+                if f.is_unsafe {
+                    sig.label.push_str("unsafe ");
+                }
+                sig.label.write("fn {s.p.text(f.name.name)}{pretty::generics(&s.p.ast, src, f.generics)}(");
+                let ps = s.p.ast.params.list(f.params);
+                for i in 0..ps.len() {
+                    if i > 0 {
+                        sig.label.push_str(", ");
+                    }
+                    let lo = utf16_len(sig.label.as_str());
+                    sig.label.push_str(pretty::param(&s.p.ast, src, ps[i]).as_str());
+                    sig.params.push((lo, utf16_len(sig.label.as_str())));
+                }
+                if f.variadic {
+                    sig.label.push_str(if ps.len() > 0 { ", ..." } else { "..." });
+                }
+                sig.label.push(')');
+                if let Some(r) = f.ret {
+                    sig.label.write(": {pretty::ty(&s.p.ast, src, r)}");
+                }
+                let from = s.p.ast.idents.list(f.ret_from);
+                for i in 0..from.len() {
+                    sig.label.push_str(if i == 0 { " from " } else { ", " });
+                    sig.label.push_str(s.p.text(from[i].name));
+                }
+            } else if let ItemKind::Struct(x) = item.kind {
+                if let ln_ast::VariantData::Tuple(fs) = x.kind {
+                    sig.label.write("{s.p.text(x.name.name)}(");
+                    let l = s.p.ast.tuple_fields.list(fs);
+                    for i in 0..l.len() {
+                        if i > 0 {
+                            sig.label.push_str(", ");
+                        }
+                        let lo = utf16_len(sig.label.as_str());
+                        sig.label.push_str(pretty::ty(&s.p.ast, src, l[i].ty).as_str());
+                        sig.params.push((lo, utf16_len(sig.label.as_str())));
+                    }
+                    sig.label.push(')');
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+            sig.doc = ide::decl_docs(&s.p.ast, Decl::Item { item, parent: None, in_extern: false, abi: None });
+        }
+        Some(Decl::Variant(v)) => {
+            if let ln_ast::VariantData::Tuple(fs) = v.data {
+                sig.label.write("{s.p.text(v.name.name)}(");
+                let l = s.p.ast.tuple_fields.list(fs);
+                for i in 0..l.len() {
+                    if i > 0 {
+                        sig.label.push_str(", ");
+                    }
+                    let lo = utf16_len(sig.label.as_str());
+                    sig.label.push_str(pretty::ty(&s.p.ast, src, l[i].ty).as_str());
+                    sig.params.push((lo, utf16_len(sig.label.as_str())));
+                }
+                sig.label.push(')');
+                sig.doc = ide::decl_docs(&s.p.ast, Decl::Variant(v));
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    return Some(sig);
+}
+
+fn utf16_len(s: str): u32 {
+    let mut n: u32 = 0;
+    for c in s.chars() {
+        n += if (c as u32) >= 65536 { 2 } else { 1 };
+    }
+    return n;
+}
+
+/// The documentation of definition `d` (for `completionItem/resolve`).
+pub fn docs_of(s: &mut Sema, d: DefId): String {
+    let none = ide::DeclIndex::new();
+    let (_, doc) = describe(s, &none, d);
+    return doc;
+}
