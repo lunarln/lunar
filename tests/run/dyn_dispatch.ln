@@ -1,0 +1,347 @@
+// Trait objects: `x as dyn Trait` views a value through its type's vtable
+// for the trait. Calls go through the vtable; arrays and struct fields may
+// hold `dyn`s of different types; supertraits, upcasting, generic traits,
+// default methods and format holes work through them.
+
+trait Shape {
+    fn area(&self): f64;
+    fn name(&self): str;
+    /// A default method: in the vtable, so an impl may override it.
+    fn describe(&self): String {
+        return core::fmt::format("{self.name()} of area {self.area()}");
+    }
+    /// Generic, so not in the vtable: it runs its default body with `Self`
+    /// being the `dyn` itself.
+    fn scaled::<F: Fn(f64): f64>(&self, f: F): f64 {
+        return f(self.area());
+    }
+}
+
+struct Circle {
+    r: f64,
+}
+
+struct Rect {
+    w: f64,
+    h: f64,
+}
+
+impl Shape for Circle {
+    fn area(&self): f64 {
+        return 3.0 * self.r * self.r;
+    }
+
+    fn name(&self): str {
+        return "circle";
+    }
+}
+
+impl Shape for Rect {
+    fn area(&self): f64 {
+        return self.w * self.h;
+    }
+
+    fn name(&self): str {
+        return "rect";
+    }
+
+    fn describe(&self): String {
+        return core::fmt::format("{self.w}x{self.h} rect");
+    }
+}
+
+fn total(shapes: [dyn Shape; &]): f64 {
+    let mut t = 0.0;
+    for s in shapes {
+        t += s.area();
+    }
+    return t;
+}
+
+#[test]
+fn calls_go_through_the_vtable() {
+    let c = Circle { r: 2.0 };
+    let r = Rect { w: 3.0, h: 4.0 };
+    let shapes = [c as dyn Shape, r as dyn Shape];
+    assert_eq!(total(shapes[..]), 24.0);
+    assert_eq!(shapes[0].name(), "circle");
+    assert_eq!(shapes[1].name(), "rect");
+    assert_eq!(shapes[0].describe(), String::from("circle of area 12"));
+    assert_eq!(shapes[1].describe(), String::from("3x4 rect"));
+    assert_eq!(shapes[1].scaled(|a| a * 2.0), 24.0);
+}
+
+#[test]
+fn growable_arrays_of_views() {
+    let a = Circle { r: 1.0 };
+    let b = Rect { w: 1.0, h: 2.0 };
+    let mut all: [dyn Shape; ..+] = [];
+    all.push(a as dyn Shape);
+    all.push(b as dyn Shape);
+    all.push(a as dyn Shape);
+    let mut names = String::new();
+    for s in all[..] {
+        names.push_str(s.name());
+        names.push(' ');
+    }
+    assert_eq!(names, String::from("circle rect circle "));
+}
+
+/// A struct holding views: it borrows what they point at.
+struct Scene {
+    title: str,
+    main: dyn Shape,
+    extra: [dyn Shape; 2],
+}
+
+impl Scene {
+    fn area(&self): f64 {
+        return self.main.area() + self.extra[0].area() + self.extra[1].area();
+    }
+}
+
+#[test]
+fn struct_fields() {
+    let c = Circle { r: 1.0 };
+    let r = Rect { w: 2.0, h: 5.0 };
+    let s = Scene {
+        title: "scene",
+        main: c as dyn Shape,
+        extra: [r as dyn Shape, r as dyn Shape],
+    };
+    assert_eq!(s.area(), 23.0);
+    assert_eq!(s.title, "scene");
+}
+
+/// What a returned `dyn` points into is part of the signature, as for any
+/// view.
+fn bigger(a: &Circle, b: &Rect): dyn Shape {
+    if a.area() > b.area() {
+        return a as dyn Shape;
+    }
+    return b as dyn Shape;
+}
+
+fn first_of(a: &Circle, b: &Circle): dyn Shape from a {
+    if b.r > 100.0 {
+        return a as dyn Shape;
+    }
+    return a as dyn Shape;
+}
+
+#[test]
+fn returned_views() {
+    let c = Circle { r: 1.0 };
+    let r = Rect { w: 2.0, h: 2.0 };
+    assert_eq!(bigger(&c, &r).name(), "rect");
+    let mut other = Circle { r: 5.0 };
+    let f = first_of(&c, &other);
+    other.r = 7.0;
+    assert_eq!(f.area(), 3.0);
+    assert_eq!(other.r, 7.0);
+}
+
+/// A generic function instantiated with a `dyn`: `dyn Shape` implements
+/// `Shape`.
+fn area_of::<T: Shape>(t: &T): f64 {
+    return t.area();
+}
+
+fn largest::<T: Shape + Light>(xs: [T; &]): f64 {
+    let mut best = 0.0;
+    for x in xs {
+        if x.area() > best {
+            best = x.area();
+        }
+    }
+    return best;
+}
+
+#[test]
+fn generic_code_over_dyn() {
+    let c = Circle { r: 1.0 };
+    let r = Rect { w: 2.0, h: 3.0 };
+    let d = c as dyn Shape;
+    assert_eq!(area_of(&d), 3.0);
+    let both = [d, r as dyn Shape];
+    assert_eq!(largest(both[..]), 6.0);
+}
+
+// Supertraits: their methods are in the vtable too, and a `dyn Sub`
+// upcasts to a `dyn Super`.
+trait Named {
+    fn name(&self): str;
+}
+
+trait Animal: Named {
+    fn sound(&self): str;
+    fn speak(&self): String {
+        return core::fmt::format("{self.name()} says {self.sound()}");
+    }
+}
+
+trait Pet: Animal {
+    fn owner(&self): str;
+}
+
+struct Dog {
+    owner: str,
+}
+
+impl Named for Dog {
+    fn name(&self): str {
+        return "dog";
+    }
+}
+
+impl Animal for Dog {
+    fn sound(&self): str {
+        return "woof";
+    }
+}
+
+impl Pet for Dog {
+    fn owner(&self): str {
+        return self.owner;
+    }
+}
+
+fn name_of(n: dyn Named): str {
+    return n.name();
+}
+
+#[test]
+fn supertraits_and_upcasts() {
+    let d = Dog { owner: "ann" };
+    let p = d as dyn Pet;
+    assert_eq!(p.owner(), "ann");
+    assert_eq!(p.sound(), "woof");
+    assert_eq!(p.name(), "dog");
+    assert_eq!(p.speak(), String::from("dog says woof"));
+    let a = p as dyn Animal;
+    assert_eq!(a.speak(), String::from("dog says woof"));
+    assert_eq!(name_of(a as dyn Named), "dog");
+    assert_eq!(name_of(p as dyn Named), "dog");
+}
+
+// A generic trait, through its arguments.
+trait Source::<T> {
+    fn get(&self, i: usize): Option::<T>;
+}
+
+struct Squares;
+
+impl Source::<u64> for Squares {
+    fn get(&self, i: usize): Option::<u64> {
+        if i < 4 {
+            return Some((i * i) as u64);
+        }
+        return None;
+    }
+}
+
+struct Letters {
+    text: str,
+}
+
+impl Source::<char> for Letters {
+    fn get(&self, i: usize): Option::<char> {
+        let mut k: usize = 0;
+        for c in self.text.chars() {
+            if k == i {
+                return Some(c);
+            }
+            k += 1;
+        }
+        return None;
+    }
+}
+
+fn sum_all(s: dyn Source::<u64>): u64 {
+    let mut i: usize = 0;
+    let mut t: u64 = 0;
+    while let Some(v) = s.get(i) {
+        t += v;
+        i += 1;
+    }
+    return t;
+}
+
+#[test]
+fn generic_traits() {
+    let sq = Squares;
+    assert_eq!(sum_all(sq as dyn Source::<u64>), 14);
+    let l = Letters { text: "abc" };
+    let d = l as dyn Source::<char>;
+    assert_eq!(d.get(1), Some('b'));
+    assert_eq!(d.get(3), None);
+}
+
+// Format holes use `Display` and `Debug`, so they work through a `dyn` of
+// either.
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+impl Display for Point {
+    fn fmt(&self, out: &mut +String) {
+        out.write("({self.x}, {self.y})");
+    }
+}
+
+#[test]
+fn display_through_dyn() {
+    let p = Point { x: 1, y: 2 };
+    let n = 42;
+    let s = "text";
+    let items = [p as dyn Display, n as dyn Display, s as dyn Display];
+    let mut out = String::new();
+    for it in items {
+        out.write("[{it}]");
+    }
+    assert_eq!(out, String::from("[(1, 2)][42][text]"));
+    let v = [1, 2, 3];
+    // A view of a temporary would not outlive this statement: view a
+    // variable.
+    let sl = v[..];
+    let dbg = sl as dyn Debug;
+    assert_eq!(core::fmt::format("{dbg:?}"), String::from("[1, 2, 3]"));
+}
+
+// `dyn mut Iterator::<T>`: `for` loops and `next` through the vtable.
+struct Countdown {
+    n: u32,
+}
+
+impl Iterator::<u32> for Countdown {
+    fn next(&mut self): Option::<u32> {
+        if self.n == 0 {
+            return None;
+        }
+        self.n -= 1;
+        return Some(self.n + 1);
+    }
+}
+
+fn drain(it: dyn mut Iterator::<u32>): u32 {
+    let mut t: u32 = 0;
+    for x in it {
+        t += x;
+    }
+    return t;
+}
+
+#[test]
+fn iterators_through_dyn() {
+    let mut c = Countdown { n: 4 };
+    assert_eq!(drain(c as dyn mut Iterator::<u32>), 10);
+    assert_eq!(c.n, 0);
+    let mut words = "a b c".split(" ");
+    let it = words as dyn mut Iterator::<str>;
+    let mut joined = String::new();
+    while let Some(w) = it.next() {
+        joined.push_str(w);
+    }
+    assert_eq!(joined, String::from("abc"));
+}

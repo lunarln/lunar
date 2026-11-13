@@ -1,0 +1,29 @@
+// error: trait::not_dyn_compatible
+// A trait whose required methods cannot go through a vtable cannot be the
+// trait of a `dyn`: generic methods, methods without `self` or taking it by
+// value, and `Self` in a signature. Supertraits count too.
+trait Generic {
+    fn each::<F: Fn(i32)>(&self, f: F);
+}
+
+trait Make {
+    fn make(): i32;
+}
+
+trait Copies {
+    fn copy(&self): Self;
+}
+
+trait Sub: Copies {
+    fn sub(&self);
+}
+
+fn a(x: dyn Generic) {}
+
+fn b(x: dyn Make) {}
+
+fn c(x: dyn Copies) {}
+
+fn d(x: dyn Sub) {}
+
+fn main() {}

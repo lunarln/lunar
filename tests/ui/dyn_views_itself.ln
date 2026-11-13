@@ -1,0 +1,22 @@
+// error: borrow::views_itself
+// A `dyn mut` cannot be kept inside the value it views.
+trait Reset {
+    fn reset(&mut self);
+}
+
+impl Reset for String {
+    fn reset(&mut self) {
+        self.clear();
+    }
+}
+
+struct Ctx {
+    text: String,
+    target: dyn mut Reset,
+}
+
+fn rewire(c: &mut Ctx) {
+    c.target = c.text as dyn mut Reset;
+}
+
+fn main() {}

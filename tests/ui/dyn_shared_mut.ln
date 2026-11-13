@@ -1,0 +1,31 @@
+// error: type::immutable
+// A `dyn Trait` gives shared access: `&mut self` methods need a `dyn mut`,
+// which is made from a mutable place and is not made from a shared `dyn`.
+trait Counter {
+    fn get(&self): u32;
+    fn bump(&mut self);
+}
+
+struct C {
+    n: u32,
+}
+
+impl Counter for C {
+    fn get(&self): u32 {
+        return self.n;
+    }
+
+    fn bump(&mut self) {
+        self.n += 1;
+    }
+}
+
+fn main() {
+    let mut c = C { n: 0 };
+    let shared = c as dyn Counter;
+    shared.bump();
+    let again = shared as dyn mut Counter;
+    let fixed = C { n: 1 };
+    let m = fixed as dyn mut Counter;
+    println("{again.get()} {m.get()}");
+}

@@ -1,0 +1,28 @@
+// error: type::unsatisfied_bound
+// error: type::mismatch
+// A value is viewed as `dyn Trait` only if its type implements the trait,
+// and only with an explicit `as dyn Trait`: never implicitly.
+trait Show {
+    fn show(&self): i32;
+}
+
+struct P {
+    x: i32,
+}
+
+impl Show for P {
+    fn show(&self): i32 {
+        return self.x;
+    }
+}
+
+fn take(d: dyn Show): i32 {
+    return d.show();
+}
+
+fn main() {
+    let n = 5;
+    let d = n as dyn Show;
+    let p = P { x: 1 };
+    take(p);
+}

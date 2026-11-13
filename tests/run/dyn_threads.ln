@@ -1,0 +1,101 @@
+// `dyn` views and threads. A `dyn Trait` is a shared view, like `[T; &]`:
+// threads may share it when the value it views is Sync, which `+ Sync`
+// promises (and checks where the value is first viewed). It is never
+// Detached, so only scoped threads may hold one; a `dyn mut` is never Send.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+
+trait Score {
+    fn score(&self, x: u64): u64;
+}
+
+struct Linear {
+    k: u64,
+}
+
+impl Score for Linear {
+    fn score(&self, x: u64): u64 {
+        return self.k * x;
+    }
+}
+
+struct Square;
+
+impl Score for Square {
+    fn score(&self, x: u64): u64 {
+        return x * x;
+    }
+}
+
+#[test]
+fn shared_views_in_scoped_threads() {
+    let lin = Linear { k: 3 };
+    let sq = Square;
+    let scorers = [lin as dyn Score + Sync, sq as dyn Score + Sync];
+    let total = AtomicU64::new(0);
+    thread::scope(|s| {
+        for i in 0..4 {
+            s.spawn_with(i as u64, |x| {
+                for sc in scorers {
+                    total.fetch_add(sc.score(x), Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    // 3 * (0 + 1 + 2 + 3) + (0 + 1 + 4 + 9)
+    assert_eq!(total.load(Ordering::SeqCst), 32);
+}
+
+/// A counter shared between threads changes behind a lock, so `&self`
+/// is enough to count.
+trait Tally {
+    fn add(&self, n: u64);
+    fn get(&self): u64;
+}
+
+struct Locked {
+    n: Mutex::<u64>,
+}
+
+impl Tally for Locked {
+    fn add(&self, n: u64) {
+        self.n.lock(|v| v += n);
+    }
+
+    fn get(&self): u64 {
+        return self.n.lock(|v| v);
+    }
+}
+
+fn work(t: dyn Tally + Sync) {
+    thread::scope(|s| {
+        for _ in 0..3 {
+            s.spawn(|| {
+                for _ in 0..100 {
+                    t.add(1);
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn sync_values_change_behind_locks() {
+    let l = Locked { n: Mutex::new(0) };
+    work(l as dyn Tally + Sync);
+    assert_eq!(l.get(), 300);
+}
+
+/// Dropping `+ Sync` (or `mut`) is implicit.
+fn peek(t: dyn Tally): u64 {
+    return t.get();
+}
+
+#[test]
+fn weaker_views_convert() {
+    let l = Locked { n: Mutex::new(5) };
+    let t = l as dyn Tally + Send + Sync;
+    assert_eq!(peek(t), 5);
+}

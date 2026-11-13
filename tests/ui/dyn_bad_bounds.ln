@@ -1,0 +1,17 @@
+// error: type::bad_dyn
+// A `dyn` names one trait, plus `Send` and `Sync`.
+trait A {
+    fn a(&self);
+}
+
+trait B {
+    fn b(&self);
+}
+
+fn none(x: dyn Send) {}
+
+fn two(x: dyn A + B) {}
+
+fn light(x: dyn A + Light) {}
+
+fn main() {}
