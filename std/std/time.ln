@@ -1,0 +1,453 @@
+// Time: spans of time (`Duration`), a clock for measuring them
+// (`Instant`), the time of day (`SystemTime`), and `sleep`.
+//
+// `sleep` lives here rather than in a `thread` module: Lunar has no
+// threads yet, and it pauses the whole program.
+
+use crater::sys;
+use core::ops::{Add, Sub};
+
+const NANOS_PER_SEC: u32 = 1000000000;
+const MAX_U64: u64 = 18446744073709551615;
+
+/// A span of time, never negative: whole seconds and the nanoseconds past
+/// them. `Duration::from_millis(1500)` is 1 second and 500,000,000
+/// nanoseconds. `+` and `-` panic if the result does not fit (or would be
+/// negative); the `checked_` and `saturating_` methods do not.
+#[derive(Eq, Ord, Hash)]
+pub struct Duration {
+    secs: u64,
+    /// Always below `NANOS_PER_SEC`.
+    nanos: u32,
+}
+
+impl Duration {
+    /// `secs` seconds and `nanos` nanoseconds (which may be a second or
+    /// more: they carry into the seconds). Panics if the seconds overflow.
+    pub fn new(secs: u64, nanos: u32): Duration {
+        let extra = (nanos / NANOS_PER_SEC) as u64;
+        let s = match secs.checked_add(extra) {
+            Some(s) => s,
+            None => panic("overflow in Duration::new"),
+        };
+        return Duration { secs: s, nanos: nanos % NANOS_PER_SEC };
+    }
+
+    /// No time at all.
+    pub fn zero(): Duration {
+        return Duration { secs: 0, nanos: 0 };
+    }
+
+    /// The longest duration (about 584 billion years).
+    pub fn max(): Duration {
+        return Duration { secs: MAX_U64, nanos: NANOS_PER_SEC - 1 };
+    }
+
+    pub fn from_secs(secs: u64): Duration {
+        return Duration { secs, nanos: 0 };
+    }
+
+    pub fn from_millis(ms: u64): Duration {
+        return Duration { secs: ms / 1000, nanos: ((ms % 1000) * 1000000) as u32 };
+    }
+
+    pub fn from_micros(us: u64): Duration {
+        return Duration { secs: us / 1000000, nanos: ((us % 1000000) * 1000) as u32 };
+    }
+
+    pub fn from_nanos(ns: u64): Duration {
+        return Duration { secs: ns / 1000000000, nanos: (ns % 1000000000) as u32 };
+    }
+
+    /// `secs` seconds, rounded to whole nanoseconds. Panics if it is
+    /// negative, not a number, or too big.
+    pub fn from_secs_f64(secs: f64): Duration {
+        if !(secs >= 0.0) || secs >= 18446744073709551616.0 {
+            panic("Duration::from_secs_f64: {secs} is negative, not a number or too big");
+        }
+        let whole = secs as u64;
+        let mut nanos = ((secs - (whole as f64)) * 1000000000.0 + 0.5) as u64;
+        let mut s = whole;
+        if nanos >= 1000000000 {
+            nanos -= 1000000000;
+            s += 1;
+        }
+        return Duration { secs: s, nanos: nanos as u32 };
+    }
+
+    pub fn is_zero(&self): bool {
+        return self.secs == 0 && self.nanos == 0;
+    }
+
+    /// The whole seconds.
+    pub fn as_secs(&self): u64 {
+        return self.secs;
+    }
+
+    /// The nanoseconds past the whole seconds.
+    pub fn subsec_nanos(&self): u32 {
+        return self.nanos;
+    }
+
+    /// The milliseconds past the whole seconds.
+    pub fn subsec_millis(&self): u32 {
+        return self.nanos / 1000000;
+    }
+
+    /// The microseconds past the whole seconds.
+    pub fn subsec_micros(&self): u32 {
+        return self.nanos / 1000;
+    }
+
+    /// All of it in milliseconds (rounded down; the largest `u64` if it
+    /// does not fit).
+    pub fn as_millis(&self): u64 {
+        return scaled(self.secs, 1000, (self.nanos / 1000000) as u64);
+    }
+
+    /// All of it in microseconds (rounded down; the largest `u64` if it
+    /// does not fit).
+    pub fn as_micros(&self): u64 {
+        return scaled(self.secs, 1000000, (self.nanos / 1000) as u64);
+    }
+
+    /// All of it in nanoseconds (the largest `u64`, about 584 years, if it
+    /// does not fit).
+    pub fn as_nanos(&self): u64 {
+        return scaled(self.secs, 1000000000, self.nanos as u64);
+    }
+
+    /// All of it in seconds, as a float.
+    pub fn as_secs_f64(&self): f64 {
+        return (self.secs as f64) + (self.nanos as f64) / 1000000000.0;
+    }
+
+    pub fn as_secs_f32(&self): f32 {
+        return self.as_secs_f64() as f32;
+    }
+
+    /// `self + other`, or `None` if it does not fit.
+    pub fn checked_add(self, other: Duration): Option::<Duration> {
+        let mut secs = self.secs.checked_add(other.secs)?;
+        let mut nanos = self.nanos + other.nanos;
+        if nanos >= NANOS_PER_SEC {
+            nanos -= NANOS_PER_SEC;
+            secs = secs.checked_add(1)?;
+        }
+        return Some(Duration { secs, nanos });
+    }
+
+    /// `self - other`, or `None` if `other` is longer.
+    pub fn checked_sub(self, other: Duration): Option::<Duration> {
+        let mut secs = self.secs.checked_sub(other.secs)?;
+        let nanos = if self.nanos >= other.nanos {
+            self.nanos - other.nanos
+        } else {
+            secs = secs.checked_sub(1)?;
+            self.nanos + NANOS_PER_SEC - other.nanos
+        };
+        return Some(Duration { secs, nanos });
+    }
+
+    /// `self * n`, or `None` if it does not fit.
+    pub fn checked_mul(self, n: u32): Option::<Duration> {
+        let total_nanos = (self.nanos as u64) * (n as u64);
+        let extra = total_nanos / 1000000000;
+        let secs = self.secs.checked_mul(n as u64)?.checked_add(extra)?;
+        return Some(Duration { secs, nanos: (total_nanos % 1000000000) as u32 });
+    }
+
+    /// `self / n` (rounded down), or `None` if `n` is 0.
+    pub fn checked_div(self, n: u32): Option::<Duration> {
+        if n == 0 {
+            return None;
+        }
+        let d = n as u64;
+        let secs = self.secs / d;
+        let carry = self.secs - secs * d;
+        let nanos = (carry * 1000000000 + (self.nanos as u64)) / d;
+        return Some(Duration { secs, nanos: nanos as u32 });
+    }
+
+    /// `self + other`, or the longest duration if it does not fit.
+    pub fn saturating_add(self, other: Duration): Duration {
+        return match self.checked_add(other) {
+            Some(d) => d,
+            None => Duration::max(),
+        };
+    }
+
+    /// `self - other`, or zero if `other` is longer.
+    pub fn saturating_sub(self, other: Duration): Duration {
+        return match self.checked_sub(other) {
+            Some(d) => d,
+            None => Duration::zero(),
+        };
+    }
+
+    /// `self * n`, or the longest duration if it does not fit.
+    pub fn saturating_mul(self, n: u32): Duration {
+        return match self.checked_mul(n) {
+            Some(d) => d,
+            None => Duration::max(),
+        };
+    }
+
+    /// `self` times `f` (which must leave it non-negative and finite).
+    pub fn mul_f64(self, f: f64): Duration {
+        return Duration::from_secs_f64(self.as_secs_f64() * f);
+    }
+
+    /// `self` divided by `f` (which must leave it non-negative and finite).
+    pub fn div_f64(self, f: f64): Duration {
+        return Duration::from_secs_f64(self.as_secs_f64() / f);
+    }
+
+    /// How far apart `self` and `other` are.
+    pub fn abs_diff(self, other: Duration): Duration {
+        if self > other {
+            return self.saturating_sub(other);
+        }
+        return other.saturating_sub(self);
+    }
+}
+
+/// `secs * per + extra`, or the largest `u64` if it does not fit.
+fn scaled(secs: u64, per: u64, extra: u64): u64 {
+    return match secs.checked_mul(per) {
+        Some(v) => v.saturating_add(extra),
+        None => MAX_U64,
+    };
+}
+
+impl Add for Duration {
+    fn add(&self, rhs: &Duration): Duration {
+        return match self.checked_add(rhs) {
+            Some(d) => d,
+            None => panic("overflow when adding durations"),
+        };
+    }
+}
+
+impl Sub for Duration {
+    fn sub(&self, rhs: &Duration): Duration {
+        return match self.checked_sub(rhs) {
+            Some(d) => d,
+            None => panic("overflow when subtracting durations"),
+        };
+    }
+}
+
+impl Default for Duration {
+    fn default(): Duration {
+        return Duration::zero();
+    }
+}
+
+impl Display for Duration {
+    /// In the largest unit that keeps a whole part, with the decimals that
+    /// are not zero: `1.5s`, `250ms`, `1.000001ms`, `3µs`, `7ns`, `0ns`.
+    fn fmt(&self, out: &mut +String) {
+        if self.secs > 0 {
+            write_decimal(out, self.secs, self.nanos, 100000000);
+            out.push('s');
+        } else if self.nanos >= 1000000 {
+            write_decimal(out, (self.nanos / 1000000) as u64, self.nanos % 1000000, 100000);
+            out.push_str("ms");
+        } else if self.nanos >= 1000 {
+            write_decimal(out, (self.nanos / 1000) as u64, self.nanos % 1000, 100);
+            out.push_str("µs");
+        } else {
+            write_decimal(out, self.nanos as u64, 0, 1);
+            out.push_str("ns");
+        }
+    }
+}
+
+impl Debug for Duration {
+    fn debug(&self, out: &mut +String) {
+        self.fmt(out);
+    }
+}
+
+/// `whole`, then `.` and the digits of `frac` (worth `frac / (unit * 10)`
+/// of one) without trailing zeros.
+fn write_decimal(out: &mut +String, whole: u64, frac: u32, unit: u32) {
+    out.write("{whole}");
+    if frac == 0 {
+        return;
+    }
+    out.push('.');
+    let mut f = frac;
+    let mut u = unit;
+    while f > 0 && u > 0 {
+        let digit = f / u;
+        out.push((48 + digit) as u8 as char);
+        f = f % u;
+        u = u / 10;
+    }
+}
+
+// ===================================================================== Instant
+
+/// A moment on a clock that never goes back (not affected by changes to
+/// the time of day), for measuring how long things take:
+/// `let t = Instant::now(); work(); println("{t.elapsed()}");`.
+/// Only differences between instants mean anything.
+#[derive(Eq, Ord, Hash, Debug)]
+pub struct Instant {
+    ns: u64,
+}
+
+impl Instant {
+    /// Now.
+    pub fn now(): Instant {
+        return Instant { ns: sys::monotonic_ns() };
+    }
+
+    /// How long since `self`.
+    pub fn elapsed(&self): Duration {
+        return Instant::now().duration_since(self);
+    }
+
+    /// How long from `earlier` to `self` (zero if `earlier` is later).
+    pub fn duration_since(&self, earlier: Instant): Duration {
+        return self.saturating_duration_since(earlier);
+    }
+
+    /// How long from `earlier` to `self`, or `None` if `earlier` is later.
+    pub fn checked_duration_since(&self, earlier: Instant): Option::<Duration> {
+        if earlier.ns > self.ns {
+            return None;
+        }
+        return Some(Duration::from_nanos(self.ns - earlier.ns));
+    }
+
+    /// How long from `earlier` to `self`, or zero if `earlier` is later.
+    pub fn saturating_duration_since(&self, earlier: Instant): Duration {
+        return match self.checked_duration_since(earlier) {
+            Some(d) => d,
+            None => Duration::zero(),
+        };
+    }
+
+    /// `d` later, or `None` if the clock cannot show that.
+    pub fn checked_add(&self, d: Duration): Option::<Instant> {
+        let ns = d.as_nanos();
+        if ns == MAX_U64 {
+            return None;
+        }
+        return Some(Instant { ns: self.ns.checked_add(ns)? });
+    }
+
+    /// `d` earlier, or `None` if the clock cannot show that.
+    pub fn checked_sub(&self, d: Duration): Option::<Instant> {
+        return Some(Instant { ns: self.ns.checked_sub(d.as_nanos())? });
+    }
+}
+
+// ===================================================================== SystemTime
+
+/// A time of day (wall-clock time), as kept by the system: it can jump
+/// when the clock is set, so measure with `Instant` instead. Times before
+/// 1970 are fine.
+#[derive(Eq, Ord, Hash, Debug)]
+pub struct SystemTime {
+    /// Since 1970-01-01 00:00:00 UTC (`nanos` below a second, added).
+    secs: i64,
+    nanos: u32,
+}
+
+/// 1970-01-01 00:00:00 UTC, where Unix time starts.
+pub fn unix_epoch(): SystemTime {
+    return SystemTime { secs: 0, nanos: 0 };
+}
+
+impl SystemTime {
+    /// Now.
+    pub fn now(): SystemTime {
+        let (secs, nanos) = sys::system_time();
+        return SystemTime { secs, nanos };
+    }
+
+    /// 1970-01-01 00:00:00 UTC (as `time::unix_epoch()`).
+    pub fn unix_epoch(): SystemTime {
+        return unix_epoch();
+    }
+
+    /// The time `secs` seconds and `nanos` nanoseconds after (or, for
+    /// negative `secs`, before) 1970-01-01 UTC.
+    pub fn from_unix(secs: i64, nanos: u32): SystemTime {
+        let carry = (nanos / NANOS_PER_SEC) as i64;
+        return SystemTime { secs: secs + carry, nanos: nanos % NANOS_PER_SEC };
+    }
+
+    /// Seconds (negative before 1970) and nanoseconds past them since
+    /// 1970-01-01 UTC.
+    pub fn to_unix(&self): (i64, u32) {
+        return (self.secs, self.nanos);
+    }
+
+    /// How long from `earlier` to `self`; `Err` with how long from `self`
+    /// to `earlier` if `earlier` is later.
+    pub fn duration_since(&self, earlier: SystemTime): Result::<Duration, Duration> {
+        if earlier > self {
+            return Err(span(self, earlier));
+        }
+        return Ok(span(earlier, self));
+    }
+
+    /// How long since `self` (`Err` if the clock is now earlier).
+    pub fn elapsed(&self): Result::<Duration, Duration> {
+        return SystemTime::now().duration_since(self);
+    }
+
+    /// `d` later, or `None` if that does not fit.
+    pub fn checked_add(&self, d: Duration): Option::<SystemTime> {
+        if d.secs > 9223372036854775807 {
+            return None;
+        }
+        let mut secs = self.secs.checked_add(d.secs as i64)?;
+        let mut nanos = self.nanos + d.nanos;
+        if nanos >= NANOS_PER_SEC {
+            nanos -= NANOS_PER_SEC;
+            secs = secs.checked_add(1)?;
+        }
+        return Some(SystemTime { secs, nanos });
+    }
+
+    /// `d` earlier, or `None` if that does not fit.
+    pub fn checked_sub(&self, d: Duration): Option::<SystemTime> {
+        if d.secs > 9223372036854775807 {
+            return None;
+        }
+        let mut secs = self.secs.checked_sub(d.secs as i64)?;
+        let nanos = if self.nanos >= d.nanos {
+            self.nanos - d.nanos
+        } else {
+            secs = secs.checked_sub(1)?;
+            self.nanos + NANOS_PER_SEC - d.nanos
+        };
+        return Some(SystemTime { secs, nanos });
+    }
+}
+
+/// How long from `a` to the later `b`.
+fn span(a: SystemTime, b: SystemTime): Duration {
+    let mut secs = (b.secs as u64).wrapping_sub(a.secs as u64);
+    let nanos = if b.nanos >= a.nanos {
+        b.nanos - a.nanos
+    } else {
+        secs -= 1;
+        b.nanos + NANOS_PER_SEC - a.nanos
+    };
+    return Duration { secs, nanos };
+}
+
+/// Pause the program for at least `d` (it may be longer: Windows sleeps in
+/// whole milliseconds, and every system rounds to its scheduler).
+pub fn sleep(d: Duration) {
+    if !d.is_zero() {
+        sys::sleep_ns(d.as_nanos());
+    }
+}

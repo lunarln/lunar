@@ -1,8 +1,9 @@
-// The Lunar standard library: I/O, math, testing helpers, process control
-// and the runtime (data stacks, panics, program entry).
+// The Lunar standard library: I/O, files and time, math, testing helpers,
+// process control and the runtime (data stacks, panics, program entry).
 
 pub mod io;
 pub mod fs;
+pub mod time;
 pub mod math;
 pub mod test;
 pub mod process;
