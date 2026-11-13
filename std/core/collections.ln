@@ -223,7 +223,7 @@ struct Entries::<K: Light, V: Light> {
 impl::<K: Light, V: Light> Iterator for Entries::<K, V> {
     type Item = (K, V);
 
-    fn next(&mut self): Option::<(K, V)> {
+    fn next(&mut self): Option::<(K, V)> via self {
         while self.i < self.slots.len() {
             let s = self.slots[self.i];
             self.i += 1;
@@ -243,7 +243,7 @@ struct Keys::<K: Light, V: Light> {
 impl::<K: Light, V: Light> Iterator for Keys::<K, V> {
     type Item = K;
 
-    fn next(&mut self): Option::<K> {
+    fn next(&mut self): Option::<K> via self {
         while self.i < self.slots.len() {
             let s = self.slots[self.i];
             self.i += 1;
@@ -263,7 +263,7 @@ struct Values::<K: Light, V: Light> {
 impl::<K: Light, V: Light> Iterator for Values::<K, V> {
     type Item = V;
 
-    fn next(&mut self): Option::<V> {
+    fn next(&mut self): Option::<V> via self {
         while self.i < self.slots.len() {
             let s = self.slots[self.i];
             self.i += 1;
@@ -449,7 +449,7 @@ struct OrderedEntries::<K: Light, V: Light> {
 impl::<K: Light, V: Light> Iterator for OrderedEntries::<K, V> {
     type Item = (K, V);
 
-    fn next(&mut self): Option::<(K, V)> {
+    fn next(&mut self): Option::<(K, V)> via self {
         if self.i == self.entries.len() {
             return None;
         }
@@ -467,7 +467,7 @@ struct OrderedKeys::<K: Light, V: Light> {
 impl::<K: Light, V: Light> Iterator for OrderedKeys::<K, V> {
     type Item = K;
 
-    fn next(&mut self): Option::<K> {
+    fn next(&mut self): Option::<K> via self {
         if self.i == self.entries.len() {
             return None;
         }
@@ -485,7 +485,7 @@ struct OrderedValues::<K: Light, V: Light> {
 impl::<K: Light, V: Light> Iterator for OrderedValues::<K, V> {
     type Item = V;
 
-    fn next(&mut self): Option::<V> {
+    fn next(&mut self): Option::<V> via self {
         if self.i == self.entries.len() {
             return None;
         }
@@ -791,7 +791,7 @@ struct DequeIter::<T: Light> {
 impl::<T: Light> Iterator for DequeIter::<T> {
     type Item = T;
 
-    fn next(&mut self): Option::<T> {
+    fn next(&mut self): Option::<T> via self {
         if self.i == self.len {
             return None;
         }
@@ -931,7 +931,7 @@ struct SliceIter::<T: Light> {
 impl::<T: Light> Iterator for SliceIter::<T> {
     type Item = T;
 
-    fn next(&mut self): Option::<T> {
+    fn next(&mut self): Option::<T> via self {
         if self.i == self.items.len() {
             return None;
         }
@@ -1134,7 +1134,7 @@ struct SortedEntries::<K: Light, V: Light> {
 impl::<K: Light, V: Light> Iterator for SortedEntries::<K, V> {
     type Item = (K, V);
 
-    fn next(&mut self): Option::<(K, V)> {
+    fn next(&mut self): Option::<(K, V)> via self {
         if self.i == self.entries.len() {
             return None;
         }
@@ -1152,7 +1152,7 @@ struct SortedKeys::<K: Light, V: Light> {
 impl::<K: Light, V: Light> Iterator for SortedKeys::<K, V> {
     type Item = K;
 
-    fn next(&mut self): Option::<K> {
+    fn next(&mut self): Option::<K> via self {
         if self.i == self.entries.len() {
             return None;
         }
@@ -1170,7 +1170,7 @@ struct SortedValues::<K: Light, V: Light> {
 impl::<K: Light, V: Light> Iterator for SortedValues::<K, V> {
     type Item = V;
 
-    fn next(&mut self): Option::<V> {
+    fn next(&mut self): Option::<V> via self {
         if self.i == self.entries.len() {
             return None;
         }

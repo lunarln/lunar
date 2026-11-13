@@ -464,7 +464,7 @@ struct SplitN {
 impl Iterator for SplitN {
     type Item = str;
 
-    fn next(&mut self): Option::<str> {
+    fn next(&mut self): Option::<str> via self {
         if self.left == 0 || self.inner.done {
             return None;
         }
@@ -489,7 +489,7 @@ struct RSplit {
 impl Iterator for RSplit {
     type Item = str;
 
-    fn next(&mut self): Option::<str> {
+    fn next(&mut self): Option::<str> via self {
         if self.done || self.left == 0 {
             return None;
         }
@@ -520,7 +520,7 @@ struct SplitWhitespace {
 impl Iterator for SplitWhitespace {
     type Item = str;
 
-    fn next(&mut self): Option::<str> {
+    fn next(&mut self): Option::<str> via self {
         let s = self.rest.trim_start();
         if s.is_empty() {
             self.rest = s;
@@ -646,7 +646,7 @@ struct Split {
 impl Iterator for Split {
     type Item = str;
 
-    fn next(&mut self): Option::<str> {
+    fn next(&mut self): Option::<str> via self {
         if self.done {
             return None;
         }
@@ -676,7 +676,7 @@ struct Lines {
 impl Iterator for Lines {
     type Item = str;
 
-    fn next(&mut self): Option::<str> {
+    fn next(&mut self): Option::<str> via self {
         return match self.inner.next() {
             Some(line) => Some(if line.ends_with("\r") { line[..line.len() - 1] } else { line }),
             None => None,

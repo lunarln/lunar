@@ -190,7 +190,7 @@ pub struct Components {
 
 impl Components {
     /// The part of the path not yet returned.
-    pub fn rest(&self): str {
+    pub fn rest(&self): str via self {
         let b = self.s.as_bytes();
         let mut p = self.pos;
         if self.state == 2 {
@@ -205,7 +205,7 @@ impl Components {
 impl Iterator for Components {
     type Item = Component;
 
-    fn next(&mut self): Option::<Component> {
+    fn next(&mut self): Option::<Component> via self {
         let b = self.s.as_bytes();
         if self.state == 0 {
             self.state = 1;
