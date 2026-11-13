@@ -5,7 +5,10 @@ use core::collections::HashMap;
 use ln_ast::*;
 use ln_lexer::Token;
 use ln_parser::{Expansion, ExpansionKind};
-use crater::{Printer, ARRAY_WIDTH, CALL_WIDTH, CHAIN_WIDTH, END, IF_ELSE_WIDTH, LET_ELSE_WIDTH, SHORT_ITEM, STRUCT_LIT_WIDTH};
+use crater::{
+    ARRAY_WIDTH, CALL_WIDTH, CHAIN_WIDTH, END, IF_ELSE_WIDTH, LET_ELSE_WIDTH, Printer, SHORT_ITEM,
+    STRUCT_LIT_WIDTH,
+};
 use crater::doc::Doc;
 use crater::source::NONE;
 
@@ -109,7 +112,12 @@ impl Printer {
 
     pub fn stmt(&mut self, s: Stmt) {
         match s.kind {
-            StmtKind::Let { pat, ty, init, else_ } => {
+            StmtKind::Let {
+                pat,
+                ty,
+                init,
+                else_,
+            } => {
                 // `let Some(x) = y else { return };` on one line if short.
                 let single = match else_ {
                     Some(b) => self.just_tail(b) && !self.s.has_cmts(s.span.lo, s.span.hi),
@@ -230,8 +238,16 @@ impl Printer {
                 let open = self.s.find(self.ast.exprs.get(f).span.hi, Token::LParen);
                 self.args(open, hi - 1, args, CALL_WIDTH);
             }
-            ExprKind::MethodCall { .. } | ExprKind::Field(_, _) | ExprKind::TupleField(_, _, _) | ExprKind::Index(_, _) | ExprKind::Try(_) => self.postfix(id),
-            ExprKind::Range { start, end, inclusive } => {
+            ExprKind::MethodCall { .. }
+            | ExprKind::Field(_, _)
+            | ExprKind::TupleField(_, _, _)
+            | ExprKind::Index(_, _)
+            | ExprKind::Try(_) => self.postfix(id),
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } => {
                 let mut at = lo;
                 if let Some(x) = start {
                     self.expr(x);
@@ -450,10 +466,24 @@ impl Printer {
 
     /// The layouts of a call's arguments: flat, hugging the last one, or
     /// one a line (`broken`).
-    fn args_layout(&mut self, lp: Id::<Doc>, parts: [Id::<Doc>; &], rp: Id::<Doc>, broken: Id::<Doc>, args: List::<Id::<Expr>>, had: bool, comments: bool, limit: u32) {
+    fn args_layout(
+        &mut self,
+        lp: Id::<Doc>,
+        parts: [Id::<Doc>; &],
+        rp: Id::<Doc>,
+        broken: Id::<Doc>,
+        args: List::<Id::<Expr>>,
+        had: bool,
+        comments: bool,
+        limit: u32,
+    ) {
         let n = args.len();
         let last = self.ast.expr_ids.list(args)[n - 1];
-        let hug = if comments { HUG_NONE } else { self.hug(last, n) };
+        let hug = if comments {
+            HUG_NONE
+        } else {
+            self.hug(last, n)
+        };
         let mut i: usize = 0;
         let mut early_hard = false;
         while i + 1 < n {
@@ -538,19 +568,29 @@ impl Printer {
         let one = if n == 1 { HUG_BREAK } else { HUG_NONE };
         return match self.ast.exprs.get(e).kind {
             ExprKind::Closure(c) => match self.ast.exprs.get(c.body).kind {
-                ExprKind::Block(_) | ExprKind::Match { .. } | ExprKind::If { .. } | ExprKind::IfLet { .. } | ExprKind::Unsafe(_) => HUG_BREAK,
+                ExprKind::Block(_)
+                | ExprKind::Match { .. }
+                | ExprKind::If { .. }
+                | ExprKind::IfLet { .. }
+                | ExprKind::Unsafe(_) => HUG_BREAK,
                 _ => HUG_FLAT,
             },
             ExprKind::Block(_) | ExprKind::Unsafe(_) => HUG_BREAK,
             ExprKind::Match { .. } | ExprKind::If { .. } | ExprKind::IfLet { .. } => one,
-            ExprKind::While { .. } | ExprKind::WhileLet { .. } | ExprKind::Loop(_) | ExprKind::For { .. } => one,
+            ExprKind::While { .. }
+            | ExprKind::WhileLet { .. }
+            | ExprKind::Loop(_)
+            | ExprKind::For { .. } => one,
             ExprKind::Array(_) | ExprKind::StructLit { .. } | ExprKind::Tuple(_) => one,
             ExprKind::Call(_, _) | ExprKind::MacCall(_) => one,
             // A chain hugs only if its last call does: `f(xs.iter().map(|x| {`.
             ExprKind::MethodCall { args, .. } => {
                 if !self.is_chain(e) {
                     one
-                } else if args.len() > 0 && self.hug(self.ast.expr_ids.list(args)[args.len() - 1], args.len()) != HUG_NONE {
+                } else if args.len() > 0
+                    && self.hug(self.ast.expr_ids.list(args)[args.len() - 1], args.len())
+                        != HUG_NONE
+                {
                     one
                 } else {
                     HUG_NONE
@@ -675,14 +715,20 @@ impl Printer {
             }
             i += 1;
         }
-        let broken = if early { self.d.broken(c) } else { self.d.group(c, CHAIN_WIDTH) };
+        let broken = if early {
+            self.d.broken(c)
+        } else {
+            self.d.group(c, CHAIN_WIDTH)
+        };
         // Else the last call may hug its arguments with the chain on one
         // line: `xs.iter().map(|x| {` ... `})`. (Comments are inside the
         // pieces, which every layout shares.)
         let mut hug = !early;
         if hug {
             hug = match self.ast.exprs.get(links[0]).kind {
-                ExprKind::MethodCall { args, .. } => args.len() > 0 && self.hug(self.ast.expr_ids.list(args)[args.len() - 1], args.len()) != HUG_NONE,
+                ExprKind::MethodCall { args, .. } => args.len() > 0
+                    && self.hug(self.ast.expr_ids.list(args)[args.len() - 1], args.len())
+                        != HUG_NONE,
                 _ => false,
             };
         }
@@ -706,7 +752,9 @@ impl Printer {
     /// Whether a link of a chain starts with `.`.
     fn is_dot(&self, id: Id::<Expr>): bool {
         return match self.ast.exprs.get(id).kind {
-            ExprKind::MethodCall { .. } | ExprKind::Field(_, _) | ExprKind::TupleField(_, _, _) => true,
+            ExprKind::MethodCall { .. }
+            | ExprKind::Field(_, _)
+            | ExprKind::TupleField(_, _, _) => true,
             _ => false,
         };
     }
@@ -716,8 +764,16 @@ impl Printer {
     fn link(&mut self, id: Id::<Expr>) {
         let e = self.ast.exprs.get(id);
         match e.kind {
-            ExprKind::MethodCall { recv, name, generics, args } => {
-                self.tok(self.s.find(self.ast.exprs.get(recv).span.hi, Token::Dot), ".");
+            ExprKind::MethodCall {
+                recv,
+                name,
+                generics,
+                args,
+            } => {
+                self.tok(
+                    self.s.find(self.ast.exprs.get(recv).span.hi, Token::Dot),
+                    ".",
+                );
                 self.ident(name);
                 if let Some(g) = generics {
                     self.type_args(g);
@@ -734,7 +790,10 @@ impl Printer {
                 self.tok_src(sp.lo, sp.hi);
             }
             ExprKind::Index(x, i) => {
-                self.tok(self.s.find(self.ast.exprs.get(x).span.hi, Token::LBracket), "[");
+                self.tok(
+                    self.s.find(self.ast.exprs.get(x).span.hi, Token::LBracket),
+                    "[",
+                );
                 self.expr(i);
                 self.tok(e.span.hi - 1, "]");
             }
@@ -822,7 +881,11 @@ impl Printer {
         self.open();
         self.tok_bare(close, ")");
         let rp = self.close();
-        let trailing = if n == 1 { self.d.text(",") } else { self.trailing_comma(had) };
+        let trailing = if n == 1 {
+            self.d.text(",")
+        } else {
+            self.trailing_comma(had)
+        };
         let soft = self.d.softline();
         let g = self.list_doc(lp, parts[..], rp, trailing, soft, CALL_WIDTH);
         self.emit(g);
@@ -887,7 +950,9 @@ impl Printer {
         let mut single = false;
         if let Some(x) = else_ {
             if let ExprKind::Block(b) = self.ast.exprs.get(x).kind {
-                single = self.just_tail(then) && self.just_tail(b) && !self.s.has_cmts(e.span.lo, e.span.hi);
+                single = self.just_tail(then)
+                    && self.just_tail(b)
+                    && !self.s.has_cmts(e.span.lo, e.span.hi);
             }
         }
         if single {
@@ -913,7 +978,12 @@ impl Printer {
                 self.header_expr(cond);
                 (then, else_)
             }
-            ExprKind::IfLet { pat, scrut, then, else_ } => {
+            ExprKind::IfLet {
+                pat,
+                scrut,
+                then,
+                else_,
+            } => {
                 self.tok(self.s.find(lo + 2, Token::Let), "let");
                 self.text(" ");
                 self.pat(pat);
@@ -962,7 +1032,8 @@ impl Printer {
         self.expr(scrut);
         self.line();
         self.header_end();
-        let open = self.s.find(self.ast.exprs.get(scrut).span.hi, Token::LBrace);
+        let open = self.s
+            .find(self.ast.exprs.get(scrut).span.hi, Token::LBrace);
         let n = arms.len();
         let trailed = self.brace(open);
         if n == 0 && !self.cmt_before(close) {
@@ -992,7 +1063,10 @@ impl Printer {
         self.pat(a.pat);
         if let Some(g) = a.guard {
             self.text(" ");
-            self.tok(self.s.find(self.ast.pats.get(a.pat).span.hi, Token::If), "if");
+            self.tok(
+                self.s.find(self.ast.pats.get(a.pat).span.hi, Token::If),
+                "if",
+            );
             self.text(" ");
             self.expr(g);
         }
@@ -1132,7 +1206,14 @@ impl Printer {
         while k < self.s.toks.len() && self.s.toks[k].lo < m.span.hi {
             let t = self.s.toks[k].kind;
             let item = match t {
-                Token::Fn | Token::Struct | Token::Enum | Token::Trait | Token::Impl | Token::Use | Token::Mod | Token::Macro => true,
+                Token::Fn
+                | Token::Struct
+                | Token::Enum
+                | Token::Trait
+                | Token::Impl
+                | Token::Use
+                | Token::Mod
+                | Token::Macro => true,
                 Token::Const | Token::Static | Token::Extern | Token::Type => true,
                 _ => false,
             };
@@ -1172,7 +1253,13 @@ impl Printer {
                         return None;
                     }
                 } else {
-                    let parsed = ln_parser::parse_expansion(&mut self.ast, self.src[lo as usize..hi as usize], lo, HashMap::new(), ExpansionKind::Expr);
+                    let parsed = ln_parser::parse_expansion(
+                        &mut self.ast,
+                        self.src[lo as usize..hi as usize],
+                        lo,
+                        HashMap::new(),
+                        ExpansionKind::Expr,
+                    );
                     if parsed.diags.len() > 0 {
                         return None;
                     }

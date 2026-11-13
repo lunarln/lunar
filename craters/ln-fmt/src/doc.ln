@@ -35,7 +35,11 @@ pub enum Doc {
     Concat(List::<Id::<Doc>>),
     /// The lines inside are indented one level more.
     Indent(Id::<Doc>),
-    Group { doc: Id::<Doc>, broken: bool, limit: u32 },
+    Group {
+        doc: Id::<Doc>,
+        broken: bool,
+        limit: u32,
+    },
     Cond { alts: List::<Id::<Doc>>, limit: u32 },
     /// One or the other, as the enclosing group is broken or flat.
     IfBreak { broken: Id::<Doc>, flat: Id::<Doc> },
@@ -143,7 +147,11 @@ impl Docs {
         };
         // A group with a hard line break is broken.
         let d2 = match d {
-            Doc::Group { doc, limit, .. } => Doc::Group { doc, broken: h, limit },
+            Doc::Group { doc, limit, .. } => Doc::Group {
+                doc,
+                broken: h,
+                limit,
+            },
             _ => d,
         };
         self.hard.push(h);
@@ -172,7 +180,10 @@ impl Docs {
     pub fn text(&mut +self, s: str): Id::<Doc> {
         let lo = self.pool.len() as u32;
         self.pool.push_str(s);
-        return self.add(Doc::Text { lo, hi: self.pool.len() as u32 });
+        return self.add(Doc::Text {
+            lo,
+            hi: self.pool.len() as u32,
+        });
     }
 
     pub fn empty(&self): Id::<Doc> {
@@ -200,11 +211,19 @@ impl Docs {
     }
 
     pub fn group(&mut +self, doc: Id::<Doc>, limit: u32): Id::<Doc> {
-        return self.add(Doc::Group { doc, broken: false, limit });
+        return self.add(Doc::Group {
+            doc,
+            broken: false,
+            limit,
+        });
     }
 
     pub fn broken(&mut +self, doc: Id::<Doc>): Id::<Doc> {
-        return self.add(Doc::Group { doc, broken: true, limit: 0 });
+        return self.add(Doc::Group {
+            doc,
+            broken: true,
+            limit: 0,
+        });
     }
 
     pub fn indent(&mut +self, doc: Id::<Doc>): Id::<Doc> {
@@ -237,7 +256,11 @@ impl Docs {
     /// broken: how a last argument looks hugged by its call's parentheses.
     pub fn force_break(&mut +self, d: Id::<Doc>): Id::<Doc> {
         return match self.nodes.get(d) {
-            Doc::Group { doc, limit, .. } => self.add(Doc::Group { doc, broken: true, limit }),
+            Doc::Group { doc, limit, .. } => self.add(Doc::Group {
+                doc,
+                broken: true,
+                limit,
+            }),
             // A call or chain whose last argument hugs: hugged (and broken).
             Doc::Cond { alts, .. } => {
                 let l = self.ids.list(alts);
@@ -325,18 +348,38 @@ fn all_spaces(s: str): bool {
 /// columns flat, with what follows them (`rest`, the printer's stack) up to
 /// the next line break. The width of the start documents together may be
 /// at most `limit` (none if 0), and so for every group inside with a limit.
-fn fits(d: &Docs, src: str, start: [Cmd; &], rest: [Cmd; &], rem0: i64, limit: u32, fs: &mut [FCmd; -..+]): bool {
+fn fits(
+    d: &Docs,
+    src: str,
+    start: [Cmd; &],
+    rest: [Cmd; &],
+    rem0: i64,
+    limit: u32,
+    fs: &mut [FCmd; -..+],
+): bool {
     if rem0 < 0 {
         return false;
     }
     fs.clear();
     let mut rem = rem0;
     let mut used: i64 = 0;
-    fs.push(FCmd { mode: FLAT, doc: d.empty, end: true, lim: limit, base: 0 });
+    fs.push(FCmd {
+        mode: FLAT,
+        doc: d.empty,
+        end: true,
+        lim: limit,
+        base: 0,
+    });
     let mut i = start.len();
     while i > 0 {
         i -= 1;
-        fs.push(FCmd { mode: start[i].mode, doc: start[i].doc, end: false, lim: 0, base: 0 });
+        fs.push(FCmd {
+            mode: start[i].mode,
+            doc: start[i].doc,
+            end: false,
+            lim: 0,
+            base: 0,
+        });
     }
     let mut ri = rest.len();
     loop {
@@ -353,7 +396,13 @@ fn fits(d: &Docs, src: str, start: [Cmd; &], rest: [Cmd; &], rem0: i64, limit: u
                     // only what is left of it.
                     match d.nodes.get(r.doc) {
                         Doc::Chain { rest: links, .. } => {
-                            fs.push(FCmd { mode: r.mode, doc: links, end: false, lim: 0, base: 0 });
+                            fs.push(FCmd {
+                                mode: r.mode,
+                                doc: links,
+                                end: false,
+                                lim: 0,
+                                base: 0,
+                            });
                         }
                         Doc::Fill(l) => {
                             let parts = d.ids.list(l);
@@ -363,7 +412,13 @@ fn fits(d: &Docs, src: str, start: [Cmd; &], rest: [Cmd; &], rem0: i64, limit: u
                     }
                     continue;
                 }
-                FCmd { mode: r.mode, doc: r.doc, end: false, lim: 0, base: 0 }
+                FCmd {
+                    mode: r.mode,
+                    doc: r.doc,
+                    end: false,
+                    lim: 0,
+                    base: 0,
+                }
             }
         };
         if f.end {
@@ -421,40 +476,104 @@ fn fits(d: &Docs, src: str, start: [Cmd; &], rest: [Cmd; &], rem0: i64, limit: u
                 continue;
             }
             Doc::Indent(x) => {
-                fs.push(FCmd { mode: f.mode, doc: x, end: false, lim: 0, base: 0 });
+                fs.push(FCmd {
+                    mode: f.mode,
+                    doc: x,
+                    end: false,
+                    lim: 0,
+                    base: 0,
+                });
                 continue;
             }
-            Doc::Group { doc, broken, limit: lim } => {
+            Doc::Group {
+                doc,
+                broken,
+                limit: lim,
+            } => {
                 let mode = if broken { BREAK } else { f.mode };
                 if lim > 0 && mode == FLAT {
-                    fs.push(FCmd { mode, doc: d.empty, end: true, lim, base: used });
+                    fs.push(FCmd {
+                        mode,
+                        doc: d.empty,
+                        end: true,
+                        lim,
+                        base: used,
+                    });
                 }
-                fs.push(FCmd { mode, doc, end: false, lim: 0, base: 0 });
+                fs.push(FCmd {
+                    mode,
+                    doc,
+                    end: false,
+                    lim: 0,
+                    base: 0,
+                });
                 continue;
             }
             Doc::Cond { alts, limit: lim } => {
                 let l = d.ids.list(alts);
                 if f.mode == FLAT {
                     if lim > 0 {
-                        fs.push(FCmd { mode: FLAT, doc: d.empty, end: true, lim, base: used });
+                        fs.push(FCmd {
+                            mode: FLAT,
+                            doc: d.empty,
+                            end: true,
+                            lim,
+                            base: used,
+                        });
                     }
-                    fs.push(FCmd { mode: FLAT, doc: l[0], end: false, lim: 0, base: 0 });
+                    fs.push(FCmd {
+                        mode: FLAT,
+                        doc: l[0],
+                        end: false,
+                        lim: 0,
+                        base: 0,
+                    });
                 } else {
-                    fs.push(FCmd { mode: BREAK, doc: l[l.len() - 1], end: false, lim: 0, base: 0 });
+                    fs.push(FCmd {
+                        mode: BREAK,
+                        doc: l[l.len() - 1],
+                        end: false,
+                        lim: 0,
+                        base: 0,
+                    });
                 }
                 continue;
             }
             Doc::IfBreak { broken, flat } => {
-                fs.push(FCmd { mode: f.mode, doc: if f.mode == BREAK { broken } else { flat }, end: false, lim: 0, base: 0 });
+                fs.push(FCmd {
+                    mode: f.mode,
+                    doc: if f.mode == BREAK { broken } else { flat },
+                    end: false,
+                    lim: 0,
+                    base: 0,
+                });
                 continue;
             }
             Doc::Rhs(x) => {
                 w = 1;
-                fs.push(FCmd { mode: f.mode, doc: x, end: false, lim: 0, base: 0 });
+                fs.push(FCmd {
+                    mode: f.mode,
+                    doc: x,
+                    end: false,
+                    lim: 0,
+                    base: 0,
+                });
             }
             Doc::Chain { head, rest } => {
-                fs.push(FCmd { mode: f.mode, doc: rest, end: false, lim: 0, base: 0 });
-                fs.push(FCmd { mode: f.mode, doc: head, end: false, lim: 0, base: 0 });
+                fs.push(FCmd {
+                    mode: f.mode,
+                    doc: rest,
+                    end: false,
+                    lim: 0,
+                    base: 0,
+                });
+                fs.push(FCmd {
+                    mode: f.mode,
+                    doc: head,
+                    end: false,
+                    lim: 0,
+                    base: 0,
+                });
                 continue;
             }
         }
@@ -479,7 +598,13 @@ fn push_rev(fs: &mut +[FCmd; -..+], l: [Id::<Doc>; &], mode: u8) {
     let mut i = l.len();
     while i > 0 {
         i -= 1;
-        fs.push(FCmd { mode, doc: l[i], end: false, lim: 0, base: 0 });
+        fs.push(FCmd {
+            mode,
+            doc: l[i],
+            end: false,
+            lim: 0,
+            base: 0,
+        });
     }
 }
 
@@ -597,7 +722,11 @@ impl Out {
             }
             if first || protected(prot, start as u32) {
                 self.text.push_str(line);
-                self.pos = if first { self.pos + measure(line).0 } else { measure(line).0 };
+                self.pos = if first {
+                    self.pos + measure(line).0
+                } else {
+                    measure(line).0
+                };
             } else {
                 let lb = line.as_bytes();
                 let mut ws: usize = 0;
@@ -653,8 +782,22 @@ fn protected(prot: [Span; &], pos: u32): bool {
 /// and `Comment` documents are in; `prot` the ranges of its multi-line
 /// strings and comments, sorted.
 pub fn render(d: &Docs, src: str, prot: [Span; &], root: Id::<Doc>): String {
-    let mut o = Out { text: String::new(), pos: 0, line_ind: 0, pending: false, suffix: [], spaced: false };
-    let mut stack: [Cmd; -..+] = [Cmd { ind: 0, mode: BREAK, doc: root, k: 0 }];
+    let mut o = Out {
+        text: String::new(),
+        pos: 0,
+        line_ind: 0,
+        pending: false,
+        suffix: [],
+        spaced: false,
+    };
+    let mut stack: [Cmd; -..+] = [
+        Cmd {
+            ind: 0,
+            mode: BREAK,
+            doc: root,
+            k: 0,
+        },
+    ];
     let mut fs: [FCmd; -..+] = [];
     let none: [Cmd; -..+] = [];
     let width = WIDTH as i64;
@@ -699,46 +842,108 @@ pub fn render(d: &Docs, src: str, prot: [Span; &], root: Id::<Doc>): String {
                 let mut i = items.len();
                 while i > 0 {
                     i -= 1;
-                    stack.push(Cmd { ind: c.ind, mode: c.mode, doc: items[i], k: 0 });
+                    stack.push(Cmd {
+                        ind: c.ind,
+                        mode: c.mode,
+                        doc: items[i],
+                        k: 0,
+                    });
                 }
             }
-            Doc::Indent(x) => stack.push(Cmd { ind: c.ind + INDENT, mode: c.mode, doc: x, k: 0 }),
+            Doc::Indent(x) => stack.push(Cmd {
+                ind: c.ind + INDENT,
+                mode: c.mode,
+                doc: x,
+                k: 0,
+            }),
             Doc::Group { doc, broken, limit } => {
                 let mut mode = BREAK;
                 if !broken {
                     if c.mode == FLAT {
                         mode = FLAT;
                     } else {
-                        let start = [Cmd { ind: c.ind, mode: FLAT, doc, k: 0 }];
-                        if fits(d, src, start[..], stack[..], width - o.col(c.ind), limit, &mut fs) {
+                        let start = [
+                            Cmd {
+                                ind: c.ind,
+                                mode: FLAT,
+                                doc,
+                                k: 0,
+                            },
+                        ];
+                        if fits(
+                            d,
+                            src,
+                            start[..],
+                            stack[..],
+                            width - o.col(c.ind),
+                            limit,
+                            &mut fs,
+                        )
+                        {
                             mode = FLAT;
                         }
                     }
                 }
-                stack.push(Cmd { ind: c.ind, mode, doc, k: 0 });
+                stack.push(Cmd {
+                    ind: c.ind,
+                    mode,
+                    doc,
+                    k: 0,
+                });
             }
             Doc::Cond { alts, limit } => {
                 let l = d.ids.list(alts);
                 let n = l.len();
                 if c.mode == FLAT {
-                    stack.push(Cmd { ind: c.ind, mode: FLAT, doc: l[0], k: 0 });
+                    stack.push(Cmd {
+                        ind: c.ind,
+                        mode: FLAT,
+                        doc: l[0],
+                        k: 0,
+                    });
                 } else {
                     let mut chosen = n - 1;
                     let mut mode = BREAK;
                     let mut i: usize = 0;
                     while i + 1 < n {
-                        let start = [Cmd { ind: c.ind, mode: FLAT, doc: l[i], k: 0 }];
-                        if fits(d, src, start[..], stack[..], width - o.col(c.ind), limit, &mut fs) {
+                        let start = [
+                            Cmd {
+                                ind: c.ind,
+                                mode: FLAT,
+                                doc: l[i],
+                                k: 0,
+                            },
+                        ];
+                        if fits(
+                            d,
+                            src,
+                            start[..],
+                            stack[..],
+                            width - o.col(c.ind),
+                            limit,
+                            &mut fs,
+                        )
+                        {
                             chosen = i;
                             mode = FLAT;
                             break;
                         }
                         i += 1;
                     }
-                    stack.push(Cmd { ind: c.ind, mode, doc: l[chosen], k: 0 });
+                    stack.push(Cmd {
+                        ind: c.ind,
+                        mode,
+                        doc: l[chosen],
+                        k: 0,
+                    });
                 }
             }
-            Doc::IfBreak { broken, flat } => stack.push(Cmd { ind: c.ind, mode: c.mode, doc: if c.mode == BREAK { broken } else { flat }, k: 0 }),
+            Doc::IfBreak { broken, flat } => stack.push(Cmd {
+                ind: c.ind,
+                mode: c.mode,
+                doc: if c.mode == BREAK { broken } else { flat },
+                k: 0,
+            }),
             Doc::Fill(l) => {
                 let parts = d.ids.list(l);
                 let n = parts.len();
@@ -747,70 +952,203 @@ pub fn render(d: &Docs, src: str, prot: [Span; &], root: Id::<Doc>): String {
                     continue;
                 }
                 if c.mode == FLAT {
-                    stack.push(Cmd { ind: c.ind, mode: FLAT, doc: c.doc, k: c.k + 1 });
-                    stack.push(Cmd { ind: c.ind, mode: FLAT, doc: parts[k], k: 0 });
+                    stack.push(Cmd {
+                        ind: c.ind,
+                        mode: FLAT,
+                        doc: c.doc,
+                        k: c.k + 1,
+                    });
+                    stack.push(Cmd {
+                        ind: c.ind,
+                        mode: FLAT,
+                        doc: parts[k],
+                        k: 0,
+                    });
                     continue;
                 }
                 let rem = width - o.col(c.ind);
-                let content = [Cmd { ind: c.ind, mode: FLAT, doc: parts[k], k: 0 }];
+                let content = [
+                    Cmd {
+                        ind: c.ind,
+                        mode: FLAT,
+                        doc: parts[k],
+                        k: 0,
+                    },
+                ];
                 // The last content is followed by the list's `,`.
                 let last = k + 1 >= n;
-                let content_fits = fits(d, src, content[..], none[..], if last { rem - 1 } else { rem }, 0, &mut fs);
+                let content_fits = fits(
+                    d,
+                    src,
+                    content[..],
+                    none[..],
+                    if last { rem - 1 } else { rem },
+                    0,
+                    &mut fs,
+                );
                 let content_mode = if content_fits { FLAT } else { BREAK };
                 if last {
-                    stack.push(Cmd { ind: c.ind, mode: content_mode, doc: parts[k], k: 0 });
+                    stack.push(Cmd {
+                        ind: c.ind,
+                        mode: content_mode,
+                        doc: parts[k],
+                        k: 0,
+                    });
                     continue;
                 }
                 let three = [
-                    Cmd { ind: c.ind, mode: FLAT, doc: parts[k], k: 0 },
-                    Cmd { ind: c.ind, mode: FLAT, doc: parts[k + 1], k: 0 },
-                    Cmd { ind: c.ind, mode: FLAT, doc: parts[k + 2], k: 0 },
+                    Cmd {
+                        ind: c.ind,
+                        mode: FLAT,
+                        doc: parts[k],
+                        k: 0,
+                    },
+                    Cmd {
+                        ind: c.ind,
+                        mode: FLAT,
+                        doc: parts[k + 1],
+                        k: 0,
+                    },
+                    Cmd {
+                        ind: c.ind,
+                        mode: FLAT,
+                        doc: parts[k + 2],
+                        k: 0,
+                    },
                 ];
                 let next_last = k + 3 >= n;
-                let both = fits(d, src, three[..], none[..], if next_last { rem - 1 } else { rem }, 0, &mut fs);
-                stack.push(Cmd { ind: c.ind, mode: BREAK, doc: c.doc, k: c.k + 2 });
-                stack.push(Cmd { ind: c.ind, mode: if both { FLAT } else { BREAK }, doc: parts[k + 1], k: 0 });
-                stack.push(Cmd { ind: c.ind, mode: content_mode, doc: parts[k], k: 0 });
+                let both = fits(
+                    d,
+                    src,
+                    three[..],
+                    none[..],
+                    if next_last { rem - 1 } else { rem },
+                    0,
+                    &mut fs,
+                );
+                stack.push(Cmd {
+                    ind: c.ind,
+                    mode: BREAK,
+                    doc: c.doc,
+                    k: c.k + 2,
+                });
+                stack.push(Cmd {
+                    ind: c.ind,
+                    mode: if both { FLAT } else { BREAK },
+                    doc: parts[k + 1],
+                    k: 0,
+                });
+                stack.push(Cmd {
+                    ind: c.ind,
+                    mode: content_mode,
+                    doc: parts[k],
+                    k: 0,
+                });
             }
             Doc::Chain { head, rest } => {
                 if c.k == 0 {
                     // The head first; then this again, knowing where it began.
-                    stack.push(Cmd { ind: c.ind, mode: c.mode, doc: c.doc, k: o.text.len() as u32 + 1 });
-                    stack.push(Cmd { ind: c.ind, mode: c.mode, doc: head, k: 0 });
+                    stack.push(Cmd {
+                        ind: c.ind,
+                        mode: c.mode,
+                        doc: c.doc,
+                        k: o.text.len() as u32 + 1,
+                    });
+                    stack.push(Cmd {
+                        ind: c.ind,
+                        mode: c.mode,
+                        doc: head,
+                        k: 0,
+                    });
                 } else {
                     let start = (c.k - 1) as usize;
                     let multi = o.text.as_str()[start..].contains("\n");
                     let ind = if multi { c.ind } else { c.ind + INDENT };
-                    stack.push(Cmd { ind, mode: c.mode, doc: rest, k: 0 });
+                    stack.push(Cmd {
+                        ind,
+                        mode: c.mode,
+                        doc: rest,
+                        k: 0,
+                    });
                 }
             }
             Doc::Rhs(x) => {
                 if c.mode == FLAT {
                     o.print(src, c.ind, " ");
-                    stack.push(Cmd { ind: c.ind, mode: FLAT, doc: x, k: 0 });
+                    stack.push(Cmd {
+                        ind: c.ind,
+                        mode: FLAT,
+                        doc: x,
+                        k: 0,
+                    });
                     continue;
                 }
                 if o.pending || o.suffix.len() > 0 {
                     // After a comment: on the next line.
                     o.newline(src, c.ind + INDENT);
-                    stack.push(Cmd { ind: c.ind + INDENT, mode: BREAK, doc: x, k: 0 });
+                    stack.push(Cmd {
+                        ind: c.ind + INDENT,
+                        mode: BREAK,
+                        doc: x,
+                        k: 0,
+                    });
                     continue;
                 }
-                let same = [Cmd { ind: c.ind, mode: FLAT, doc: x, k: 0 }];
-                if fits(d, src, same[..], stack[..], width - o.col(c.ind) - 1, 0, &mut fs) {
+                let same = [
+                    Cmd {
+                        ind: c.ind,
+                        mode: FLAT,
+                        doc: x,
+                        k: 0,
+                    },
+                ];
+                if fits(
+                    d,
+                    src,
+                    same[..],
+                    stack[..],
+                    width - o.col(c.ind) - 1,
+                    0,
+                    &mut fs,
+                )
+                {
                     o.print(src, c.ind, " ");
-                    stack.push(Cmd { ind: c.ind, mode: FLAT, doc: x, k: 0 });
+                    stack.push(Cmd {
+                        ind: c.ind,
+                        mode: FLAT,
+                        doc: x,
+                        k: 0,
+                    });
                     continue;
                 }
                 let ind = c.ind + INDENT;
-                let next = [Cmd { ind, mode: FLAT, doc: x, k: 0 }];
-                if !d.is_hard(x) && fits(d, src, next[..], stack[..], width - ind as i64, 0, &mut fs) {
+                let next = [
+                    Cmd {
+                        ind,
+                        mode: FLAT,
+                        doc: x,
+                        k: 0,
+                    },
+                ];
+                if !d.is_hard(x)
+                    && fits(d, src, next[..], stack[..], width - ind as i64, 0, &mut fs)
+                {
                     o.newline(src, ind);
-                    stack.push(Cmd { ind, mode: FLAT, doc: x, k: 0 });
+                    stack.push(Cmd {
+                        ind,
+                        mode: FLAT,
+                        doc: x,
+                        k: 0,
+                    });
                     continue;
                 }
                 o.print(src, c.ind, " ");
-                stack.push(Cmd { ind: c.ind, mode: BREAK, doc: x, k: 0 });
+                stack.push(Cmd {
+                    ind: c.ind,
+                    mode: BREAK,
+                    doc: x,
+                    k: 0,
+                });
             }
         }
     }

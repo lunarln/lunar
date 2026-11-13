@@ -63,7 +63,11 @@ pub fn format_source(src: str): Result::<String, FmtError> {
         let d = parsed.diags[0];
         let mut m = String::new();
         m.push_str(parsed.ast.text(d.message));
-        return Err(FmtError { kind: FmtErrorKind::Syntax, message: m, span: d.span });
+        return Err(FmtError {
+            kind: FmtErrorKind::Syntax,
+            message: m,
+            span: d.span,
+        });
     }
     let mut before = String::new();
     ln_ast::dump(&parsed.ast, &mut before);
@@ -76,7 +80,11 @@ pub fn format_source(src: str): Result::<String, FmtError> {
         out = to_crlf(out.as_str());
     }
     if let Err(m) = verify::check(src, before.as_str(), out.as_str()) {
-        return Err(FmtError { kind: FmtErrorKind::Internal, message: m, span: Span::new(0, 0) });
+        return Err(FmtError {
+            kind: FmtErrorKind::Internal,
+            message: m,
+            span: Span::new(0, 0),
+        });
     }
     return Ok(out);
 }
@@ -336,7 +344,10 @@ impl Printer {
         if hi > self.last_end {
             self.last_end = hi;
         }
-        while self.ci < self.s.cmts.len() && self.s.cmts[self.ci].prev_end == hi && !self.s.cmts[self.ci].own_line {
+        while self.ci < self.s.cmts.len()
+            && self.s.cmts[self.ci].prev_end == hi
+            && !self.s.cmts[self.ci].own_line
+        {
             let i = self.ci;
             self.ci += 1;
             self.comment(i, 0, NONE);
@@ -355,7 +366,11 @@ impl Printer {
         while ws < lo as usize && (b[ws] == b' ' || b[ws] == b'\t') {
             ws += 1;
         }
-        self.emit_doc(Doc::Verbatim { lo, hi, indent: (ws - start) as u32 });
+        self.emit_doc(Doc::Verbatim {
+            lo,
+            hi,
+            indent: (ws - start) as u32,
+        });
         self.last_leaf = TEXT;
         // Its comments are in it.
         while self.cmt_before(hi) {
@@ -387,10 +402,18 @@ impl Printer {
                 self.hard();
             }
             if c.block && !c.newline_after {
-                self.emit_doc(Doc::Comment { lo: c.lo, hi: c.hi, kind: INLINE });
+                self.emit_doc(Doc::Comment {
+                    lo: c.lo,
+                    hi: c.hi,
+                    kind: INLINE,
+                });
                 self.text(" ");
             } else {
-                self.emit_doc(Doc::Comment { lo: c.lo, hi: c.hi, kind: OWN });
+                self.emit_doc(Doc::Comment {
+                    lo: c.lo,
+                    hi: c.hi,
+                    kind: OWN,
+                });
                 self.last_leaf = TEXT;
             }
             if flags & KEEP != 0 && c.blank_after {
@@ -404,13 +427,21 @@ impl Printer {
             if self.last_leaf == TEXT {
                 self.text(" ");
             }
-            self.emit_doc(Doc::Comment { lo: c.lo, hi: c.hi, kind: INLINE });
+            self.emit_doc(Doc::Comment {
+                lo: c.lo,
+                hi: c.hi,
+                kind: INLINE,
+            });
             self.last_leaf = TEXT;
             if (c.end as usize) < self.src.len() && self.src.as_bytes()[c.end as usize] == b' ' {
                 self.text(" ");
             }
         } else {
-            self.emit_doc(Doc::Comment { lo: c.lo, hi: c.hi, kind: TRAILING });
+            self.emit_doc(Doc::Comment {
+                lo: c.lo,
+                hi: c.hi,
+                kind: TRAILING,
+            });
             self.last_leaf = TEXT;
         }
         if c.end > self.last_end {
@@ -433,8 +464,14 @@ impl Printer {
     /// An empty line if the source has one between what was printed last
     /// and what comes next (a comment, or `lo`).
     fn blank_before(&mut self, lo: u32) {
-        let next = if self.cmt_before(lo) { self.s.cmts[self.ci].lo } else { lo };
-        if self.last_end < next && newlines(self.src.as_bytes(), self.last_end as usize, next as usize) > 1 {
+        let next = if self.cmt_before(lo) {
+            self.s.cmts[self.ci].lo
+        } else {
+            lo
+        };
+        if self.last_end < next
+            && newlines(self.src.as_bytes(), self.last_end as usize, next as usize) > 1
+        {
             self.hard();
         }
     }
@@ -477,7 +514,15 @@ impl Printer {
     /// `(a, b)`; broken: an item a line, with `trailing` after the last
     /// (see `trailing_comma`). `edge` is the line inside the brackets:
     /// `SoftLine`, or `Line` for `{ a }`.
-    fn list_doc(&mut self, open: Id::<Doc>, parts: [Id::<Doc>; &], close: Id::<Doc>, trailing: Id::<Doc>, edge: Id::<Doc>, limit: u32): Id::<Doc> {
+    fn list_doc(
+        &mut self,
+        open: Id::<Doc>,
+        parts: [Id::<Doc>; &],
+        close: Id::<Doc>,
+        trailing: Id::<Doc>,
+        edge: Id::<Doc>,
+        limit: u32,
+    ): Id::<Doc> {
         let comma = self.d.text(",");
         let line = self.d.line();
         let mut inner: [Id::<Doc>; -..+] = [edge];
@@ -506,7 +551,11 @@ impl Printer {
     /// macro's arguments, whatever the source has.
     fn trailing_comma(&mut self, had: bool): Id::<Doc> {
         if self.in_macro > 0 {
-            return if had { self.d.text(",") } else { self.d.empty() };
+            return if had {
+                self.d.text(",")
+            } else {
+                self.d.empty()
+            };
         }
         let c = self.d.text(",");
         let e = self.d.empty();

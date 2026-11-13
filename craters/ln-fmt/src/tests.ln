@@ -110,12 +110,16 @@ fn try_text(what: str, text: str, t: &mut Tally) {
         Ok(again) => {
             if again.as_str() != out.as_str() {
                 t.failures += 1;
-                t.report.write("{what}: not idempotent near `{first_diff(out.as_str(), again.as_str())}`\n");
+                t.report
+                    .write(
+                        "{what}: not idempotent near `{first_diff(out.as_str(), again.as_str())}`\n",
+                    );
             }
         }
         Err(e) => {
             t.failures += 1;
-            t.report.write("{what}: formatting its output failed: {e.message}\n");
+            t.report
+                .write("{what}: formatting its output failed: {e.message}\n");
         }
     }
 }
@@ -161,7 +165,13 @@ fn every_file_in_the_repository() {
     let mut docs = String::from(root.as_str());
     docs.push_str("/docs/errors");
     files(docs.as_str(), ".md", &mut names, &mut ends);
-    let mut t = Tally { files: 0, syntax: 0, changed: 0, failures: 0, report: String::new() };
+    let mut t = Tally {
+        files: 0,
+        syntax: 0,
+        changed: 0,
+        failures: 0,
+        report: String::new(),
+    };
     let mut start: usize = 0;
     for k in 0..ends.len() {
         let path = names.as_str()[start..ends[k]];
@@ -192,7 +202,9 @@ fn every_file_in_the_repository() {
             }
         }
     }
-    println("{t.files} texts: {t.changed} would change, {t.syntax} have syntax errors, {t.failures} failures");
+    println(
+        "{t.files} texts: {t.changed} would change, {t.syntax} have syntax errors, {t.failures} failures",
+    );
     if t.failures > 0 {
         panic("{t.report}");
     }
@@ -203,10 +215,19 @@ fn every_file_in_the_repository() {
 #[test]
 fn functions() {
     check("fn  main ( ) {  }", "fn main() {}\n");
-    check("pub fn add(a:i32,b:i32):i32{return a+b;}", "pub fn add(a: i32, b: i32): i32 {\n    return a + b;\n}\n");
-    check("unsafe  fn raw ( ) : i32 { 1 }", "unsafe fn raw(): i32 {\n    1\n}\n");
+    check(
+        "pub fn add(a:i32,b:i32):i32{return a+b;}",
+        "pub fn add(a: i32, b: i32): i32 {\n    return a + b;\n}\n",
+    );
+    check(
+        "unsafe  fn raw ( ) : i32 { 1 }",
+        "unsafe fn raw(): i32 {\n    1\n}\n",
+    );
     // Generic parameters with `::<>`, bounds with ` + `.
-    check("fn max::<T:Ord+Clone,U>(a:T,b:U){}", "fn max::<T: Ord + Clone, U>(a: T, b: U) {}\n");
+    check(
+        "fn max::<T:Ord+Clone,U>(a:T,b:U){}",
+        "fn max::<T: Ord + Clone, U>(a: T, b: U) {}\n",
+    );
     // Parameters that do not fit go one a line, with a trailing comma.
     check(
         "fn long_function_name(first_argument: SomeLongType, second_argument: AnotherLongType): ReturnTypeXY { x }",
@@ -238,23 +259,45 @@ fn functions() {
 ",
     );
     // A line of exactly 100 columns fits.
-    keep("fn long_function_name(first_argument: SomeLongType, second_argument: AnotherLongType): ReturnType {}\n");
+    keep(
+        "fn long_function_name(first_argument: SomeLongType, second_argument: AnotherLongType): ReturnType {}\n",
+    );
     // Without a body, in traits and extern blocks.
-    check("trait T { fn f(&self) ; fn g(&mut self):(); }", "trait T {\n    fn f(&self);\n    fn g(&mut self): ();\n}\n");
+    check(
+        "trait T { fn f(&self) ; fn g(&mut self):(); }",
+        "trait T {\n    fn f(&self);\n    fn g(&mut self): ();\n}\n",
+    );
 }
 
 #[test]
 fn parameter_modes() {
     keep("fn f(a: T, b: &T, c: &mut T, d: &mut +T, mut e: T, _: T) {}\n");
-    keep("impl S {\n    fn a(self) {}\n    fn b(mut self) {}\n    fn c(&self) {}\n    fn d(&mut self) {}\n    fn e(&mut +self) {}\n}\n");
-    check("fn set(&mut self,kept s:str,kept mut t:&T){}", "fn set(&mut self, kept s: str, kept mut t: &T) {}\n");
+    keep(
+        "impl S {\n    fn a(self) {}\n    fn b(mut self) {}\n    fn c(&self) {}\n    fn d(&mut self) {}\n    fn e(&mut +self) {}\n}\n",
+    );
+    check(
+        "fn set(&mut self,kept s:str,kept mut t:&T){}",
+        "fn set(&mut self, kept s: str, kept mut t: &T) {}\n",
+    );
     // A parameter may be named `kept`.
     keep("fn f(kept: i32) {}\n");
     // `from` after the return type.
-    check("fn first(a:&String,b:&String):str from a{a.as_str()}", "fn first(a: &String, b: &String): str from a {\n    a.as_str()\n}\n");
-    check("fn both(a:&String,b:&String):str from a,b;", "fn both(a: &String, b: &String): str from a, b;\n");
-    check("fn kind(a:&String):str from static;", "fn kind(a: &String): str from static;\n");
-    check("fn view(&self):str from self;", "fn view(&self): str from self;\n");
+    check(
+        "fn first(a:&String,b:&String):str from a{a.as_str()}",
+        "fn first(a: &String, b: &String): str from a {\n    a.as_str()\n}\n",
+    );
+    check(
+        "fn both(a:&String,b:&String):str from a,b;",
+        "fn both(a: &String, b: &String): str from a, b;\n",
+    );
+    check(
+        "fn kind(a:&String):str from static;",
+        "fn kind(a: &String): str from static;\n",
+    );
+    check(
+        "fn view(&self):str from self;",
+        "fn view(&self): str from self;\n",
+    );
 }
 
 #[test]
@@ -263,18 +306,42 @@ fn types() {
         "type A=([u8;4],[u8;_],[u8],[u8;..+],[u8;-..+],[u8;&],[u8;&mut]);",
         "type A = ([u8; 4], [u8; _], [u8], [u8; ..+], [u8; -..+], [u8; &], [u8; &mut]);\n",
     );
-    check("type P=(*u8,*mut u8,!,(),(i32,));", "type P = (*u8, *mut u8, !, (), (i32,));\n");
-    check("type F=fn(i32,&String,&mut u8):bool;", "type F = fn(i32, &String, &mut u8): bool;\n");
-    check("type G=Pair::<Option::<i32>,HashMap::<K,V>>;", "type G = Pair::<Option::<i32>, HashMap::<K, V>>;\n");
-    check("fn f::<F:Fn(&String):usize+Clone>(f:F){}", "fn f::<F: Fn(&String): usize + Clone>(f: F) {}\n");
-    check("fn adder(n:i32):impl Fn(i32):i32{move|x|x+n}", "fn adder(n: i32): impl Fn(i32): i32 {\n    move |x| x + n\n}\n");
-    check("fn g(x:&mut +String,y:[str;..+]){}", "fn g(x: &mut +String, y: [str; ..+]) {}\n");
+    check(
+        "type P=(*u8,*mut u8,!,(),(i32,));",
+        "type P = (*u8, *mut u8, !, (), (i32,));\n",
+    );
+    check(
+        "type F=fn(i32,&String,&mut u8):bool;",
+        "type F = fn(i32, &String, &mut u8): bool;\n",
+    );
+    check(
+        "type G=Pair::<Option::<i32>,HashMap::<K,V>>;",
+        "type G = Pair::<Option::<i32>, HashMap::<K, V>>;\n",
+    );
+    check(
+        "fn f::<F:Fn(&String):usize+Clone>(f:F){}",
+        "fn f::<F: Fn(&String): usize + Clone>(f: F) {}\n",
+    );
+    check(
+        "fn adder(n:i32):impl Fn(i32):i32{move|x|x+n}",
+        "fn adder(n: i32): impl Fn(i32): i32 {\n    move |x| x + n\n}\n",
+    );
+    check(
+        "fn g(x:&mut +String,y:[str;..+]){}",
+        "fn g(x: &mut +String, y: [str; ..+]) {}\n",
+    );
 }
 
 #[test]
 fn structs_and_enums() {
-    check("struct Point{pub x:i32,y:i32}", "struct Point {\n    pub x: i32,\n    y: i32,\n}\n");
-    check("struct Pair::<T>(pub T,T);", "struct Pair::<T>(pub T, T);\n");
+    check(
+        "struct Point{pub x:i32,y:i32}",
+        "struct Point {\n    pub x: i32,\n    y: i32,\n}\n",
+    );
+    check(
+        "struct Pair::<T>(pub T,T);",
+        "struct Pair::<T>(pub T, T);\n",
+    );
     check("struct Unit ;", "struct Unit;\n");
     check("struct Empty{}", "struct Empty {}\n");
     check(
@@ -286,21 +353,36 @@ fn structs_and_enums() {
         "enum E { Long { first_field: SomeType, second_field: OtherType } }",
         "enum E {\n    Long {\n        first_field: SomeType,\n        second_field: OtherType,\n    },\n}\n",
     );
-    check("#[derive(Eq,Debug)] enum K { #[default] A, B }", "#[derive(Eq,Debug)]\nenum K {\n    #[default]\n    A,\n    B,\n}\n");
+    check(
+        "#[derive(Eq,Debug)] enum K { #[default] A, B }",
+        "#[derive(Eq,Debug)]\nenum K {\n    #[default]\n    A,\n    B,\n}\n",
+    );
 }
 
 #[test]
 fn traits_and_impls() {
-    check("pub trait Show:Display+Debug{fn show(&self):str;}", "pub trait Show: Display + Debug {\n    fn show(&self): str;\n}\n");
-    check("impl::<T:Dull> Show for Pair::<T>{}", "impl::<T: Dull> Show for Pair::<T> {}\n");
+    check(
+        "pub trait Show:Display+Debug{fn show(&self):str;}",
+        "pub trait Show: Display + Debug {\n    fn show(&self): str;\n}\n",
+    );
+    check(
+        "impl::<T:Dull> Show for Pair::<T>{}",
+        "impl::<T: Dull> Show for Pair::<T> {}\n",
+    );
     check("impl !Send for P {}", "impl !Send for P {}\n");
-    check("impl Point{fn new():Point{Point{x:0,y:0}}}", "impl Point {\n    fn new(): Point {\n        Point { x: 0, y: 0 }\n    }\n}\n");
+    check(
+        "impl Point{fn new():Point{Point{x:0,y:0}}}",
+        "impl Point {\n    fn new(): Point {\n        Point { x: 0, y: 0 }\n    }\n}\n",
+    );
 }
 
 #[test]
 fn other_items() {
     check("mod shapes ;", "mod shapes;\n");
-    check("pub mod inline{fn f(){}}", "pub mod inline {\n    fn f() {}\n}\n");
+    check(
+        "pub mod inline{fn f(){}}",
+        "pub mod inline {\n    fn f() {}\n}\n",
+    );
     check("const N:usize=4;", "const N: usize = 4;\n");
     check("static mut COUNT:u64=0;", "static mut COUNT: u64 = 0;\n");
     check("type Bytes=[u8;&];", "type Bytes = [u8; &];\n");
@@ -312,12 +394,21 @@ fn other_items() {
 
 #[test]
 fn use_lists_are_sorted() {
-    check("use std::io::{println as say,print};", "use std::io::{print, println as say};\n");
-    check("use a::{Z,b,self,C,a10,a9};", "use a::{self, C, Z, a9, a10, b};\n");
+    check(
+        "use std::io::{println as say,print};",
+        "use std::io::{print, println as say};\n",
+    );
+    check(
+        "use a::{Z,b,self,C,a10,a9};",
+        "use a::{self, C, Z, a9, a10, b};\n",
+    );
     check("use crater::shapes::*;", "use crater::shapes::*;\n");
     check("use a::{b::{d,c},a};", "use a::{a, b::{c, d}};\n");
     // A glob after the names, a renaming after the name.
-    check("use crater::a::{b::{c,d},e as f,*,e};", "use crater::a::{b::{c, d}, e, e as f, *};\n");
+    check(
+        "use crater::a::{b::{c,d},e as f,*,e};",
+        "use crater::a::{b::{c, d}, e, e as f, *};\n",
+    );
     // Too long for a line: filled.
     check(
         "use ln_ast::{Block, ConstDecl, EnumDecl, FnDecl, ImplDecl, MacroDef, Span, StaticDecl, StructDecl, TraitDecl, TypeAlias};",
@@ -328,27 +419,56 @@ fn use_lists_are_sorted() {
 ",
     );
     // With comments inside, the order is kept.
-    check("use a::{c, // see\n b};", "use a::{\n    c, // see\n    b,\n};\n");
+    check(
+        "use a::{c, // see\n b};",
+        "use a::{\n    c, // see\n    b,\n};\n",
+    );
 }
 
 #[test]
 fn statements() {
-    check("fn f(){let x=1;let mut y:i32=2;let (a,b)=(1,2);x+=1;y=x;}", "fn f() {\n    let x = 1;\n    let mut y: i32 = 2;\n    let (a, b) = (1, 2);\n    x += 1;\n    y = x;\n}\n");
+    check(
+        "fn f(){let x=1;let mut y:i32=2;let (a,b)=(1,2);x+=1;y=x;}",
+        "fn f() {\n    let x = 1;\n    let mut y: i32 = 2;\n    let (a, b) = (1, 2);\n    x += 1;\n    y = x;\n}\n",
+    );
     // At most one empty line in a row; none at the start or end of a block.
-    check("fn f() {\n\n    a();\n\n\n    b();\n\n}\n", "fn f() {\n    a();\n\n    b();\n}\n");
+    check(
+        "fn f() {\n\n    a();\n\n\n    b();\n\n}\n",
+        "fn f() {\n    a();\n\n    b();\n}\n",
+    );
     // `let ... else`: on one line if short.
-    check("fn f(){let Some(v)=m else{return};}", "fn f() {\n    let Some(v) = m else { return };\n}\n");
-    check("fn f(){let Some(v)=m else{return;};}", "fn f() {\n    let Some(v) = m else {\n        return;\n    };\n}\n");
+    check(
+        "fn f(){let Some(v)=m else{return};}",
+        "fn f() {\n    let Some(v) = m else { return };\n}\n",
+    );
+    check(
+        "fn f(){let Some(v)=m else{return;};}",
+        "fn f() {\n    let Some(v) = m else {\n        return;\n    };\n}\n",
+    );
     // Block-like statements keep (or not) their `;`.
-    keep("fn f() {\n    if a {\n        b();\n    }\n    match x {\n        _ => {}\n    };\n    unsafe { g() };\n}\n");
+    keep(
+        "fn f() {\n    if a {\n        b();\n    }\n    match x {\n        _ => {}\n    };\n    unsafe { g() };\n}\n",
+    );
 }
 
 #[test]
 fn operators() {
-    check("fn f(){x=a+b*c-d/e%f;y=!a&&-b||*c;z=&mut v;w=& &v;}", "fn f() {\n    x = a + b * c - d / e % f;\n    y = !a && -b || *c;\n    z = &mut v;\n    w = & &v;\n}\n");
-    check("fn f(){a>>=1;b=c>>2;d=e>=f;g=h<<3;}", "fn f() {\n    a >>= 1;\n    b = c >> 2;\n    d = e >= f;\n    g = h << 3;\n}\n");
-    check("fn f(){for i in 0..n{} for j in 0..=n{} let s=a[1..];let t=a[..2];let u=x as u64;}", "fn f() {\n    for i in 0..n {}\n    for j in 0..=n {}\n    let s = a[1..];\n    let t = a[..2];\n    let u = x as u64;\n}\n");
-    check("fn f(){let r=1. ..2.;}", "fn f() {\n    let r = 1. ..2.;\n}\n");
+    check(
+        "fn f(){x=a+b*c-d/e%f;y=!a&&-b||*c;z=&mut v;w=& &v;}",
+        "fn f() {\n    x = a + b * c - d / e % f;\n    y = !a && -b || *c;\n    z = &mut v;\n    w = & &v;\n}\n",
+    );
+    check(
+        "fn f(){a>>=1;b=c>>2;d=e>=f;g=h<<3;}",
+        "fn f() {\n    a >>= 1;\n    b = c >> 2;\n    d = e >= f;\n    g = h << 3;\n}\n",
+    );
+    check(
+        "fn f(){for i in 0..n{} for j in 0..=n{} let s=a[1..];let t=a[..2];let u=x as u64;}",
+        "fn f() {\n    for i in 0..n {}\n    for j in 0..=n {}\n    let s = a[1..];\n    let t = a[..2];\n    let u = x as u64;\n}\n",
+    );
+    check(
+        "fn f(){let r=1. ..2.;}",
+        "fn f() {\n    let r = 1. ..2.;\n}\n",
+    );
     // Long chains of one operator break before it.
     check(
         "fn f() { if first_condition_is_long(a) && second_condition_is_longer(b) && third_condition(c) && fourth(d) { x(); } }",
@@ -410,9 +530,13 @@ fn calls_and_chains() {
 }
 ",
     );
-    keep("fn f() {\n    call_something(first_argument_value, second_argument_value, third_value_xyz);\n}\n");
+    keep(
+        "fn f() {\n    call_something(first_argument_value, second_argument_value, third_value_xyz);\n}\n",
+    );
     // A single argument may be as wide as the line.
-    keep("fn f() {\n    println(\"a long format string with {holes} that is wider than sixty columns, see\");\n}\n");
+    keep(
+        "fn f() {\n    println(\"a long format string with {holes} that is wider than sixty columns, see\");\n}\n",
+    );
     // A chain whose head breaks keeps its links at the head's indentation.
     check(
         "fn f() { let e = ProjectError::new(manifest::WORKSPACE(), \"this workspace has several programs; pick one\").note(\"programs: {names}\").help(\"`lunar run -p {first}`\"); }",
@@ -506,19 +630,31 @@ fn calls_and_chains() {
 }
 ",
     );
-    check("fn f(){x.y.z;a.b().c()?;t.0.1;v[i][j];}", "fn f() {\n    x.y.z;\n    a.b().c()?;\n    t.0.1;\n    v[i][j];\n}\n");
-    check("fn f(){let x=size_of::<T>();p.get::<u8>(1);}", "fn f() {\n    let x = size_of::<T>();\n    p.get::<u8>(1);\n}\n");
+    check(
+        "fn f(){x.y.z;a.b().c()?;t.0.1;v[i][j];}",
+        "fn f() {\n    x.y.z;\n    a.b().c()?;\n    t.0.1;\n    v[i][j];\n}\n",
+    );
+    check(
+        "fn f(){let x=size_of::<T>();p.get::<u8>(1);}",
+        "fn f() {\n    let x = size_of::<T>();\n    p.get::<u8>(1);\n}\n",
+    );
 }
 
 #[test]
 fn literals() {
     // Struct literals wider than `struct_lit_width` go one field a line.
-    check("fn f(){let p=Point{x:1,y};}", "fn f() {\n    let p = Point { x: 1, y };\n}\n");
+    check(
+        "fn f(){let p=Point{x:1,y};}",
+        "fn f() {\n    let p = Point { x: 1, y };\n}\n",
+    );
     check(
         "fn f(){let r=Range{start:begin,end:finish};}",
         "fn f() {\n    let r = Range {\n        start: begin,\n        end: finish,\n    };\n}\n",
     );
-    check("fn f(){let a=[1,2,3];let b=[0;8];let e=[];let t=(1,);let u=();}", "fn f() {\n    let a = [1, 2, 3];\n    let b = [0; 8];\n    let e = [];\n    let t = (1,);\n    let u = ();\n}\n");
+    check(
+        "fn f(){let a=[1,2,3];let b=[0;8];let e=[];let t=(1,);let u=();}",
+        "fn f() {\n    let a = [1, 2, 3];\n    let b = [0; 8];\n    let e = [];\n    let t = (1,);\n    let u = ();\n}\n",
+    );
     // Short items fill lines.
     check(
         "fn f(){let a=[100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000, 1100000];}",
@@ -530,15 +666,26 @@ fn literals() {
 ",
     );
     // Literals are kept as written, and format strings with their holes.
-    keep("fn f() {\n    let x = 0xff_u8 + 1_000 + 1.5e3;\n    println(\"{x}  {m.get(\"k\")}{{\");\n    let c = '\\n';\n    let b = b'a';\n}\n");
+    keep(
+        "fn f() {\n    let x = 0xff_u8 + 1_000 + 1.5e3;\n    println(\"{x}  {m.get(\"k\")}{{\");\n    let c = '\\n';\n    let b = b'a';\n}\n",
+    );
 }
 
 #[test]
 fn control_flow() {
-    check("fn f(){if a{b()}else if c{d()}else{e()}}", "fn f() {\n    if a {\n        b()\n    } else if c {\n        d()\n    } else {\n        e()\n    }\n}\n");
+    check(
+        "fn f(){if a{b()}else if c{d()}else{e()}}",
+        "fn f() {\n    if a {\n        b()\n    } else if c {\n        d()\n    } else {\n        e()\n    }\n}\n",
+    );
     // A short `if ... else` expression stays on one line.
-    check("fn f(){let x=if a>b{a}else{b};}", "fn f() {\n    let x = if a > b { a } else { b };\n}\n");
-    check("fn f(){if let Some(x)=y{z(x);}while let Some(v)=it.next(){} while i<n{i+=1;} loop{break;}}", "fn f() {\n    if let Some(x) = y {\n        z(x);\n    }\n    while let Some(v) = it.next() {}\n    while i < n {\n        i += 1;\n    }\n    loop {\n        break;\n    }\n}\n");
+    check(
+        "fn f(){let x=if a>b{a}else{b};}",
+        "fn f() {\n    let x = if a > b { a } else { b };\n}\n",
+    );
+    check(
+        "fn f(){if let Some(x)=y{z(x);}while let Some(v)=it.next(){} while i<n{i+=1;} loop{break;}}",
+        "fn f() {\n    if let Some(x) = y {\n        z(x);\n    }\n    while let Some(v) = it.next() {}\n    while i < n {\n        i += 1;\n    }\n    loop {\n        break;\n    }\n}\n",
+    );
     check(
         "fn f(){match s{Shape::Circle(r)|Shape::Square(r)=>r,Shape::Rect{w,h:height}=>{w*height}_ if x>1=>{let a=1;a}_=>0.0}}",
         "fn f() {
@@ -554,7 +701,10 @@ fn control_flow() {
 }
 ",
     );
-    check("fn f(){let v=loop{if done(){break 42;}};return;}", "fn f() {\n    let v = loop {\n        if done() {\n            break 42;\n        }\n    };\n    return;\n}\n");
+    check(
+        "fn f(){let v=loop{if done(){break 42;}};return;}",
+        "fn f() {\n    let v = loop {\n        if done() {\n            break 42;\n        }\n    };\n    return;\n}\n",
+    );
 }
 
 #[test]
@@ -579,14 +729,20 @@ fn patterns() {
 
 #[test]
 fn closures() {
-    check("fn f(){let a=|x:i32|x+k;let b=||c+=1;let c=move||n;let d=|x:i32|:i32{x};let e=|_,mut y:&mut i32|y;}", "fn f() {\n    let a = |x: i32| x + k;\n    let b = || c += 1;\n    let c = move || n;\n    let d = |x: i32|: i32 { x };\n    let e = |_, mut y: &mut i32| y;\n}\n");
+    check(
+        "fn f(){let a=|x:i32|x+k;let b=||c+=1;let c=move||n;let d=|x:i32|:i32{x};let e=|_,mut y:&mut i32|y;}",
+        "fn f() {\n    let a = |x: i32| x + k;\n    let b = || c += 1;\n    let c = move || n;\n    let d = |x: i32|: i32 { x };\n    let e = |_, mut y: &mut i32| y;\n}\n",
+    );
 }
 
 #[test]
 fn macros() {
     // A macro call whose arguments are expressions is formatted as a call
     // (its trailing comma, or none, kept).
-    check("fn f(){assert_eq!(a,b);assert!(x,);}", "fn f() {\n    assert_eq!(a, b);\n    assert!(x,);\n}\n");
+    check(
+        "fn f(){assert_eq!(a,b);assert!(x,);}",
+        "fn f() {\n    assert_eq!(a, b);\n    assert!(x,);\n}\n",
+    );
     check(
         "fn f(){assert_eq!(kinds(\"1.5e3 2e-1 7u8\").as_str(), \"Number(Float) Number(Float) Number(Int)\");}",
         "fn f() {
@@ -598,36 +754,65 @@ fn macros() {
 ",
     );
     // Other token trees keep their layout, moved with their line.
-    check("fn f(){\n  m!(a;  b);\n  n! { x  y }\n}\n", "fn f() {\n    m!(a;  b);\n    n! { x  y }\n}\n");
+    check(
+        "fn f(){\n  m!(a;  b);\n  n! { x  y }\n}\n",
+        "fn f() {\n    m!(a;  b);\n    n! { x  y }\n}\n",
+    );
     // So do macro definitions.
     keep("pub macro square($x:expr) {\n    let t = $x;     // cannot clash\n    t * t\n}\n");
-    keep("macro max {\n    ($x:expr) => { $x },\n    ($x:expr, $($rest:expr),+) => {\n        let a = $x;\n        a\n    },\n}\n");
-    check("mod m {\nmacro twice {\n    ($x:expr) => {\n        $x + $x\n    },\n}\n}\n", "mod m {\n    macro twice {\n        ($x:expr) => {\n            $x + $x\n        },\n    }\n}\n");
+    keep(
+        "macro max {\n    ($x:expr) => { $x },\n    ($x:expr, $($rest:expr),+) => {\n        let a = $x;\n        a\n    },\n}\n",
+    );
+    check(
+        "mod m {\nmacro twice {\n    ($x:expr) => {\n        $x + $x\n    },\n}\n}\n",
+        "mod m {\n    macro twice {\n        ($x:expr) => {\n            $x + $x\n        },\n    }\n}\n",
+    );
     // Strings in token trees keep their lines.
-    check("mod m {\nmacro s {\n    () => { \"a\nb\" },\n}\n}\n", "mod m {\n    macro s {\n        () => { \"a\nb\" },\n    }\n}\n");
+    check(
+        "mod m {\nmacro s {\n    () => { \"a\nb\" },\n}\n}\n",
+        "mod m {\n    macro s {\n        () => { \"a\nb\" },\n    }\n}\n",
+    );
 }
 
 // ===================================================================== comments
 
 #[test]
 fn comments_between_items() {
-    keep("// A file comment.\n\n/// Docs.\n/// More docs.\n#[test]\nfn a() {}\n\n// Between.\nfn b() {} // Trailing.\n\n/* Block. */\nfn c() {}\n// At the end.\n");
+    keep(
+        "// A file comment.\n\n/// Docs.\n/// More docs.\n#[test]\nfn a() {}\n\n// Between.\nfn b() {} // Trailing.\n\n/* Block. */\nfn c() {}\n// At the end.\n",
+    );
     // A doc comment after the attributes.
     keep("#[inline]\n/// Docs.\nfn a() {}\n");
-    check("fn a() {}   // trailing   \n//! inner\nfn b() {}", "fn a() {} // trailing\n//! inner\nfn b() {}\n");
+    check(
+        "fn a() {}   // trailing   \n//! inner\nfn b() {}",
+        "fn a() {} // trailing\n//! inner\nfn b() {}\n",
+    );
 }
 
 #[test]
 fn comments_in_blocks() {
-    keep("fn f() {\n    // First.\n    let x = 1; // After x.\n\n    // Before y.\n    let y = 2;\n    // Last.\n}\n");
+    keep(
+        "fn f() {\n    // First.\n    let x = 1; // After x.\n\n    // Before y.\n    let y = 2;\n    // Last.\n}\n",
+    );
     // In empty blocks.
     keep("fn f() {\n    // Nothing yet.\n}\n");
-    check("fn f() { // Nothing yet.\n}", "fn f() { // Nothing yet.\n}\n");
-    check("fn f() {\n    if a { // Why.\n        b();\n    }\n}\n", "fn f() {\n    if a { // Why.\n        b();\n    }\n}\n");
+    check(
+        "fn f() { // Nothing yet.\n}",
+        "fn f() { // Nothing yet.\n}\n",
+    );
+    check(
+        "fn f() {\n    if a { // Why.\n        b();\n    }\n}\n",
+        "fn f() {\n    if a { // Why.\n        b();\n    }\n}\n",
+    );
     keep("fn f() {\n    loop {\n        // Waiting.\n    }\n}\n");
     // Before `else`.
-    keep("fn f() {\n    if a {\n        b();\n    }\n    // Otherwise.\n    else {\n        c();\n    }\n}\n");
-    check("fn f() {\n    if a {\n        b();\n    } // Otherwise.\n    else {\n        c();\n    }\n}\n", "fn f() {\n    if a {\n        b();\n    } // Otherwise.\n    else {\n        c();\n    }\n}\n");
+    keep(
+        "fn f() {\n    if a {\n        b();\n    }\n    // Otherwise.\n    else {\n        c();\n    }\n}\n",
+    );
+    check(
+        "fn f() {\n    if a {\n        b();\n    } // Otherwise.\n    else {\n        c();\n    }\n}\n",
+        "fn f() {\n    if a {\n        b();\n    } // Otherwise.\n    else {\n        c();\n    }\n}\n",
+    );
 }
 
 #[test]
@@ -641,7 +826,10 @@ fn comments_in_lists() {
         "fn f() { call(\n    // before a\n    a,\n    b, // after b\n); }",
         "fn f() {\n    call(\n        // before a\n        a,\n        b, // after b\n    );\n}\n",
     );
-    check("fn f() { call(a /* inline */, b); }", "fn f() {\n    call(a /* inline */, b);\n}\n");
+    check(
+        "fn f() { call(a /* inline */, b); }",
+        "fn f() {\n    call(a /* inline */, b);\n}\n",
+    );
     check(
         "fn f(\n    a: i32, // the first\n    b: i32,\n) {}",
         "fn f(\n    a: i32, // the first\n    b: i32,\n) {}\n",
@@ -655,20 +843,34 @@ fn comments_in_lists() {
         "fn f() {\n    let p = P {\n        a: 1, // one\n        b: 2,\n    };\n}\n",
     );
     // After the last item.
-    check("fn f() { call(a, b // last\n); }", "fn f() {\n    call(\n        a,\n        b, // last\n    );\n}\n");
+    check(
+        "fn f() { call(a, b // last\n); }",
+        "fn f() {\n    call(\n        a,\n        b, // last\n    );\n}\n",
+    );
 }
 
 #[test]
 fn comments_in_match_arms() {
-    keep("fn f() {\n    match x {\n        // The first.\n        A => 1, // One.\n\n        // The second.\n        B => {\n            // Inside.\n            2\n        }\n        // Nothing after.\n    }\n}\n");
-    check("fn f() {\n    match x {\n        A => // why\n            1,\n    }\n}\n", "fn f() {\n    match x {\n        A => // why\n            1,\n    }\n}\n");
+    keep(
+        "fn f() {\n    match x {\n        // The first.\n        A => 1, // One.\n\n        // The second.\n        B => {\n            // Inside.\n            2\n        }\n        // Nothing after.\n    }\n}\n",
+    );
+    check(
+        "fn f() {\n    match x {\n        A => // why\n            1,\n    }\n}\n",
+        "fn f() {\n    match x {\n        A => // why\n            1,\n    }\n}\n",
+    );
 }
 
 #[test]
 fn comments_in_expressions() {
     keep("fn f() {\n    let x = a\n        // why b\n        + b;\n}\n");
-    check("fn f() {\n    let x = // why\n        5;\n}\n", "fn f() {\n    let x = // why\n        5;\n}\n");
-    check("fn f() {\n    let x =\n        // why\n        5;\n}\n", "fn f() {\n    let x =\n        // why\n        5;\n}\n");
+    check(
+        "fn f() {\n    let x = // why\n        5;\n}\n",
+        "fn f() {\n    let x = // why\n        5;\n}\n",
+    );
+    check(
+        "fn f() {\n    let x =\n        // why\n        5;\n}\n",
+        "fn f() {\n    let x =\n        // why\n        5;\n}\n",
+    );
 }
 
 // ===================================================================== safety
@@ -693,14 +895,29 @@ fn the_check_compares_trees_and_comments() {
     ln_ast::dump(&ln_parser::parse_file(src).ast, &mut tree);
     assert!(verify(src, tree.as_str(), src).is_ok());
     // Whitespace and spans may change.
-    assert!(verify(src, tree.as_str(), "fn f() { a(); // c\n}\n").is_ok());
+    assert!(
+        verify(src, tree.as_str(), "fn f() { a(); // c\n}\n")
+            .is_ok()
+    );
     // The tree may not.
-    assert!(verify(src, tree.as_str(), "fn f() {\n    b(); // c\n}\n").is_err());
+    assert!(
+        verify(src, tree.as_str(), "fn f() {\n    b(); // c\n}\n")
+            .is_err()
+    );
     // Nor the comments.
-    assert!(verify(src, tree.as_str(), "fn f() {\n    a();\n}\n").is_err());
-    assert!(verify(src, tree.as_str(), "fn f() {\n    a(); // d\n}\n").is_err());
+    assert!(
+        verify(src, tree.as_str(), "fn f() {\n    a();\n}\n")
+            .is_err()
+    );
+    assert!(
+        verify(src, tree.as_str(), "fn f() {\n    a(); // d\n}\n")
+            .is_err()
+    );
     // Nor may it stop parsing.
-    assert!(verify(src, tree.as_str(), "fn f() {\n    a(); // c\n").is_err());
+    assert!(
+        verify(src, tree.as_str(), "fn f() {\n    a(); // c\n")
+            .is_err()
+    );
     // `use` lists may be reordered.
     let u = "use a::{c, b};\n";
     let mut ut = String::new();
@@ -711,11 +928,18 @@ fn the_check_compares_trees_and_comments() {
 
 #[test]
 fn line_endings() {
-    check("fn  f() {\r\n    a(); // c\r\n}\r\n", "fn f() {\r\n    a(); // c\r\n}\r\n");
+    check(
+        "fn  f() {\r\n    a(); // c\r\n}\r\n",
+        "fn f() {\r\n    a(); // c\r\n}\r\n",
+    );
 }
 
 #[test]
 fn long_lines_that_cannot_break_stay_long() {
-    keep("fn f() {\n    let message = \"a very long string literal that cannot be broken anywhere at all, so it stays\";\n}\n");
-    keep("use some::very::long::path::to::a::module::that::goes::on::and::on::forever::and::ever::Item;\n");
+    keep(
+        "fn f() {\n    let message = \"a very long string literal that cannot be broken anywhere at all, so it stays\";\n}\n",
+    );
+    keep(
+        "use some::very::long::path::to::a::module::that::goes::on::and::on::forever::and::ever::Item;\n",
+    );
 }

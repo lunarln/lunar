@@ -33,7 +33,11 @@ pub struct Outcome {
 
 impl Outcome {
     fn new(): Outcome {
-        return Outcome { code: 0, out: String::new(), err: String::new() };
+        return Outcome {
+            code: 0,
+            out: String::new(),
+            err: String::new(),
+        };
     }
 
     /// Print it; its exit code.
@@ -179,7 +183,9 @@ fn syntax_errors(name: str, text: str, color: bool, out: &mut +String) {
     ln_sema::loader::parse_source(&mut p, text, base);
     render_all(&p, color, out);
     let errors = p.diags.error_count();
-    out.write("error: could not format `{name}` due to {errors} syntax error{if errors == 1 { "" } else { "s" }}; it was left as it is\n");
+    out.write(
+        "error: could not format `{name}` due to {errors} syntax error{if errors == 1 { "" } else { "s" }}; it was left as it is\n",
+    );
     let hint = explain::hint(&p);
     if hint.len() > 0 {
         out.write("\n{hint}\n");
@@ -193,7 +199,11 @@ fn internal_error(name: str, message: str, out: &mut +String) {
 
 /// The `.ln` files of the packages `lunar fmt` works on: `-p <name>`, else
 /// the package it started in, else (at a workspace root) every member.
-fn project_files(package: Option::<str>, names: &mut +String, ends: &mut +[usize; ..+]): Result::<(), ProjectError> from static {
+fn project_files(
+    package: Option::<str>,
+    names: &mut +String,
+    ends: &mut +[usize; ..+],
+): Result::<(), ProjectError> from static {
     let mut proj = Project::new();
     let here = cwd();
     proj.find_workspace(here.as_str())?;
@@ -213,7 +223,13 @@ fn project_files(package: Option::<str>, names: &mut +String, ends: &mut +[usize
                 listed.push_str(proj.text(pkg.name));
             }
             if dirs.len() == 0 {
-                return Err(ProjectError::new(manifest::WORKSPACE(), "no package `{name}` in this workspace").note("its packages are: {listed}"));
+                return Err(
+                    ProjectError::new(
+                        manifest::WORKSPACE(),
+                        "no package `{name}` in this workspace",
+                    )
+                    .note("its packages are: {listed}"),
+                );
             }
         }
         None => {
@@ -286,7 +302,10 @@ fn check_lists_the_files_that_would_change() {
     assert_eq!(o.out.as_str(), expected.as_str());
     assert_eq!(o.err.as_str(), "");
     // Nothing was written.
-    assert_eq!(fs::read_to_string(messy.as_str()).unwrap().as_str(), "fn  main ( ) { }\n");
+    assert_eq!(
+        fs::read_to_string(messy.as_str()).unwrap().as_str(),
+        "fn  main ( ) { }\n"
+    );
     // Formatted files pass.
     let only_tidy = [tidy.as_str()];
     assert_eq!(format_files(only_tidy[..], true, false).code, 0);
@@ -301,7 +320,10 @@ fn files_are_formatted_in_place() {
     let o = format_files(paths[..], false, false);
     assert_eq!(o.code, 0);
     assert_eq!(o.out.as_str(), "");
-    assert_eq!(fs::read_to_string(path.as_str()).unwrap().as_str(), "fn main() {\n    let x = 1;\n}\n");
+    assert_eq!(
+        fs::read_to_string(path.as_str()).unwrap().as_str(),
+        "fn main() {\n    let x = 1;\n}\n"
+    );
     assert_eq!(format_files(paths[..], true, false).code, 0);
     let _ = fs::remove_file(path.as_str());
 }
@@ -314,7 +336,10 @@ fn files_with_syntax_errors_are_left_alone() {
     assert_eq!(o.code, 1);
     assert!(o.err.as_str().contains("err(syntax::"));
     assert!(o.err.as_str().contains("it was left as it is"));
-    assert_eq!(fs::read_to_string(path.as_str()).unwrap().as_str(), "fn main( {\n");
+    assert_eq!(
+        fs::read_to_string(path.as_str()).unwrap().as_str(),
+        "fn main( {\n"
+    );
     let _ = fs::remove_file(path.as_str());
 }
 

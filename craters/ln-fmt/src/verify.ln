@@ -16,7 +16,9 @@ pub fn check(src: str, before: str, out: str): Result::<(), String> {
     if parsed.diags.len() > 0 {
         let d = parsed.diags[0];
         let mut m = String::new();
-        m.write("the formatted text does not parse: {parsed.ast.text(d.message)} (line {line_of(out, d.span.lo)} of the result)");
+        m.write(
+            "the formatted text does not parse: {parsed.ast.text(d.message)} (line {line_of(out, d.span.lo)} of the result)",
+        );
         return Err(m);
     }
     let mut after = String::new();
@@ -35,21 +37,29 @@ pub fn check(src: str, before: str, out: str): Result::<(), String> {
 fn same_comments(src: str, out: str): Result::<(), String> {
     let x = scan(src);
     let y = scan(out);
-    let n = if x.cmts.len() < y.cmts.len() { x.cmts.len() } else { y.cmts.len() };
+    let n = if x.cmts.len() < y.cmts.len() {
+        x.cmts.len()
+    } else {
+        y.cmts.len()
+    };
     let mut i: usize = 0;
     while i < n {
         let a = src[x.cmts[i].lo as usize..x.cmts[i].hi as usize];
         let b = out[y.cmts[i].lo as usize..y.cmts[i].hi as usize];
         if a != b {
             let mut m = String::new();
-            m.write("formatting would change comment {i + 1} (line {line_of(src, x.cmts[i].lo)}): `{a}` became `{b}`");
+            m.write(
+                "formatting would change comment {i + 1} (line {line_of(src, x.cmts[i].lo)}): `{a}` became `{b}`",
+            );
             return Err(m);
         }
         i += 1;
     }
     if x.cmts.len() != y.cmts.len() {
         let mut m = String::new();
-        m.write("formatting would change the number of comments from {x.cmts.len()} to {y.cmts.len()}");
+        m.write(
+            "formatting would change the number of comments from {x.cmts.len()} to {y.cmts.len()}",
+        );
         return Err(m);
     }
     return Ok(());
@@ -199,7 +209,11 @@ fn canon_lines(t: str, lines: [Span; &], out: &mut +String) {
             while c > 0 {
                 let x = parts[c - 1];
                 let y = parts[c];
-                if !less(buf.as_str()[y.lo as usize..y.hi as usize], buf.as_str()[x.lo as usize..x.hi as usize]) {
+                if !less(
+                    buf.as_str()[y.lo as usize..y.hi as usize],
+                    buf.as_str()[x.lo as usize..x.hi as usize],
+                )
+                {
                     break;
                 }
                 parts[c - 1] = y;

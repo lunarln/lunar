@@ -93,7 +93,11 @@ pub fn scan(src: str): Source {
     let mut toks: [STok; ..+] = [];
     for t in all {
         if t.token != Token::DocComment {
-            toks.push(STok { kind: t.token, lo: t.range.start as u32, hi: t.range.end as u32 });
+            toks.push(STok {
+                kind: t.token,
+                lo: t.range.start as u32,
+                hi: t.range.end as u32,
+            });
         }
     }
     let b = src.as_bytes();
@@ -155,7 +159,11 @@ pub fn scan(src: str): Source {
     let m = cmts.len();
     let mut c: usize = 0;
     while c < m {
-        let next = if c + 1 < m && cmts[c + 1].next_lo == cmts[c].next_lo { cmts[c + 1].lo } else { cmts[c].next_lo };
+        let next = if c + 1 < m && cmts[c + 1].next_lo == cmts[c].next_lo {
+            cmts[c + 1].lo
+        } else {
+            cmts[c].next_lo
+        };
         let nl = newlines(b, cmts[c].end as usize, next as usize);
         cmts[c].newline_after = nl > 0 || !cmts[c].block;
         cmts[c].blank_after = nl > 1;

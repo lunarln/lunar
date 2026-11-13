@@ -3,7 +3,7 @@
 use core::arena::{Id, List};
 use ln_ast::*;
 use ln_lexer::Token;
-use crater::{Printer, CALL_WIDTH, END, STRUCT_LIT_WIDTH, STRUCT_VARIANT_WIDTH};
+use crater::{CALL_WIDTH, END, Printer, STRUCT_LIT_WIDTH, STRUCT_VARIANT_WIDTH};
 use crater::doc::Doc;
 use crater::source::NONE;
 
@@ -133,7 +133,8 @@ impl Printer {
                 }
                 self.ty(i.self_ty);
                 self.text(" ");
-                let open = self.s.find(self.ast.tys.get(i.self_ty).span.hi, Token::LBrace);
+                let open = self.s
+                    .find(self.ast.tys.get(i.self_ty).span.hi, Token::LBrace);
                 self.item_block(open, i.items);
             }
             ItemKind::Use(u) => {
@@ -503,15 +504,32 @@ impl Printer {
     /// A list of types (a tuple's, a function type's parameters): on one
     /// line, for what is around it to break instead, unless it has
     /// comments. `one` needs a comma (`(A,)`).
-    fn type_list(&mut self, lp: Id::<Doc>, parts: [Id::<Doc>; &], rp: Id::<Doc>, had: bool, one: bool, open: u32, close: u32) {
+    fn type_list(
+        &mut self,
+        lp: Id::<Doc>,
+        parts: [Id::<Doc>; &],
+        rp: Id::<Doc>,
+        had: bool,
+        one: bool,
+        open: u32,
+        close: u32,
+    ) {
         if close != NONE && !self.s.has_cmts(open, close) {
             let flat = self.flat_items(parts, had);
-            let comma = if one && !(had && self.in_macro > 0) { self.d.text(",") } else { self.d.empty() };
+            let comma = if one && !(had && self.in_macro > 0) {
+                self.d.text(",")
+            } else {
+                self.d.empty()
+            };
             let all = [lp, flat, comma, rp];
             let c = self.d.concat(all[..]);
             self.emit(c);
         } else {
-            let trailing = if one { self.d.text(",") } else { self.trailing_comma(had) };
+            let trailing = if one {
+                self.d.text(",")
+            } else {
+                self.trailing_comma(had)
+            };
             let soft = self.d.softline();
             let g = self.list_doc(lp, parts, rp, trailing, soft, 0);
             self.emit(g);
@@ -975,7 +993,8 @@ impl Printer {
                 self.text(" ");
                 match size {
                     ArraySize::Fixed(x) => self.expr(x),
-                    ArraySize::Inferred => self.tok(self.s.find(self.last_end, Token::Placeholder), "_"),
+                    ArraySize::Inferred =>
+                        self.tok(self.s.find(self.last_end, Token::Placeholder), "_"),
                     ArraySize::Grow => {
                         self.tok(self.s.find(self.last_end, Token::DotDot), "..");
                         self.tok(self.s.find(self.last_end, Token::Plus), "+");
@@ -1087,7 +1106,12 @@ impl Printer {
             PatKind::Struct { path, fields, rest } => {
                 self.path(path);
                 self.text(" ");
-                self.struct_pat(self.s.find(path.span.hi, Token::LBrace), p.span.hi - 1, fields, rest);
+                self.struct_pat(
+                    self.s.find(path.span.hi, Token::LBrace),
+                    p.span.hi - 1,
+                    fields,
+                    rest,
+                );
             }
             PatKind::Path(path) => self.path(path),
             PatKind::Or(ps) => {
@@ -1209,7 +1233,11 @@ impl Printer {
                 self.pat(f.pat);
             }
             let d = self.close();
-            let hi = if fp.span.hi > f.name.span.hi { fp.span.hi } else { f.name.span.hi };
+            let hi = if fp.span.hi > f.name.span.hi {
+                fp.span.hi
+            } else {
+                f.name.span.hi
+            };
             let (s, h) = self.sep(hi, close, i + 1 == n && !rest);
             had = h;
             parts.push(d);
