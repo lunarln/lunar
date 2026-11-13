@@ -19,6 +19,13 @@
 // must be committed explicitly, which happens only when a slot grows past
 // the most it has ever held.
 //
+// Threads: the free lists, the bump pointer and the retained-memory count
+// are shared by every thread and guarded by one spin lock, held only while
+// a slot is taken off or put on a list (a few loads and stores; never
+// across a system call except when a freed slot gives memory back). A
+// waiting thread spins briefly, then yields its time slice. Growing an
+// array touches only its own slot, which belongs to one thread at a time.
+//
 // Layout of a data stack: [header: 64 bytes][elements...]. The array handle
 // `{ ptr, len, cap }` points at the first element.
 
@@ -43,6 +50,16 @@ const KEEP: usize = 65536;
 const RETAIN_BUDGET: usize = 67108864;
 const MAX_USIZE: usize = 18446744073709551615;
 
+/// Byte offsets of `Header` fields that are read on their own.
+const CLOSE_AT: usize = 32;
+const HANDLE_AT: usize = 40;
+const REFS_AT: usize = 56;
+
+/// Atomic orderings (LLVM's numbers, as `core::intrinsics` takes them).
+const RELAXED: u32 = 2;
+const ACQUIRE: u32 = 4;
+const RELEASE: u32 = 5;
+
 static mut REGION: usize = 0;
 static mut REGION_END: usize = 0;
 /// Next never-used address in the region.
@@ -51,6 +68,8 @@ static mut BUMP: usize = 0;
 static mut FREE: [usize; 41] = [0; 41];
 /// Committed bytes past KEEP held by free slots.
 static mut RETAINED: usize = 0;
+/// Guards `BUMP`, `FREE` and `RETAINED`: 1 while a thread holds it.
+static mut ALLOC_LOCK: u32 = 0;
 
 pub static mut ARGC: i32 = 0;
 pub static mut ARGV: usize = 0;
@@ -76,10 +95,14 @@ struct Header {
     /// What to do when the array is freed: 0 nothing; `HANDLE_FILE` or
     /// `HANDLE_SOCKET`: close the handle that is its first element (see
     /// `OwnedHandle`); `FLUSH_FILE` or `FLUSH_SOCKET`: write its first
-    /// `pending` bytes to `handle` (see `set_flush`).
+    /// `pending` bytes to `handle`; `BLOCK`: count down `refs`, and at
+    /// zero call the function in `handle` on the first element (see
+    /// `block_new`).
     close: usize,
     handle: i64,
     pending: usize,
+    /// References to a `BLOCK` (changed atomically).
+    refs: usize,
 }
 
 #[lang = "rt_init"]
@@ -87,6 +110,8 @@ fn rt_init(argc: i32, argv: usize) {
     unsafe {
         ARGC = argc;
         ARGV = argv;
+        // The main thread is thread 1.
+        THREAD_ID = next_thread_id();
     }
     reserve_region();
 }
@@ -117,36 +142,67 @@ fn too_many_arrays(): ! {
     sys::exit(134);
 }
 
+fn alloc_lock() {
+    unsafe {
+        let p = intrinsics::addr_of_mut(&mut ALLOC_LOCK);
+        if intrinsics::atomic_swap(p, 1, ACQUIRE) == 0 {
+            return;
+        }
+        let mut spins: u32 = 0;
+        loop {
+            if intrinsics::atomic_load(p as *u32, RELAXED) == 0 && intrinsics::atomic_swap(p, 1, ACQUIRE) == 0 {
+                return;
+            }
+            spins += 1;
+            if spins >= 64 {
+                sys::yield_now();
+            }
+        }
+    }
+}
+
+fn alloc_unlock() {
+    unsafe {
+        let p = intrinsics::addr_of_mut(&mut ALLOC_LOCK);
+        intrinsics::atomic_store(p, 0, RELEASE);
+    }
+}
+
 /// A slot of `1 << order` bytes for a new data stack, with its first page
 /// committed and its header set to allow the whole slot.
 fn acquire(order: usize): *mut u8 {
     unsafe {
         let slot = 1 << order;
+        if REGION == 0 {
+            // Allocation before `rt_init` (not expected, but harmless).
+            reserve_region();
+        }
+        alloc_lock();
         if FREE[order] != 0 {
             let base = FREE[order] as *mut u8;
             let h = base as *mut Header;
             let mut header = intrinsics::ptr_read(h);
             FREE[order] = header.next;
             RETAINED -= extra(header.committed);
+            alloc_unlock();
             header.next = 0;
             header.limit = slot - HEADER;
             header.close = 0;
+            header.refs = 0;
             intrinsics::ptr_write(h, header);
             return base;
-        }
-        if REGION == 0 {
-            // Allocation before `rt_init` (not expected, but harmless).
-            reserve_region();
         }
         // Slots are aligned to their size.
         let start = (BUMP + slot - 1) / slot * slot;
         if start > REGION_END || REGION_END - start < slot {
+            alloc_unlock();
             too_many_arrays();
         }
-        let base = start as *mut u8;
         BUMP = start + slot;
+        alloc_unlock();
+        let base = start as *mut u8;
         sys::commit(base, PAGE);
-        intrinsics::ptr_write(base as *mut Header, Header { committed: PAGE - HEADER, next: 0, order, limit: slot - HEADER, close: 0, handle: 0, pending: 0 });
+        intrinsics::ptr_write(base as *mut Header, Header { committed: PAGE - HEADER, next: 0, order, limit: slot - HEADER, close: 0, handle: 0, pending: 0, refs: 0 });
         return base;
     }
 }
@@ -160,6 +216,15 @@ fn extra(committed: usize): usize {
 fn stack_overflow(): ! {
     sys::write(2, "fatal: data stack overflow (an array grew past its cap or reservation)\n".as_bytes());
     sys::exit(134);
+}
+
+/// The smallest order whose slot holds `need` bytes (header included).
+fn order_for(need: usize): usize {
+    let mut order = MIN_ORDER;
+    while (1 << order) < need {
+        order += 1;
+    }
+    return order;
 }
 
 /// Give the empty array behind `handle` a slot that holds exactly `count`
@@ -181,12 +246,7 @@ fn ds_cap(handle: *mut RawArr, elem_size: usize, count: usize) {
         if count > (max_slot - HEADER) / elem_size {
             stack_overflow();
         }
-        let need = count * elem_size + HEADER;
-        let mut order = MIN_ORDER;
-        while (1 << order) < need {
-            order += 1;
-        }
-        let base = acquire(order);
+        let base = acquire(order_for(count * elem_size + HEADER));
         let h = base as *mut Header;
         let mut header = intrinsics::ptr_read(h);
         header.limit = count * elem_size;
@@ -194,6 +254,34 @@ fn ds_cap(handle: *mut RawArr, elem_size: usize, count: usize) {
         a.ptr = intrinsics::ptr_offset_mut(base, HEADER as isize);
         a.cap = 0;
         intrinsics::ptr_write(handle, a);
+    }
+}
+
+/// Make sure the slot at `base` has at least `need` bytes committed after
+/// its header (`need` fits the slot).
+fn commit_to(base: *mut u8, need: usize) {
+    unsafe {
+        let h = base as *mut Header;
+        let mut header = intrinsics::ptr_read(h);
+        if need <= header.committed {
+            return;
+        }
+        let mut want = header.committed * 2;
+        if want < need {
+            want = need;
+        }
+        // Whole pages, including the header; doubling may overshoot the
+        // slot, but `need` itself fits.
+        let slot = 1 << header.order;
+        let mut total = (want + HEADER + PAGE - 1) / PAGE * PAGE;
+        if total > slot {
+            total = slot;
+        }
+        // Only the new pages: the slot's first `old` bytes are committed.
+        let old = header.committed + HEADER;
+        sys::commit(intrinsics::ptr_offset_mut(base, old as isize), total - old);
+        header.committed = total - HEADER;
+        intrinsics::ptr_write(h, header);
     }
 }
 
@@ -219,34 +307,16 @@ fn ds_grow(handle: *mut RawArr, elem_size: usize, additional: usize) {
         }
         let base = intrinsics::ptr_offset_mut(a.ptr, 0 - (HEADER as isize));
         let h = base as *mut Header;
-        let mut header = intrinsics::ptr_read(h);
-        // `a.len * elem_size <= header.limit`, so this cannot wrap.
-        if additional > header.limit / elem_size - a.len {
+        let limit = intrinsics::ptr_read(h).limit;
+        // `a.len * elem_size <= limit`, so this cannot wrap.
+        if additional > limit / elem_size - a.len {
             stack_overflow();
         }
-        let need = (a.len + additional) * elem_size;
-        if need > header.committed {
-            let mut want = header.committed * 2;
-            if want < need {
-                want = need;
-            }
-            // Whole pages, including the header; doubling may overshoot the
-            // slot, but `need` itself fits (checked above).
-            let slot = 1 << header.order;
-            let mut total = (want + HEADER + PAGE - 1) / PAGE * PAGE;
-            if total > slot {
-                total = slot;
-            }
-            // Only the new pages: the slot's first `old` bytes are committed.
-            let old = header.committed + HEADER;
-            sys::commit(intrinsics::ptr_offset_mut(base, old as isize), total - old);
-            header.committed = total - HEADER;
-            intrinsics::ptr_write(h, header);
-        }
+        commit_to(base, (a.len + additional) * elem_size);
         // Capacity never exceeds the cap.
-        let mut usable = header.committed;
-        if usable > header.limit {
-            usable = header.limit;
+        let mut usable = intrinsics::ptr_read(h).committed;
+        if usable > limit {
+            usable = limit;
         }
         a.cap = usable / elem_size;
         intrinsics::ptr_write(handle, a);
@@ -262,8 +332,23 @@ fn ds_free(ptr: *mut u8) {
     unsafe {
         let base = intrinsics::ptr_offset_mut(ptr, 0 - (HEADER as isize));
         let h = base as *mut Header;
+        // A block's other fields do not change while it is shared, but its
+        // count does: read what it is on its own.
+        let close = intrinsics::ptr_read(((base as usize) + CLOSE_AT) as *usize);
+        if close == BLOCK {
+            let refs = ((base as usize) + REFS_AT) as *mut usize;
+            if intrinsics::atomic_sub(refs, 1, RELEASE) != 1 {
+                return;
+            }
+            // Everything the other owners did happens before the drop.
+            intrinsics::atomic_fence(ACQUIRE);
+            let drop = intrinsics::ptr_read(((base as usize) + HANDLE_AT) as *fn(*mut u8));
+            drop(ptr);
+        }
         let mut header = intrinsics::ptr_read(h);
-        if header.close >= FLUSH_FILE {
+        if close == BLOCK {
+            header.close = 0;
+        } else if header.close >= FLUSH_FILE {
             flush_pending(header.close, header.handle, ptr as *u8, header.pending);
             header.close = 0;
         } else if header.close != 0 {
@@ -273,6 +358,7 @@ fn ds_free(ptr: *mut u8) {
         // Keep the memory for the next array that takes this slot, unless
         // free slots already hold too much.
         let e = extra(header.committed);
+        alloc_lock();
         if RETAINED + e > RETAIN_BUDGET {
             sys::decommit(intrinsics::ptr_offset_mut(base, KEEP as isize), e);
             header.committed = KEEP - HEADER;
@@ -282,29 +368,107 @@ fn ds_free(ptr: *mut u8) {
         header.next = FREE[header.order];
         intrinsics::ptr_write(h, header);
         FREE[header.order] = base as usize;
+        alloc_unlock();
     }
 }
+
+// ===================================================================== panics
 
 /// Panic raised by compiler-inserted checks.
 #[lang = "panic_str"]
 fn panic_str(msg: str, file: str, line: u32, col: u32): ! {
-    let mut s = String::from("panicked at ");
-    s.push_str(file);
-    s.write(":{line}:{col}: {msg}\n");
-    sys::write(2, s.as_bytes());
-    sys::exit(101);
+    let mut loc = String::from(file);
+    loc.write(":{line}:{col}");
+    panicked(String::from(msg), loc);
 }
 
 #[lang = "panic_bounds"]
 fn panic_bounds(index: usize, len: usize, file: str, line: u32, col: u32): ! {
-    let mut s = String::from("panicked at ");
-    s.push_str(file);
-    s.write(":{line}:{col}: index out of bounds: the length is {len} but the index is {index}\n");
-    sys::write(2, s.as_bytes());
-    sys::exit(101);
+    let mut loc = String::from(file);
+    loc.write(":{line}:{col}");
+    let mut msg = String::new();
+    msg.write("index out of bounds: the length is {len} but the index is {index}");
+    panicked(msg, loc);
 }
 
-// ===================================================================== owned handles
+/// Whether this thread is already panicking (a panic while it records the
+/// first one ends the process).
+#[thread_local]
+static mut PANICKING: bool = false;
+
+/// End the program after a panic with `msg` at `loc` (a `file:line:col`,
+/// or empty), or, on a thread started by `std::thread`, end that thread:
+/// it records the panic for whoever joins it, poisons the locks it holds,
+/// and exits on the spot (no unwinding: what it owns stays allocated).
+pub fn panicked(msg: String, loc: String): ! {
+    let current = unsafe { CURRENT };
+    let again = unsafe { PANICKING };
+    if current == 0 || again {
+        let mut s = String::from("panicked");
+        if again && current != 0 {
+            s = String::from("thread panicked while panicking");
+        }
+        if loc.len() > 0 {
+            s.write(" at {loc}");
+        }
+        s.write(": {msg}\n");
+        sys::write(2, s.as_bytes());
+        if again && current != 0 {
+            sys::exit(134);
+        }
+        sys::exit(101);
+    }
+    unsafe {
+        PANICKING = true;
+    }
+    crater::thread::exit_panicked(current, msg, loc);
+}
+
+// ===================================================================== threads
+
+/// The `std::thread` record of the running thread (the address of its
+/// shared state), or 0 on the main thread.
+#[thread_local]
+static mut CURRENT: usize = 0;
+
+/// The running thread's id (see `thread_id`); 0 until asked.
+#[thread_local]
+static mut THREAD_ID: u64 = 0;
+
+/// The last thread id handed out (the main thread's is 1).
+static mut LAST_ID: u64 = 0;
+
+/// Called first on a thread `std::thread` starts: `record` is its shared
+/// state, `id` its id.
+pub fn enter_thread(record: usize, id: u64) {
+    unsafe {
+        CURRENT = record;
+        THREAD_ID = id;
+    }
+}
+
+/// The `std::thread` record of the running thread, or 0 on the main thread.
+pub fn current_record(): usize {
+    return unsafe { CURRENT };
+}
+
+/// A new thread id: 1 for the first (the main thread asks for its own
+/// lazily, so it may get another), then counting up.
+pub fn next_thread_id(): u64 {
+    return unsafe { intrinsics::atomic_add(intrinsics::addr_of_mut(&mut LAST_ID), 1, RELAXED) } + 1;
+}
+
+/// The running thread's id, unique for the life of the process.
+pub fn thread_id(): u64 {
+    unsafe {
+        if THREAD_ID == 0 {
+            THREAD_ID = next_thread_id();
+        }
+        return THREAD_ID;
+    }
+}
+
+// ===================================================================== blocks
 
 /// `OwnedHandle` kinds: a file (or pipe or directory) handle.
 pub const HANDLE_FILE: usize = 1;
@@ -314,6 +478,69 @@ pub const HANDLE_SOCKET: usize = 2;
 pub const FLUSH_FILE: usize = 3;
 /// `set_flush` targets: a socket.
 pub const FLUSH_SOCKET: usize = 4;
+/// A block of memory with a reference count and a drop function (see
+/// `block_new`).
+const BLOCK: usize = 5;
+
+/// A block of at least `bytes` bytes (64-byte aligned) whose first byte is
+/// at `as_ptr()` of the returned array, owned by the array like any data
+/// stack, with a reference count of 1. Freeing the array counts the
+/// references down; the last one calls `drop` on the first byte, then
+/// releases the memory. `block_retain` adds a reference, and `block_dup`
+/// makes another array that owns one: this is how `std::sync::Shared` and
+/// the channels share a value between threads, and how they run code when
+/// the last owner goes away (Lunar has no destructors).
+///
+/// The array itself stays empty (`len` 0); the block is only reached
+/// through its pointer. Each block takes at least a 64 KiB slot of address
+/// space.
+pub fn block_new(bytes: usize, drop: fn(*mut u8)): [u8; ..+] {
+    let size = if bytes == 0 { 1 } else { bytes };
+    let mut cell: [u8; ..+] = [].capped(size);
+    let first = cell[..].as_ptr() as usize;
+    unsafe {
+        let base = first - HEADER;
+        commit_to(base as *mut u8, size);
+        intrinsics::ptr_write((base + HANDLE_AT) as *mut fn(*mut u8), drop);
+        intrinsics::ptr_write((base + REFS_AT) as *mut usize, 1);
+        intrinsics::ptr_write((base + CLOSE_AT) as *mut usize, BLOCK);
+    }
+    return cell;
+}
+
+/// Add a reference to the block whose first byte is at `first`.
+pub fn block_retain(first: *u8) {
+    unsafe {
+        let refs = ((first as usize) - HEADER + REFS_AT) as *mut usize;
+        intrinsics::atomic_add(refs, 1, RELAXED);
+    }
+}
+
+/// Another owner of the block `cell` owns (it holds a new reference).
+pub fn block_dup(cell: &[u8; ..+]): [u8; ..+] {
+    block_retain(cell[..].as_ptr());
+    return unsafe { intrinsics::ptr_read(intrinsics::addr_of(cell)) };
+}
+
+/// Drop a reference to the block at `first` that no array owns (taken
+/// with `block_retain`), as freeing an owning array would.
+pub fn block_release(first: *mut u8) {
+    ds_free(first);
+}
+
+/// Replace the function the last reference to the block at `first` calls.
+pub fn block_set_drop(first: *u8, drop: fn(*mut u8)) {
+    unsafe {
+        intrinsics::ptr_write(((first as usize) - HEADER + HANDLE_AT) as *mut fn(*mut u8), drop);
+    }
+}
+
+/// How many references the block at `first` has right now.
+pub fn block_refs(first: *u8): usize {
+    return unsafe { intrinsics::atomic_load(((first as usize) - HEADER + REFS_AT) as *usize, ACQUIRE) };
+}
+
+// ===================================================================== owned handles
 
 /// Make freeing the byte array whose first element is at `first` (an
 /// array that already has its data stack, such as one made by `capped`)

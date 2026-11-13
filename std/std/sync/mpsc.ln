@@ -1,0 +1,230 @@
+// Channels with many senders and one receiver.
+//
+// ```lunar
+// let (tx, rx) = mpsc::channel::<String>();
+// for i in 0..4 {
+//     let tx = tx.clone();
+//     thread::spawn(move || tx.send(core::fmt::format("job {i}")).unwrap());
+// }
+// drop_all_senders(tx);
+// for msg in rx { println("{msg}"); }   // ends when every sender is gone
+// ```
+//
+// `channel()` is unbounded: `send` never waits. `sync_channel(n)` holds at
+// most `n` items: `send` waits for room, and with `n` 0 waits until a
+// receiver takes the item (a rendezvous). A channel is disconnected when
+// every sender is gone (`recv` fails once it is empty) or the receiver is
+// gone (`send` fails, giving the value back). Values must be `Send` and
+// `Detached` (they may travel to threads that outlive the sender's
+// variables).
+
+use crater::sync::chan::{End, RecvFail, SendFail, pair};
+use crater::time::Duration;
+
+const MAX_USIZE: usize = 18446744073709551615;
+
+/// `send` failed: the receiver is gone. The value comes back.
+pub struct SendError::<T> {
+    pub value: T,
+}
+
+impl::<T> core::fmt::Display for SendError::<T> {
+    fn fmt(&self, out: &mut +String) {
+        out.push_str("sending on a closed channel");
+    }
+}
+
+/// Why `try_send` did not send. The value comes back.
+pub enum TrySendError::<T> {
+    /// The channel is full.
+    Full(T),
+    /// The receiver is gone.
+    Disconnected(T),
+}
+
+impl::<T> TrySendError::<T> {
+    /// The value that was not sent.
+    pub fn into_inner(self): T {
+        return match self {
+            TrySendError::Full(v) => v,
+            TrySendError::Disconnected(v) => v,
+        };
+    }
+
+    pub fn is_full(&self): bool {
+        return match self {
+            TrySendError::Full(_) => true,
+            TrySendError::Disconnected(_) => false,
+        };
+    }
+}
+
+impl::<T> core::fmt::Display for TrySendError::<T> {
+    fn fmt(&self, out: &mut +String) {
+        if self.is_full() {
+            out.push_str("sending on a full channel");
+        } else {
+            out.push_str("sending on a closed channel");
+        }
+    }
+}
+
+/// `recv` failed: the channel is empty and every sender is gone.
+#[derive(Eq, Debug)]
+pub struct RecvError;
+
+impl core::fmt::Display for RecvError {
+    fn fmt(&self, out: &mut +String) {
+        out.push_str("receiving on a closed channel");
+    }
+}
+
+/// Why `try_recv` did not receive.
+#[derive(Eq, Debug, Display)]
+pub enum TryRecvError {
+    /// Nothing is queued now.
+    Empty,
+    /// Nothing is queued, and every sender is gone.
+    Disconnected,
+}
+
+/// Why `recv_timeout` did not receive.
+#[derive(Eq, Debug, Display)]
+pub enum RecvTimeoutError {
+    /// Nothing arrived in time.
+    Timeout,
+    /// Nothing is queued, and every sender is gone.
+    Disconnected,
+}
+
+/// The sending end of `channel()`: `send` never waits. Clone it for more
+/// senders.
+pub struct Sender::<T> {
+    end: End::<T>,
+}
+
+/// The sending end of `sync_channel(n)`: `send` waits for room.
+pub struct SyncSender::<T> {
+    end: End::<T>,
+}
+
+/// The receiving end. Iterating over it receives until the channel is
+/// empty and every sender is gone.
+pub struct Receiver::<T> {
+    end: End::<T>,
+}
+
+/// An unbounded channel.
+pub fn channel::<T: Send + Detached>(): (Sender::<T>, Receiver::<T>) {
+    let (tx, rx) = pair::<T>(MAX_USIZE);
+    return (Sender { end: tx }, Receiver { end: rx });
+}
+
+/// A channel holding at most `bound` items; with `bound` 0, each `send`
+/// waits until a receiver takes its item.
+pub fn sync_channel::<T: Send + Detached>(bound: usize): (SyncSender::<T>, Receiver::<T>) {
+    let (tx, rx) = pair::<T>(bound);
+    return (SyncSender { end: tx }, Receiver { end: rx });
+}
+
+fn send_result::<T>(r: Result::<(), SendFail::<T>>): Result::<(), SendError::<T>> {
+    return match r {
+        Ok(()) => Ok(()),
+        Err(SendFail::Full(v)) => Err(SendError { value: v }),
+        Err(SendFail::Disconnected(v)) => Err(SendError { value: v }),
+        Err(SendFail::Timeout(v)) => Err(SendError { value: v }),
+    };
+}
+
+fn try_send_result::<T>(r: Result::<(), SendFail::<T>>): Result::<(), TrySendError::<T>> {
+    return match r {
+        Ok(()) => Ok(()),
+        Err(SendFail::Full(v)) => Err(TrySendError::Full(v)),
+        Err(SendFail::Disconnected(v)) => Err(TrySendError::Disconnected(v)),
+        Err(SendFail::Timeout(v)) => Err(TrySendError::Full(v)),
+    };
+}
+
+impl::<T> Sender::<T> {
+    /// Queue `v` for the receiver; `Err` with `v` if it is gone.
+    pub fn send(&self, v: T): Result::<(), SendError::<T>> from v {
+        return send_result(self.end.send(v, true, None));
+    }
+
+    /// Whether the receiver is gone.
+    pub fn is_disconnected(&self): bool {
+        return self.end.other_side_gone(true);
+    }
+}
+
+impl::<T> Clone for Sender::<T> {
+    fn clone(&self): Sender::<T> {
+        return Sender { end: self.end.dup() };
+    }
+}
+
+impl::<T> SyncSender::<T> {
+    /// Queue `v`, waiting while the channel is full; `Err` with `v` if the
+    /// receiver is gone.
+    pub fn send(&self, v: T): Result::<(), SendError::<T>> from v {
+        return send_result(self.end.send(v, true, None));
+    }
+
+    /// Queue `v` if there is room now.
+    pub fn try_send(&self, v: T): Result::<(), TrySendError::<T>> from v {
+        return try_send_result(self.end.send(v, false, None));
+    }
+
+    /// Whether the receiver is gone.
+    pub fn is_disconnected(&self): bool {
+        return self.end.other_side_gone(true);
+    }
+}
+
+impl::<T> Clone for SyncSender::<T> {
+    fn clone(&self): SyncSender::<T> {
+        return SyncSender { end: self.end.dup() };
+    }
+}
+
+impl::<T> Receiver::<T> {
+    /// The next item, waiting for one; `Err` once the channel is empty and
+    /// every sender is gone.
+    pub fn recv(&self): Result::<T, RecvError> {
+        return match self.end.recv(true, None) {
+            Ok(v) => Ok(v),
+            Err(_) => Err(RecvError),
+        };
+    }
+
+    /// The next item if one is queued now.
+    pub fn try_recv(&self): Result::<T, TryRecvError> {
+        return match self.end.recv(false, None) {
+            Ok(v) => Ok(v),
+            Err(RecvFail::Disconnected) => Err(TryRecvError::Disconnected),
+            Err(_) => Err(TryRecvError::Empty),
+        };
+    }
+
+    /// The next item, waiting at most `timeout` for one.
+    pub fn recv_timeout(&self, timeout: Duration): Result::<T, RecvTimeoutError> {
+        return match self.end.recv(true, Some(timeout)) {
+            Ok(v) => Ok(v),
+            Err(RecvFail::Disconnected) => Err(RecvTimeoutError::Disconnected),
+            Err(_) => Err(RecvTimeoutError::Timeout),
+        };
+    }
+
+    /// How many items are queued right now.
+    pub fn len(&self): usize {
+        return self.end.len();
+    }
+}
+
+impl::<T> Iterator::<T> for Receiver::<T> {
+    /// The next item, waiting for one; `None` once the channel is empty and
+    /// every sender is gone.
+    fn next(&mut self): Option::<T> {
+        return self.recv().ok();
+    }
+}

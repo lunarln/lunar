@@ -1,0 +1,434 @@
+// Threads of the operating system.
+//
+// ```lunar
+// let h = thread::spawn(move || expensive(input));
+// match h.join() {
+//     Ok(v) => println("{v}"),
+//     Err(p) => println("the thread panicked: {p}"),
+// }
+// ```
+//
+// `spawn` runs a closure on a new thread. The thread may outlive the
+// function that started it, so the closure and its result must be
+// `Detached` (hold no views: a `move` closure of owned values) and `Send`.
+// `scope` starts threads that may borrow from the caller, because they all
+// finish before `scope` returns.
+//
+// A thread that panics prints its message, as the main thread does, and
+// stops on the spot: nothing is unwound, so what it owned stays allocated
+// until the program exits, and the locks it held are poisoned (see
+// `std::sync`). `join` gives the panic as an `Err`. A panic on the main
+// thread ends the program; returning from `main` ends it too, with every
+// thread still running.
+
+use core::cell::UnsafeCell;
+use core::intrinsics;
+use crater::rt;
+use crater::sys;
+use crater::sync::Shared;
+use crater::sync::atomic::{AtomicU32, Ordering};
+use crater::sync::raw::FOREVER;
+use crater::time::Duration;
+
+const RUNNING: u32 = 0;
+const DONE: u32 = 1;
+const PANICKED: u32 = 2;
+
+/// A thread's number, unique for the life of the program.
+#[derive(Eq, Ord, Hash, Debug)]
+pub struct ThreadId {
+    id: u64,
+}
+
+impl ThreadId {
+    /// The number.
+    pub fn as_u64(self): u64 {
+        return self.id;
+    }
+}
+
+impl core::fmt::Display for ThreadId {
+    fn fmt(&self, out: &mut +String) {
+        out.write("ThreadId({self.id})");
+    }
+}
+
+/// The panic of a thread: its message, and where it happened.
+pub struct Panic {
+    message: String,
+    location: String,
+}
+
+impl Panic {
+    /// What the thread panicked with: `panic`'s message, or the failed
+    /// check's (`index out of bounds: ...`).
+    pub fn message(&self): str {
+        return self.message.as_str();
+    }
+
+    /// The `file:line:column` of a failed check, or empty for a `panic`
+    /// call.
+    pub fn location(&self): str {
+        return self.location.as_str();
+    }
+}
+
+impl core::fmt::Display for Panic {
+    fn fmt(&self, out: &mut +String) {
+        out.push_str(self.message.as_str());
+        if self.location.len() > 0 {
+            out.write(" at {self.location}");
+        }
+    }
+}
+
+impl core::fmt::Debug for Panic {
+    fn debug(&self, out: &mut +String) {
+        out.write("Panic({self.message:?})");
+    }
+}
+
+/// What a thread and the handles to it share, at the start of every
+/// `Packet` (the runtime knows only this part).
+struct Core {
+    state: AtomicU32,
+    /// Set when a handle joined the thread (so `scope` knows a panic was
+    /// seen).
+    joined: AtomicU32,
+    id: u64,
+    name: String,
+    panic: UnsafeCell::<Option::<Panic>>,
+}
+
+struct Packet::<T> {
+    core: Core,
+    result: UnsafeCell::<Option::<T>>,
+}
+
+unsafe impl::<T: Send> Send for Packet::<T> {}
+unsafe impl::<T: Send> Sync for Packet::<T> {}
+
+fn new_packet::<T>(name: String): Shared::<Packet::<T>> {
+    let core = Core { state: AtomicU32::new(RUNNING), joined: AtomicU32::new(0), id: rt::next_thread_id(), name, panic: UnsafeCell::new(None) };
+    return unsafe { Shared::new_unchecked(Packet { core, result: UnsafeCell::new(None) }) };
+}
+
+/// Wait until the thread whose `Core` is at `c` finished; its state.
+fn wait_for(c: *Core): u32 {
+    unsafe {
+        let p = (*c).state.as_ptr() as *u32;
+        loop {
+            let s = (*c).state.load(Ordering::Acquire);
+            if s != RUNNING {
+                return s;
+            }
+            sys::futex_wait(p, RUNNING, FOREVER);
+        }
+    }
+}
+
+/// Take the value out of the `Some` at `p`, leaving `None`.
+unsafe fn take::<T>(p: *mut Option::<T>): T {
+    let o = unsafe { intrinsics::ptr_read(p as *Option::<T>) };
+    unsafe {
+        intrinsics::ptr_write(p, None);
+    }
+    return o.unwrap();
+}
+
+/// What a finished thread gave: its result or its panic.
+fn outcome::<T>(pk: *Packet::<T>): Result::<T, Panic> {
+    unsafe {
+        let c = intrinsics::addr_of(&(*pk).core);
+        let s = wait_for(c);
+        (*pk).core.joined.store(1, Ordering::Relaxed);
+        if s == DONE {
+            return Ok(take((*pk).result.get()));
+        }
+        return Err(take((*pk).core.panic.get()));
+    }
+}
+
+/// What a new thread starts with: its closure and its record.
+struct Start::<F, T> {
+    f: F,
+    packet: Shared::<Packet::<T>>,
+}
+
+/// The first function of every thread `std::thread` starts.
+fn thread_main::<F: FnOnce(): T, T>(arg: *mut u8): usize {
+    let start: Start::<F, T> = unsafe { intrinsics::ptr_read(arg as *Start::<F, T>) };
+    rt::block_release(arg);
+    let Start { f, packet } = start;
+    let pk = packet.as_ptr();
+    let id = unsafe { (*pk).core.id };
+    rt::enter_thread(pk as usize, id);
+    let r = f();
+    unsafe {
+        intrinsics::ptr_write((*pk).result.get(), Some(r));
+        (*pk).core.state.store(DONE, Ordering::Release);
+        sys::futex_wake((*pk).core.state.as_ptr() as *u32, true);
+    }
+    return 0;
+}
+
+/// Start a thread running `f` with `packet` as its record.
+fn start::<F: FnOnce(): T, T>(f: F, packet: Shared::<Packet::<T>>, stack: usize): Result::<(), crater::io::Error> {
+    let none: fn(*mut u8) = drop_nothing;
+    let block = rt::block_new(core::mem::size_of::<Start::<F, T>>(), none);
+    let p = (block[..].as_ptr() as usize) as *mut u8;
+    unsafe {
+        intrinsics::ptr_write(p as *mut Start::<F, T>, Start { f, packet });
+    }
+    // The new thread releases this reference once it took its start.
+    rt::block_retain(p as *u8);
+    let entry: fn(*mut u8): usize = thread_main::<F, T>;
+    if !sys::thread_spawn(entry, p, stack) {
+        let e = crater::io::Error::last_os_error();
+        let back: Start::<F, T> = unsafe { intrinsics::ptr_read(p as *Start::<F, T>) };
+        let _ = back;
+        rt::block_release(p);
+        return Err(e);
+    }
+    return Ok(());
+}
+
+fn drop_nothing(p: *mut u8) {
+    let _ = p;
+}
+
+/// Called by the runtime when a thread started here panics: print, record
+/// the panic for `join`, poison the locks the thread holds, and end it.
+pub fn exit_panicked(record: usize, msg: String, loc: String): ! {
+    let c = record as *Core;
+    let mut line = String::from("thread '");
+    unsafe {
+        if (*c).name.len() > 0 {
+            line.push_str((*c).name.as_str());
+        } else {
+            line.push_str("<unnamed>");
+        }
+    }
+    line.push_str("' panicked");
+    if loc.len() > 0 {
+        line.write(" at {loc}");
+    }
+    line.write(": {msg}\n");
+    sys::write(2, line.as_bytes());
+    crater::sync::raw::poison_held_locks();
+    unsafe {
+        intrinsics::ptr_write((*c).panic.get(), Some(Panic { message: msg, location: loc }));
+        (*c).state.store(PANICKED, Ordering::Release);
+        sys::futex_wake((*c).state.as_ptr() as *u32, true);
+    }
+    // The thread's own reference to its record: it never returns to drop
+    // it.
+    rt::block_release(record as *mut u8);
+    sys::thread_exit();
+}
+
+// ===================================================================== spawn
+
+/// A thread started by `spawn`: `join` waits for it. Freeing the handle
+/// without joining lets the thread run on by itself.
+pub struct JoinHandle::<T> {
+    packet: Shared::<Packet::<T>>,
+}
+
+impl::<T> JoinHandle::<T> {
+    /// Wait for the thread to finish: what its closure returned, or its
+    /// panic.
+    pub fn join(self): Result::<T, Panic> {
+        return outcome(self.packet.as_ptr());
+    }
+
+    /// Whether the thread finished (its result is ready to `join`).
+    pub fn is_finished(&self): bool {
+        return self.packet.with(|p| p.core.state.load(Ordering::Acquire) != RUNNING);
+    }
+
+    /// The thread's id.
+    pub fn id(&self): ThreadId {
+        return ThreadId { id: self.packet.with(|p| p.core.id) };
+    }
+}
+
+/// Settings for a new thread: `Builder::new().name("worker").spawn(f)`.
+pub struct Builder {
+    name: String,
+    stack_size: usize,
+}
+
+impl Builder {
+    pub fn new(): Builder {
+        return Builder { name: String::new(), stack_size: 0 };
+    }
+
+    /// The thread's name, shown when it panics.
+    pub fn name(mut self, name: str): Builder {
+        self.name = String::from(name);
+        return self;
+    }
+
+    /// The size of its stack in bytes (the default is 2 MiB on Linux and
+    /// macOS, the program's on Windows). Lunar's arrays live on data
+    /// stacks, so threads need little.
+    pub fn stack_size(mut self, bytes: usize): Builder {
+        self.stack_size = bytes;
+        return self;
+    }
+
+    /// Start the thread (see `spawn`); `Err` if the system could not.
+    pub fn spawn::<F: FnOnce(): T + Send + Detached, T: Send + Detached>(self, f: F): Result::<JoinHandle::<T>, crater::io::Error> {
+        let Builder { name, stack_size } = self;
+        let packet = new_packet::<T>(name);
+        start(f, packet.clone(), stack_size)?;
+        return Ok(JoinHandle { packet });
+    }
+}
+
+/// Start a thread running `f`: a handle to `join` it. `f` and its result
+/// are moved to the thread, so they must be `Send`, and since the thread
+/// may outlive the caller they must hold no views (`Detached`): use a
+/// `move` closure of owned values. Panics if the system cannot start a
+/// thread.
+pub fn spawn::<F: FnOnce(): T + Send + Detached, T: Send + Detached>(f: F): JoinHandle::<T> {
+    return match Builder::new().spawn(f) {
+        Ok(h) => h,
+        Err(e) => panic("failed to start a thread: {e}"),
+    };
+}
+
+// ===================================================================== scope
+
+/// Threads that may borrow from the function that started them; see
+/// `scope`.
+#[lang = "thread_scope"]
+pub struct Scope {
+    /// The records of the threads started here (each holding a reference).
+    threads: [usize; ..+],
+    /// Always empty. A view of what the threads borrow: `spawn` keeps its
+    /// closure here, so the threads' borrows last as long as the scope.
+    env: [u8; &],
+}
+
+/// A thread started by `Scope::spawn`.
+pub struct ScopedJoinHandle::<T> {
+    packet: Shared::<Packet::<T>>,
+    /// Always empty: ties the handle (and the result it gives) to what the
+    /// scope's threads borrow.
+    scope: [u8; &],
+}
+
+impl::<T> ScopedJoinHandle::<T> {
+    /// Wait for the thread to finish: what its closure returned, or its
+    /// panic.
+    pub fn join(self): Result::<T, Panic> {
+        let _ = self.scope;
+        return outcome(self.packet.as_ptr());
+    }
+
+    /// Whether the thread finished.
+    pub fn is_finished(&self): bool {
+        return self.packet.with(|p| p.core.state.load(Ordering::Acquire) != RUNNING);
+    }
+
+    /// The thread's id.
+    pub fn id(&self): ThreadId {
+        return ThreadId { id: self.packet.with(|p| p.core.id) };
+    }
+}
+
+impl Scope {
+    /// Start a thread running `f`, which may borrow what the closure given
+    /// to `scope` borrows (but not that closure's own variables). What it
+    /// borrows must be `Sync`, what it takes `Send`.
+    pub fn spawn::<F: FnOnce(): T + Send, T: Send>(&mut +self, kept f: F): ScopedJoinHandle::<T> {
+        let packet = new_packet::<T>(String::new());
+        if let Err(e) = start(f, packet.clone(), 0) {
+            panic("failed to start a thread: {e}");
+        }
+        let p = packet.as_ptr() as *u8;
+        rt::block_retain(p);
+        self.threads.push(p as usize);
+        return ScopedJoinHandle { packet, scope: self.env };
+    }
+}
+
+/// Run `f` with a `Scope` for starting threads that borrow from the
+/// caller, then wait for every one of them: what `f` returned. Panics if
+/// one of them panicked and was not joined.
+///
+/// ```lunar
+/// let data: [u64; ..+] = load();
+/// let total = AtomicU64::new(0);
+/// thread::scope(|s| {
+///     for chunk in data.chunks(1000) {
+///         s.spawn(|| total.fetch_add(sum(chunk), Ordering::Relaxed));
+///     }
+/// });
+/// ```
+///
+/// `f` runs at the same time as the threads it starts, so it must be `Fn`
+/// (it may not change what it borrows) and `Sync` (what it borrows is
+/// shared with them).
+pub fn scope::<F: Fn(&mut +Scope): R + Sync, R>(f: F): R {
+    let mut s = Scope { threads: [], env: "".as_bytes() };
+    // What `f` returns may point into what it borrows (through the handles
+    // of its threads), never into `s` itself, whose views are empty: it is
+    // lent through a pointer so the result does not count as pointing
+    // into it.
+    let sp = intrinsics::addr_of_mut(&mut s);
+    let r = unsafe { f(&mut *sp) };
+    let mut unjoined_panic = false;
+    for t in s.threads {
+        let c = t as *Core;
+        let state = wait_for(c);
+        if state == PANICKED && unsafe { (*c).joined.load(Ordering::Relaxed) } == 0 {
+            unjoined_panic = true;
+        }
+        rt::block_release(t as *mut u8);
+    }
+    if unjoined_panic {
+        panic("a scoped thread panicked");
+    }
+    return r;
+}
+
+// ===================================================================== the current thread
+
+/// Stop the calling thread for at least `d`.
+pub fn sleep(d: Duration) {
+    crater::time::sleep(d);
+}
+
+/// Let other threads run.
+pub fn yield_now() {
+    sys::yield_now();
+}
+
+/// The calling thread's id.
+pub fn current_id(): ThreadId {
+    return ThreadId { id: rt::thread_id() };
+}
+
+/// The calling thread's name: "main" on the main thread, `None` for a
+/// thread started without one.
+pub fn current_name(): Option::<String> {
+    let r = rt::current_record();
+    if r == 0 {
+        return Some(String::from("main"));
+    }
+    let c = r as *Core;
+    unsafe {
+        if (*c).name.len() == 0 {
+            return None;
+        }
+        return Some(String::from((*c).name.as_str()));
+    }
+}
+
+/// How many threads can run at once (the processors the program may use).
+pub fn available_parallelism(): usize {
+    return sys::cpu_count();
+}

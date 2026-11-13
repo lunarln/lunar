@@ -110,6 +110,7 @@ pub mod borrow {
     pub fn WRONG_MARKER(): Code { return c("wrong_marker"); }
     pub fn NOT_AN_ARGUMENT(): Code { return c("not_an_argument"); }
     pub fn ESCAPES_VIA_RETURN(): Code { return c("escapes_via_return"); }
+    pub fn SCOPED_THREAD_BORROW(): Code { return c("scoped_thread_borrow"); }
 }
 
 pub mod macro_ {
@@ -179,7 +180,7 @@ pub fn all_codes(): [crater::diag::Code; ..+] {
         ("syntax", "unexpected_token unknown_char unterminated bad_escape bad_number bad_format missing_semi missing_body bad_char bad_attribute conflict_marker"),
         ("name", "unresolved duplicate private not_a_type not_a_value not_a_trait module_file bad_self unbound_in_alternative inconsistent_binding bound_twice"),
         ("trait", "dull_impl negative_impl missing_item extra_item signature conflicting_impl ambiguous_method inherent_foreign unsafe_impl auto_impl"),
-        ("borrow", "use_after_move move_out_of_borrow grow_only shrink_while_borrowed move_while_borrowed assign_while_borrowed outlives_root escapes_function escapes_via_param missing_marker wrong_marker not_an_argument escapes_via_return"),
+        ("borrow", "use_after_move move_out_of_borrow grow_only shrink_while_borrowed move_while_borrowed assign_while_borrowed outlives_root escapes_function escapes_via_param missing_marker wrong_marker not_an_argument escapes_via_return scoped_thread_borrow"),
         ("macro", "undefined no_match bad_matcher repetition recursion_limit derive_output not_supported error"),
         ("unsafe", "outside_unsafe in_unsafe_fn"),
         ("lint", "needless_borrow mut_param_not_read unused_variable unreachable unused_mut unknown_cfg irrefutable_let_else"),

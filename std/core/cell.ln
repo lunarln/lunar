@@ -1,0 +1,33 @@
+// Interior mutability: a value that may change behind shared views.
+
+use crater::intrinsics;
+
+/// A value that may be changed through a shared view (`&self`), by raw
+/// pointer: the building block of atomics and locks.
+///
+/// The compiler treats it specially: it is never copied implicitly (it is
+/// neither Dull nor Light, so it moves and cannot be an array item), it is
+/// not `Sync` (types built on it promise that with `unsafe impl` once they
+/// guard their changes), and a static holding one is writable memory.
+#[lang = "unsafe_cell"]
+pub struct UnsafeCell::<T> {
+    value: T,
+}
+
+impl::<T> UnsafeCell::<T> {
+    pub const fn new(value: T): UnsafeCell::<T> {
+        return UnsafeCell { value };
+    }
+
+    /// A pointer to the value. Reading or writing through it is up to the
+    /// caller: nothing else may access the value at the same time.
+    pub fn get(&self): *mut T {
+        let p = intrinsics::addr_of(&self.value);
+        return (p as usize) as *mut T;
+    }
+
+    /// The value, taken out of the cell.
+    pub fn into_inner(self): T {
+        return self.value;
+    }
+}
