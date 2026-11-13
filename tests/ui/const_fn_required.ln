@@ -1,0 +1,21 @@
+// error: type::const_eval
+// Only `const fn`s run in the initializers of statics and constants.
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn origin(): Point {
+    return Point { x: 0, y: 0 };
+}
+
+const fn at(x: i32, y: i32): Point {
+    return Point { x, y };
+}
+
+static A: Point = at(1, 2);
+static B: Point = origin();
+
+fn main() {
+    println("{A.x} {B.y}");
+}

@@ -284,7 +284,8 @@ pub fn exit(code: i32): ! {
 }
 
 /// Whether reserved memory is usable as it is: the kernel supplies pages on
-/// first touch, so `commit` has nothing to do.
+/// first touch, so `commit` has nothing to do. Set once, by the reservation
+/// at startup, before any other thread exists; only read afterwards.
 static mut LAZY: bool = false;
 
 /// Reserve `size` bytes of address space. Preferably readable and writable

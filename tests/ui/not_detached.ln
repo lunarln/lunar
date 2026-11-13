@@ -1,0 +1,22 @@
+// error: type::not_detached
+// `spawn` takes only values without views, a lock's closure cannot hand
+// out a view of the locked value, and channels carry owned values.
+use std::sync::Mutex;
+use std::sync::mpsc;
+use std::thread;
+
+fn main() {
+    let name = String::from("lunar");
+    let view = name.as_str();
+    let h = thread::spawn(move || view.len());
+    let _ = h;
+    let n = 5;
+    let h2 = thread::spawn(|| n + 1);
+    let _ = h2;
+    let m = Mutex::new(String::from("x"));
+    let inside = m.lock(|s| s.as_str());
+    let _ = inside;
+    let (tx, rx) = mpsc::channel::<str>();
+    let _ = tx;
+    let _ = rx;
+}

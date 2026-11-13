@@ -1,0 +1,7 @@
+// error: trait::auto_impl
+// `Send` and `Sync` can only be implemented for this crater's structs
+// and enums.
+unsafe impl Send for *mut u8 {}
+unsafe impl Sync for String {}
+
+fn main() {}

@@ -1,0 +1,18 @@
+// error: borrow::use_after_move
+// error: borrow::move_out_of_borrow
+// Cells (and the locks and atomics built on them) move rather than copy:
+// a copy could be read while another thread changes the original.
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+
+static TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn main() {
+    let m = Mutex::new(1u64);
+    let a = m;
+    let b = m;
+    let _ = a;
+    let _ = b;
+    let t = TOTAL;
+    let _ = t;
+}

@@ -27,7 +27,7 @@ use crater::rt;
 use crater::sys;
 use crater::sync::Shared;
 use crater::sync::atomic::{AtomicU32, Ordering};
-use crater::sync::raw::FOREVER;
+use crater::sync::raw::{FOREVER, Queue};
 use crater::time::Duration;
 
 const RUNNING: u32 = 0;
@@ -299,6 +299,52 @@ pub fn spawn::<F: FnOnce(): T + Send + Detached, T: Send + Detached>(f: F): Join
     };
 }
 
+/// Threads that return the same type, joined in the order they started.
+/// Arrays cannot hold `JoinHandle`s (they own their thread's record), so
+/// this is how to keep any number of them:
+///
+/// ```lunar
+/// let mut g = thread::Group::<u64>::new();
+/// for i in 0..8 {
+///     g.spawn(move || work(i));
+/// }
+/// while let Some(r) = g.join_next() {
+///     println("{r.unwrap()}");
+/// }
+/// ```
+///
+/// Freeing a group lets the threads it did not join run on by themselves.
+pub struct Group::<T> {
+    threads: Queue::<Shared::<Packet::<T>>>,
+}
+
+impl::<T: Send + Detached> Group::<T> {
+    pub fn new(): Group::<T> {
+        return Group { threads: Queue::new() };
+    }
+
+    /// Start a thread running `f` (see `spawn`).
+    pub fn spawn::<F: FnOnce(): T + Send + Detached>(&mut self, f: F) {
+        let packet = new_packet::<T>(String::new());
+        if let Err(e) = start(f, packet.clone(), 0) {
+            panic("failed to start a thread: {e}");
+        }
+        self.threads.push(packet);
+    }
+
+    /// How many threads were started and not joined yet.
+    pub fn len(&self): usize {
+        return self.threads.len();
+    }
+
+    /// Wait for the oldest thread not joined yet: what its closure returned,
+    /// or its panic; `None` if all were joined.
+    pub fn join_next(&mut self): Option::<Result::<T, Panic>> {
+        let Some(packet) = self.threads.pop() else { return None; };
+        return Some(outcome(packet.as_ptr()));
+    }
+}
+
 // ===================================================================== scope
 
 /// Threads that may borrow from the function that started them; see
@@ -352,6 +398,19 @@ impl Scope {
         rt::block_retain(p);
         self.threads.push(p as usize);
         return ScopedJoinHandle { packet, scope: self.env };
+    }
+
+    /// `spawn`, giving `arg` to the thread: `f` takes it as its argument,
+    /// while still borrowing what it borrows. For starting threads in a
+    /// loop, each with its own part of the work:
+    ///
+    /// ```lunar
+    /// for chunk in data.chunks(1000) {
+    ///     s.spawn_with(chunk, |c| total.fetch_add(sum(c), Ordering::Relaxed));
+    /// }
+    /// ```
+    pub fn spawn_with::<A: Send, F: FnOnce(A): T + Send, T: Send>(&mut +self, kept arg: A, kept f: F): ScopedJoinHandle::<T> from self, arg, f {
+        return self.spawn(move || f(arg));
     }
 }
 

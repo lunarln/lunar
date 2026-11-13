@@ -2013,6 +2013,42 @@ impl Sema {
                 return Ok(ConstVal::Adt(index, self.p.consts.add_list(out[..])));
             }
             ExprKind::Block(b) | ExprKind::Unsafe(b) => return self.const_block(module, b, ty, env),
+            ExprKind::TupleField(base, i, _) => {
+                let err = self.p.types.error();
+                let v = self.eval_const_inner(module, base, err, env)?;
+                let fields = match v {
+                    ConstVal::Tuple(l) => l,
+                    ConstVal::Adt(_, l) => l,
+                    _ => return Err(String::from("`.0` in a constant needs a tuple or tuple struct")),
+                };
+                if (i as usize) >= fields.len() {
+                    return Err(core::fmt::format("no field `{i}` here"));
+                }
+                return Ok(self.p.consts.list(fields)[i as usize]);
+            }
+            ExprKind::Field(base, name) => {
+                let err = self.p.types.error();
+                let v = self.eval_const_inner(module, base, err, env)?;
+                let bt = self.const_expr_ty(module, base, env);
+                let fname = self.p.text(name.name).to_string();
+                let TyKind::Adt(adt_id, _) = self.p.types.kind(bt) else {
+                    return Err(core::fmt::format("cannot tell the type of the value whose field `{fname}` is read in this constant"));
+                };
+                let ConstVal::Adt(vi, fields) = v else {
+                    return Err(core::fmt::format("no field `{fname}` here"));
+                };
+                let adt = self.p.adt(adt_id);
+                if (vi as usize) >= adt.variants.len() {
+                    return Err(core::fmt::format("no field `{fname}` here"));
+                }
+                let var = self.p.variants.list(adt.variants)[vi as usize];
+                for k in 0..var.fields.len() {
+                    if self.p.fields.list(var.fields)[k].name == name.name && k < fields.len() {
+                        return Ok(self.p.consts.list(fields)[k]);
+                    }
+                }
+                return Err(core::fmt::format("no field `{fname}` here"));
+            }
             ExprKind::If { cond, then, else_ } => {
                 let bool_ty = self.p.types.mk(TyKind::Bool);
                 let c = match self.eval_const_inner(module, cond, bool_ty, env)? {
@@ -2183,13 +2219,60 @@ impl Sema {
         let saved = env.enter(self_def);
         for i in 0..names.len() {
             if let Some(n) = names[i] {
-                env.bind(n, vals[i]);
+                let pt = if i < sig.params.len() { self.p.params.list(sig.params)[i].ty } else { self.p.types.error() };
+                env.bind(n, vals[i], pt);
             }
         }
         let fm = self.p.defs[f.index()].module;
         let r = self.const_block(fm, body, sig.ret, env);
         env.leave(saved);
         return r;
+    }
+
+    /// The type of a constant expression, as far as field access needs it:
+    /// a binding's, a struct literal's, a `const fn` call's result, or the
+    /// error type.
+    fn const_expr_ty(&mut self, module: DefId, e: Id::<Expr>, env: &ConstEnv): Ty {
+        let err = self.p.types.error();
+        match self.p.ast.exprs.get(e).kind {
+            ExprKind::Paren(x) => return self.const_expr_ty(module, x, env),
+            ExprKind::Path(p) => {
+                let mut idents: [Ident; ..+] = [];
+                self.path_idents(p, &mut idents);
+                if idents.len() == 1 {
+                    if let Some(t) = env.type_of(idents[0].name) {
+                        return t;
+                    }
+                }
+            }
+            ExprKind::StructLit { path, .. } => {
+                let mut idents: [Ident; ..+] = [];
+                self.path_idents(path, &mut idents);
+                if let Some((d, used)) = self.const_resolve(module, idents[..], Ns::Type, env) {
+                    if used == idents.len() {
+                        if let DefData::Adt(_) = self.p.defs[d.index()].data {
+                            return self.p.types.mk(TyKind::Adt(d, List::empty()));
+                        }
+                    }
+                }
+            }
+            ExprKind::Call(callee, _) => {
+                if let ExprKind::Path(p) = self.p.ast.exprs.get(callee).kind {
+                    let mut idents: [Ident; ..+] = [];
+                    self.path_idents(p, &mut idents);
+                    if let Some((d, used)) = self.const_resolve(module, idents[..], Ns::Value, env) {
+                        let f = if used + 1 == idents.len() { self.inherent_fn(d, idents[used].name) } else if used == idents.len() { Some(d) } else { None };
+                        if let Some(f) = f {
+                            if let DefData::Fn(fd) = self.p.defs[f.index()].data {
+                                return fd.sig.ret;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        return err;
     }
 
     /// Evaluate the block of a `const fn` (or a block in a constant): `let`s
@@ -2204,7 +2287,8 @@ impl Sema {
                         return Err(String::from("only `let name = value;` is supported in a `const fn`"));
                     };
                     let v = self.eval_const_inner(module, init, err, env)?;
-                    env.bind(name.name, v);
+                    let t = self.const_expr_ty(module, init, env);
+                    env.bind(name.name, v, t);
                 }
                 ln_ast::StmtKind::Expr(x) => {
                     if let ExprKind::Return(r) = self.p.ast.exprs.get(x).kind {
@@ -2236,6 +2320,8 @@ impl Sema {
 struct ConstEnv {
     names: [Symbol; -..+],
     values: [ConstVal; -..+],
+    /// The type of each binding, as far as it is known (for field access).
+    tys: [Ty; -..+],
     start: usize,
     /// The struct or enum `Self` names in each call (`None` outside impls).
     selfs: [Option::<DefId>; -..+],
@@ -2244,7 +2330,7 @@ struct ConstEnv {
 
 impl ConstEnv {
     fn new(): ConstEnv {
-        return ConstEnv { names: [], values: [], start: 0, selfs: [], calls: 0 };
+        return ConstEnv { names: [], values: [], tys: [], start: 0, selfs: [], calls: 0 };
     }
 
     fn lookup(&self, name: Symbol): Option::<ConstVal> {
@@ -2258,9 +2344,22 @@ impl ConstEnv {
         return None;
     }
 
-    fn bind(&mut self, name: Symbol, v: ConstVal) {
+    fn bind(&mut self, name: Symbol, v: ConstVal, ty: Ty) {
         self.names.push(name);
         self.values.push(v);
+        self.tys.push(ty);
+    }
+
+    /// The type of a binding, as far as it is known.
+    fn type_of(&self, name: Symbol): Option::<Ty> {
+        let mut i = self.names.len();
+        while i > self.start {
+            i -= 1;
+            if self.names[i] == name {
+                return Some(self.tys[i]);
+            }
+        }
+        return None;
     }
 
     fn self_def(&self): Option::<DefId> {
@@ -2283,6 +2382,7 @@ impl ConstEnv {
         let (start, len) = saved;
         self.names.truncate(len);
         self.values.truncate(len);
+        self.tys.truncate(len);
         self.start = start;
         self.selfs.pop();
         self.calls -= 1;

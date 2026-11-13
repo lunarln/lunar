@@ -1,0 +1,15 @@
+// error: borrow::scoped_thread_borrow
+// Scoped threads may borrow what the scope's closure borrows, not its own
+// variables.
+use std::thread;
+
+fn main() {
+    let outer = String::from("outer");
+    thread::scope(|s| {
+        let local = String::from("local");
+        s.spawn(|| local.len());
+        let view = local.as_str();
+        s.spawn(move || view.len());
+        s.spawn(|| outer.len());
+    });
+}

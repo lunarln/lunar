@@ -1,0 +1,9 @@
+// error: trait::dull_impl
+// `Detached` follows from a type's fields.
+struct Name {
+    text: str,
+}
+
+impl Detached for Name {}
+
+fn main() {}

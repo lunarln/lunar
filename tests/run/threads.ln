@@ -1,0 +1,224 @@
+// std::thread: spawn and join, panics on threads, names and ids, groups,
+// scoped threads that borrow, sleep and yield.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[test]
+fn spawn_and_join() {
+    let h = thread::spawn(move || 40 + 2);
+    assert_eq!(h.join().unwrap(), 42);
+    // Owned values move in and out.
+    let name = String::from("lunar");
+    let h = thread::spawn(move || {
+        let mut s = name;
+        s.push_str(" threads");
+        s
+    });
+    assert_eq!(h.join().unwrap(), String::from("lunar threads"));
+}
+
+#[test]
+fn join_waits_for_the_thread() {
+    let start = Instant::now();
+    let h = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(30));
+        7
+    });
+    assert_eq!(h.join().unwrap(), 7);
+    assert!(start.elapsed() >= Duration::from_millis(30));
+}
+
+#[test]
+fn is_finished() {
+    let h = thread::spawn(move || 1);
+    while !h.is_finished() {
+        thread::yield_now();
+    }
+    assert_eq!(h.join().unwrap(), 1);
+}
+
+fn index(i: usize): u32 {
+    let a: [u32; 3] = [1, 2, 3];
+    return a[i];
+}
+
+#[test]
+fn join_gives_the_panic() {
+    let h = thread::spawn(move || {
+        let n = 3 * 7;
+        if n > 0 {
+            panic("worker failed: {n}");
+        }
+        n
+    });
+    let e = match h.join() {
+        Ok(_) => panic("expected a panic"),
+        Err(p) => p,
+    };
+    assert_eq!(String::from(e.message()), String::from("worker failed: 21"));
+    assert_eq!(String::from(e.location()), String::new());
+    // A failed check panics too, with where it happened.
+    let h = thread::spawn(move || index(5));
+    let e = match h.join() {
+        Ok(_) => panic("expected a panic"),
+        Err(p) => p,
+    };
+    assert!(e.message().starts_with("index out of bounds: the length is 3 but the index is 5"));
+    assert!(e.location().contains("threads.ln"));
+}
+
+#[test]
+fn panics_leave_the_program_running() {
+    let mut g = thread::Group::<u64>::new();
+    for i in 0..6 {
+        g.spawn(move || {
+            if i % 2 == 1 {
+                panic("odd {i}");
+            }
+            i
+        });
+    }
+    let mut ok: u64 = 0;
+    let mut failed = 0;
+    while let Some(r) = g.join_next() {
+        match r {
+            Ok(v) => ok += v,
+            Err(_) => failed += 1,
+        }
+    }
+    assert_eq!(ok, 6);
+    assert_eq!(failed, 3);
+}
+
+#[test]
+fn names_and_ids() {
+    assert!(name_is(thread::current_name(), "main"));
+    let main_id = thread::current_id();
+    let h = thread::Builder::new().name("worker").stack_size(1 << 20).spawn(move || {
+        (thread::current_name(), thread::current_id())
+    }).unwrap();
+    let id = h.id();
+    let (name, inner) = h.join().unwrap();
+    assert!(name_is(name, "worker"));
+    assert!(inner == id);
+    assert!(inner != main_id);
+    let h = thread::spawn(move || thread::current_name());
+    assert!(h.join().unwrap().is_none());
+    assert!(thread::available_parallelism() >= 1);
+}
+
+#[test]
+fn many_threads() {
+    let mut g = thread::Group::<u64>::new();
+    for i in 0..32 {
+        g.spawn(move || {
+            let mut s: u64 = 0;
+            for k in 0..1000 {
+                s += k * i;
+            }
+            s
+        });
+    }
+    assert_eq!(g.len(), 32);
+    let mut total: u64 = 0;
+    while let Some(r) = g.join_next() {
+        total += r.unwrap();
+    }
+    // sum over i of i * 499500
+    assert_eq!(total, 499500 * 496);
+}
+
+#[test]
+fn scoped_threads_borrow() {
+    let data: [u64; ..+] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let total = AtomicU64::new(0);
+    let words = String::from("borrowed by every thread");
+    let (left, right) = thread::scope(|s| {
+        let a = s.spawn(|| {
+            let mut t: u64 = 0;
+            for x in data[..5] {
+                t += x;
+            }
+            total.fetch_add(t, Ordering::Relaxed);
+            t
+        });
+        let b = s.spawn(|| {
+            let mut t: u64 = 0;
+            for x in data[5..] {
+                t += x;
+            }
+            total.fetch_add(t, Ordering::Relaxed);
+            t
+        });
+        for _ in 0..4 {
+            s.spawn(|| total.fetch_add(words.len() as u64, Ordering::Relaxed));
+        }
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert_eq!(left, 15);
+    assert_eq!(right, 40);
+    // Every thread finished when `scope` returned.
+    assert_eq!(total.load(Ordering::Relaxed), 55 + 4 * 24);
+}
+
+#[test]
+fn scoped_results_may_borrow() {
+    let text = String::from("alpha beta gamma");
+    let view = text.as_str();
+    let first = thread::scope(|s| {
+        let h = s.spawn(move || match view.split_once(" ") {
+            Some(p) => p.0,
+            None => view,
+        });
+        h.join().unwrap()
+    });
+    assert_eq!(String::from(first), String::from("alpha"));
+}
+
+#[test]
+fn scope_waits_for_unjoined_threads() {
+    let done = AtomicU64::new(0);
+    thread::scope(|s| {
+        for _ in 0..8 {
+            s.spawn(|| {
+                thread::sleep(Duration::from_millis(5));
+                done.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+    });
+    assert_eq!(done.load(Ordering::SeqCst), 8);
+}
+
+#[test]
+fn scoped_panics_join() {
+    let m = Mutex::new(0u64);
+    let r = thread::scope(|s| {
+        let h = s.spawn(|| {
+            m.lock(|v| v += 1);
+            if m.lock(|v| v) > 0 {
+                panic("scoped failure");
+            }
+            0
+        });
+        h.join().is_err()
+    });
+    assert!(r);
+    assert_eq!(m.lock(|v| v), 1);
+}
+
+#[test]
+fn sleep_sleeps() {
+    let start = Instant::now();
+    thread::sleep(Duration::from_millis(20));
+    assert!(start.elapsed() >= Duration::from_millis(20));
+}
+
+fn name_is(n: Option::<String>, want: str): bool {
+    return match n {
+        Some(s) => s.as_str() == want,
+        None => false,
+    };
+}

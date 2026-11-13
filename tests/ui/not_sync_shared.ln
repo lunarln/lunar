@@ -1,0 +1,20 @@
+// error: type::not_sync
+// Shared values and what scoped threads borrow must be Sync.
+use core::cell::UnsafeCell;
+use std::sync::Shared;
+use std::thread;
+
+struct Counter {
+    n: UnsafeCell::<u64>,
+}
+
+unsafe impl Send for Counter {}
+
+fn main() {
+    let s = Shared::new(Counter { n: UnsafeCell::new(0) });
+    let _ = s;
+    let c = Counter { n: UnsafeCell::new(0) };
+    thread::scope(|sc| {
+        sc.spawn(|| unsafe { core::intrinsics::atomic_load(c.n.get() as *u64, 7) });
+    });
+}

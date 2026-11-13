@@ -372,6 +372,8 @@ pub fn stderr(): Stderr {
 static mut STDIN_BUF: [u8; 16384] = [0; 16384];
 static mut STDIN_POS: usize = 0;
 static mut STDIN_END: usize = 0;
+/// Guards the buffer: threads read standard input one at a time.
+static STDIN_LOCK: crater::sync::raw::RawMutex = crater::sync::raw::RawMutex::new();
 
 /// Refill the standard input buffer if it is empty: false at the end.
 fn stdin_fill(): Result::<bool, Error> {
@@ -389,18 +391,26 @@ fn stdin_fill(): Result::<bool, Error> {
     }
 }
 
+/// `Stdin::read`, with `STDIN_LOCK` held.
+fn stdin_read(buf: [u8; &mut]): Result::<usize, Error> {
+    if !stdin_fill()? {
+        return Ok(0);
+    }
+    unsafe {
+        let avail = STDIN_END - STDIN_POS;
+        let n = if avail < buf.len() { avail } else { buf.len() };
+        copy_bytes(buf[..n], STDIN_BUF[STDIN_POS..STDIN_POS + n]);
+        STDIN_POS += n;
+        return Ok(n);
+    }
+}
+
 impl Read for Stdin {
     fn read(&mut self, buf: [u8; &mut]): Result::<usize, Error> {
-        if !stdin_fill()? {
-            return Ok(0);
-        }
-        unsafe {
-            let avail = STDIN_END - STDIN_POS;
-            let n = if avail < buf.len() { avail } else { buf.len() };
-            copy_bytes(buf[..n], STDIN_BUF[STDIN_POS..STDIN_POS + n]);
-            STDIN_POS += n;
-            return Ok(n);
-        }
+        STDIN_LOCK.lock();
+        let r = stdin_read(buf);
+        STDIN_LOCK.unlock();
+        return r;
     }
 }
 
@@ -410,6 +420,21 @@ impl Stdin {
     /// `InvalidData` (adding nothing) if the line is not UTF-8.
     /// `while stdin().read_line(&mut line)? > 0 { ...; line.clear(); }`
     pub fn read_line(&mut self, out: &mut +String): Result::<usize, Error> {
+        STDIN_LOCK.lock();
+        let r = stdin_read_line(out);
+        STDIN_LOCK.unlock();
+        return r;
+    }
+
+    /// The remaining lines, without their `\n` or `\r\n`.
+    pub fn lines(self): StdinLines {
+        return StdinLines { done: false };
+    }
+}
+
+/// `Stdin::read_line`, with `STDIN_LOCK` held.
+fn stdin_read_line(out: &mut +String): Result::<usize, Error> {
+    {
         let mut bytes: [u8; ..+] = [];
         loop {
             if !stdin_fill()? {
@@ -437,11 +462,6 @@ impl Stdin {
             }
             None => Err(not_utf8()),
         };
-    }
-
-    /// The remaining lines, without their `\n` or `\r\n`.
-    pub fn lines(self): StdinLines {
-        return StdinLines { done: false };
     }
 }
 

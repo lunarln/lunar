@@ -7,6 +7,8 @@
 // panics while holding one can poison it and let it go (see
 // `poison_held_locks`).
 
+use core::intrinsics;
+use crater::rt;
 use crater::sys;
 use crater::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
@@ -177,3 +179,131 @@ pub fn poison_held_locks() {
         HELD_LEN = 0;
     }
 }
+
+// ===================================================================== queues
+
+const MAX_USIZE: usize = 18446744073709551615;
+
+/// Bytes before the first item of a queue's block: `head`, `len`, `cap`.
+const META: usize = 64;
+
+/// A first-in first-out queue of values of any type, owners included (an
+/// array cannot hold owners). The items are in a ring buffer in a block of
+/// their own, which owns them: when the queue is freed, the items still in
+/// it are dropped. Moving an item moves its bits (owning arrays never move
+/// their elements). Growing moves the items to a block twice the size.
+/// (Used by the channels and `thread::Group`.)
+pub struct Queue::<T> {
+    buf: [u8; ..+],
+}
+
+/// Drop the items still in the queue block at `p`.
+fn drop_queue::<T>(p: *mut u8) {
+    let mut q = QueueRaw::<T> { base: p as usize };
+    while q.len() > 0 {
+        let v = q.pop_raw();
+        let _ = v;
+    }
+}
+
+/// A queue's block, by address.
+struct QueueRaw::<T> {
+    base: usize,
+}
+
+impl::<T> QueueRaw::<T> {
+    fn get(&self, i: usize): usize {
+        return unsafe { intrinsics::ptr_read((self.base + i * 8) as *usize) };
+    }
+
+    fn set(&self, i: usize, v: usize) {
+        unsafe {
+            intrinsics::ptr_write((self.base + i * 8) as *mut usize, v);
+        }
+    }
+
+    fn len(&self): usize {
+        return self.get(1);
+    }
+
+    fn cap(&self): usize {
+        return self.get(2);
+    }
+
+    fn slot(&self, i: usize): *mut T {
+        let size = core::mem::size_of::<T>();
+        return (self.base + META + i * size) as *mut T;
+    }
+
+    fn pop_raw(&mut self): T {
+        let head = self.get(0);
+        let v = unsafe { intrinsics::ptr_read(self.slot(head) as *T) };
+        let cap = self.cap();
+        self.set(0, if head + 1 == cap { 0 } else { head + 1 });
+        self.set(1, self.len() - 1);
+        return v;
+    }
+
+    fn push_raw(&mut self, v: T) {
+        let cap = self.cap();
+        let mut at = self.get(0) + self.len();
+        if at >= cap {
+            at -= cap;
+        }
+        unsafe {
+            intrinsics::ptr_write(self.slot(at), v);
+        }
+        self.set(1, self.len() + 1);
+    }
+}
+
+fn new_block::<T>(cap: usize): [u8; ..+] {
+    let size = core::mem::size_of::<T>();
+    let drop: fn(*mut u8) = drop_queue::<T>;
+    let buf = rt::block_new(META + cap * size, drop);
+    let q = QueueRaw::<T> { base: buf[..].as_ptr() as usize };
+    q.set(0, 0);
+    q.set(1, 0);
+    q.set(2, cap);
+    return buf;
+}
+
+impl::<T> Queue::<T> {
+    pub fn new(): Queue::<T> {
+        // Zero-sized items take no room: the count is all there is.
+        let cap = if core::mem::size_of::<T>() == 0 { MAX_USIZE } else { 8 };
+        return Queue { buf: new_block::<T>(cap) };
+    }
+
+    fn raw(&self): QueueRaw::<T> {
+        return QueueRaw::<T> { base: self.buf[..].as_ptr() as usize };
+    }
+
+    pub fn len(&self): usize {
+        return self.raw().len();
+    }
+
+    pub fn push(&mut self, v: T) {
+        let mut q = self.raw();
+        if q.len() == q.cap() {
+            // Twice the room, the items moved over in order.
+            let bigger = new_block::<T>(q.cap() * 2);
+            let mut nq = QueueRaw::<T> { base: bigger[..].as_ptr() as usize };
+            while q.len() > 0 {
+                nq.push_raw(q.pop_raw());
+            }
+            self.buf = bigger;
+            q = nq;
+        }
+        q.push_raw(v);
+    }
+
+    pub fn pop(&mut self): Option::<T> {
+        let mut q = self.raw();
+        if q.len() == 0 {
+            return None;
+        }
+        return Some(q.pop_raw());
+    }
+}
+

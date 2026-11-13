@@ -1,0 +1,26 @@
+// error: trait::unsafe_impl
+// `Send` and `Sync` need `unsafe impl`; nothing else may have it.
+struct Handle {
+    raw: *mut u8,
+}
+
+impl Send for Handle {}
+unsafe impl !Sync for Handle {}
+
+unsafe impl Handle {
+    fn get(&self): *mut u8 {
+        return self.raw;
+    }
+}
+
+trait Speak {
+    fn speak(&self): str;
+}
+
+unsafe impl Speak for Handle {
+    fn speak(&self): str {
+        return "raw";
+    }
+}
+
+fn main() {}

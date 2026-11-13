@@ -1,0 +1,26 @@
+// error: type::not_send
+// Values that cannot move to another thread: a raw pointer, a closure
+// that changes what it borrows, a mutable slice, a type with `impl !Send`.
+use std::thread;
+
+struct Raw {
+    p: *mut u8,
+}
+
+struct Pinned {
+    n: u32,
+}
+
+impl !Send for Pinned {}
+
+fn need_send::<T: Send>(t: T) {}
+
+fn main() {
+    let r = Raw { p: core::ptr::null_mut() };
+    let h = thread::spawn(move || r.p as usize);
+    let _ = h;
+    need_send(Pinned { n: 1 });
+    let mut a: [u32; 4] = [1, 2, 3, 4];
+    let s: [u32; &mut] = a[..];
+    need_send(s);
+}
