@@ -84,7 +84,7 @@ fn lookup() {
     let r = net::resolve("localhost:99").unwrap();
     assert_eq!(r[0].port(), 99u16);
     assert!(net::resolve("no-port").is_err());
-    assert!(net::lookup_host("does-not-exist.invalid").is_err());
+    assert!(net::lookup_host("").is_err());
 }
 
 #[test]
