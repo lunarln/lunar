@@ -6,9 +6,10 @@
 use core::arena::{Id, List};
 use ln_ast::{Ast, FieldDecl, Item, ItemKind, Span, VariantData};
 use ln_ast::pretty;
-use ln_lexer::{Spanned, Token};
 use ln_sema::defs::{DefData, DefId, DefKind};
 use ln_sema::diag::is_dummy;
+use ln_sema::highlight;
+use ln_sema::highlight::{Classified, TokenClass};
 use ln_sema::loader::Craters;
 use ln_sema::program::{Program, RefTarget};
 use ln_sema::sema::Sema;
@@ -313,64 +314,24 @@ pub fn semantic_tokens(p: &Program, file: u32, out: &mut +[SemTok; ..+]) {
         mods.push(0);
         first.push(false);
     }
-    let (toks, _) = ln_lexer::lex(text);
-    let mut gap: usize = 0;
-    for i in 0..toks.len() + 1 {
-        let end = if i < toks.len() { toks[i].range.start } else { n };
-        paint_comments(b, gap, end, &mut ty, &mut first);
-        if i < toks.len() {
-            gap = toks[i].range.end;
-        }
-    }
-    let nt = toks.len();
-    for i in 0..nt {
-        let t = toks[i];
-        let (k, m) = match t.token {
-            Token::Ident => ident_class(text, toks[..], i),
-            Token::SelfType => (T_TYPE, 0),
-            Token::True | Token::False => (T_KEYWORD, 0),
-            Token::Number(_) => (T_NUMBER, 0),
-            Token::Str | Token::Char | Token::Byte => (T_STRING, 0),
-            Token::DocComment => (T_COMMENT, M_DOCUMENTATION),
-            Token::Bang => if i > 0 && toks[i - 1].token == Token::Ident && toks[i - 1].range.end == t.range.start && macro_bang(toks[..], i) { (T_MACRO, 0) } else { (T_NONE, 0) },
-            _ => if keyword(t.token) { (T_KEYWORD, 0) } else { (T_NONE, 0) },
+    // What the lexer sees, as the diagnostics' highlighter sees it.
+    let mut cl: [Classified; ..+] = [];
+    highlight::classify(text, &mut cl);
+    for c in cl {
+        let (k, m) = match c.class {
+            TokenClass::Plain => (T_NONE, 0),
+            TokenClass::Keyword | TokenClass::Bool => (T_KEYWORD, 0),
+            TokenClass::Type => if highlight::is_primitive(text[c.start..c.end]) || text[c.start..c.end] == "String" { (T_TYPE, M_DEFAULT_LIBRARY) } else { (T_TYPE, 0) },
+            TokenClass::Number => (T_NUMBER, 0),
+            TokenClass::String => (T_STRING, 0),
+            TokenClass::Comment => (T_COMMENT, 0),
+            TokenClass::DocComment => (T_COMMENT, M_DOCUMENTATION),
+            TokenClass::Macro => (T_MACRO, 0),
+            TokenClass::Attribute => (T_DECORATOR, 0),
         };
-        paint(&mut ty, &mut mods, &mut first, t.range.start, t.range.end, k, m);
-    }
-    // Attributes, `#[...]`, but for the strings in them.
-    let mut i: usize = 0;
-    while i < nt {
-        if toks[i].token == Token::Hash {
-            let mut j = i + 1;
-            if j < nt && toks[j].token == Token::Bang {
-                j += 1;
-            }
-            if j < nt && toks[j].token == Token::LBracket {
-                let mut depth: usize = 0;
-                let mut k = j;
-                while k < nt {
-                    let tk = toks[k].token;
-                    if tk == Token::LBracket {
-                        depth += 1;
-                    } else if tk == Token::RBracket {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    k += 1;
-                }
-                let last = if k < nt { k } else { nt - 1 };
-                paint(&mut ty, &mut mods, &mut first, toks[i].range.start, toks[last].range.end, T_DECORATOR, 0);
-                for q in i..last + 1 {
-                    if toks[q].token == Token::Str {
-                        paint(&mut ty, &mut mods, &mut first, toks[q].range.start, toks[q].range.end, T_STRING, 0);
-                    }
-                }
-                i = last;
-            }
+        if k != T_NONE {
+            paint(&mut ty, &mut mods, &mut first, c.start, c.end, k, m);
         }
-        i += 1;
     }
     // What the analysis knows: every resolved name in this file.
     let std_roots = std_crates(p);
@@ -597,97 +558,6 @@ fn paint(ty: &mut [u8; -..+], mods: &mut [u8; -..+], first: &mut [bool; -..+], s
     if e < ty.len() {
         first[e] = true;
     }
-}
-
-/// Comments in `b[start..end]` (a gap between tokens).
-fn paint_comments(b: [u8; &], start: usize, end: usize, ty: &mut [u8; -..+], first: &mut [bool; -..+]) {
-    let mut i = start;
-    while i + 1 < end {
-        if b[i] == b'/' && b[i + 1] == b'/' {
-            let mut j = i;
-            while j < end && b[j] != b'\n' && b[j] != b'\r' {
-                j += 1;
-            }
-            for k in i..j {
-                ty[k] = T_COMMENT;
-            }
-            first[i] = true;
-            i = j;
-        } else if b[i] == b'/' && b[i + 1] == b'*' {
-            let mut depth: usize = 0;
-            let mut j = i;
-            while j < end {
-                if j + 1 < end && b[j] == b'/' && b[j + 1] == b'*' {
-                    depth += 1;
-                    j += 2;
-                } else if j + 1 < end && b[j] == b'*' && b[j + 1] == b'/' {
-                    depth -= 1;
-                    j += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    j += 1;
-                }
-            }
-            for k in i..j {
-                ty[k] = T_COMMENT;
-            }
-            first[i] = true;
-            i = j;
-        } else {
-            i += 1;
-        }
-    }
-}
-
-/// The `!` of `name!(...)`.
-fn macro_bang(toks: [Spanned; &], i: usize): bool {
-    if i + 1 >= toks.len() {
-        return false;
-    }
-    let next = toks[i + 1].token;
-    return next == Token::LParen || next == Token::LBracket || next == Token::LBrace;
-}
-
-/// What an identifier looks like before the analysis says what it is: a
-/// macro name, a metavariable or a primitive type.
-fn ident_class(text: str, toks: [Spanned; &], i: usize): (u8, u8) {
-    let t = toks[i];
-    if i + 1 < toks.len() {
-        let next = toks[i + 1];
-        if next.token == Token::Bang && next.range.start == t.range.end && macro_bang(toks, i + 1) {
-            return (T_MACRO, 0);
-        }
-    }
-    if i > 0 && toks[i - 1].token == Token::Dollar && toks[i - 1].range.end == t.range.start {
-        return (T_MACRO, 0);
-    }
-    let name = text[t.range.start..t.range.end];
-    if is_primitive(name) {
-        return (T_TYPE, M_DEFAULT_LIBRARY);
-    }
-    return (T_NONE, 0);
-}
-
-pub fn is_primitive(name: str): bool {
-    let prims = ["i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize", "f32", "f64", "bool", "char", "str", "String", "FmtArgs"];
-    for q in prims {
-        if q == name {
-            return true;
-        }
-    }
-    return false;
-}
-
-fn keyword(t: Token): bool {
-    return match t {
-        Token::As | Token::Break | Token::Const | Token::Continue | Token::Crater | Token::Else | Token::Enum | Token::Extern => true,
-        Token::Fn | Token::For | Token::If | Token::Impl | Token::In | Token::Let | Token::Loop | Token::Macro | Token::Match => true,
-        Token::Mod | Token::Move | Token::Mut | Token::Pub | Token::Return | Token::SelfValue | Token::Static | Token::Struct => true,
-        Token::Super | Token::Trait | Token::Type | Token::Unsafe | Token::Use | Token::While => true,
-        _ => false,
-    };
 }
 
 // ===================================================================== inlay hints
