@@ -30,6 +30,8 @@
 mod cli;
 mod commands;
 mod compile;
+#[cfg(test)]
+mod debuginfo_tests;
 mod explain;
 mod git;
 mod ide;
