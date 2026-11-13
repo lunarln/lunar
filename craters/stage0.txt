@@ -1,0 +1,5 @@
+# The released compiler that builds craters/ (stage 0), with the standard
+# library it was released with. The code in craters/ may use only what this
+# release supports; std/ may use what the in-tree compiler supports. How to
+# move it forward: CONTRIBUTING.md, "Bumping stage 0".
+0.1.0

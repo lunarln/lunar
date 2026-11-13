@@ -1,5 +1,10 @@
 name: CI
 
+# The compiler is built from the released compiler named in
+# craters/stage0.txt (stage 0, with its own standard library): stage 1 is
+# craters/ built by it, stage 2 is built by stage 1 and stage 3 by stage 2,
+# and stages 2 and 3 must be identical. Every test runs against stage 2.
+
 on:
   push:
     branches: [main]
@@ -9,10 +14,6 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-
 jobs:
   test:
     name: ${{ matrix.os }}
@@ -21,57 +22,52 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      - uses: ./.github/actions/llvm
 
-      - name: Install LLVM 20 (Linux)
+      - uses: ./.github/actions/stage0
+
+      # For the debugger tests (craters/lunar/src/debuginfo_tests.ln):
+      # macOS has lldb with Xcode, LLVM's Windows build has llvm-pdbutil.
+      - name: Install lldb (Linux)
         if: runner.os == 'Linux'
         run: |
-          wget -q https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 20
-          sudo apt-get install -y llvm-20-dev libpolly-20-dev zlib1g-dev libzstd-dev
-          echo "LLVM_CONFIG=/usr/bin/llvm-config-20" >> "$GITHUB_ENV"
+          sudo apt-get update -q
+          sudo apt-get install -y -q lldb-20
+          echo "/usr/lib/llvm-20/bin" >> "$GITHUB_PATH"
 
-      - name: Install LLVM 20 (macOS)
-        if: runner.os == 'macOS'
+      - name: Bootstrap (stage 2 == stage 3)
         run: |
-          brew install llvm@20
-          echo "LLVM_CONFIG=$(brew --prefix llvm@20)/bin/llvm-config" >> "$GITHUB_ENV"
-
-      - name: Install LLVM 20 (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $v = "20.1.8"
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$v/LLVM-$v-win64.exe"
-          # GitHub's release CDN occasionally times out (504); retry.
-          Invoke-WebRequest $url -OutFile llvm.exe -MaximumRetryCount 3 -RetryIntervalSec 15
-          Start-Process -Wait -FilePath .\llvm.exe -ArgumentList "/S", "/D=C:\LLVM"
-          "LLVM_SYS_201_PREFIX=C:\LLVM" >> $env:GITHUB_ENV
-          "C:\LLVM\bin" >> $env:GITHUB_PATH
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build
-        run: cargo build --workspace --all-targets
-
-      - name: Test
-        run: cargo test --workspace
+          tools/bootstrap.sh "$STAGE0" target/bootstrap
+          # Stage 2, as a native path for the tests to run.
+          dir=$(cd target/bootstrap/stage2 && { pwd -W 2>/dev/null || pwd; })
+          exe=lunar
+          if [ "$RUNNER_OS" = Windows ]; then exe=lunar.exe; fi
+          echo "LUNAR_BIN=$dir/$exe" >> "$GITHUB_ENV"
 
       - name: Check std for every OS
-        shell: bash
         run: |
           for os in linux macos windows; do
-            ./target/debug/lunar check --target-os "$os" examples/tour.ln
+            "$LUNAR_BIN" check --target-os "$os" examples/tour.ln
           done
 
-      - name: Run the example
-        shell: bash
+      - name: Test the compiler's packages
+        working-directory: craters
         run: |
-          ./target/debug/lunar run examples/arrays.ln
-          ./target/debug/lunar test examples/arrays.ln
+          for manifest in */lunar.toml; do
+            package=$(dirname "$manifest")
+            if [ "$package" != lunar-tests ]; then
+              "$LUNAR_BIN" test -p "$package"
+            fi
+          done
+
+      # The command line, the package manager and the language server, run
+      # as programs (craters/lunar-tests).
+      - name: Test lunar
+        working-directory: craters
+        run: '"$LUNAR_BIN" test -p lunar-tests'
