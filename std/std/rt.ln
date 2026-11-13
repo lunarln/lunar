@@ -73,6 +73,13 @@ struct Header {
     /// The most bytes of elements the array may hold: its cap, or the whole
     /// slot after the header.
     limit: usize,
+    /// What to do when the array is freed: 0 nothing; `HANDLE_FILE` or
+    /// `HANDLE_SOCKET`: close the handle that is its first element (see
+    /// `OwnedHandle`); `FLUSH_FILE` or `FLUSH_SOCKET`: write its first
+    /// `pending` bytes to `handle` (see `set_flush`).
+    close: usize,
+    handle: i64,
+    pending: usize,
 }
 
 #[lang = "rt_init"]
@@ -123,6 +130,7 @@ fn acquire(order: usize): *mut u8 {
             RETAINED -= extra(header.committed);
             header.next = 0;
             header.limit = slot - HEADER;
+            header.close = 0;
             intrinsics::ptr_write(h, header);
             return base;
         }
@@ -138,7 +146,7 @@ fn acquire(order: usize): *mut u8 {
         let base = start as *mut u8;
         BUMP = start + slot;
         sys::commit(base, PAGE);
-        intrinsics::ptr_write(base as *mut Header, Header { committed: PAGE - HEADER, next: 0, order, limit: slot - HEADER });
+        intrinsics::ptr_write(base as *mut Header, Header { committed: PAGE - HEADER, next: 0, order, limit: slot - HEADER, close: 0, handle: 0, pending: 0 });
         return base;
     }
 }
@@ -255,6 +263,13 @@ fn ds_free(ptr: *mut u8) {
         let base = intrinsics::ptr_offset_mut(ptr, 0 - (HEADER as isize));
         let h = base as *mut Header;
         let mut header = intrinsics::ptr_read(h);
+        if header.close >= FLUSH_FILE {
+            flush_pending(header.close, header.handle, ptr as *u8, header.pending);
+            header.close = 0;
+        } else if header.close != 0 {
+            sys::close_handle(header.close, intrinsics::ptr_read(ptr as *i64));
+            header.close = 0;
+        }
         // Keep the memory for the next array that takes this slot, unless
         // free slots already hold too much.
         let e = extra(header.committed);
@@ -287,4 +302,111 @@ fn panic_bounds(index: usize, len: usize, file: str, line: u32, col: u32): ! {
     s.write(":{line}:{col}: index out of bounds: the length is {len} but the index is {index}\n");
     sys::write(2, s.as_bytes());
     sys::exit(101);
+}
+
+// ===================================================================== owned handles
+
+/// `OwnedHandle` kinds: a file (or pipe or directory) handle.
+pub const HANDLE_FILE: usize = 1;
+/// `OwnedHandle` kinds: a socket.
+pub const HANDLE_SOCKET: usize = 2;
+/// `set_flush` targets: a file handle (also a pipe or a console).
+pub const FLUSH_FILE: usize = 3;
+/// `set_flush` targets: a socket.
+pub const FLUSH_SOCKET: usize = 4;
+
+/// Make freeing the byte array whose first element is at `first` (an
+/// array that already has its data stack, such as one made by `capped`)
+/// write its first `pending` bytes (see `set_pending`) to `handle`, a
+/// `FLUSH_FILE` or `FLUSH_SOCKET`; `kind` 0 turns that off. This is how a
+/// `BufWriter` flushes when it is freed. Failures are ignored.
+pub fn set_flush(first: *u8, kind: usize, handle: i64) {
+    unsafe {
+        let h = ((first as usize) - HEADER) as *mut Header;
+        let mut header = intrinsics::ptr_read(h as *Header);
+        header.close = kind;
+        header.handle = handle;
+        header.pending = 0;
+        intrinsics::ptr_write(h, header);
+    }
+}
+
+/// How many bytes of the array at `first` freeing it writes (see
+/// `set_flush`).
+pub fn set_pending(first: *u8, pending: usize) {
+    unsafe {
+        let h = ((first as usize) - HEADER) as *mut Header;
+        let mut header = intrinsics::ptr_read(h as *Header);
+        header.pending = pending;
+        intrinsics::ptr_write(h, header);
+    }
+}
+
+/// Write `n` bytes at `p` to `handle`, as far as it goes.
+fn flush_pending(kind: usize, handle: i64, p: *u8, n: usize) {
+    let bytes = unsafe { intrinsics::slice_from_raw(p, n) };
+    let mut off: usize = 0;
+    while off < n {
+        let w = if kind == FLUSH_SOCKET { sys::sock_send(handle, bytes[off..]) } else { sys::handle_write(handle, bytes[off..]) };
+        if w <= 0 {
+            return;
+        }
+        off += w as usize;
+    }
+}
+
+/// An operating system handle (a file descriptor, a Windows `HANDLE` or
+/// `SOCKET`) with one owner, closed when its owner is freed.
+///
+/// Lunar has no destructors yet, so the handle lives as the only element
+/// of a small owning array, and the array's data stack header records what
+/// kind of handle it is. Freeing the array (when its owner goes out of
+/// scope, is replaced or is moved into a call that frees it) closes the
+/// handle. Owning an array also makes every type holding an `OwnedHandle`
+/// move instead of copy, so two values never close the same handle. Each
+/// one takes a 64 KiB slot of address space (one page of memory).
+pub struct OwnedHandle {
+    cell: [i64; ..+],
+}
+
+impl OwnedHandle {
+    /// Own `raw`, a handle of `kind` (`HANDLE_FILE` or `HANDLE_SOCKET`).
+    pub fn new(raw: i64, kind: usize): OwnedHandle {
+        let mut cell: [i64; ..+] = [].capped(1);
+        cell.push(raw);
+        set_close(cell[..].as_ptr(), kind);
+        return OwnedHandle { cell };
+    }
+
+    /// The handle, still owned by this value.
+    pub fn raw(&self): i64 {
+        return self.cell[0];
+    }
+
+    /// Close the handle now; false if the operating system reports a
+    /// failure (see `sys::last_error`).
+    pub fn close(self): bool {
+        let raw = self.cell[0];
+        let kind = set_close(self.cell[..].as_ptr(), 0);
+        return sys::close_handle(kind, raw);
+    }
+
+    /// Give up ownership: the handle is no longer closed with this value.
+    pub fn into_raw(self): i64 {
+        set_close(self.cell[..].as_ptr(), 0);
+        return self.cell[0];
+    }
+}
+
+/// Set what freeing the data stack of the array whose first element is at
+/// `first` closes; returns what it was set to.
+fn set_close(first: *i64, kind: usize): usize {
+    unsafe {
+        let h = ((first as usize) - HEADER) as *mut Header;
+        let mut header = intrinsics::ptr_read(h as *Header);
+        let old = header.close;
+        header.close = kind;
+        intrinsics::ptr_write(h, header);
+        return old;
+    }
 }

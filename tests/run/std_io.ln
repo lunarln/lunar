@@ -1,0 +1,135 @@
+// std::io: the Read and Write traits, in-memory readers and writers,
+// BufReader's three ways to read lines, BufWriter, and errors.
+
+use std::io::{self, Read, Write, BufReader, BufWriter, Cursor, Error, ErrorKind};
+
+#[test]
+fn cursor_reads_in_pieces() {
+    let data = "hello world";
+    let mut c = Cursor::new(data.as_bytes());
+    let mut buf: [u8; 5] = [0; 5];
+    assert_eq!(c.read(buf[..]).unwrap(), 5);
+    assert_eq!(str::from_utf8(buf[..]).unwrap(), "hello");
+    assert_eq!(c.position(), 5);
+    let mut rest = String::new();
+    assert_eq!(c.read_to_string(&mut rest).unwrap(), 6);
+    assert_eq!(rest, String::from(" world"));
+    assert_eq!(c.read(buf[..]).unwrap(), 0);
+    c.set_position(0);
+    let mut big: [u8; 20] = [0; 20];
+    let e = c.read_exact(big[..]);
+    assert!(e.is_err());
+    assert_eq!(kind(e), ErrorKind::UnexpectedEof);
+}
+
+fn kind(r: Result::<(), Error>): ErrorKind {
+    return match r {
+        Ok(_) => panic("expected an error"),
+        Err(e) => e.kind(),
+    };
+}
+
+#[test]
+fn write_to_arrays() {
+    let mut out: [u8; -..+] = [];
+    out.write_all("abc".as_bytes()).unwrap();
+    let n = 42;
+    out.print("n={n}").unwrap();
+    out.println("!").unwrap();
+    assert_eq!(str::from_utf8(out[..]).unwrap(), "abcn=42!\n");
+}
+
+#[test]
+fn lines_as_views() {
+    let text = "one\ntwo\r\n\nlast";
+    let mut r = BufReader::with_capacity(4, Cursor::new(text.as_bytes()));
+    let mut seen = String::new();
+    while r.next_line().unwrap() {
+        let line = r.line();
+        seen.push_str(line);
+        seen.push('|');
+    }
+    assert_eq!(seen, String::from("one|two||last|"));
+    assert!(!r.next_line().unwrap());
+}
+
+#[test]
+fn lines_appended_and_iterated() {
+    let text = "alpha\nbeta\n";
+    let mut r = BufReader::new(Cursor::new(text.as_bytes()));
+    let mut line = String::new();
+    assert_eq!(r.read_line(&mut line).unwrap(), 6);
+    assert_eq!(r.read_line(&mut line).unwrap(), 5);
+    assert_eq!(r.read_line(&mut line).unwrap(), 0);
+    assert_eq!(line, String::from("alpha\nbeta\n"));
+
+    let mut count = 0;
+    let mut total = 0;
+    for l in BufReader::new(Cursor::new("a\nbb\nccc".as_bytes())).lines() {
+        count += 1;
+        total += l.unwrap().len();
+    }
+    assert_eq!(count, 3);
+    assert_eq!(total, 6);
+}
+
+#[test]
+fn read_until_and_fill_buf() {
+    let mut r = BufReader::new(Cursor::new("k1=v1;k2=v2".as_bytes()));
+    let mut field: [u8; ..+] = [];
+    assert_eq!(r.read_until(b';', &mut field).unwrap(), 6);
+    assert_eq!(str::from_utf8(field[..]).unwrap(), "k1=v1;");
+    let avail = r.fill_buf().unwrap().len();
+    assert_eq!(avail, 5);
+    r.consume(3);
+    let mut rest = String::new();
+    r.read_to_string(&mut rest).unwrap();
+    assert_eq!(rest, String::from("v2"));
+}
+
+#[test]
+fn invalid_utf8_lines() {
+    let bad: [u8; 4] = [b'a', 0xff, b'\n', b'b'];
+    let mut r = BufReader::new(Cursor::new(bad[..]));
+    let e = r.next_line();
+    assert!(e.is_err());
+    let mut s = String::new();
+    let mut r2 = BufReader::new(Cursor::new(bad[..]));
+    assert!(r2.read_line(&mut s).is_err());
+    assert_eq!(s.len(), 0);
+}
+
+#[test]
+fn buf_writer_into_memory() {
+    let sink: [u8; -..+] = [];
+    let mut w = BufWriter::with_capacity(16, sink);
+    w.write_all("0123456789".as_bytes()).unwrap();
+    assert_eq!(w.buffer().len(), 10);
+    w.write_all("abcdefghij".as_bytes()).unwrap();
+    // The first ten went through when the second would not fit.
+    assert_eq!(w.buffer().len(), 10);
+    w.write_all("a much longer write than the buffer".as_bytes()).unwrap();
+    let inner = w.into_inner().unwrap();
+    assert_eq!(str::from_utf8(inner[..]).unwrap(), "0123456789abcdefghija much longer write than the buffer");
+}
+
+#[test]
+fn errors_display() {
+    let e = Error::new(ErrorKind::NotFound);
+    assert_eq!(core::fmt::format("{e}"), String::from("not found"));
+    let os = Error::from_os(2);
+    assert_eq!(os.kind(), ErrorKind::NotFound);
+    assert_eq!(os.os_code(), 2);
+    assert_eq!(ErrorKind::TimedOut.as_str(), "timed out");
+}
+
+#[test]
+fn buffered_stdout() {
+    let mut out = io::stdout().buffered();
+    for i in 0..3 {
+        out.println("line {i}").unwrap();
+    }
+    out.flush().unwrap();
+    let mut err = io::stderr();
+    err.write_str("to stderr\n").unwrap();
+}

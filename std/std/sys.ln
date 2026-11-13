@@ -18,6 +18,191 @@
 //   remove_file(path: str): bool
 //   write_all(fd: i32, bytes: [u8; &]): bool
 //   input_available(fd: i32): bool      (reading would not block)
+//
+// Files by handle (an `i64`: a `HANDLE` on Windows, a descriptor on Unix;
+// -1 on failure, with `last_error` set):
+//   open(path, read, write, append, truncate, create, create_new): i64
+//   handle_read(h, buf): isize          (bytes, 0 at end, or -1)
+//   handle_write(h, bytes): isize       (bytes written, or -1)
+//   seek(h, offset: i64, whence: i32): i64   (0 start, 1 current, 2 end)
+//   sync(h): bool, set_len(h, len: u64): bool
+//   close_handle(kind: usize, h: i64): bool   (rt::HANDLE_FILE or _SOCKET)
+//   stat(path, follow: bool, out: &mut FileStat): bool
+//   fstat(h, out: &mut FileStat): bool
+//   rename(from, to), hard_link(src, dst), symlink(src, dst, dir: bool),
+//   set_readonly(path, readonly): bool
+// Time, randomness and the environment:
+//   monotonic_ns(): u64, system_time(): (i64, u32), sleep_ns(ns: u64)
+//   random_fill(buf: [u8; &mut]): bool
+//   env_block(out: &mut +String)        (`NAME=value\0` for each variable)
+// Sockets (handles as above; errors from `net_error`):
+//   socket(v6, stream), sock_bind, sock_listen, sock_accept, sock_connect,
+//   sock_recv, sock_send, sock_recv_from, sock_send_to, sock_shutdown,
+//   sock_name, sock_set_nonblocking, sock_set_timeout, sock_timeout,
+//   sock_set_flag, sock_flag, sock_poll, lookup
+
+/// What `stat` and `fstat` report about a file.
+pub struct FileStat {
+    pub len: u64,
+    /// 1 a file, 2 a directory, 3 a symbolic link (only when not
+    /// following links).
+    pub kind: u8,
+    pub readonly: bool,
+    /// Times as seconds and nanoseconds since 1970-01-01 UTC.
+    pub modified_s: i64,
+    pub modified_ns: u32,
+    pub accessed_s: i64,
+    pub accessed_ns: u32,
+    /// Whether the system records creation times (not Linux's `stat`).
+    pub has_created: bool,
+    pub created_s: i64,
+    pub created_ns: u32,
+}
+
+impl FileStat {
+    pub fn new(): FileStat {
+        return FileStat {
+            len: 0,
+            kind: 0,
+            readonly: false,
+            modified_s: 0,
+            modified_ns: 0,
+            accessed_s: 0,
+            accessed_ns: 0,
+            has_created: false,
+            created_s: 0,
+            created_ns: 0,
+        };
+    }
+}
+
+/// A socket address in a form every platform can encode: an IPv4 address
+/// is the first 4 bytes of `ip`.
+pub struct RawAddr {
+    pub v6: bool,
+    pub ip: [u8; 16],
+    pub port: u16,
+    pub flowinfo: u32,
+    pub scope_id: u32,
+}
+
+impl RawAddr {
+    pub fn new(): RawAddr {
+        return RawAddr { v6: false, ip: [0; 16], port: 0, flowinfo: 0, scope_id: 0 };
+    }
+}
+
+/// Socket flags for `sock_set_flag` and `sock_flag`.
+pub const FLAG_NODELAY: i32 = 1;
+pub const FLAG_BROADCAST: i32 = 2;
+pub const FLAG_REUSEADDR: i32 = 3;
+pub const FLAG_ONLY_V6: i32 = 4;
+
+/// A little-endian `u16`/`u32`/`i64` at byte `at` of `b`.
+pub fn get_u16(b: [u8; &], at: usize): u16 {
+    return (b[at] as u16) | ((b[at + 1] as u16) << 8);
+}
+
+pub fn get_u32(b: [u8; &], at: usize): u32 {
+    return (b[at] as u32) | ((b[at + 1] as u32) << 8) | ((b[at + 2] as u32) << 16) | ((b[at + 3] as u32) << 24);
+}
+
+pub fn get_u64(b: [u8; &], at: usize): u64 {
+    return (get_u32(b, at) as u64) | ((get_u32(b, at + 4) as u64) << 32);
+}
+
+pub fn put_u16(b: [u8; &mut], at: usize, v: u16) {
+    b[at] = v as u8;
+    b[at + 1] = (v >> 8) as u8;
+}
+
+pub fn put_u32(b: [u8; &mut], at: usize, v: u32) {
+    let mut i: usize = 0;
+    while i < 4 {
+        b[at + i] = (v >> (8 * i as u32)) as u8;
+        i += 1;
+    }
+}
+
+pub fn put_u64(b: [u8; &mut], at: usize, v: u64) {
+    put_u32(b, at, v as u32);
+    put_u32(b, at + 4, (v >> 32) as u32);
+}
+
+/// The address family of IPv6 (IPv4's, `AF_INET`, is 2 everywhere).
+#[cfg(windows)]
+pub const AF_INET6: i32 = 23;
+#[cfg(target_os = "macos")]
+pub const AF_INET6: i32 = 30;
+#[cfg(all(unix, not(target_os = "macos")))]
+pub const AF_INET6: i32 = 10;
+
+/// `a` as a `sockaddr_in` or `sockaddr_in6` in `b` (zeroed, at least 28
+/// bytes); its length.
+pub fn encode_addr(a: RawAddr, b: [u8; &mut]): i32 {
+    let n: usize = if a.v6 { 28 } else { 16 };
+    put_family(b, if a.v6 { AF_INET6 } else { 2 }, n);
+    // The port in network byte order.
+    b[2] = (a.port >> 8) as u8;
+    b[3] = a.port as u8;
+    if a.v6 {
+        put_u32(b, 4, a.flowinfo);
+        for i in 0..16 {
+            b[8 + i] = a.ip[i];
+        }
+        put_u32(b, 24, a.scope_id);
+    } else {
+        for i in 0..4 {
+            b[4 + i] = a.ip[i];
+        }
+    }
+    return n as i32;
+}
+
+/// The address in a `sockaddr_in` or `sockaddr_in6`.
+pub fn decode_addr(b: [u8; &]): RawAddr {
+    let mut a = RawAddr::new();
+    if b.len() < 8 {
+        return a;
+    }
+    a.port = ((b[2] as u16) << 8) | (b[3] as u16);
+    if family(b) == AF_INET6 && b.len() >= 28 {
+        a.v6 = true;
+        a.flowinfo = get_u32(b, 4);
+        for i in 0..16 {
+            a.ip[i] = b[8 + i];
+        }
+        a.scope_id = get_u32(b, 24);
+    } else {
+        for i in 0..4 {
+            a.ip[i] = b[4 + i];
+        }
+    }
+    return a;
+}
+
+/// BSD socket addresses start with their length and a one-byte family.
+#[cfg(target_os = "macos")]
+fn put_family(b: [u8; &mut], family: i32, len: usize) {
+    b[0] = len as u8;
+    b[1] = family as u8;
+}
+
+#[cfg(target_os = "macos")]
+fn family(b: [u8; &]): i32 {
+    return b[1] as i32;
+}
+
+#[cfg(not(target_os = "macos"))]
+fn put_family(b: [u8; &mut], family: i32, len: usize) {
+    let _ = len;
+    put_u16(b, 0, family as u16);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn family(b: [u8; &]): i32 {
+    return get_u16(b, 0) as i32;
+}
 
 #[cfg(windows)]
 mod windows;

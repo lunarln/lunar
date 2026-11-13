@@ -9,7 +9,7 @@ fn kind(k: ErrorKind): str {
         ErrorKind::PermissionDenied => "permission denied",
         ErrorKind::InvalidInput => "invalid input",
         ErrorKind::InvalidData => "invalid data",
-        ErrorKind::Other => "other",
+        _ => "other",
     };
 }
 
