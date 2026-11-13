@@ -1,14 +1,38 @@
 // Lunar for VS Code: starts `lunar lsp` and connects it to .ln files.
 
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 const vscode = require("vscode");
 const { LanguageClient } = require("vscode-languageclient/node");
 
 /** @type {LanguageClient | undefined} */
 let client;
 
+/**
+ * The `lunar` to run: `lunar.server.path` if set, else `lunar` on PATH, else
+ * the one the install scripts put in `$LUNAR_PREFIX/bin` or `~/.lunar/bin`
+ * (an editor started from the desktop may not see a PATH set in a shell
+ * profile), else plain `lunar`.
+ */
+function serverCommand() {
+  const configured = vscode.workspace.getConfiguration("lunar").get("server.path");
+  if (configured) {
+    return configured;
+  }
+  const exe = process.platform === "win32" ? "lunar.exe" : "lunar";
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    if (dir && fs.existsSync(path.join(dir, exe))) {
+      return path.join(dir, exe);
+    }
+  }
+  const prefix = process.env.LUNAR_PREFIX || path.join(os.homedir(), ".lunar");
+  const installed = path.join(prefix, "bin", exe);
+  return fs.existsSync(installed) ? installed : "lunar";
+}
+
 function createClient() {
-  const config = vscode.workspace.getConfiguration("lunar");
-  const command = config.get("server.path") || "lunar";
+  const command = serverCommand();
   // No `transport`: stdio is the default, and naming it makes the client
   // append `--stdio` to the arguments.
   const run = { command, args: ["lsp"] };
@@ -33,10 +57,10 @@ async function start() {
   try {
     await client.start();
   } catch (e) {
-    const command = vscode.workspace.getConfiguration("lunar").get("server.path") || "lunar";
+    const command = serverCommand();
     const choice = await vscode.window.showErrorMessage(
       `Could not start the Lunar language server (\`${command} lsp\`): ${e.message ?? e}. ` +
-        "Install `lunar` on your PATH (cargo install --path crates/ln-driver) or set `lunar.server.path`.",
+        "Install Lunar (see https://github.com/lunarln/lunar#installing) or set `lunar.server.path`.",
       "Open Settings",
     );
     if (choice === "Open Settings") {
