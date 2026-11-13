@@ -33,13 +33,30 @@ jobs:
       - uses: ./.github/actions/stage0
 
       # For the debugger tests (craters/lunar/src/debuginfo_tests.ln):
-      # macOS has lldb with Xcode, LLVM's Windows build has llvm-pdbutil.
+      # macOS has lldb with Xcode; LLVM's Windows build has lldb, which
+      # needs Python 3.10, and llvm-pdbutil.
       - name: Install lldb (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q lldb-20
           echo "/usr/lib/llvm-20/bin" >> "$GITHUB_PATH"
+
+      - name: Python 3.10 for lldb (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Debugger tools
+        run: |
+          for tool in lldb llvm-pdbutil; do
+            if "$tool" --version > /dev/null 2>&1; then
+              echo "$tool: $("$tool" --version | head -n 1)"
+            else
+              echo "$tool: not available (its tests are skipped)"
+            fi
+          done
 
       - name: Bootstrap (stage 2 == stage 3)
         run: |
@@ -68,6 +85,17 @@ jobs:
 
       # The command line, the package manager and the language server, run
       # as programs (craters/lunar-tests).
+      # One test at a time, so that the log says which one runs.
       - name: Test lunar
         working-directory: craters
-        run: '"$LUNAR_BIN" test -p lunar-tests'
+        timeout-minutes: 40
+        run: |
+          status=0
+          for name in $(grep -h -A1 '^#\[test\]' lunar-tests/src/*.ln | sed -n 's/^fn \([a-z0-9_]*\).*/\1/p'); do
+            echo "::group::$name"
+            start=$SECONDS
+            "$LUNAR_BIN" test -p lunar-tests "$name" || status=1
+            echo "::endgroup::"
+            echo "$name: $((SECONDS - start))s"
+          done
+          exit $status
