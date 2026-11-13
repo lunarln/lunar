@@ -318,6 +318,9 @@ to 64 MiB in total.
   whole expression is done, so a later operand may not shrink, replace or
   move what an earlier one points into:
   `show(c.first(), c.clear_get())` is `err(borrow::shrink_while_borrowed)`.
+  Likewise a `for` loop keeps the address of its array (and a temporary
+  slice such as `c.all()`) for the whole loop, so its body may not shrink
+  what that points into; an array in a variable is read again on each pass.
 * Owners are freed when they go out of scope (also on `return`, `break`,
   `continue`). Moving out of a variable makes it unusable
   (`err(borrow::use_after_move)`).

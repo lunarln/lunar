@@ -28,7 +28,9 @@ operands of a call (its receiver first), a tuple, an array or struct
 literal, an operator and a format string are evaluated left to right, and
 each value waits in a temporary until the whole expression is done:
 `show(c.first(), c.clear_get())` would hand `show` a view into the items
-`clear_get` freed. Compute the shrinking operand with `let` first.
+`clear_get` freed. Compute the shrinking operand with `let` first. In the
+same way, `for x in c.all() { c.clear(); }` keeps the slice `c.all()` for
+the whole loop; loop over indexes instead and read each item in the body.
 
 A view returned by a function points into the arguments its signature
 says (its `from` clause; without one, `self` for a method that borrows it,
