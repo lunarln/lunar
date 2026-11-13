@@ -316,6 +316,8 @@ fn use_lists_are_sorted() {
     check("use a::{Z,b,self,C,a10,a9};", "use a::{self, C, Z, a9, a10, b};\n");
     check("use crater::shapes::*;", "use crater::shapes::*;\n");
     check("use a::{b::{d,c},a};", "use a::{a, b::{c, d}};\n");
+    // A glob after the names, a renaming after the name.
+    check("use crater::a::{b::{c,d},e as f,*,e};", "use crater::a::{b::{c, d}, e, e as f, *};\n");
     // Too long for a line: filled.
     check(
         "use ln_ast::{Block, ConstDecl, EnumDecl, FnDecl, ImplDecl, MacroDef, Span, StaticDecl, StructDecl, TraitDecl, TypeAlias};",
@@ -421,6 +423,29 @@ fn calls_and_chains() {
     )
     .note(\"programs: {names}\")
     .help(\"`lunar run -p {first}`\");
+}
+",
+    );
+    // A link before the last that takes several lines breaks the chain; so
+    // does an argument before the last its list.
+    check(
+        "fn f() { let x = items.iter().map(|item| { let v = 1; v }).filter(|v| v > 10).collect(); foo(|x| { let y = 1; y }, b); }",
+        "fn f() {
+    let x = items
+        .iter()
+        .map(|item| {
+            let v = 1;
+            v
+        })
+        .filter(|v| v > 10)
+        .collect();
+    foo(
+        |x| {
+            let y = 1;
+            y
+        },
+        b,
+    );
 }
 ",
     );

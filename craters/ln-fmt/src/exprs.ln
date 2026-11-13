@@ -457,7 +457,7 @@ impl Printer {
         let mut i: usize = 0;
         let mut early_hard = false;
         while i + 1 < n {
-            if self.d.is_hard(parts[2 * i]) {
+            if self.d.will_break(parts[2 * i]) {
                 early_hard = true;
             }
             i += 1;
@@ -664,19 +664,22 @@ impl Printer {
         }
         let body = self.d.concat(inner[..]);
         let c = self.d.chain(head, body);
-        let broken = self.d.group(c, CHAIN_WIDTH);
-        // The last call may hug its arguments with the chain on one line:
-        // `xs.iter().map(|x| {` ... `})`.
+        // A link before the last that takes several lines (a closure with
+        // a block, even hugged) breaks the chain.
         let np = pieces.len();
-        // (Comments are inside the pieces, which every layout shares.)
-        let mut hug = !self.d.is_hard(head);
+        let mut early = self.d.will_break(head);
         let mut i: usize = 0;
         while i + 1 < np {
-            if self.d.is_hard(pieces[i]) {
-                hug = false;
+            if self.d.will_break(pieces[i]) {
+                early = true;
             }
             i += 1;
         }
+        let broken = if early { self.d.broken(c) } else { self.d.group(c, CHAIN_WIDTH) };
+        // Else the last call may hug its arguments with the chain on one
+        // line: `xs.iter().map(|x| {` ... `})`. (Comments are inside the
+        // pieces, which every layout shares.)
+        let mut hug = !early;
         if hug {
             hug = match self.ast.exprs.get(links[0]).kind {
                 ExprKind::MethodCall { args, .. } => args.len() > 0 && self.hug(self.ast.expr_ids.list(args)[args.len() - 1], args.len()) != HUG_NONE,
@@ -1062,11 +1065,15 @@ impl Printer {
                 }
                 i += 1;
             }
-            // A trailing comma's comments.
+            // A trailing comma: kept in a macro's arguments, and its comments.
             let comma = self.s.find(self.last_end, Token::Comma);
             if comma != NONE {
-                self.flush(comma, 0);
-                self.done(comma + 1);
+                if self.in_macro > 0 {
+                    self.tok(comma, ",");
+                } else {
+                    self.flush(comma, 0);
+                    self.done(comma + 1);
+                }
             }
             self.tok(self.s.find(self.last_end, Token::Pipe), "|");
         }
@@ -1118,6 +1125,23 @@ impl Printer {
     /// A macro call's arguments as expressions, if each comma-separated
     /// part of its tokens parses as one.
     fn mac_args(&mut self, m: MacCall): Option::<List::<Id::<Expr>>> {
+        // Their tokens must survive formatting as they are: no items (whose
+        // lists this printer may change) and no empty statements.
+        let mut k = self.s.first_at(m.path.span.hi);
+        let mut prev = Token::Bang;
+        while k < self.s.toks.len() && self.s.toks[k].lo < m.span.hi {
+            let t = self.s.toks[k].kind;
+            let item = match t {
+                Token::Fn | Token::Struct | Token::Enum | Token::Trait | Token::Impl | Token::Use | Token::Mod | Token::Macro => true,
+                Token::Const | Token::Static | Token::Extern | Token::Type => true,
+                _ => false,
+            };
+            if item || (t == Token::Semi && (prev == Token::Semi || prev == Token::LBrace)) {
+                return None;
+            }
+            prev = t;
+            k += 1;
+        }
         let n = m.tokens.len();
         let mut out: [Id::<Expr>; -..+] = [];
         let mut lo = NONE;

@@ -1242,8 +1242,8 @@ impl Printer {
 
 // ===================================================================== use order
 
-/// The text a `use` tree sorts by: its path, `*`, or `{...}` (its own
-/// items sorted).
+/// The text a `use` tree sorts by: its path, then `{` for `*` or `|` for a
+/// list, which sort after any name.
 fn use_key(a: &Ast, t: UseTree, out: &mut +String) {
     let mut i: usize = 0;
     for id in a.idents.list(t.prefix) {
@@ -1259,17 +1259,18 @@ fn use_key(a: &Ast, t: UseTree, out: &mut +String) {
             out.push_str(" as ");
             out.push_str(a.text(r.name));
         }
+        // After every name, as rustfmt orders them: globs, then lists.
         UseKind::Glob => {
             if i > 0 {
                 out.push_str("::");
             }
-            out.push('*');
+            out.push('{');
         }
         UseKind::Nested(_) => {
             if i > 0 {
                 out.push_str("::");
             }
-            out.push('{');
+            out.push('|');
         }
     }
 }

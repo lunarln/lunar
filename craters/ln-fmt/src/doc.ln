@@ -66,6 +66,9 @@ pub struct Docs {
     ids: Arena::<Id::<Doc>>,
     /// Whether each document contains a hard line break (outside a `Cond`).
     hard: [bool; ..+],
+    /// Whether it contains one anywhere, a `Cond`'s alternatives included
+    /// (Prettier's `willBreak`).
+    deep: [bool; ..+],
     pool: String,
     empty: Id::<Doc>,
     line: Id::<Doc>,
@@ -79,6 +82,7 @@ impl Docs {
             nodes: Arena::new(),
             ids: Arena::new(),
             hard: [],
+            deep: [],
             pool: String::new(),
             empty: Id::from_index(0),
             line: Id::from_index(0),
@@ -98,6 +102,11 @@ impl Docs {
 
     pub fn is_hard(&self, id: Id::<Doc>): bool {
         return self.hard[id.index()];
+    }
+
+    /// Whether `id` will take more than one line however it is laid out.
+    pub fn will_break(&self, id: Id::<Doc>): bool {
+        return self.deep[id.index()];
     }
 
     pub fn list(&self, l: List::<Id::<Doc>>): [Id::<Doc>; &] {
@@ -120,18 +129,40 @@ impl Docs {
             Doc::Group { doc, broken, .. } => broken || self.hard[doc.index()],
             _ => false,
         };
+        let deep = match d {
+            Doc::Hard => true,
+            Doc::Comment { kind, .. } => kind != INLINE,
+            Doc::Concat(l) => self.any_deep(l),
+            Doc::Fill(l) => self.any_deep(l),
+            Doc::Cond { alts, .. } => self.any_deep(alts),
+            Doc::Indent(x) => self.deep[x.index()],
+            Doc::Rhs(x) => self.deep[x.index()],
+            Doc::Group { doc, broken, .. } => broken || self.deep[doc.index()],
+            Doc::Chain { head, rest } => self.deep[head.index()] || self.deep[rest.index()],
+            _ => false,
+        };
         // A group with a hard line break is broken.
         let d2 = match d {
             Doc::Group { doc, limit, .. } => Doc::Group { doc, broken: h, limit },
             _ => d,
         };
         self.hard.push(h);
+        self.deep.push(deep);
         return self.nodes.add(d2);
     }
 
     fn any_hard(&self, l: List::<Id::<Doc>>): bool {
         for x in self.ids.list(l) {
             if self.hard[x.index()] {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn any_deep(&self, l: List::<Id::<Doc>>): bool {
+        for x in self.ids.list(l) {
+            if self.deep[x.index()] {
                 return true;
             }
         }
