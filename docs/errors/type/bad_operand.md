@@ -11,7 +11,9 @@ integer `u32`"), and `*x` needs a raw pointer.
 On other types, operators are calls to the traits in `core::ops` and
 `core::cmp`: `a + b` needs `Add`, `a == b` needs `Eq`, `a < b` needs `Ord`,
 and so on. If the type does not implement the trait, the operator is
-rejected. For a generic `T`, add the trait to `T`'s bounds.
+rejected. For a generic `T`, add the trait to `T`'s bounds. The result of an
+arithmetic operator is the trait's `Output` (`<T as Add>::Output`), which
+an impl chooses with `type Output = ...;`.
 
 The same code covers misused ranges: a range with a missing end (`a..`) is
 only allowed when slicing, and an inclusive range needs an end (`a..=b`) and
@@ -42,6 +44,8 @@ struct Money {
 }
 
 impl core::ops::Add for Money {
+    type Output = Money;
+
     fn add(&self, rhs: &Money): Money {
         return Money { cents: self.cents + rhs.cents };
     }

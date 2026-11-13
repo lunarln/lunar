@@ -14,6 +14,11 @@ use crater::*;
 pub fn path(a: &Ast, src: str, p: Path): String {
     let mut out = String::new();
     let segs = a.segments.list(p.segments);
+    // `<T as Trait>::Item`: the segments are the trait's, then the item.
+    let trait_end = if p.qself.is_some() && segs.len() > 0 { segs.len() - 1 } else { 0 };
+    if let Some(q) = p.qself {
+        out.write("<{ty(a, src, q)} as ");
+    }
     for i in 0..segs.len() {
         if i > 0 {
             out.push_str("::");
@@ -22,10 +27,26 @@ pub fn path(a: &Ast, src: str, p: Path): String {
         if let Some(args) = segs[i].args {
             out.push_str("::<");
             ty_list(a, src, args, &mut out);
+            bindings_text(a, src, segs[i].bindings, args.len() > 0, &mut out);
+            out.push('>');
+        }
+        if p.qself.is_some() && i + 1 == trait_end {
             out.push('>');
         }
     }
     return out;
+}
+
+/// `Item = u8, Out = B` after the type arguments of a segment (`, `
+/// first if `after_types`).
+fn bindings_text(a: &Ast, src: str, l: List::<AssocBinding>, after_types: bool, out: &mut String) {
+    let bs = a.assoc_bindings.list(l);
+    for i in 0..bs.len() {
+        if i > 0 || after_types {
+            out.push_str(", ");
+        }
+        out.write("{a.text(bs[i].name.name)} = {ty(a, src, bs[i].ty)}");
+    }
 }
 
 /// The types of `l`, separated by `, `.
@@ -420,12 +441,26 @@ pub fn item(a: &Ast, src: str, it: Item, extern_abi: Option::<str>): String {
             out.push_str(ty(a, src, i.self_ty).as_str());
         }
         ItemKind::Mod(m) => out.write("{v}mod {a.text(m.name.name)}"),
-        ItemKind::Const(c) => out.write("{v}const {a.text(c.name.name)}: {ty(a, src, c.ty)} = {expr(a, src, c.value)}"),
+        ItemKind::Const(c) => {
+            out.write("{v}const {a.text(c.name.name)}: {ty(a, src, c.ty)}");
+            if let Some(x) = c.value {
+                out.write(" = {expr(a, src, x)}");
+            }
+        }
         ItemKind::Static(s) => {
             let m = if s.is_mut { "mut " } else { "" };
             out.write("{v}static {m}{a.text(s.name.name)}: {ty(a, src, s.ty)} = {expr(a, src, s.value)}");
         }
-        ItemKind::TypeAlias(t) => out.write("{v}type {a.text(t.name.name)}{generics(a, src, t.generics)} = {ty(a, src, t.ty)}"),
+        ItemKind::TypeAlias(t) => {
+            out.write("{v}type {a.text(t.name.name)}{generics(a, src, t.generics)}");
+            if t.bounds.len() > 0 {
+                out.push_str(": ");
+                bounds_text(a, src, t.bounds, &mut out);
+            }
+            if let Some(x) = t.ty {
+                out.write(" = {ty(a, src, x)}");
+            }
+        }
         ItemKind::Extern(b) => {
             let abi = match b.abi {
                 Some(s) => a.text(s),

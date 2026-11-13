@@ -1,0 +1,13 @@
+// error: trait::not_dyn_compatible
+// A `dyn`'s constants are read through its vtable as values of their type,
+// which cannot be the type viewed.
+trait Zero {
+    const ZERO: Self;
+    fn is_zero(&self): bool;
+}
+
+fn check(z: dyn Zero): bool {
+    return z.is_zero();
+}
+
+fn main() {}

@@ -29,7 +29,7 @@ use ln_sema::query::MethodCand;
 use ln_sema::resolve::ModRes;
 use ln_sema::sema::Sema;
 use ln_sema::thir;
-use ln_sema::ty::{ArrKind, Ty, TyKind};
+use ln_sema::ty::{ArrKind, TraitRef, Ty, TyKind};
 use crater::ide;
 use crater::ide::Decl;
 use crater::symbols;
@@ -1118,6 +1118,10 @@ fn resolve_first(s: &mut Sema, cx: Cx, text: str, toks: [Spanned; &], i: usize, 
     }
     let name = text[toks[i].range.start..toks[i].range.end];
     let sym = s.p.ast.names.get(name)?;
+    // A generic parameter of the function around the cursor: `T::`.
+    if let Some(t) = generic_param_named(s, cx, sym) {
+        return Some(PathRes::Ty(t));
+    }
     let first_ns = if more { Ns::Type } else { Ns::Value };
     let r = match s.lookup_unqualified(m, sym, first_ns) {
         Some(r) => r,
@@ -1130,6 +1134,73 @@ fn resolve_first(s: &mut Sema, cx: Cx, text: str, toks: [Spanned; &], i: usize, 
         ModRes::Def(d) => Some(PathRes::Def(d)),
         ModRes::Prim(t) => Some(PathRes::Ty(t)),
     };
+}
+
+/// The function (not closure) the cursor is in.
+fn owner_fn(s: &Sema, cx: Cx): Option::<DefId> {
+    let b = cx.body?;
+    return match s.p.closures.get(b) {
+        Some(c) => Some(c.parent),
+        None => Some(b),
+    };
+}
+
+/// The generic parameter `name` in scope at the cursor (of the function or
+/// its impl or trait), as a type.
+fn generic_param_named(s: &mut Sema, cx: Cx, name: Symbol): Option::<Ty> {
+    let owner = owner_fn(s, cx)?;
+    let names = s.generic_names_of(owner);
+    let mut i = names.len();
+    while i > 0 {
+        i -= 1;
+        if s.p.symbols.list(names)[i] == name {
+            return Some(s.p.types.mk(TyKind::Param(i as u32, name)));
+        }
+    }
+    return None;
+}
+
+/// The associated types and constants of `t` at the cursor (`T::`,
+/// `Self::`): those of the traits its bounds name (with supertraits), of
+/// the trait an impl implements for `Self`, and an inherent impl's
+/// constants.
+fn add_assoc_items(s: &mut Sema, cx: Cx, t: Ty, out: &mut +Items) {
+    let mut traits: [TraitRef; ..+] = [];
+    if let Some(owner) = owner_fn(s, cx) {
+        let lcx = s.lower_cx(owner);
+        s.bound_traits_of(lcx, t, &mut traits);
+    }
+    let mut seen: [DefId; ..+] = [];
+    for tr in traits[..] {
+        let mut ts: [TraitRef; ..+] = [];
+        s.p.dyn_traits(tr, &mut ts);
+        for x in ts[..] {
+            let td = s.p.trait_data(x.trait_id);
+            for i in 0..td.assoc.len() {
+                let a = s.p.trait_assocs.list(td.assoc)[i];
+                if !seen[..].contains(a.def) {
+                    seen.push(a.def);
+                }
+            }
+        }
+    }
+    // Constants of inherent impls of the type.
+    for k in 0..s.p.impls.len() {
+        let imp = s.p.impls[k];
+        let DefData::Impl(d) = s.p.def(imp).data else { continue; };
+        if d.trait_ref.is_some() || d.self_ty != t {
+            continue;
+        }
+        for e in s.p.impl_consts.iter() {
+            let ((i, _), c) = e;
+            if i == imp && !seen[..].contains(c) {
+                seen.push(c);
+            }
+        }
+    }
+    for d in seen[..] {
+        add_def(s, cx, d, false, false, S_TRAIT_MEMBER, out);
+    }
 }
 
 /// `Self` where the cursor is: the type of the enclosing impl.
@@ -1643,6 +1714,7 @@ fn complete_path(s: &mut Sema, cx: Cx, text: str, toks: [Spanned; &], segs: [usi
         return;
     }
     if let Some(t) = t {
+        add_assoc_items(s, cx, t, out);
         let mut cands: [MethodCand; ..+] = [];
         s.methods_of(t, false, &mut cands);
         for c in cands {
@@ -1943,6 +2015,7 @@ fn add_named(s: &mut Sema, cx: Cx, name: str, d: DefId, in_use: bool, next_is_pa
         DefKind::Const => CK_CONSTANT,
         DefKind::Static => CK_CONSTANT,
         DefKind::TypeAlias => CK_STRUCT,
+        DefKind::AssocTy => CK_TYPE_PARAMETER,
         DefKind::Macro => CK_FUNCTION,
     };
     let (detail, doc) = describe(s, &out.idx, d);

@@ -1,0 +1,115 @@
+// `Iterator` with its associated type `Item`: the standard library's
+// iterators and adapters, user iterators, `for` loops, bounds
+// `I: Iterator::<Item = X>`, `impl Iterator::<Item = X>` results and
+// `dyn Iterator::<Item = X>` views.
+
+use core::collections::{HashMap, SortedMap};
+
+/// The sum of any iterator of `u64`s.
+fn total::<I: Iterator::<Item = u64>>(it: I): u64 {
+    let mut t: u64 = 0;
+    for x in it {
+        t += x;
+    }
+    return t;
+}
+
+/// The keys of any iterator of pairs: `K` and `V` come from the item type.
+/// (Items may be views into the iterator, which the function owns, unless
+/// they are Detached.)
+fn keys_of::<K: Light + Detached, V: Light, I: Iterator::<Item = (K, V)>>(it: I): [K; ..+] {
+    let mut out: [K; ..+] = [];
+    for (k, _) in it {
+        out.push(k);
+    }
+    return out;
+}
+
+/// Lengths of words, computed lazily.
+fn lengths(s: str): impl Iterator::<Item = usize> {
+    return s.split_whitespace().map(|w| w.len());
+}
+
+#[test]
+fn adapters() {
+    let n = "a bb  ccc".split_whitespace().map(|w| w.len()).count();
+    assert_eq!(n, 3);
+    assert_eq!(total((1..5).map(|x: u64| x * 10)), 100);
+    let mut picked: [u32; ..+] = [];
+    for (i, x) in (0..20).filter(|x| x % 3 == 0).enumerate().skip(1).take(3) {
+        picked.push((i as u32) * 100 + x);
+    }
+    assert_eq!(picked[..], [103, 206, 309][..]);
+    let mut sizes: [usize; ..+] = [];
+    for l in lengths("one three five") {
+        sizes.push(l);
+    }
+    assert_eq!(sizes[..], [3, 5, 4][..]);
+    let evens = "1 2 3 4".split(" ").map(|s| s.parse::<u64>().unwrap()).filter(|n| n % 2 == 0);
+    assert_eq!(total(evens), 6);
+}
+
+#[test]
+fn collections() {
+    let mut m: SortedMap::<char, str> = SortedMap::new();
+    m.insert('b', "two");
+    m.insert('a', "one");
+    let ks = keys_of(m.iter());
+    assert_eq!(ks[..], ['a', 'b'][..]);
+    let mut h: HashMap::<u64, u64> = HashMap::new();
+    h.insert(3, 30);
+    h.insert(4, 40);
+    assert_eq!(total(h.values()), 70);
+    assert_eq!(total(h.keys().map(|k| k * 2)), 14);
+}
+
+// A user iterator gets the adapters too.
+struct Fib {
+    a: u64,
+    b: u64,
+}
+
+impl Iterator for Fib {
+    type Item = u64;
+    fn next(&mut self): Option::<u64> {
+        let r = self.a;
+        self.a = self.b;
+        self.b = r + self.b;
+        return Some(r);
+    }
+}
+
+#[test]
+fn user_iterators() {
+    let small = Fib { a: 0, b: 1 }.take(10).filter(|x| x % 2 == 0);
+    assert_eq!(total(small), 44);
+    let mut it = Fib { a: 0, b: 1 }.skip(5);
+    assert_eq!(it.next(), Some(5));
+    let mut last: u64 = 0;
+    let seven = Fib { a: 0, b: 1 }.take(7);
+    for x in seven {
+        last = x;
+    }
+    assert_eq!(last, 8);
+}
+
+/// Through a `dyn`: the type says what the items are.
+fn sum_dyn(it: dyn mut Iterator::<Item = u64>): u64 {
+    let mut t: u64 = 0;
+    for x in it {
+        t += x;
+    }
+    return t;
+}
+
+#[test]
+fn through_dyn() {
+    let mut f = Fib { a: 1, b: 1 }.take(4);
+    assert_eq!(sum_dyn(f as dyn mut Iterator::<Item = u64>), 7);
+    let mut r = 1..4u64;
+    assert_eq!(sum_dyn(r as dyn mut Iterator::<Item = u64>), 6);
+    // A `dyn` iterator implements `Iterator` itself.
+    let mut g = Fib { a: 0, b: 1 };
+    let d = g as dyn mut Iterator::<Item = u64>;
+    assert_eq!(total(d.take(5)), 7);
+}

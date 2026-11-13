@@ -1,5 +1,135 @@
-/// Values that produce a sequence of items; usable in `for` loops.
+/// Values that produce a sequence of items, one at a time; usable in `for`
+/// loops. `Item` is what they produce: `fn f::<I: Iterator::<Item = u8>>`
+/// takes any iterator of bytes, `impl Iterator::<Item = str>` returns one of
+/// strings.
 #[lang = "iterator"]
-pub trait Iterator::<T> {
-    fn next(&mut self): Option::<T>;
+pub trait Iterator {
+    /// What the iterator produces.
+    type Item;
+
+    /// The next item, or `None` when there are no more.
+    fn next(&mut self): Option::<Self::Item>;
+
+    /// Each item passed through `f`.
+    fn map::<B, F: FnMut(Self::Item): B>(self, f: F): Map::<Self, F> {
+        return Map { iter: self, f };
+    }
+
+    /// The items for which `f` is true.
+    fn filter::<F: FnMut(&Self::Item): bool>(self, f: F): Filter::<Self, F> {
+        return Filter { iter: self, f };
+    }
+
+    /// Each item with its index: `(0, a), (1, b), ...`.
+    fn enumerate(self): Enumerate::<Self> {
+        return Enumerate { iter: self, n: 0 };
+    }
+
+    /// The first `n` items (fewer if there are not that many).
+    fn take(self, n: usize): Take::<Self> {
+        return Take { iter: self, left: n };
+    }
+
+    /// The items after the first `n`.
+    fn skip(self, n: usize): Skip::<Self> {
+        return Skip { iter: self, skip: n };
+    }
+
+    /// How many items there are (consuming the iterator).
+    fn count(mut self): usize {
+        let mut n: usize = 0;
+        while let Some(_) = self.next() {
+            n += 1;
+        }
+        return n;
+    }
+}
+
+/// `it.map(f)`
+pub struct Map::<I, F> {
+    iter: I,
+    f: F,
+}
+
+impl::<B, I: Iterator, F: FnMut(I::Item): B> Iterator for Map::<I, F> {
+    type Item = B;
+
+    fn next(&mut self): Option::<B> {
+        return match self.iter.next() {
+            Some(x) => Some((self.f)(x)),
+            None => None,
+        };
+    }
+}
+
+/// `it.filter(f)`
+pub struct Filter::<I, F> {
+    iter: I,
+    f: F,
+}
+
+impl::<I: Iterator, F: FnMut(&I::Item): bool> Iterator for Filter::<I, F> {
+    type Item = I::Item;
+
+    fn next(&mut self): Option::<I::Item> {
+        while let Some(x) = self.iter.next() {
+            if (self.f)(&x) {
+                return Some(x);
+            }
+        }
+        return None;
+    }
+}
+
+/// `it.enumerate()`
+pub struct Enumerate::<I> {
+    iter: I,
+    n: usize,
+}
+
+impl::<I: Iterator> Iterator for Enumerate::<I> {
+    type Item = (usize, I::Item);
+
+    fn next(&mut self): Option::<(usize, I::Item)> {
+        let x = self.iter.next()?;
+        let i = self.n;
+        self.n += 1;
+        return Some((i, x));
+    }
+}
+
+/// `it.take(n)`
+pub struct Take::<I> {
+    iter: I,
+    left: usize,
+}
+
+impl::<I: Iterator> Iterator for Take::<I> {
+    type Item = I::Item;
+
+    fn next(&mut self): Option::<I::Item> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        return self.iter.next();
+    }
+}
+
+/// `it.skip(n)`
+pub struct Skip::<I> {
+    iter: I,
+    skip: usize,
+}
+
+impl::<I: Iterator> Iterator for Skip::<I> {
+    type Item = I::Item;
+
+    fn next(&mut self): Option::<I::Item> {
+        while self.skip > 0 {
+            self.skip -= 1;
+            self.iter.next()?;
+        }
+        return self.iter.next();
+    }
 }

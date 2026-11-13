@@ -64,6 +64,8 @@ pub fn parse_f64(s: str): Option::<f64> {
 }
 
 impl core::str::FromStr for f64 {
+    type Err = core::num::ParseError;
+
     /// A decimal number (as `parse_f64`), or `inf`, `infinity` or `NaN` in
     /// any case, with an optional sign.
     fn from_str(s: str): Result::<f64, core::num::ParseError> {
@@ -86,6 +88,8 @@ impl core::str::FromStr for f64 {
 }
 
 impl core::str::FromStr for f32 {
+    type Err = core::num::ParseError;
+
     fn from_str(s: str): Result::<f32, core::num::ParseError> {
         let v = s.parse::<f64>()?;
         return Ok(v as f32);

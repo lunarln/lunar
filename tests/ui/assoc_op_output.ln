@@ -1,0 +1,26 @@
+// error: type::mismatch
+// `a += b` stores `a + b` in `a`: `Add::Output` must be `a`'s type.
+use core::ops::Add;
+
+struct Meters {
+    v: f64,
+}
+
+struct Area {
+    v: f64,
+}
+
+impl Add for Meters {
+    type Output = Area;
+    fn add(&self, rhs: &Meters): Area {
+        return Area { v: self.v * rhs.v };
+    }
+}
+
+fn main() {
+    let mut a = Meters { v: 1.0 };
+    let b = Meters { v: 2.0 };
+    let c = a + b;
+    println("{c.v}");
+    a += b;
+}

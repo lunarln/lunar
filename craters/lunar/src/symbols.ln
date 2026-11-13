@@ -145,7 +145,13 @@ fn outline_item(a: &Ast, src: str, item: Item, parent: u32, in_impl: bool, out: 
             out.add(a.text(s.name.name), pretty::ty(a, src, s.ty).as_str(), SK_VARIABLE, item.span, s.name.span, parent);
         }
         ItemKind::TypeAlias(t) => {
-            out.add(a.text(t.name.name), pretty::ty(a, src, t.ty).as_str(), SK_TYPE_PARAMETER, item.span, t.name.span, parent);
+            // An associated type in a trait may have no type (its bounds,
+            // if any, describe it).
+            let detail = match t.ty {
+                Some(x) => pretty::ty(a, src, x),
+                None => String::from("type"),
+            };
+            out.add(a.text(t.name.name), detail.as_str(), SK_TYPE_PARAMETER, item.span, t.name.span, parent);
         }
         ItemKind::Extern(b) => outline_items(a, src, b.items, parent, false, out),
         ItemKind::Macro(m) => {
@@ -215,7 +221,7 @@ pub fn def_symbol_kind(p: &Program, d: DefId): Option::<u32> {
         DefKind::Impl => None,
         DefKind::Const => Some(SK_CONSTANT),
         DefKind::Static => Some(SK_VARIABLE),
-        DefKind::TypeAlias => Some(SK_TYPE_PARAMETER),
+        DefKind::TypeAlias | DefKind::AssocTy => Some(SK_TYPE_PARAMETER),
         DefKind::Macro => Some(SK_FUNCTION),
     };
 }
@@ -508,7 +514,7 @@ fn classify(p: &Program, t: RefTarget, std_roots: [DefId; &]): (u8, u8) {
                 DefKind::Impl => T_NONE,
                 DefKind::Const => T_VARIABLE,
                 DefKind::Static => T_VARIABLE,
-                DefKind::TypeAlias => T_TYPE,
+                DefKind::TypeAlias | DefKind::AssocTy => T_TYPE,
                 DefKind::Macro => T_MACRO,
             };
             let mut m = lib;

@@ -1,0 +1,7 @@
+// error: name::no_assoc
+// `Iterator` has an associated type `Item`, not `Itme`.
+fn count::<I: Iterator::<Itme = u8>>(it: I): usize {
+    return it.count();
+}
+
+fn main() {}

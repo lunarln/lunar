@@ -40,12 +40,16 @@ pub enum DefKind {
     Static,
     TypeAlias,
     Macro,
+    /// `type Item;` in a trait, or `type Item = u8;` in an impl of it.
+    /// (Associated constants are `Const`s whose parent is a trait or impl.)
+    AssocTy,
 }
 
 impl DefKind {
     pub fn describe(self): str {
         return match self {
             DefKind::Macro => "macro",
+            DefKind::AssocTy => "associated type",
             DefKind::Mod => "module",
             DefKind::Fn => "function",
             DefKind::Struct => "struct",
@@ -249,6 +253,17 @@ pub struct TraitMethod {
     pub has_default: bool,
 }
 
+/// An associated type or constant declared in a trait.
+pub struct TraitAssoc {
+    pub name: Symbol,
+    /// A `DefKind::AssocTy` or a `DefKind::Const`.
+    pub def: DefId,
+    pub is_const: bool,
+    /// `type Item = T;` / `const N: usize = 4;` in the trait: impls may
+    /// leave it out.
+    pub has_default: bool,
+}
+
 pub struct TraitData {
     /// Param 0 is `Self`; the trait's own params follow.
     pub generics: Generics,
@@ -256,6 +271,21 @@ pub struct TraitData {
     pub methods: List::<TraitMethod>,
     /// Auto traits (`Dull`, `Light`) are implemented by the compiler.
     pub auto: bool,
+    /// Associated types and constants, in declaration order (in
+    /// `Program::trait_assocs`).
+    pub assoc: List::<TraitAssoc>,
+    /// The associated type constraints of the supertraits (`trait Int:
+    /// Add::<Output = Self>`), as equality predicates on `Self` (parameter
+    /// 0), in `Program::preds`.
+    pub super_eqs: List::<Pred>,
+}
+
+/// An associated type: in a trait, its bounds (on `Self::Item`, with the
+/// trait's generics: `Self` is parameter 0) and default; in an impl, the
+/// type (with the impl's generics).
+pub struct AssocTyData {
+    pub bounds: List::<TraitRef>,
+    pub ty: Option::<Ty>,
 }
 
 /// An impl. Its methods are in `Program::impl_methods`.
@@ -338,6 +368,7 @@ pub enum DefData {
     Const(ConstData),
     Static(StaticData),
     Alias(AliasData),
+    AssocTy(AssocTyData),
 }
 
 pub struct DefInfo {

@@ -613,7 +613,7 @@ impl Cg {
         let ex = p.thir.expr(e);
         let ty = self.t(p, ex.ty);
         let built = match ex.kind {
-            ExprKind::Read { .. } | ExprKind::Lit(_) | ExprKind::Call { .. } | ExprKind::Tuple(_) | ExprKind::Adt { .. } | ExprKind::Array(_) => true,
+            ExprKind::Read { .. } | ExprKind::Lit(_) | ExprKind::AssocConst { .. } | ExprKind::Call { .. } | ExprKind::Tuple(_) | ExprKind::Adt { .. } | ExprKind::Array(_) => true,
             ExprKind::ArrayRepeat { .. } | ExprKind::If { .. } | ExprKind::Match { .. } | ExprKind::Loop { .. } | ExprKind::Closure { .. } => true,
             _ => false,
         };
@@ -646,6 +646,20 @@ impl Cg {
                     return Some(self.unit());
                 }
             },
+            ExprKind::AssocConst { item, args } => {
+                let v = self.assoc_const_val(p, item, args)?;
+                return match self.const_val(p, v, ty) {
+                    Ok(c) => Some(c),
+                    Err(err) => {
+                        self.ice(p, err.as_str());
+                        Some(self.unit())
+                    }
+                };
+            }
+            ExprKind::DynConst { base, item } => {
+                let ptr = self.dyn_const_ptr(p, base, item)?;
+                return Some(self.load(p, ptr, ty));
+            }
             ExprKind::FnRef { def, args } => {
                 let targs = self.t_list(p, args);
                 return Some(self.instance(p, def, targs));
@@ -931,6 +945,13 @@ impl Cg {
                 Ok(g) => self.copy_mem(p, dest, g, ty),
                 Err(err) => self.ice(p, err.as_str()),
             },
+            ExprKind::AssocConst { item, args } => {
+                let v = self.assoc_const_val(p, item, args)?;
+                match self.const_global(p, v, ty) {
+                    Ok(g) => self.copy_mem(p, dest, g, ty),
+                    Err(err) => self.ice(p, err.as_str()),
+                }
+            }
             ExprKind::Call { callee, args } => {
                 let v = self.call_expr(p, callee, args, ty, ex.span, dest)?;
                 if (v as usize) != (dest as usize) {

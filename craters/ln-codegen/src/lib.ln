@@ -531,8 +531,11 @@ impl Cg {
                 }
                 self.struct_ty(fields[..])
             }
-            TyKind::Opaque(..) => {
+            TyKind::Opaque(..) | TyKind::Proj(..) => {
                 let r = p.reveal(t);
+                if r == t {
+                    return self.unit_ty();
+                }
                 self.llty(p, r)
             }
             TyKind::Dyn(..) => self.dyn_ty(),

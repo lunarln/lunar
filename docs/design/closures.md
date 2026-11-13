@@ -82,7 +82,7 @@ fn make_adder(n: i32): impl Fn(i32): i32 {
     return move |x| x + n;
 }
 
-fn evens(n: i32): impl Iterator::<i32> {
+fn evens(n: i32): impl Iterator::<Item = i32> {
     return (0..n).filter(|x| x % 2 == 0);
 }
 ```

@@ -1,11 +1,12 @@
-# trait::extra_item: an impl defines a method the trait does not declare
+# trait::extra_item: an impl defines an item the trait does not declare
 
-An `impl Trait for T` block contains a method whose name is not one of the
-trait's methods.
+An `impl Trait for T` block contains a method, associated type or constant
+whose name is not one of the trait's.
 
-A trait impl may only define the methods that the trait declares. An extra
-method could never be called through the trait, and it is usually a typo in
-a method name or a method that was meant for an inherent impl.
+A trait impl may only define the methods, associated types and constants
+that the trait declares. An extra one could never be used through the
+trait, and it is usually a typo in a name or an item that was meant for an
+inherent impl.
 
 ## Erroneous example
 

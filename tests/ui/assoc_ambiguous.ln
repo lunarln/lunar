@@ -1,0 +1,18 @@
+// error: trait::ambiguous_assoc
+// absent: name::no_assoc
+// `T::Item` could be `Source`'s or `Sink`'s.
+trait Source {
+    type Item;
+    fn get(&self): Self::Item;
+}
+
+trait Sink {
+    type Item;
+    fn put(&self, x: Self::Item);
+}
+
+fn pass::<T: Source + Sink>(t: &T): T::Item {
+    return t.get();
+}
+
+fn main() {}

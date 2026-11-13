@@ -1,5 +1,7 @@
-// error: name::not_a_type
+// error: name::no_assoc
 // absent: name::unresolved
+// `T::Item` names an associated type of one of `T`'s bounds; `Container`
+// has none.
 trait Container {
     fn size(&self): usize;
 }

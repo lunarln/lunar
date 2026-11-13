@@ -880,15 +880,20 @@ impl Cg {
                 self.di_pointer(sty)
             }
             TyKind::Closure(def, args) => self.di_closure(p, t, def, args, name.as_str(), lt, bits, align),
-            TyKind::Opaque(..) => {
+            TyKind::Opaque(..) | TyKind::Proj(..) => {
                 let r = p.reveal(t);
+                if r == t {
+                    let u = p.types.unit();
+                    return self.di_type(p, u);
+                }
                 self.di_type(p, r)
             }
             // `{ pointer, vtable }`: the data (of a type the debugger does
             // not know) and the vtable's words (`ln_sema::objects`).
             TyKind::Dyn(d, args, _) => {
                 let mut es: [VtEntry; ..+] = [];
-                p.vtable_entries(TraitRef { trait_id: d, args }, &mut es);
+                let principal = p.dyn_trait_ref(d, args);
+                p.vtable_entries(principal, &mut es);
                 let u8t = p.types.int(IntTy::U8);
                 let data = p.types.ptr(u8t, false);
                 let usize_t = p.types.int(IntTy::Usize);
@@ -1116,15 +1121,19 @@ impl Cg {
                 out.write("{n}");
                 out.push('}');
             }
-            TyKind::Opaque(..) => {
+            TyKind::Opaque(..) | TyKind::Proj(..) => {
                 let r = p.reveal(t);
-                self.di_ty_name(p, r, out);
+                if r == t {
+                    p.write_ty(out, t);
+                } else {
+                    self.di_ty_name(p, r, out);
+                }
             }
             // CodeView: `dyn$<Trait>`, like the arrays.
             TyKind::Dyn(d, args, _) => {
                 if self.di_cv {
                     out.push_str("dyn$<");
-                    p.write_trait_ref(out, TraitRef { trait_id: d, args });
+                    p.write_dyn_trait(out, d, args);
                     out.push('>');
                 } else {
                     p.write_ty(out, t);

@@ -161,8 +161,14 @@ impl Parser {
                 let name = self.ident()?;
                 self.expect(T::Colon)?;
                 let ty = self.ty()?;
-                self.expect(T::Eq)?;
-                let value = self.expr()?;
+                // `const N: usize;` declares an associated constant in a
+                // trait (checked when collecting).
+                let value = if self.at(T::Semi) {
+                    None
+                } else {
+                    self.expect(T::Eq)?;
+                    Some(self.expr()?)
+                };
                 self.expect_item_semi("constant")?;
                 ItemKind::Const(ConstDecl { name, ty, value })
             }
@@ -193,10 +199,17 @@ impl Parser {
                 self.bump();
                 let name = self.ident()?;
                 let generics = self.generics_decl()?;
-                self.expect(T::Eq)?;
-                let ty = self.ty()?;
+                // `type Item: Light;` / `type Item;` declare an associated
+                // type in a trait (checked when collecting).
+                let bounds = if self.eat(T::Colon) { self.bounds()? } else { List::empty() };
+                let ty = if self.at(T::Semi) {
+                    None
+                } else {
+                    self.expect(T::Eq)?;
+                    Some(self.ty()?)
+                };
                 self.expect_item_semi("type alias")?;
-                ItemKind::TypeAlias(TypeAlias { name, generics, ty })
+                ItemKind::TypeAlias(TypeAlias { name, generics, bounds, ty })
             }
             Some(T::Macro) => ItemKind::Macro(self.macro_def()?),
             // `path!(...)` in item position.

@@ -1,0 +1,15 @@
+// error: trait::missing_item
+// absent: trait::signature
+// An impl of `Iterator` must say what its items are: `type Item = ...;`.
+struct Count {
+    n: u32,
+}
+
+impl Iterator for Count {
+    fn next(&mut self): Option::<u32> {
+        self.n += 1;
+        return Some(self.n);
+    }
+}
+
+fn main() {}

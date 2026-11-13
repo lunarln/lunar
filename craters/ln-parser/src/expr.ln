@@ -91,6 +91,8 @@ impl Parser {
         return match self.peek() {
             Some(T::Ident | T::Number(_) | T::Str | T::Char | T::Byte | T::True | T::False | T::LParen | T::LBracket | T::LBrace | T::Minus | T::Bang | T::Star) => true,
             Some(T::SelfValue | T::SelfType | T::Crater | T::Super | T::If | T::Match | T::Unsafe | T::Loop | T::While | T::For | T::Move | T::Pipe | T::PipePipe) => true,
+            // `<T as Trait>::N`
+            Some(T::LAngle) => true,
             _ => false,
         };
     }
@@ -394,6 +396,8 @@ impl Parser {
                 }
             }
             T::Pipe | T::PipePipe | T::Move => ExprKind::Closure(self.closure()?),
+            // `<T as Trait>::N`, `<T as Trait>::f`
+            T::LAngle => ExprKind::Path(self.qualified_path()?),
             T::LParen => {
                 self.bump();
                 if self.eat(T::RParen) {

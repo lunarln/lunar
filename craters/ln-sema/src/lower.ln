@@ -66,6 +66,9 @@ pub struct LowerCx {
     pub generics_span: Span,
     /// Lowering this function's return type, where `impl Trait` is allowed.
     pub opaque_owner: Option::<DefId>,
+    /// Inside an impl of a trait (or an item of one): the trait, through
+    /// which `Self::Item` is found.
+    pub impl_trait: Option::<TraitRef>,
 }
 
 impl LowerCx {
@@ -79,6 +82,7 @@ impl LowerCx {
             allow_infer: false,
             generics_span: dummy_span(),
             opaque_owner: None,
+            impl_trait: None,
         };
     }
 }
@@ -122,7 +126,7 @@ impl Sema {
     /// each is declared. A trait's implicit `Self` has a dummy span.
     pub fn generic_params_of(&mut +self, id: DefId, names: &mut +[Symbol; ..+], spans: &mut +[Span; ..+]) {
         let d = self.p.defs[id.index()];
-        if d.kind == DefKind::Fn {
+        if is_member_kind(d.kind) {
             if let Some(parent) = d.parent {
                 self.generic_params_of(parent, names, spans);
             }
@@ -149,7 +153,7 @@ impl Sema {
     /// The predicates in scope for an item, appended to `out`.
     pub fn env_into(&mut +self, id: DefId, out: &mut +[Pred; ..+]) {
         let d = self.p.defs[id.index()];
-        if d.kind == DefKind::Fn {
+        if is_member_kind(d.kind) {
             if let Some(parent) = d.parent {
                 self.env_into(parent, out);
                 if self.p.defs[parent.index()].kind == DefKind::Trait {
@@ -195,7 +199,7 @@ impl Sema {
                 let n = self.p.sym("Self");
                 Some(self.p.types.mk(TyKind::Param(0, n)))
             }
-            DefKind::Fn => match d.parent {
+            DefKind::Fn | DefKind::AssocTy | DefKind::Const => match d.parent {
                 Some(p) => self.self_ty_of(p),
                 None => None,
             },
@@ -235,7 +239,16 @@ impl Sema {
         let generic_spans = self.spans.add_list(spans[..]);
         let self_ty = self.self_ty_of(id);
         let env = self.env_of(id);
-        return LowerCx { module: d.module, generic_names, generic_spans, self_ty, env, allow_infer: false, generics_span: gspan, opaque_owner: None };
+        // The impl this item is in (or is), for `Self::Item`.
+        let owner = if d.kind == DefKind::Impl { Some(id) } else if is_member_kind(d.kind) { d.parent } else { None };
+        let impl_trait = match owner {
+            Some(o) => match self.p.defs[o.index()].data {
+                DefData::Impl(i) => i.trait_ref,
+                _ => None,
+            },
+            None => None,
+        };
+        return LowerCx { module: d.module, generic_names, generic_spans, self_ty, env, allow_infer: false, generics_span: gspan, opaque_owner: None, impl_trait };
     }
 
     // ===================================================================== driver
@@ -336,12 +349,24 @@ impl Sema {
                 self.lower_impl_header(DefId::new(i), im);
             }
         }
+        // Associated types: their bounds and defaults in traits, their
+        // types in impls.
+        for i in 0..n {
+            let id = DefId::new(i);
+            if let AstRef::Alias(ta) = self.ast(id) {
+                if self.p.defs[i].kind == DefKind::AssocTy {
+                    self.lower_assoc_ty(id, ta);
+                }
+            }
+        }
         for i in 0..n {
             let id = DefId::new(i);
             match self.ast(id) {
                 AstRef::Fn(f, ext) => self.lower_fn(id, f, ext),
                 AstRef::Alias(_) => {
-                    self.alias_ty(id);
+                    if self.p.defs[i].kind == DefKind::TypeAlias {
+                        self.alias_ty(id);
+                    }
                 }
                 _ => {}
             }
@@ -467,25 +492,36 @@ impl Sema {
             let p = self.p.ast.generic_params.list(g.params)[i];
             self.p.refs.push(Ref { span: p.name.span, target: RefTarget::TyParam(p.name.span) });
         }
+        let diags0 = self.p.diags.len();
+        let deferred0 = self.deferred.len();
         let mut preds: [Pred; ..+] = [];
-        for i in 0..g.params.len() {
-            let p = self.p.ast.generic_params.list(g.params)[i];
-            for j in 0..p.bounds.len() {
-                let b = self.p.ast.paths.list(p.bounds)[j];
-                if let Some(tr) = self.lower_trait_ref(cx, b) {
-                    let idx = offset + i as u32;
-                    let ty = self.p.types.mk(TyKind::Param(idx, p.name.name));
-                    preds.push(Pred { ty, trait_ref: tr, span: b.span });
-                }
-            }
+        self.lower_param_bounds(cx, g, offset, &mut preds);
+        if self.p.diags.len() > diags0 {
+            // A bound may name another parameter's associated type (`F:
+            // Fn(I::Item): B` with `I: Iterator`): try again with what the
+            // first try found in scope.
+            self.p.diags.truncate(diags0);
+            self.deferred.truncate(deferred0);
+            let mut env: [Pred; ..+] = [];
+            env.extend(self.p.preds.list(cx.env));
+            env.extend(preds[..]);
+            let mut cx2 = cx;
+            cx2.env = self.p.preds.add_list(env[..]);
+            preds = [];
+            self.lower_param_bounds(cx2, g, offset, &mut preds);
         }
         let mut sts: [TraitRef; ..+] = [];
+        // `trait Int: Add::<Output = Self>`: constraints on `Self`.
+        let mut super_eqs: [Pred; ..+] = [];
+        let self_name = self.p.sym("Self");
+        let self_param = self.p.types.mk(TyKind::Param(0, self_name));
         for i in 0..supers.len() {
             let s = self.p.ast.paths.list(supers)[i];
-            if let Some(tr) = self.lower_trait_ref(cx, s) {
+            if let Some(tr) = self.lower_bound(cx, s, self_param, &mut super_eqs) {
                 sts.push(tr);
             }
         }
+        let sel = self.p.preds.add_list(super_eqs[..]);
         let pl = self.p.preds.add_list(preds[..]);
         let data = match self.p.defs[id.index()].data {
             DefData::Fn(f) => {
@@ -502,6 +538,7 @@ impl Sema {
                 let mut t = t;
                 t.generics.preds = pl;
                 t.supertraits = self.p.trait_refs.add_list(sts[..]);
+                t.super_eqs = sel;
                 DefData::Trait(t)
             }
             DefData::Impl(i) => {
@@ -512,6 +549,27 @@ impl Sema {
             other => other,
         };
         self.p.defs[id.index()].data = data;
+    }
+
+    /// The bounds of the generic parameters `g` declares (the first one
+    /// numbered `offset`), with their associated type constraints as
+    /// equality predicates, onto `preds`.
+    fn lower_param_bounds(&mut self, cx: LowerCx, g: ln_ast::Generics, offset: u32, preds: &mut +[Pred; ..+]) {
+        for i in 0..g.params.len() {
+            let p = self.p.ast.generic_params.list(g.params)[i];
+            for j in 0..p.bounds.len() {
+                let b = self.p.ast.paths.list(p.bounds)[j];
+                let idx = offset + i as u32;
+                let ty = self.p.types.mk(TyKind::Param(idx, p.name.name));
+                // `I: Iterator::<Item = u8>`: the bound, then its
+                // constraints as equality predicates.
+                let mut eqs: [Pred; ..+] = [];
+                if let Some(tr) = self.lower_bound(cx, b, ty, &mut eqs) {
+                    preds.push(Pred { ty, trait_ref: tr, span: b.span });
+                    preds.extend(eqs[..]);
+                }
+            }
+        }
     }
 
     /// `impl A + B` in a function's return type: a new opaque type with
@@ -528,13 +586,6 @@ impl Sema {
         };
         let mut inner = cx;
         inner.opaque_owner = None;
-        let mut trait_refs: [TraitRef; ..+] = [];
-        for i in 0..bounds.len() {
-            let b = self.p.ast.paths.list(bounds)[i];
-            if let Some(tr) = self.lower_trait_ref(inner, b) {
-                trait_refs.push(tr);
-            }
-        }
         let mut idx: u32 = 0;
         for k in self.p.opaques.keys() {
             let (d, _) = k;
@@ -542,15 +593,26 @@ impl Sema {
                 idx += 1;
             }
         }
-        let bl = self.p.trait_refs.add_list(trait_refs[..]);
-        self.p.opaques.insert((owner, idx), OpaqueInfo { bounds: bl, concrete: None, span });
         let mut args: [Ty; ..+] = [];
         for i in 0..cx.generic_names.len() {
             let n = self.p.symbols.list(cx.generic_names)[i];
             args.push(self.p.types.mk(TyKind::Param(i as u32, n)));
         }
         let al = self.p.types.mk_list(args[..]);
-        return self.p.types.mk(TyKind::Opaque(owner, idx, al));
+        let opaque = self.p.types.mk(TyKind::Opaque(owner, idx, al));
+        let mut trait_refs: [TraitRef; ..+] = [];
+        // `impl Iterator::<Item = u8>`: constraints on the opaque type.
+        let mut eqs: [Pred; ..+] = [];
+        for i in 0..bounds.len() {
+            let b = self.p.ast.paths.list(bounds)[i];
+            if let Some(tr) = self.lower_bound(inner, b, opaque, &mut eqs) {
+                trait_refs.push(tr);
+            }
+        }
+        let bl = self.p.trait_refs.add_list(trait_refs[..]);
+        let el = self.p.preds.add_list(eqs[..]);
+        self.p.opaques.insert((owner, idx), OpaqueInfo { bounds: bl, eqs: el, concrete: None, span });
+        return opaque;
     }
 
     /// `dyn Trait + Send + Sync`, `dyn mut Trait`: one trait whose methods
@@ -559,9 +621,12 @@ impl Sema {
         let mut principal: Option::<TraitRef> = None;
         let mut flags: u32 = if is_mut { DYN_MUT } else { 0 };
         let mut resolved = true;
+        // The constraints, on a placeholder self type.
+        let mut eqs: [Pred; ..+] = [];
+        let placeholder = self.p.types.error();
         for i in 0..bounds.len() {
             let b = self.p.ast.paths.list(bounds)[i];
-            let Some(tr) = self.lower_trait_ref(cx, b) else {
+            let Some(tr) = self.lower_bound(cx, b, placeholder, &mut eqs) else {
                 resolved = false;
                 continue;
             };
@@ -598,7 +663,53 @@ impl Sema {
             }
             return self.p.types.error();
         };
-        let ty = self.p.types.mk(TyKind::Dyn(tr.trait_id, tr.args, flags));
+        // Every associated type of the trait (and its supertraits) must be
+        // given: the type says what they are, as a vtable cannot.
+        let mut items: [DefId; ..+] = [];
+        let mut owners: [TraitRef; ..+] = [];
+        self.p.dyn_assoc_tys_of(tr, &mut items, &mut owners);
+        let mut all: [Ty; ..+] = [];
+        all.extend(self.p.types.list(tr.args));
+        let mut missing: [DefId; ..+] = [];
+        for k in 0..items.len() {
+            let mut a: [Ty; ..+] = [placeholder];
+            a.extend(self.p.types.list(owners[k].args));
+            let al = self.p.types.mk_list(a[..]);
+            let proj = self.p.types.mk(TyKind::Proj(items[k], al));
+            let mut found: Option::<Ty> = None;
+            for e in eqs[..] {
+                if e.ty == proj {
+                    found = Some(self.p.types.at(e.trait_ref.args, 0));
+                }
+            }
+            match found {
+                Some(t) => all.push(t),
+                None => {
+                    missing.push(items[k]);
+                    all.push(self.p.types.error());
+                }
+            }
+        }
+        if missing.len() > 0 {
+            let name = self.def_name(tr.trait_id);
+            let mut list = String::new();
+            let mut example = String::new();
+            for k in 0..missing.len() {
+                if k > 0 {
+                    list.push_str(", ");
+                    example.push_str(", ");
+                }
+                let an = self.def_name(missing[k]);
+                list.write("`{an}`");
+                example.write("{an} = ...");
+            }
+            self.error(codes::ty::BAD_DYN(), span, "a `dyn {name}` must say what its associated types are: {list}");
+            self.note("calls through a `dyn` cannot find out the type of the value viewed, so its type names them");
+            self.help("write `dyn {name}::<{example}>`");
+            self.emit();
+        }
+        let al = self.p.types.mk_list(all[..]);
+        let ty = self.p.types.mk(TyKind::Dyn(tr.trait_id, al, flags));
         self.deferred.push(Deferred { kind: DeferKind::DynCompat, ty, env: cx.env, span, generics_span: cx.generics_span });
         return ty;
     }
@@ -637,7 +748,66 @@ impl Sema {
         }
     }
 
+    /// A trait path where associated type constraints are not allowed
+    /// (supertraits, impl headers).
     pub fn lower_trait_ref(&mut self, cx: LowerCx, path: Path): Option::<TraitRef> {
+        let (tr, bindings) = self.lower_trait_ref_inner(cx, path)?;
+        if bindings.len() > 0 {
+            let b = self.p.ast.assoc_bindings.list(bindings)[0];
+            let n = self.str_of(b.name.name);
+            self.error(codes::ty::GENERIC_COUNT(), b.name.span, "associated type constraints are not allowed here");
+            self.note("`Trait::<{n} = T>` constrains a bound: a generic parameter's, an `impl Trait` or a `dyn`");
+            self.help("in an impl, give the type in its body: `type {n} = T;`");
+            self.emit();
+        }
+        return Some(tr);
+    }
+
+    /// A trait bound `path` on `self_ty`, with its associated type
+    /// constraints (`Iterator::<Item = u8>`) pushed onto `eqs` as equality
+    /// predicates `<self_ty as Trait>::Item == u8`.
+    pub fn lower_bound(&mut self, cx: LowerCx, path: Path, self_ty: Ty, eqs: &mut +[Pred; ..+]): Option::<TraitRef> {
+        let (tr, bindings) = self.lower_trait_ref_inner(cx, path)?;
+        let start = eqs.len();
+        for i in 0..bindings.len() {
+            let b = self.p.ast.assoc_bindings.list(bindings)[i];
+            let value = self.lower_ty(cx, b.ty, TyPos::Other);
+            let mut found: [(TraitRef, DefId); ..+] = [];
+            self.p.bound_assocs(tr, b.name.name, false, &mut found);
+            if found.len() == 0 {
+                let n = self.str_of(b.name.name);
+                let tn = self.def_name(tr.trait_id);
+                self.error(codes::name::NO_ASSOC(), b.name.span, "trait `{tn}` has no associated type `{n}`");
+                self.emit();
+                continue;
+            }
+            let (owner, item) = found[0];
+            self.p.refs.push(Ref { span: b.name.span, target: RefTarget::Def(item) });
+            let mut a: [Ty; ..+] = [self_ty];
+            a.extend(self.p.types.list(owner.args));
+            let al = self.p.types.mk_list(a[..]);
+            let proj = self.p.types.mk(TyKind::Proj(item, al));
+            let mut dup = false;
+            for k in start..eqs.len() {
+                if eqs[k].ty == proj {
+                    dup = true;
+                }
+            }
+            if dup {
+                let n = self.str_of(b.name.name);
+                self.error(codes::name::DUPLICATE(), b.name.span, "associated type `{n}` is constrained twice");
+                self.emit();
+                continue;
+            }
+            let vl = self.p.types.mk_list([value][..]);
+            eqs.push(Pred { ty: proj, trait_ref: TraitRef { trait_id: item, args: vl }, span: b.name.span });
+        }
+        return Some(tr);
+    }
+
+    /// A trait path's trait and arguments, and its associated type
+    /// constraints (unlowered).
+    fn lower_trait_ref_inner(&mut self, cx: LowerCx, path: Path): Option::<(TraitRef, List::<ln_ast::AssocBinding>)> {
         let mut idents: [Ident; ..+] = [];
         self.path_idents(path, &mut idents);
         let res = self.resolve_prefix(cx.module, idents[..], Ns::Type);
@@ -677,7 +847,7 @@ impl Sema {
             return None;
         }
         let al = self.p.types.mk_list(args[..]);
-        return Some(TraitRef { trait_id: def, args: al });
+        return Some((TraitRef { trait_id: def, args: al }, seg.bindings));
     }
 
     fn lower_fields(&mut self, cx: LowerCx, data: VariantData): (CtorKind, List::<FieldDef>) {
@@ -958,11 +1128,85 @@ impl Sema {
         }
     }
 
+    /// An associated type: in a trait, its bounds and default (with the
+    /// trait's generics, `Self` being parameter 0); in an impl, its type.
+    fn lower_assoc_ty(&mut self, id: DefId, ta: ln_ast::TypeAlias) {
+        let d = self.p.defs[id.index()];
+        let Some(parent) = d.parent else { return; };
+        let in_trait = self.p.defs[parent.index()].kind == DefKind::Trait;
+        let cx = self.lower_cx(id);
+        let mut bounds: [TraitRef; ..+] = [];
+        if in_trait {
+            for i in 0..ta.bounds.len() {
+                let b = self.p.ast.paths.list(ta.bounds)[i];
+                if let Some(tr) = self.lower_trait_ref(cx, b) {
+                    bounds.push(tr);
+                }
+            }
+        }
+        let ty = match ta.ty {
+            Some(t) => Some(self.lower_ty(cx, t, TyPos::Other)),
+            None => None,
+        };
+        let bl = self.p.trait_refs.add_list(bounds[..]);
+        self.p.defs[id.index()].data = DefData::AssocTy(AssocTyData { bounds: bl, ty });
+    }
+
     fn lower_const(&mut self, id: DefId, c: ln_ast::ConstDecl) {
-        let cx = LowerCx::new(self.p.defs[id.index()].module);
+        let d = self.p.defs[id.index()];
+        // An associated constant: of a trait (maybe without a value) or of
+        // an impl, in the context of its generics and `Self`.
+        let parent_kind = match d.parent {
+            Some(p) => Some(self.p.defs[p.index()].kind),
+            None => None,
+        };
+        let in_trait = parent_kind == Some(DefKind::Trait);
+        let cx = if parent_kind.is_some() { self.lower_cx(id) } else { LowerCx::new(d.module) };
         let ty = self.lower_ty(cx, c.ty, TyPos::Other);
-        let value = self.eval_const(cx.module, c.value, ty);
+        self.p.defs[id.index()].data = DefData::Const(ConstData { ty, value: None });
+        let value = match c.value {
+            Some(e) => {
+                let self_def = match cx.self_ty {
+                    Some(st) => match self.p.types.kind(st) {
+                        TyKind::Adt(a, _) => Some(a),
+                        _ => None,
+                    },
+                    None => None,
+                };
+                self.eval_const_with_self(d.module, e, ty, self_def)
+            }
+            None => {
+                if !in_trait {
+                    let n = self.str_of(c.name.name);
+                    let ts = self.p.ty_str(ty);
+                    let what = if parent_kind.is_some() { "associated constant" } else { "constant" };
+                    self.error(codes::syntax::MISSING_VALUE(), d.span, "{what} `{n}` has no value");
+                    self.note("only a trait may declare a constant without a value, for each impl to give one");
+                    self.help("give it one: `const {n}: {ts} = ...;`");
+                    self.emit();
+                }
+                None
+            }
+        };
         self.p.defs[id.index()].data = DefData::Const(ConstData { ty, value });
+    }
+
+    /// `eval_const` where `Self` names the struct or enum `self_def` (in an
+    /// impl).
+    pub fn eval_const_with_self(&mut self, module: DefId, e: Id::<Expr>, ty: Ty, self_def: Option::<DefId>): Option::<ConstVal> {
+        let mut env = ConstEnv::new();
+        let saved = env.enter(self_def);
+        let r = self.eval_const_inner(module, e, ty, &mut env);
+        env.leave(saved);
+        return match r {
+            Ok(v) => Some(v),
+            Err(msg) => {
+                let sp = self.p.ast.exprs.get(e).span;
+                self.error(codes::ty::CONST_EVAL(), sp, "{msg}");
+                self.emit();
+                None
+            }
+        };
     }
 
     fn lower_static(&mut self, id: DefId, s: ln_ast::StaticDecl) {
@@ -1129,15 +1373,162 @@ impl Sema {
         self.deferred.push(Deferred { kind: DeferKind::ArrayElem, ty: elem, env: cx.env, span, generics_span: cx.generics_span });
     }
 
-    /// Start building `name::not_a_type` for an associated type (the caller
-    /// emits it).
-    fn assoc_types_unsupported(&mut self, span: Span) {
-        self.error(codes::name::NOT_A_TYPE(), span, "associated types are not supported");
-        self.note("traits in Lunar have methods and associated functions, but no associated types");
-        self.help("make the type a generic parameter of the trait instead, as in `Iterator::<T>`");
+    /// Start building `name::not_a_type` for `Type::Item` where `Type` is
+    /// not a generic parameter or `Self` (the caller emits it).
+    fn assoc_needs_trait(&mut self, p: Path) {
+        let segs = self.p.ast.segments.list(p.segments);
+        let n = segs.len();
+        let item = self.str_of(segs[n - 1].ident.name);
+        let mut ty = String::new();
+        for k in 0..n - 1 {
+            if k > 0 {
+                ty.push_str("::");
+            }
+            ty.push_str(self.p.text(segs[k].ident.name));
+        }
+        self.error(codes::name::NOT_A_TYPE(), p.span, "which trait's `{item}`? `{ty}::{item}` does not say");
+        self.note("`T::{item}` finds the associated type through the bounds of a generic parameter `T` or `Self`; other types may implement several traits with an `{item}`");
+        self.help("name the trait: `<{ty} as Trait>::{item}`");
+    }
+
+    /// Whether `name` is a generic parameter in scope (its index).
+    fn generic_index(&self, cx: LowerCx, name: Symbol): Option::<usize> {
+        let mut i = cx.generic_names.len();
+        while i > 0 {
+            i -= 1;
+            if self.p.symbols.list(cx.generic_names)[i] == name {
+                return Some(i);
+            }
+        }
+        return None;
+    }
+
+    /// The traits (with arguments) that the bounds in scope give `self_ty`
+    /// (a generic parameter, `Self` or a projection): those of `cx.env` and
+    /// their supertraits, and in an impl of a trait, that trait for `Self`.
+    pub fn bound_traits_of(&mut self, cx: LowerCx, self_ty: Ty, out: &mut +[TraitRef; ..+]) {
+        let base = self.p.preds.list(cx.env).to_grow();
+        let mut el: [Pred; ..+] = [];
+        self.p.elaborate(base[..], &mut el);
+        for p in el {
+            if p.ty == self_ty && !self.p.is_eq_pred(p) && !out[..].contains(p.trait_ref) {
+                out.push(p.trait_ref);
+            }
+        }
+        if let Some(tr) = cx.impl_trait {
+            if Some(self_ty) == cx.self_ty && !out[..].contains(tr) {
+                out.push(tr);
+            }
+        }
+    }
+
+    /// The associated type `name` of `self_ty` (a generic parameter, `Self`
+    /// or a projection), found through the bounds in scope: the projection
+    /// `<self_ty as Trait>::name`. Reports `name::no_assoc` or
+    /// `trait::ambiguous_assoc`.
+    pub fn assoc_ty_of(&mut self, cx: LowerCx, self_ty: Ty, name: Ident, span: Span): Ty {
+        let mut traits: [TraitRef; ..+] = [];
+        self.bound_traits_of(cx, self_ty, &mut traits);
+        let mut found: [(TraitRef, DefId); ..+] = [];
+        for tr in traits[..] {
+            let mut here: [(TraitRef, DefId); ..+] = [];
+            self.p.bound_assocs(tr, name.name, false, &mut here);
+            for h in here[..] {
+                let (_, d) = h;
+                let mut seen = false;
+                for f in found[..] {
+                    let (_, e) = f;
+                    if e == d {
+                        seen = true;
+                    }
+                }
+                if !seen {
+                    found.push(h);
+                }
+            }
+        }
+        let n = self.str_of(name.name);
+        let ts = self.ty_str(self_ty);
+        if found.len() == 0 {
+            self.error(codes::name::NO_ASSOC(), name.span, "`{ts}` has no associated type `{n}`");
+            if traits.len() == 0 {
+                self.note("`{ts}` has no bounds, so it has no associated types");
+            } else {
+                let mut list = String::new();
+                for k in 0..traits.len() {
+                    if k > 0 {
+                        list.push_str(", ");
+                    }
+                    let s = self.p.trait_ref_str(traits[k]);
+                    list.write("`{s}`");
+                }
+                self.note("none of its bounds has one: {list}");
+            }
+            self.help("add a bound on a trait with an associated type `{n}`: `{ts}: Trait`");
+            self.emit();
+            return self.p.types.error();
+        }
+        if found.len() > 1 {
+            let mut list = String::new();
+            for k in 0..found.len() {
+                if k > 0 {
+                    list.push_str(" and ");
+                }
+                let (t, _) = found[k];
+                let s = self.p.trait_ref_str(t);
+                list.write("`{s}`");
+            }
+            let (t0, _) = found[0];
+            let first = self.p.trait_ref_str(t0);
+            self.error(codes::trait_::AMBIGUOUS_ASSOC(), span, "`{ts}::{n}` is ambiguous: both {list} have an associated type `{n}`");
+            self.help("name the trait: `<{ts} as {first}>::{n}`");
+            self.emit();
+            return self.p.types.error();
+        }
+        let (owner, item) = found[0];
+        self.p.refs.push(Ref { span: name.span, target: RefTarget::Def(item) });
+        let mut a: [Ty; ..+] = [self_ty];
+        a.extend(self.p.types.list(owner.args));
+        let al = self.p.types.mk_list(a[..]);
+        return self.p.types.mk(TyKind::Proj(item, al));
+    }
+
+    /// `<T as Trait>::Item`.
+    fn lower_qpath_ty(&mut self, cx: LowerCx, q: Id::<ln_ast::Ty>, p: Path): Ty {
+        let self_ty = self.lower_ty(cx, q, TyPos::Other);
+        let n = p.segments.len();
+        let segs = self.p.ast.segments.list(p.segments);
+        let item = segs[n - 1];
+        if n < 2 {
+            return self.p.types.error();
+        }
+        let tp = Path { segments: List::from_parts(p.segments.start(), n - 1), span: p.span, qself: None };
+        let Some(tr) = self.lower_trait_ref(cx, tp) else { return self.p.types.error(); };
+        if item.args.is_some() {
+            self.error(codes::ty::GENERIC_COUNT(), item.ident.span, "associated types take no generic arguments");
+            self.emit();
+        }
+        let mut found: [(TraitRef, DefId); ..+] = [];
+        self.p.bound_assocs(tr, item.ident.name, false, &mut found);
+        if found.len() == 0 {
+            let iname = self.str_of(item.ident.name);
+            let tn = self.def_name(tr.trait_id);
+            self.error(codes::name::NO_ASSOC(), item.ident.span, "trait `{tn}` has no associated type `{iname}`");
+            self.emit();
+            return self.p.types.error();
+        }
+        let (owner, d) = found[0];
+        self.p.refs.push(Ref { span: item.ident.span, target: RefTarget::Def(d) });
+        let mut a: [Ty; ..+] = [self_ty];
+        a.extend(self.p.types.list(owner.args));
+        let al = self.p.types.mk_list(a[..]);
+        return self.p.types.mk(TyKind::Proj(d, al));
     }
 
     fn lower_path_ty(&mut self, cx: LowerCx, p: Path): Ty {
+        if let Some(q) = p.qself {
+            return self.lower_qpath_ty(cx, q, p);
+        }
         let n_segs = p.segments.len();
         // Generic parameters and `Self`.
         if n_segs == 1 {
@@ -1184,10 +1575,36 @@ impl Sema {
                 self.emit();
                 return self.p.types.error();
             }
-            if is_self || self.p.symbols.list(cx.generic_names).contains(first.name) {
-                self.assoc_types_unsupported(p.span);
-                self.emit();
-                return self.p.types.error();
+            let param = self.generic_index(cx, first.name);
+            if is_self || param.is_some() {
+                let mut t = if is_self {
+                    cx.self_ty.unwrap()
+                } else {
+                    let i = param.unwrap();
+                    if i < cx.generic_spans.len() {
+                        let decl = self.spans.list(cx.generic_spans)[i];
+                        if !is_dummy(decl) {
+                            self.p.refs.push(Ref { span: first.span, target: RefTarget::TyParam(decl) });
+                        }
+                    }
+                    self.p.types.mk(TyKind::Param(i as u32, first.name))
+                };
+                let segs = self.p.ast.segments.list(p.segments).to_grow();
+                if segs[0].args.is_some() {
+                    self.error(codes::ty::GENERIC_COUNT(), p.span, "generic parameters cannot take generic arguments");
+                    self.emit();
+                }
+                for k in 1..segs.len() {
+                    if segs[k].args.is_some() {
+                        self.error(codes::ty::GENERIC_COUNT(), segs[k].ident.span, "associated types take no generic arguments");
+                        self.emit();
+                    }
+                    t = self.assoc_ty_of(cx, t, segs[k].ident, p.span);
+                    if self.p.types.is_error(t) {
+                        return t;
+                    }
+                }
+                return t;
             }
         }
         let mut idents: [Ident; ..+] = [];
@@ -1222,7 +1639,7 @@ impl Sema {
                     }
                     self.error(codes::name::NOT_A_TYPE(), idents[used - 1].span, "expected a type or module, found {d.kind.describe()} `{prefix}`");
                 }
-                None => self.assoc_types_unsupported(p.span),
+                None => self.assoc_needs_trait(p),
             }
             self.emit();
             return self.p.types.error();
@@ -1301,9 +1718,29 @@ impl Sema {
             self.emit();
             return None;
         }
+        let Some(aty) = a.ty else {
+            let n = self.str_of(a.name.name);
+            self.error(codes::syntax::MISSING_VALUE(), a.name.span, "type alias `{n}` has no type");
+            self.note("only a trait may declare a type without one (an associated type), for each impl to give one");
+            self.help("give it one: `type {n} = ...;`");
+            self.emit();
+            let e = self.p.types.error();
+            if let DefData::Alias(ad) = self.p.defs[id.index()].data {
+                let mut ad = ad;
+                ad.ty = Some(e);
+                self.p.defs[id.index()].data = DefData::Alias(ad);
+            }
+            return Some(e);
+        };
+        if a.bounds.len() > 0 {
+            let first = self.p.ast.paths.list(a.bounds)[0].span;
+            self.error(codes::syntax::UNEXPECTED_TOKEN(), first, "a type alias has no bounds");
+            self.note("bounds after `type Name:` are for associated types, declared in traits");
+            self.emit();
+        }
         self.alias_stack.push(id);
         let cx = self.lower_cx(id);
-        let t = self.lower_ty(cx, a.ty, TyPos::Other);
+        let t = self.lower_ty(cx, aty, TyPos::Other);
         self.alias_stack.pop();
         if let DefData::Alias(ad) = self.p.defs[id.index()].data {
             let mut ad = ad;
@@ -1685,6 +2122,7 @@ impl Sema {
                 self.emit();
             }
         }
+        self.check_impl_assocs(id, data, tr, td, self_span);
         // Supertraits must also be implemented.
         let mut args: [Ty; ..+] = [];
         args.push(data.self_ty);
@@ -1699,6 +2137,122 @@ impl Sema {
                 self.error(codes::ty::UNSATISFIED_BOUND(), self_span, "`{s}` implements `{tname}` but not its supertrait `{sn}`");
                 self.emit();
             }
+        }
+        // And their constraints (`trait Int: Add::<Output = Self>`).
+        for i in 0..td.super_eqs.len() {
+            let e0 = self.p.preds.list(td.super_eqs)[i];
+            let ety = self.p.types.subst(e0.ty, al);
+            let etr = self.p.types.subst_trait_ref(e0.trait_ref, al);
+            if self.p.implements(ety, etr, self.p.preds.list(data.generics.preds)) {
+                continue;
+            }
+            let env = self.p.preds.list(data.generics.preds).to_grow();
+            let got0 = self.p.normalize(ety, env[..]);
+            let want0 = self.p.types.at(etr.args, 0);
+            let (ps, want, got) = (self.p.ty_str(ety), self.p.ty_str(want0), self.p.ty_str(got0));
+            self.error(codes::ty::ASSOC_MISMATCH(), self_span, "`{tname}` requires `{ps}` to be `{want}`, but it is `{got}`");
+            self.emit();
+        }
+    }
+
+    /// The associated types and constants of impl `id` of `tr` against the
+    /// trait's: each one without a default is given, each one given is the
+    /// trait's (with a type meeting its bounds, a constant of its type).
+    fn check_impl_assocs(&mut self, id: DefId, data: ImplData, tr: TraitRef, td: TraitData, self_span: Span) {
+        let tname = self.def_name(tr.trait_id);
+        let env = self.p.preds.list(data.generics.preds).to_grow();
+        let mut args: [Ty; ..+] = [data.self_ty];
+        args.extend(self.p.types.list(tr.args));
+        let al = self.p.types.mk_list(args[..]);
+        for i in 0..td.assoc.len() {
+            let a = self.p.trait_assocs.list(td.assoc)[i];
+            let an = self.str_of(a.name);
+            let asp = self.p.defs[a.def.index()].span;
+            if !a.is_const {
+                let Some(d) = self.p.impl_types.get((id, a.name)) else {
+                    if !a.has_default {
+                        self.error(codes::trait_::MISSING_ITEM(), self_span, "missing associated type `{an}` in implementation of `{tname}`");
+                        self.secondary(asp, "required by the trait here");
+                        self.help("add `type {an} = ...;` to the impl");
+                        self.emit();
+                    }
+                    continue;
+                };
+                let DefData::AssocTy(ad) = self.p.defs[d.index()].data else { continue; };
+                let Some(value) = ad.ty else { continue; };
+                let DefData::AssocTy(decl) = self.p.defs[a.def.index()].data else { continue; };
+                for j in 0..decl.bounds.len() {
+                    let b0 = self.p.trait_refs.list(decl.bounds)[j];
+                    let b = self.p.types.subst_trait_ref(b0, al);
+                    if self.p.implements(value, b, env[..]) {
+                        continue;
+                    }
+                    let vs = self.p.ty_str(value);
+                    let bs = self.p.trait_ref_str(b);
+                    let dsp = self.p.defs[d.index()].span;
+                    self.error(codes::ty::UNSATISFIED_BOUND(), dsp, "`{vs}` does not implement `{bs}`, which `{tname}::{an}` requires");
+                    self.secondary(asp, "the trait requires it here");
+                    self.emit();
+                }
+            } else {
+                let Some(d) = self.p.impl_consts.get((id, a.name)) else {
+                    if !a.has_default {
+                        self.error(codes::trait_::MISSING_ITEM(), self_span, "missing constant `{an}` in implementation of `{tname}`");
+                        self.secondary(asp, "required by the trait here");
+                        let ct = match self.p.defs[a.def.index()].data {
+                            DefData::Const(c) => self.p.types.subst(c.ty, al),
+                            _ => self.p.types.error(),
+                        };
+                        let cts = self.p.ty_str(ct);
+                        self.help("add `const {an}: {cts} = ...;` to the impl");
+                        self.emit();
+                    }
+                    continue;
+                };
+                let want = match self.p.defs[a.def.index()].data {
+                    DefData::Const(c) => self.p.types.subst(c.ty, al),
+                    _ => continue,
+                };
+                let got = match self.p.defs[d.index()].data {
+                    DefData::Const(c) => c.ty,
+                    _ => continue,
+                };
+                let w = self.p.normalize(want, env[..]);
+                let g = self.p.normalize(got, env[..]);
+                if w != g && !self.p.types.has_error(w) && !self.p.types.has_error(g) {
+                    let (ws, gs) = (self.p.ty_str(w), self.p.ty_str(g));
+                    let dsp = self.p.defs[d.index()].span;
+                    self.error(codes::trait_::SIGNATURE(), dsp, "constant `{an}` has type `{gs}`, but the trait declares `{ws}`");
+                    self.secondary(asp, "declared here");
+                    self.emit();
+                }
+            }
+        }
+        // Items the trait does not have.
+        let mut extra: [(DefId, bool); ..+] = [];
+        for e in self.p.impl_types.iter() {
+            let ((imp, _), d) = e;
+            if imp == id {
+                extra.push((d, false));
+            }
+        }
+        for e in self.p.impl_consts.iter() {
+            let ((imp, _), d) = e;
+            if imp == id {
+                extra.push((d, true));
+            }
+        }
+        for x in extra[..] {
+            let (d, is_const) = x;
+            let name = self.p.defs[d.index()].name;
+            if self.p.trait_assoc(tr.trait_id, name, is_const).is_some() {
+                continue;
+            }
+            let n = self.str_of(name);
+            let what = if is_const { "constant" } else { "associated type" };
+            let sp = self.p.defs[d.index()].span;
+            self.error(codes::trait_::EXTRA_ITEM(), sp, "{what} `{n}` is not a member of trait `{tname}`");
+            self.emit();
         }
     }
 
@@ -1720,6 +2274,9 @@ impl Sema {
             args.push(self.p.types.mk(TyKind::Param((impl_count + j) as u32, n)));
         }
         let al = self.p.types.mk_list(args[..]);
+        // `Self::Item` in either signature is the impl's type.
+        let env_list = self.env_of(impl_m);
+        let env = self.p.preds.list(env_list).to_grow();
         let mut same = true;
         let (tn, imn) = (tf.sig.params.len(), imf.sig.params.len());
         if tn != imn {
@@ -1732,8 +2289,11 @@ impl Sema {
         for i in 0..tn {
             let tp = self.p.params.list(tf.sig.params)[i];
             let ip = self.p.params.list(imf.sig.params)[i];
-            let want = self.p.types.subst(tp.ty, al);
-            if want != ip.ty || tp.mode != ip.mode {
+            let want0 = self.p.types.subst(tp.ty, al);
+            let want = self.p.normalize(want0, env[..]);
+            let got = self.p.normalize(ip.ty, env[..]);
+            // (An associated type the impl leaves out is reported apart.)
+            if (want != got && !self.p.types.has_error(want)) || tp.mode != ip.mode {
                 same = false;
                 let (w, g) = (self.p.ty_str(want), self.p.ty_str(ip.ty));
                 let (wm, gm) = (mode_prefix(tp.mode), mode_prefix(ip.mode));
@@ -1749,9 +2309,11 @@ impl Sema {
                 self.emit();
             }
         }
-        let want_ret = self.p.types.subst(tf.sig.ret, al);
-        if want_ret != imf.sig.ret {
-            let (w, g) = (self.p.ty_str(want_ret), self.p.ty_str(imf.sig.ret));
+        let want_ret0 = self.p.types.subst(tf.sig.ret, al);
+        let want_ret = self.p.normalize(want_ret0, env[..]);
+        let got_ret = self.p.normalize(imf.sig.ret, env[..]);
+        if want_ret != got_ret && !self.p.types.has_error(want_ret) {
+            let (w, g) = (self.p.ty_str(want_ret), self.p.ty_str(got_ret));
             self.error(codes::trait_::SIGNATURE(), imf.sig.ret_span, "return type mismatch with trait: expected `{w}`, found `{g}`");
             self.emit();
             same = false;
@@ -1997,6 +2559,10 @@ impl Sema {
                         return Ok(v);
                     }
                 }
+                // `<Type as Trait>::N`
+                if let Some(q) = p.qself {
+                    return self.const_qualified(module, q, p, env);
+                }
                 let Some((d, used)) = self.const_resolve(module, idents[..], Ns::Value, env) else {
                     return Err(core::fmt::format("cannot find constant `{shown}`"));
                 };
@@ -2005,24 +2571,16 @@ impl Sema {
                     if let Some(f) = self.inherent_fn(d, idents[used].name) {
                         return Ok(ConstVal::Fn(f));
                     }
+                    // `Type::N`: an associated constant of a struct or enum.
+                    if let DefData::Adt(_) = self.p.defs[d.index()].data {
+                        return self.const_of_adt(d, idents[used].name, env);
+                    }
                 }
                 if used != idents.len() {
                     return Err(core::fmt::format("cannot find constant `{shown}`"));
                 }
                 return match self.ast(d) {
-                    AstRef::Const(c) => {
-                        if let DefData::Const(cd) = self.p.defs[d.index()].data {
-                            if let Some(v) = cd.value {
-                                return Ok(v);
-                            }
-                        }
-                        let m = self.p.defs[d.index()].module;
-                        let cx = LowerCx::new(m);
-                        let cty = self.lower_ty(cx, c.ty, TyPos::Other);
-                        let mut fresh = ConstEnv::new();
-                        fresh.calls = env.calls;
-                        self.eval_const_inner(m, c.value, cty, &mut fresh)
-                    }
+                    AstRef::Const(_) => self.const_def_value(d, env),
                     AstRef::Fn(..) => Ok(ConstVal::Fn(d)),
                     _ => {
                         // A unit struct or enum variant.
@@ -2218,6 +2776,103 @@ impl Sema {
     /// Resolve a path in a constant: `Self` (inside a `const fn` method),
     /// or the longest prefix that names an item. The item and how many
     /// segments it used.
+    /// The value of constant `d` (a free or associated one), evaluating it
+    /// now if it has not been yet.
+    fn const_def_value(&mut self, d: DefId, env: &ConstEnv): Result::<ConstVal, String> {
+        if let DefData::Const(cd) = self.p.defs[d.index()].data {
+            if let Some(v) = cd.value {
+                return Ok(v);
+            }
+        }
+        let AstRef::Const(c) = self.ast(d) else {
+            return Err(String::from("not a constant"));
+        };
+        let Some(value) = c.value else {
+            let n = self.str_of(c.name.name);
+            return Err(core::fmt::format("`{n}` has no value"));
+        };
+        let info = self.p.defs[d.index()];
+        let cx = if info.parent.is_some() { self.lower_cx(d) } else { LowerCx::new(info.module) };
+        let cty = self.lower_ty(cx, c.ty, TyPos::Other);
+        let self_def = match cx.self_ty {
+            Some(st) => match self.p.types.kind(st) {
+                TyKind::Adt(a, _) => Some(a),
+                _ => None,
+            },
+            None => None,
+        };
+        let mut fresh = ConstEnv::new();
+        fresh.calls = env.calls;
+        let saved = fresh.enter(self_def);
+        let r = self.eval_const_inner(info.module, value, cty, &mut fresh);
+        fresh.leave(saved);
+        return r;
+    }
+
+    /// `Type::N` in a constant: the associated constant `N` of struct or
+    /// enum `adt` (without generic parameters), from an inherent impl, a
+    /// trait impl, or a trait's default.
+    fn const_of_adt(&mut self, adt: DefId, name: Symbol, env: &ConstEnv): Result::<ConstVal, String> {
+        let n = self.str_of(name);
+        let an = self.def_name(adt);
+        if self.generic_count_of(adt) > 0 {
+            return Err(core::fmt::format("`{an}` is generic: name its arguments with `<{an}::<...> as Trait>::{n}`"));
+        }
+        let ty = self.p.types.adt(adt, List::empty());
+        let mut found: [DefId; ..+] = [];
+        for k in 0..self.p.impls.len() {
+            let imp = self.p.impls[k];
+            let DefData::Impl(d) = self.p.defs[imp.index()].data else { continue; };
+            if d.self_ty != ty {
+                continue;
+            }
+            if let Some(c) = self.p.impl_consts.get((imp, name)) {
+                found.push(c);
+            } else if let Some(tr) = d.trait_ref {
+                // The trait's default.
+                if let Some(a) = self.p.trait_assoc(tr.trait_id, name, true) {
+                    if a.has_default {
+                        found.push(a.def);
+                    }
+                }
+            }
+        }
+        if found.len() == 0 {
+            return Err(core::fmt::format("`{an}` has no associated constant `{n}`"));
+        }
+        if found.len() > 1 {
+            return Err(core::fmt::format("`{an}::{n}` is ambiguous: several traits give `{an}` a constant `{n}`; name the trait with `<{an} as Trait>::{n}`"));
+        }
+        return self.const_def_value(found[0], env);
+    }
+
+    /// `<Type as Trait>::N` in a constant.
+    fn const_qualified(&mut self, module: DefId, q: Id::<ln_ast::Ty>, p: Path, env: &ConstEnv): Result::<ConstVal, String> {
+        let cx = LowerCx::new(module);
+        let self_ty = self.lower_ty(cx, q, TyPos::Other);
+        let n = p.segments.len();
+        let name = self.p.ast.segments.list(p.segments)[n - 1].ident.name;
+        let tp = Path { segments: List::from_parts(p.segments.start(), n - 1), span: p.span, qself: None };
+        let Some(tr) = self.lower_trait_ref(cx, tp) else {
+            return Err(String::from("cannot find the trait"));
+        };
+        let mut found: [(TraitRef, DefId); ..+] = [];
+        self.p.bound_assocs(tr, name, true, &mut found);
+        let shown = self.p.ast.path_text(p);
+        if found.len() == 0 {
+            return Err(core::fmt::format("cannot find constant `{shown}`"));
+        }
+        let (owner, item) = found[0];
+        let mut a: [Ty; ..+] = [self_ty];
+        a.extend(self.p.types.list(owner.args));
+        let al = self.p.types.mk_list(a[..]);
+        let Some(d) = self.p.assoc_const_def(item, al) else {
+            let ts = self.p.ty_str(self_ty);
+            return Err(core::fmt::format("`{ts}` has no value for `{shown}`: it does not implement the trait"));
+        };
+        return self.const_def_value(d, env);
+    }
+
     fn const_resolve(&mut self, module: DefId, idents: [Ident; &], ns: Ns, env: &ConstEnv): Option::<(DefId, usize)> {
         if self.p.text(idents[0].name) == "Self" {
             return match env.self_def() {
@@ -2491,6 +3146,13 @@ impl ConstEnv {
         self.selfs.pop();
         self.calls -= 1;
     }
+}
+
+/// Kinds of definitions that are members of a trait or impl when they have
+/// a parent: methods, associated types and associated constants. They see
+/// the generics (and `Self`) of their trait or impl.
+pub fn is_member_kind(k: DefKind): bool {
+    return k == DefKind::Fn || k == DefKind::AssocTy || k == DefKind::Const;
 }
 
 fn mode_prefix(m: ParamMode): str {

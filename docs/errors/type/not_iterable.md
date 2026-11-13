@@ -4,7 +4,7 @@ A `for` loop works over:
 
 * integer ranges, `a..b` and `a..=b`;
 * arrays and slices of any kind, yielding their (Dull) items by value;
-* any type implementing `core::iter::Iterator::<T>`.
+* any type implementing `core::iter::Iterator`, yielding its `Item`s.
 
 This error is reported when the value after `in` is none of these, and when
 a range has bounds that are not integers (such as `0.0..1.0`).

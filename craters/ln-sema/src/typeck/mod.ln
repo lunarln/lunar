@@ -38,6 +38,7 @@ use crater::resolve::ModRes;
 use crater::program::{Program, Ref, RefTarget};
 use crater::sema::{AstRef, Sema};
 use crater::thir::{Arg, Block, Body, Callee, Coercion, Expr, ExprKind, FmtPiece, Local, LocalId, LocalKind, LoopId, Pat, PatKind, ReadMode, Stmt};
+use crater::typeck::closure::is_fn_trait;
 use crater::ty::*;
 use crater::typeck::closure::PendingClosure;
 use crater::typeck::pat::{AltOf, OrBind, OrFrame, PatName};
@@ -111,6 +112,19 @@ pub struct OpaqueVar {
     pub span: Span,
 }
 
+/// A projection whose self type is not known yet, which must turn out to be
+/// `ty`: `<?0 as Iterator>::Item == ?1` (from a bound `I: Iterator::<Item =
+/// X>` of a called function, or a projection unified with a type while its
+/// self type was still a variable). Settled once the self type is known
+/// (`process_projs`).
+pub struct PendingProj {
+    pub proj: Ty,
+    pub ty: Ty,
+    pub span: Span,
+    /// Settled (or reported): nothing more to do.
+    pub settled: bool,
+}
+
 /// An inference table entry as it was before a change.
 pub enum Undo {
     Var(u32, Var),
@@ -122,6 +136,7 @@ pub struct Snapshot {
     vars: usize,
     lens: usize,
     trail: usize,
+    projs: usize,
 }
 
 /// The state of checking one function body.
@@ -147,6 +162,10 @@ pub struct FnCtx {
     pub unsafe_depth: u32,
     pub in_unsafe_fn: bool,
     pub obligations: [Obligation; -..+],
+    /// Projections waiting for their self type (see `PendingProj`).
+    pub projs: [PendingProj; -..+],
+    /// How deep normalizing projections has gone (they may nest).
+    pub proj_depth: u32,
     /// Array element types to check for Light once inference is done.
     pub dull_checks: [(Ty, Span); -..+],
     /// Integer literals to range-check once their type is known.
@@ -191,6 +210,8 @@ impl FnCtx {
             unsafe_depth: 0,
             in_unsafe_fn,
             obligations: [],
+            projs: [],
+            proj_depth: 0,
             dull_checks: [],
             lit_checks: [],
             reported_annotations: false,
@@ -354,6 +375,22 @@ impl Sema {
             };
             let v = self.new_var(span);
             self.fcx.opaque_vars.push(OpaqueVar { idx: i, var: v, span });
+            // `impl Iterator::<Item = u8>`: what the body returns must have
+            // that item.
+            let eqs = match self.p.opaques.get((def, i)) {
+                Some(o) => o.eqs,
+                None => List::empty(),
+            };
+            for j in 0..eqs.len() {
+                let e = self.p.preds.list(eqs)[j];
+                let TyKind::Proj(item, pargs) = self.p.types.kind(e.ty) else { continue; };
+                let mut a: [Ty; ..+] = [v];
+                a.extend(self.p.types.list(pargs)[1..]);
+                let al = self.p.types.mk_list(a[..]);
+                let proj = self.p.types.mk(TyKind::Proj(item, al));
+                let want = self.p.types.at(e.trait_ref.args, 0);
+                self.oblige_proj(proj, want, span);
+            }
         }
         let mut params: [LocalId; ..+] = [];
         for i in 0..fd.sig.params.len() {
@@ -650,7 +687,7 @@ impl Sema {
 
     /// The inference tables as they are now.
     pub fn snapshot(&self): Snapshot {
-        return Snapshot { vars: self.fcx.vars.len(), lens: self.fcx.lens.len(), trail: self.fcx.trail.len() };
+        return Snapshot { vars: self.fcx.vars.len(), lens: self.fcx.lens.len(), trail: self.fcx.trail.len(), projs: self.fcx.projs.len() };
     }
 
     /// Undo every inference step since `s` was taken.
@@ -664,6 +701,9 @@ impl Sema {
         }
         self.fcx.vars.truncate(s.vars);
         self.fcx.lens.truncate(s.lens);
+        if self.fcx.projs.len() > s.projs {
+            self.fcx.projs.truncate(s.projs);
+        }
     }
 
     /// Replace placeholder inference markers produced by type lowering.
@@ -697,18 +737,255 @@ impl Sema {
                         _ => self.p.types.array(e, ArrKind::FixedVar(r)),
                     };
                 }
+                // A projection whose type is known by now is that type.
+                TyKind::Proj(..) => {
+                    let n = self.project_head(t);
+                    if n == t {
+                        return t;
+                    }
+                    t = n;
+                }
                 _ => return t,
             }
         }
     }
 
-    /// Fully resolve all inference variables that have been solved.
+    /// Fully resolve all inference variables that have been solved, and
+    /// the projections whose types are known.
     pub fn resolve(&mut self, t: Ty): Ty {
+        let mut r0 = t;
+        if self.p.types.has_infer(t) {
+            let mut r = Resolver { vars: self.fcx.vars[..], lens: self.fcx.lens[..] };
+            r0 = self.p.types.fold(t, &mut r);
+        }
+        if self.p.types.has_proj(r0) && self.fcx.proj_depth < 8 {
+            self.fcx.proj_depth += 1;
+            let env = self.fcx.env.clone();
+            let n = self.p.normalize(r0, env[..]);
+            self.fcx.proj_depth -= 1;
+            return n;
+        }
+        return r0;
+    }
+
+    /// `t` with the solved inference variables replaced, projections left
+    /// as they are (for messages about them).
+    pub fn vars_resolved(&mut self, t: Ty): Ty {
         if !self.p.types.has_infer(t) {
             return t;
         }
         let mut r = Resolver { vars: self.fcx.vars[..], lens: self.fcx.lens[..] };
         return self.p.types.fold(t, &mut r);
+    }
+
+    /// The projection `t` (`TyKind::Proj`) one step on: the type it stands
+    /// for, if that is known by now (from the bounds in scope, or the one
+    /// impl that fits its self type, even with variables in it); else `t`
+    /// with its arguments resolved.
+    pub fn project_head(&mut self, t: Ty): Ty {
+        let TyKind::Proj(item, args0) = self.p.types.kind(t) else { return t; };
+        if self.fcx.proj_depth >= 8 {
+            return t;
+        }
+        self.fcx.proj_depth += 1;
+        let args = self.resolve_list(args0);
+        let self_ty = self.p.types.at(args, 0);
+        let s = self.shallow(self_ty);
+        let unknown = match self.p.types.kind(s) {
+            TyKind::Infer(_) => true,
+            _ => false,
+        };
+        // The trait's arguments still being inferred: select by unification.
+        let open_args = self.any_infer(args);
+        let mut out = if args == args0 { t } else { self.p.types.mk(TyKind::Proj(item, args)) };
+        if !unknown {
+            // A closure's signature is still being inferred: select the
+            // impl here, with the variables.
+            // `impl Trait` and `dyn` types say what their items are
+            // whatever their arguments.
+            let own_info = match self.p.types.kind(s) {
+                TyKind::Opaque(..) | TyKind::Dyn(..) => true,
+                _ => false,
+            };
+            if own_info || (!open_args && !has_closure(&self.p.types, s)) {
+                let env = self.fcx.env.clone();
+                if let Some(r) = self.p.project(item, args, env[..]) {
+                    out = r;
+                }
+            } else if let Some(r) = self.project_by_impl(item, args) {
+                out = r;
+            }
+        }
+        self.fcx.proj_depth -= 1;
+        return out;
+    }
+
+    /// `<args[0] as Trait>::item` for a self type with variables in it
+    /// (`Wrapper::<?0>`): if exactly one impl of the trait fits, its type
+    /// for the item (unifying the variables as that impl says).
+    fn project_by_impl(&mut self, item: DefId, args: TyList): Option::<Ty> {
+        let trait_id = self.p.assoc_trait(item);
+        let self_ty = self.p.types.at(args, 0);
+        let rest = self.p.types.list(args)[1..].to_grow();
+        let targs = self.p.types.mk_list(rest[..]);
+        let name = self.p.defs[item.index()].name;
+        let snap = self.snapshot();
+        let mut fit: Option::<DefId> = None;
+        let mut count: usize = 0;
+        for k in 0..self.p.impls.len() {
+            let imp = self.p.impls[k];
+            let DefData::Impl(d) = self.p.def(imp).data else { continue; };
+            let Some(itr) = d.trait_ref else { continue; };
+            if itr.trait_id != trait_id || d.negative {
+                continue;
+            }
+            let fresh = self.fresh_vars(d.generics.count());
+            let st = self.p.types.subst(d.self_ty, fresh);
+            let ok = self.unify(st, self_ty) && itr.args.len() == targs.len() && self.unify_subst_lists(itr.args, fresh, targs);
+            self.rollback(snap);
+            if ok {
+                count += 1;
+                fit = Some(imp);
+            }
+        }
+        if count != 1 {
+            return None;
+        }
+        let imp = fit.unwrap();
+        let d = self.p.impl_data(imp);
+        let itr = d.trait_ref.unwrap();
+        let fresh = self.fresh_vars(d.generics.count());
+        let st = self.p.types.subst(d.self_ty, fresh);
+        self.unify(st, self_ty);
+        self.unify_subst_lists(itr.args, fresh, targs);
+        self.unify_closure_bounds(d, fresh);
+        let Some(at) = self.p.impl_types.get((imp, name)) else {
+            // The trait's default.
+            if let DefData::AssocTy(ad) = self.p.defs[item.index()].data {
+                if let Some(t) = ad.ty {
+                    return Some(self.p.types.subst(t, args));
+                }
+            }
+            return None;
+        };
+        let DefData::AssocTy(ad) = self.p.defs[at.index()].data else { return None; };
+        let Some(t) = ad.ty else { return None; };
+        return Some(self.p.types.subst(t, fresh));
+    }
+
+    /// The bounds `F: Fn(A): B` of impl `d` (its generics instantiated with
+    /// `args`) whose `F` is a closure checked here: unify the closure's
+    /// signature with the bound's, to learn `B` (`impl::<B, I: Iterator, F:
+    /// FnMut(I::Item): B> Iterator for Map::<I, F>`).
+    fn unify_closure_bounds(&mut self, d: ImplData, args: TyList) {
+        for i in 0..d.generics.preds.len() {
+            let p = self.p.preds.list(d.generics.preds)[i];
+            if self.p.is_eq_pred(p) || p.trait_ref.args.len() == 0 {
+                continue;
+            }
+            if !is_fn_trait(&self.p, p.trait_ref.trait_id) {
+                continue;
+            }
+            let pty0 = self.p.types.subst(p.ty, args);
+            let pty = self.shallow(pty0);
+            let TyKind::Closure(def, cargs) = self.p.types.kind(pty) else { continue; };
+            if !self.p.closures.contains(def) {
+                continue;
+            }
+            let sig = self.p.closure_sig(def, cargs);
+            let want0 = self.p.types.at(p.trait_ref.args, 0);
+            let want = self.p.types.subst(want0, args);
+            let snap = self.snapshot();
+            if !self.unify(want, sig) {
+                self.rollback(snap);
+            }
+        }
+    }
+
+    /// Whether `ty: tr` can hold, for a type still being inferred or one
+    /// holding a closure being checked (whose signature the program does
+    /// not know yet): an impl of the trait fits it. The obligation is
+    /// checked for good once the function is.
+    pub fn implements_now(&mut self, ty: Ty, tr: TraitRef): bool {
+        let env = self.fcx.env.clone();
+        if self.p.implements(ty, tr, env[..]) {
+            return true;
+        }
+        if !self.p.types.has_infer(ty) && !has_closure(&self.p.types, ty) {
+            return false;
+        }
+        let snap = self.snapshot();
+        for k in 0..self.p.impls.len() {
+            let imp = self.p.impls[k];
+            let DefData::Impl(d) = self.p.def(imp).data else { continue; };
+            let Some(itr) = d.trait_ref else { continue; };
+            if itr.trait_id != tr.trait_id || d.negative || itr.args.len() != tr.args.len() {
+                continue;
+            }
+            let fresh = self.fresh_vars(d.generics.count());
+            let st = self.p.types.subst(d.self_ty, fresh);
+            let ok = self.unify(st, ty) && self.unify_subst_lists(itr.args, fresh, tr.args);
+            self.rollback(snap);
+            if ok {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Record that projection `proj` must be `ty` (`PendingProj`); it is
+    /// settled once its self type is known.
+    pub fn oblige_proj(&mut self, proj: Ty, ty: Ty, span: Span) {
+        let sp = if is_dummy(span) { self.p.defs[self.fcx.def.index()].span } else { span };
+        self.fcx.projs.push(PendingProj { proj, ty, span: sp, settled: false });
+    }
+
+    /// Whether projection `t` cannot be decided yet: its self type has
+    /// variables in it.
+    fn proj_pending(&mut self, t: Ty): bool {
+        let TyKind::Proj(_, args) = self.p.types.kind(t) else { return false; };
+        let rargs = self.resolve_list(args);
+        return self.any_infer(rargs);
+    }
+
+    /// Settle the pending projections whose self types are known by now:
+    /// unify each with the type it must be (`err(type::assoc_mismatch)` if
+    /// it is another).
+    pub fn process_projs(&mut self) {
+        let mut i: usize = 0;
+        while i < self.fcx.projs.len() {
+            let pp = self.fcx.projs[i];
+            i += 1;
+            if pp.settled {
+                continue;
+            }
+            let p = self.shallow(pp.proj);
+            if let TyKind::Proj(_, args) = self.p.types.kind(p) {
+                let rargs = self.resolve_list(args);
+                if self.any_infer(rargs) {
+                    // Not one impl yet: wait for more.
+                    continue;
+                }
+            }
+            self.fcx.projs[i - 1].settled = true;
+            let snap = self.snapshot();
+            if self.unify(p, pp.ty) {
+                continue;
+            }
+            self.rollback(snap);
+            self.fcx.projs[i - 1].settled = true;
+            let shown = self.vars_resolved(pp.proj);
+            let ps = self.p.ty_str(shown);
+            let want = self.ty_str(pp.ty);
+            let got = self.ty_str(p);
+            let mut m = String::new();
+            m.write("type mismatch: `{ps}` is `{got}`, but `{want}` is required");
+            self.error_at(codes::ty::ASSOC_MISMATCH(), pp.span, m.as_str());
+            let mut l = String::new();
+            l.write("requires `{want}`");
+            self.with_label(l.as_str());
+            self.emit();
+        }
     }
 
     /// The trait reference with its arguments resolved.
@@ -794,6 +1071,19 @@ impl Sema {
             }
             (TyKind::Infer(x), _) => self.bind_var(x, b),
             (_, TyKind::Infer(x)) => self.bind_var(x, a),
+            // The same projection of the same types (one that stays a
+            // projection: of a generic parameter).
+            (TyKind::Proj(d1, xs), TyKind::Proj(d2, ys)) if d1 == d2 && self.unify_lists(xs, ys) => true,
+            // A projection whose self type is still being inferred: it must
+            // turn out to be the other type.
+            (TyKind::Proj(..), _) if self.proj_pending(a) => {
+                self.oblige_proj(a, b, dummy_span());
+                true
+            }
+            (_, TyKind::Proj(..)) if self.proj_pending(b) => {
+                self.oblige_proj(b, a, dummy_span());
+                true
+            }
             (TyKind::Tuple(xs), TyKind::Tuple(ys)) => self.unify_lists(xs, ys),
             (TyKind::Adt(d1, xs), TyKind::Adt(d2, ys)) => d1 == d2 && self.unify_lists(xs, ys),
             (TyKind::Array(e1, k1), TyKind::Array(e2, k2)) => self.unify_len(k1, k2) && self.unify(e1, e2),
@@ -1198,7 +1488,8 @@ impl Sema {
         // A `dyn` has the methods of its traits.
         if let TyKind::Dyn(d, args, _) = self.p.types.kind(ty) {
             let mut ts: [TraitRef; ..+] = [];
-            self.p.dyn_traits(TraitRef { trait_id: d, args }, &mut ts);
+            let principal = self.p.dyn_trait_ref(d, args);
+            self.p.dyn_traits(principal, &mut ts);
             for t in ts {
                 out.push(Pred { ty, trait_ref: t, span: dummy_span() });
             }
@@ -1230,6 +1521,7 @@ impl Sema {
             }
         }
         for _ in 0..4 {
+            self.process_projs();
             let mut progress = false;
             for g in goals[..] {
                 let (ty, tr) = g;
@@ -1370,6 +1662,7 @@ impl Sema {
     /// Resolve remaining inference, check deferred obligations and literals.
     fn finish(&mut self) {
         self.infer_from_bounds();
+        self.process_projs();
         for i in 0..self.fcx.vars.len() {
             if let Var::Unbound(k, _) = self.fcx.vars[i] {
                 match k {
@@ -1383,6 +1676,15 @@ impl Sema {
                     }
                     VarKind::General => {}
                 }
+            }
+        }
+        // The integer and float defaults may settle projections.
+        self.process_projs();
+        for i in 0..self.fcx.projs.len() {
+            let pp = self.fcx.projs[i];
+            if !pp.settled {
+                self.fcx.projs[i].settled = true;
+                self.annotations_needed(pp.span);
             }
         }
         // Whether a closure implements an `Fn` trait depends on its
@@ -1426,7 +1728,7 @@ impl Sema {
                     h.write("`{ts}` owns an array or string");
                     self.with_note(h.as_str());
                 } else if let TyKind::Dyn(d, dargs, _) = self.p.types.kind(t) {
-                    let principal = TraitRef { trait_id: d, args: dargs };
+                    let principal = self.p.dyn_trait_ref(d, dargs);
                     if self.p.dyn_has_trait(principal, tr) {
                         if let Some(im) = self.p.dyn_inout_method(tr) {
                             let imn = self.p.name(im).to_string();
@@ -1680,11 +1982,15 @@ impl Sema {
             ExprKind::Adt { def, args, variant, fields } => {
                 e.kind = ExprKind::Adt { def, args: self.zonk_list(args), variant, fields };
             }
+            ExprKind::AssocConst { item, args } => {
+                e.kind = ExprKind::AssocConst { item, args: self.zonk_list(args) };
+            }
             _ => {}
         }
         self.p.thir.exprs.set(id, e);
         match e.kind {
-            ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Lit(_) | ExprKind::Continue { .. } | ExprKind::Error | ExprKind::FnRef { .. } => {}
+            ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Lit(_) | ExprKind::AssocConst { .. } | ExprKind::Continue { .. } | ExprKind::Error | ExprKind::FnRef { .. } => {}
+            ExprKind::DynConst { base, .. } => self.zonk_expr(base),
             ExprKind::Field { base, .. } => self.zonk_expr(base),
             ExprKind::Index { base, index } => {
                 self.zonk_expr(base);
@@ -1884,6 +2190,14 @@ fn len_root(lens: [LenVar; &], v: u32): u32 {
             _ => return v,
         }
     }
+}
+
+/// Whether `t` holds a closure type.
+pub fn has_closure(types: &Types, t: Ty): bool {
+    return types.any(t, &|k| match k {
+        TyKind::Closure(..) => true,
+        _ => false,
+    });
 }
 
 /// Replace any leftover inference variables with defaults (after errors).

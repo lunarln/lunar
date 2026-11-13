@@ -1,17 +1,19 @@
-// Operator traits. Primitive types implement them natively.
+// Operator traits. Primitive types implement them natively (with `Output`
+// the type itself). Both operands have the type implementing the trait;
+// `Output` is the type of the result: `a + b` is `<A as Add>::Output`.
 
-#[lang = "add"] pub trait Add { fn add(&self, rhs: &Self): Self; }
-#[lang = "sub"] pub trait Sub { fn sub(&self, rhs: &Self): Self; }
-#[lang = "mul"] pub trait Mul { fn mul(&self, rhs: &Self): Self; }
-#[lang = "div"] pub trait Div { fn div(&self, rhs: &Self): Self; }
-#[lang = "rem"] pub trait Rem { fn rem(&self, rhs: &Self): Self; }
-#[lang = "neg"] pub trait Neg { fn neg(&self): Self; }
-#[lang = "not"] pub trait Not { fn not(&self): Self; }
-#[lang = "bitand"] pub trait BitAnd { fn bitand(&self, rhs: &Self): Self; }
-#[lang = "bitor"] pub trait BitOr { fn bitor(&self, rhs: &Self): Self; }
-#[lang = "bitxor"] pub trait BitXor { fn bitxor(&self, rhs: &Self): Self; }
-#[lang = "shl"] pub trait Shl { fn shl(&self, rhs: &Self): Self; }
-#[lang = "shr"] pub trait Shr { fn shr(&self, rhs: &Self): Self; }
+#[lang = "add"] pub trait Add { type Output; fn add(&self, rhs: &Self): Self::Output; }
+#[lang = "sub"] pub trait Sub { type Output; fn sub(&self, rhs: &Self): Self::Output; }
+#[lang = "mul"] pub trait Mul { type Output; fn mul(&self, rhs: &Self): Self::Output; }
+#[lang = "div"] pub trait Div { type Output; fn div(&self, rhs: &Self): Self::Output; }
+#[lang = "rem"] pub trait Rem { type Output; fn rem(&self, rhs: &Self): Self::Output; }
+#[lang = "neg"] pub trait Neg { type Output; fn neg(&self): Self::Output; }
+#[lang = "not"] pub trait Not { type Output; fn not(&self): Self::Output; }
+#[lang = "bitand"] pub trait BitAnd { type Output; fn bitand(&self, rhs: &Self): Self::Output; }
+#[lang = "bitor"] pub trait BitOr { type Output; fn bitor(&self, rhs: &Self): Self::Output; }
+#[lang = "bitxor"] pub trait BitXor { type Output; fn bitxor(&self, rhs: &Self): Self::Output; }
+#[lang = "shl"] pub trait Shl { type Output; fn shl(&self, rhs: &Self): Self::Output; }
+#[lang = "shr"] pub trait Shr { type Output; fn shr(&self, rhs: &Self): Self::Output; }
 
 // Things that can be called: closures, functions and function pointers.
 // `Sig` is a function pointer type, written with sugar in bounds:
@@ -33,7 +35,9 @@ pub struct Range::<T> {
     pub end: T,
 }
 
-impl::<T: crater::num::Int> Iterator::<T> for Range::<T> {
+impl::<T: crater::num::Int> Iterator for Range::<T> {
+    type Item = T;
+
     fn next(&mut self): Option::<T> {
         if self.start < self.end {
             let v = self.start;

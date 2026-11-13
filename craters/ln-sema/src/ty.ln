@@ -221,10 +221,18 @@ pub enum TyKind {
     Closure(DefId, TyList),
     /// `impl Trait` number `idx` in the return type of function `def`.
     Opaque(DefId, u32, TyList),
-    /// `dyn Trait::<args>`: a view of a value of some type implementing
-    /// the trait (its principal trait and arguments), with the `DYN_`
-    /// flags (`dyn mut`, `+ Send`, `+ Sync`). Laid out as `{ data, vtable }`.
+    /// `dyn Trait::<args, Item = T>`: a view of a value of some type
+    /// implementing the trait (its principal trait and arguments, then the
+    /// associated types of the trait and its supertraits, in the order of
+    /// `Program::dyn_assoc_tys`), with the `DYN_` flags (`dyn mut`,
+    /// `+ Send`, `+ Sync`). Laid out as `{ data, vtable }`.
     Dyn(DefId, TyList, u32),
+    /// A projection `<args[0] as Trait::<args[1..]>>::Item`: associated
+    /// type `def` (of `Trait`) of the self type `args[0]`. Normalized to
+    /// the type it stands for once the self type is known
+    /// (`Program::normalize`); it stays a projection while the self type
+    /// is a generic parameter whose bounds do not say.
+    Proj(DefId, TyList),
     /// Generic parameter number `idx` of the enclosing item.
     Param(u32, Symbol),
     /// Inference variable.
@@ -494,7 +502,7 @@ impl Types {
             return true;
         }
         return match k {
-            TyKind::Tuple(l) | TyKind::Adt(_, l) | TyKind::Closure(_, l) | TyKind::Opaque(_, _, l) | TyKind::Dyn(_, l, _) => self.any_in(l, f),
+            TyKind::Tuple(l) | TyKind::Adt(_, l) | TyKind::Closure(_, l) | TyKind::Opaque(_, _, l) | TyKind::Dyn(_, l, _) | TyKind::Proj(_, l) => self.any_in(l, f),
             TyKind::Array(e, _) | TyKind::Grow(e) | TyKind::Ptr(e, _) => self.any(e, f),
             TyKind::FnPtr(ps, _, r) => self.any_in(ps, f) || self.any(r, f),
             _ => false,
@@ -531,6 +539,14 @@ impl Types {
         });
     }
 
+    /// Whether `t` contains a projection (`T::Item`).
+    pub fn has_proj(&self, t: Ty): bool {
+        return self.any(t, &|k| match k {
+            TyKind::Proj(..) => true,
+            _ => false,
+        });
+    }
+
     // ----------------------------------------------------------- rebuilding
 
     /// `t` rebuilt bottom-up by `f` (see `Folder`).
@@ -555,6 +571,10 @@ impl Types {
             TyKind::Dyn(d, l, fl) => {
                 let l2 = self.fold_list(l, f);
                 if l2 == l { t } else { self.mk(TyKind::Dyn(d, l2, fl)) }
+            }
+            TyKind::Proj(d, l) => {
+                let l2 = self.fold_list(l, f);
+                if l2 == l { t } else { self.mk(TyKind::Proj(d, l2)) }
             }
             TyKind::Array(e, k) => {
                 let e2 = self.fold(e, f);

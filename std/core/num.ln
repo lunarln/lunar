@@ -4,8 +4,8 @@
 
 use crater::ops::{Add, Sub, Mul, Div, Rem};
 
-/// Integer types.
-pub trait Int: Add + Sub + Mul + Div + Rem + Eq + Ord + Dull + crater::fmt::Display {
+/// Integer types. Their arithmetic gives the same type.
+pub trait Int: Add::<Output = Self> + Sub::<Output = Self> + Mul::<Output = Self> + Div::<Output = Self> + Rem::<Output = Self> + Eq + Ord + Dull + crater::fmt::Display {
     fn zero(): Self;
     fn one(): Self;
     fn min_value(): Self;
@@ -28,8 +28,8 @@ impl Int for usize { fn zero(): usize { return 0; } fn one(): usize { return 1; 
 #[intrinsic] pub fn wrapping_sub::<T: Int>(a: T, b: T): T;
 #[intrinsic] pub fn wrapping_mul::<T: Int>(a: T, b: T): T;
 
-/// Floating point types.
-pub trait Float: Add + Sub + Mul + Div + Eq + Ord + Dull {
+/// Floating point types. Their arithmetic gives the same type.
+pub trait Float: Add::<Output = Self> + Sub::<Output = Self> + Mul::<Output = Self> + Div::<Output = Self> + Eq + Ord + Dull {
     fn zero(): Self;
     fn one(): Self;
 }
@@ -470,6 +470,8 @@ macro unsigned_int {
         }
 
         impl crater::str::FromStr for $t {
+            type Err = ParseError;
+
             fn from_str(s: str): Result::<$t, ParseError> {
                 let v = parse_unsigned(s, 10, $max)?;
                 return Ok(v as $t);
@@ -674,6 +676,8 @@ macro signed_int {
         }
 
         impl crater::str::FromStr for $t {
+            type Err = ParseError;
+
             fn from_str(s: str): Result::<$t, ParseError> {
                 let v = parse_signed(s, 10, $min, $max)?;
                 return Ok(v as $t);

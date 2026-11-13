@@ -1,0 +1,16 @@
+// error: trait::extra_item
+// An impl may only give the associated types and constants its trait
+// declares.
+trait Shape {
+    const SIDES: u32;
+}
+
+struct Square;
+
+impl Shape for Square {
+    const SIDES: u32 = 4;
+    const CORNERS: u32 = 4;
+    type Unit = f64;
+}
+
+fn main() {}

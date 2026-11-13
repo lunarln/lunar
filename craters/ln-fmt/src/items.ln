@@ -166,9 +166,12 @@ impl Printer {
                 self.tok(self.s.find(c.name.span.hi, Token::Colon), ":");
                 self.text(" ");
                 self.ty(c.ty);
-                self.text(" ");
-                self.tok(self.s.find(self.ast.tys.get(c.ty).span.hi, Token::Eq), "=");
-                self.rhs(c.value);
+                // `const N: usize;` in a trait has no value.
+                if let Some(v) = c.value {
+                    self.text(" ");
+                    self.tok(self.s.find(self.ast.tys.get(c.ty).span.hi, Token::Eq), "=");
+                    self.rhs(v);
+                }
                 self.semi(it.span.hi);
             }
             ItemKind::Static(s) => {
@@ -209,10 +212,18 @@ impl Printer {
                 self.text(" ");
                 self.ident(t.name);
                 self.generics(t.generics);
-                self.text(" ");
-                self.tok(self.s.find(t.generics.span.hi, Token::Eq), "=");
-                self.text(" ");
-                self.ty(t.ty);
+                // `type Item: Light;` in a trait.
+                if t.bounds.len() > 0 {
+                    self.tok(self.s.find(self.last_end, Token::Colon), ":");
+                    self.text(" ");
+                    self.bounds(t.bounds);
+                }
+                if let Some(x) = t.ty {
+                    self.text(" ");
+                    self.tok(self.s.find(self.last_end, Token::Eq), "=");
+                    self.text(" ");
+                    self.ty(x);
+                }
                 self.semi(it.span.hi);
             }
             ItemKind::Macro(_) => {
@@ -912,10 +923,22 @@ impl Printer {
 
     pub fn path(&mut self, p: Path) {
         let n = p.segments.len();
+        // `<T as Trait>::Item`: the trait's segments, then the item's.
+        let trait_end = if p.qself.is_some() { n - 1 } else { 0 };
+        if let Some(q) = p.qself {
+            self.tok(self.s.find(p.span.lo, Token::LAngle), "<");
+            self.ty(q);
+            self.text(" ");
+            self.tok(self.s.find(self.last_end, Token::As), "as");
+            self.text(" ");
+        }
         let mut i: usize = 0;
         while i < n {
             let seg = self.ast.segments.list(p.segments)[i];
             if i > 0 {
+                if p.qself.is_some() && i == trait_end {
+                    self.tok(self.s.find(self.last_end, Token::RAngle), ">");
+                }
                 self.tok(self.s.find(self.last_end, Token::PathSep), "::");
             }
             self.segment(seg);
@@ -926,16 +949,23 @@ impl Printer {
     fn segment(&mut self, seg: PathSegment) {
         self.ident(seg.ident);
         if let Some(args) = seg.args {
-            self.type_args(args);
+            self.args_and_bindings(args, seg.bindings);
         }
     }
 
     /// `::<A, B>` after a path segment or method name.
     pub fn type_args(&mut self, args: List::<Id::<Ty>>) {
+        self.args_and_bindings(args, List::empty());
+    }
+
+    /// `::<A, B, Item = C>`: type arguments, then associated type
+    /// constraints.
+    fn args_and_bindings(&mut self, args: List::<Id::<Ty>>, bindings: List::<AssocBinding>) {
         let open = self.s.find(self.last_end, Token::PathSep);
         let lt = self.s.find(open + 2, Token::LAngle);
         self.tok(open, "::");
-        let n = args.len();
+        let nt = args.len();
+        let n = nt + bindings.len();
         if n == 0 {
             self.tok(lt, "<");
             self.tok(self.s.find(self.last_end, Token::RAngle), ">");
@@ -949,12 +979,22 @@ impl Printer {
         let mut close: u32 = NONE;
         let mut had = false;
         while i < n {
-            let t = self.ast.ty_ids.list(args)[i];
             self.assume_break();
             self.open();
-            self.ty(t);
+            let hi = if i < nt {
+                let t = self.ast.ty_ids.list(args)[i];
+                self.ty(t);
+                self.ast.tys.get(t).span.hi
+            } else {
+                let b = self.ast.assoc_bindings.list(bindings)[i - nt];
+                self.ident(b.name);
+                self.text(" ");
+                self.tok(self.s.find(b.name.span.hi, Token::Eq), "=");
+                self.text(" ");
+                self.ty(b.ty);
+                self.ast.tys.get(b.ty).span.hi
+            };
             let d = self.close();
-            let hi = self.ast.tys.get(t).span.hi;
             if i + 1 == n {
                 // The `>` after the last argument (and its comma).
                 let mut k = self.s.first_at(hi);

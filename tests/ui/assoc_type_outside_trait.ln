@@ -1,0 +1,5 @@
+// error: syntax::missing_value
+// `type Name;` without a type declares an associated type, in a trait.
+type Bytes;
+
+fn main() {}

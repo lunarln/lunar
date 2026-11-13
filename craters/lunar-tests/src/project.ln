@@ -266,3 +266,31 @@ fn trait_objects_across_craters() {
     expect(n == 1, "one vtable for `Square` as `dyn Shape`", ir.as_str());
     let _ = fs::remove_dir_all(w.as_str());
 }
+
+/// Associated types and constants across craters: a trait declared in a
+/// library, implemented on both sides, used through bounds with
+/// constraints, generic constants, a `dyn` (its constant read from the
+/// vtable) and an `impl Iterator::<Item = u32>` from the library.
+#[test]
+fn associated_items_across_craters() {
+    let w = scratch("assoc");
+    let home = join(w.as_str(), "home");
+    let h = home.as_str();
+    ok(w.as_str(), h, ["new", "app"][..]);
+    ok(w.as_str(), h, ["new", "sources", "--lib"][..]);
+    let lib = join(w.as_str(), "sources");
+    write_file(
+        join(lib.as_str(), "src/lib.ln").as_str(),
+        "pub trait Source {\n    type Item;\n    const KIND: str;\n    fn get(&mut self): Option::<Self::Item>;\n}\n\npub struct Count {\n    pub n: u32,\n}\n\nimpl Source for Count {\n    type Item = u32;\n    const KIND: str = \"count\";\n    fn get(&mut self): Option::<u32> {\n        if self.n == 0 {\n            return None;\n        }\n        self.n -= 1;\n        return Some(self.n);\n    }\n}\n\npub fn sum::<S: Source::<Item = u32>>(mut s: S): u32 {\n    let mut t: u32 = 0;\n    while let Some(x) = s.get() {\n        t += x;\n    }\n    return t;\n}\n\npub fn kind::<S: Source>(): str {\n    return S::KIND;\n}\n\npub fn evens(n: u32): impl Iterator::<Item = u32> {\n    return (0..n).filter(|x| x % 2 == 0);\n}\n",
+    );
+    let app = join(w.as_str(), "app");
+    write_file(
+        join(app.as_str(), "src/main.ln").as_str(),
+        "use sources::{Count, Source};\n\nstruct Letters {\n    i: u8,\n}\n\nimpl Source for Letters {\n    type Item = char;\n    const KIND: str = \"letters\";\n    fn get(&mut self): Option::<char> {\n        if self.i == 2 {\n            return None;\n        }\n        self.i += 1;\n        return Some((b'a' + self.i) as char);\n    }\n}\n\nfn main() {\n    println(\"{sources::sum(Count { n: 4 })}\");\n    println(\"{sources::kind::<Count>()} {sources::kind::<Letters>()}\");\n    let mut l = Letters { i: 0 };\n    let d = l as dyn mut Source::<Item = char>;\n    let first = d.get().unwrap();\n    println(\"{first} {d.KIND}\");\n    let mut t: u32 = 0;\n    for x in sources::evens(7) {\n        t += x;\n    }\n    println(\"{t}\");\n}\n",
+    );
+    ok(app.as_str(), h, ["add", "sources", "--path", "../sources"][..]);
+    let out = ok(app.as_str(), h, ["run"][..]);
+    let want = "6\ncount letters\nb letters\n12\n";
+    expect(out.as_str().contains(want), "associated types and constants from another crater", out.as_str());
+    let _ = fs::remove_dir_all(w.as_str());
+}

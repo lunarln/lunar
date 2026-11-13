@@ -1,0 +1,383 @@
+// Associated types and constants: finding them, and normalizing
+// projections (`T::Item`, `<X as Trait>::Item`) to the types they stand for.
+//
+// A projection is the type `TyKind::Proj(item, [self, trait args...])`.
+// It is replaced by what it stands for as soon as that is known
+// (`normalize`):
+//
+// * a constraint in scope says (`I: Iterator::<Item = u8>` is the
+//   predicate `<I as Iterator>::Item == u8`, an "equality predicate":
+//   `Pred { ty: <the projection>, trait_ref: { trait_id: item, args: [u8] } }`,
+//   see `is_eq_pred`); `impl Trait` types carry theirs too;
+// * the self type is a `dyn`, whose type lists the values of its trait's
+//   associated types (`dyn Iterator::<Item = u8>`);
+// * the self type is known: its impl of the trait says (`type Item = u8;`),
+//   or the trait's default does, or for the operator traits on primitive
+//   types, `Output` is the type itself.
+//
+// A projection of a generic parameter that no constraint covers stays a
+// projection: an opaque type of its own, which the bounds of the associated
+// type (`type Item: Light;`) describe (`Program::elaborate`). Code
+// generation normalizes everything (`Program::reveal`), when every type is
+// known.
+
+use core::arena::List;
+use core::intern::Symbol;
+use crater::defs::*;
+use crater::program::Program;
+use crater::traits::OP_TRAITS;
+use crater::ty::*;
+
+/// How many projections are nested at the self type of `t`
+/// (`<<T as A>::X as B>::Y` is 2).
+pub fn proj_depth(types: &Types, t: Ty): u32 {
+    let mut n: u32 = 0;
+    let mut cur = t;
+    while let TyKind::Proj(_, args) = types.kind(cur) {
+        n += 1;
+        if args.len() == 0 || n > 8 {
+            break;
+        }
+        cur = types.at(args, 0);
+    }
+    return n;
+}
+
+impl Program {
+    /// Whether `p` is a projection equality `<T as Trait>::Item == X` (its
+    /// `trait_ref` names the associated type, with `X` as its argument)
+    /// rather than a trait bound.
+    pub fn is_eq_pred(&self, p: Pred): bool {
+        return self.defs[p.trait_ref.trait_id.index()].kind == DefKind::AssocTy;
+    }
+
+    /// The associated type or constant `name` of trait `trait_id` (not its
+    /// supertraits').
+    pub fn trait_assoc(&self, trait_id: DefId, name: Symbol, is_const: bool): Option::<TraitAssoc> {
+        let DefData::Trait(t) = self.defs[trait_id.index()].data else { return None; };
+        for a in self.trait_assocs.list(t.assoc) {
+            if a.name == name && a.is_const == is_const {
+                return Some(a);
+            }
+        }
+        return None;
+    }
+
+    /// The associated types (or constants) named `name` of `tr` and its
+    /// supertraits, each with the trait (and arguments) it belongs to.
+    pub fn bound_assocs(&mut +self, tr: TraitRef, name: Symbol, is_const: bool, out: &mut +[(TraitRef, DefId); ..+]) {
+        let mut ts: [TraitRef; ..+] = [];
+        self.dyn_traits(tr, &mut ts);
+        for t in ts {
+            if let Some(a) = self.trait_assoc(t.trait_id, name, is_const) {
+                out.push((t, a.def));
+            }
+        }
+    }
+
+    /// The trait an associated item belongs to.
+    pub fn assoc_trait(&self, item: DefId): DefId {
+        return match self.defs[item.index()].parent {
+            Some(p) => p,
+            None => item,
+        };
+    }
+
+    /// The number of a trait's own generic parameters (without `Self`).
+    pub fn trait_param_count(&self, trait_id: DefId): usize {
+        return match self.defs[trait_id.index()].data {
+            DefData::Trait(t) => t.generics.names.len(),
+            _ => 0,
+        };
+    }
+
+    /// The trait (with its arguments) of the `dyn` type `Dyn(d, args, _)`:
+    /// its arguments are the first ones; the values of the associated
+    /// types follow.
+    pub fn dyn_trait_ref(&mut +self, d: DefId, args: TyList): TraitRef {
+        let n = self.trait_param_count(d);
+        if args.len() <= n {
+            return TraitRef { trait_id: d, args };
+        }
+        let prefix = self.types.list(args)[..n].to_grow();
+        let l = self.types.mk_list(prefix[..]);
+        return TraitRef { trait_id: d, args: l };
+    }
+
+    /// The associated types a `dyn tr` must constrain, in the order their
+    /// values follow the trait's arguments in its type: those of each of
+    /// `dyn_traits(tr)` (the trait, then its supertraits), each trait's in
+    /// declaration order. With each, the trait it belongs to (as `out2`).
+    pub fn dyn_assoc_tys_of(&mut +self, tr: TraitRef, out: &mut +[DefId; ..+], traits: &mut +[TraitRef; ..+]) {
+        let mut ts: [TraitRef; ..+] = [];
+        self.dyn_traits(tr, &mut ts);
+        for t in ts {
+            let td = self.trait_data(t.trait_id);
+            for a in self.trait_assocs.list(td.assoc) {
+                if !a.is_const {
+                    out.push(a.def);
+                    traits.push(t);
+                }
+            }
+        }
+    }
+
+    /// `dyn_assoc_tys_of` without the traits.
+    pub fn dyn_assoc_tys(&mut +self, tr: TraitRef, out: &mut +[DefId; ..+]) {
+        let mut traits: [TraitRef; ..+] = [];
+        self.dyn_assoc_tys_of(tr, out, &mut traits);
+    }
+
+    /// The type `<args[0] as Trait::<args[1..]>>::item` stands for, if that
+    /// is known (see the top of this file); `None` for a projection that
+    /// stays one (of a generic parameter, or of a type still being
+    /// inferred).
+    pub fn project(&mut +self, item: DefId, args: TyList, env: [Pred; &]): Option::<Ty> {
+        if args.len() == 0 {
+            return None;
+        }
+        let trait_id = self.assoc_trait(item);
+        let self_ty = self.types.at(args, 0);
+        if self.types.is_error(self_ty) {
+            return Some(self.types.error());
+        }
+        let pt = self.types.mk(TyKind::Proj(item, args));
+        // Constraints in scope (and their supertraits').
+        if env.len() > 0 {
+            let mut el: [Pred; ..+] = [];
+            self.elaborate(env, &mut el);
+            for p in el {
+                if p.ty == pt && self.is_eq_pred(p) && p.trait_ref.args.len() == 1 {
+                    return Some(self.types.at(p.trait_ref.args, 0));
+                }
+            }
+        }
+        let rest = self.types.list(args)[1..].to_grow();
+        let targs = self.types.mk_list(rest[..]);
+        let tr = TraitRef { trait_id, args: targs };
+        match self.types.kind(self_ty) {
+            TyKind::Grow(inner) => {
+                let mut a: [Ty; ..+] = [inner];
+                a.extend(rest[..]);
+                let al = self.types.mk_list(a[..]);
+                return self.project(item, al, env);
+            }
+            TyKind::Opaque(def, i, oargs) => {
+                let mut ps: [Pred; ..+] = [];
+                self.opaque_preds(def, i, oargs, &mut ps);
+                for p in ps {
+                    if p.ty == pt && self.is_eq_pred(p) && p.trait_ref.args.len() == 1 {
+                        return Some(self.types.at(p.trait_ref.args, 0));
+                    }
+                }
+                return None;
+            }
+            TyKind::Dyn(d, dargs, _) => {
+                let principal = self.dyn_trait_ref(d, dargs);
+                let mut items: [DefId; ..+] = [];
+                let mut traits: [TraitRef; ..+] = [];
+                self.dyn_assoc_tys_of(principal, &mut items, &mut traits);
+                let n = principal.args.len();
+                for k in 0..items.len() {
+                    if items[k] == item && traits[k] == tr && n + k < dargs.len() {
+                        return Some(self.types.at(dargs, n + k));
+                    }
+                }
+                // Not one of its traits: maybe an impl that covers it.
+            }
+            TyKind::Param(..) | TyKind::Infer(_) | TyKind::Proj(..) => return None,
+            _ => {}
+        }
+        // The operator traits on primitive types: `Output` is the type
+        // itself.
+        if let Some(lang) = self.lang_name(trait_id) {
+            let mut is_op = false;
+            for o in OP_TRAITS() {
+                if o == lang {
+                    is_op = true;
+                }
+            }
+            if is_op && self.builtin_impl(self_ty, trait_id, env) {
+                return Some(self_ty);
+            }
+        }
+        let Some(found) = self.find_impl(self_ty, tr, env) else { return None; };
+        let (imp, iargs) = found;
+        let name = self.defs[item.index()].name;
+        if let Some(d) = self.impl_types.get((imp, name)) {
+            if let DefData::AssocTy(ad) = self.defs[d.index()].data {
+                if let Some(t) = ad.ty {
+                    return Some(self.types.subst(t, iargs));
+                }
+            }
+            return Some(self.types.error());
+        }
+        // The trait's default (with `Self` and the trait's arguments).
+        if let DefData::AssocTy(ad) = self.defs[item.index()].data {
+            if let Some(t) = ad.ty {
+                return Some(self.types.subst(t, args));
+            }
+        }
+        return Some(self.types.error());
+    }
+
+    /// `t` with each projection whose type is known replaced by it (see
+    /// `project`), in environment `env`.
+    pub fn normalize(&mut +self, t: Ty, env: [Pred; &]): Ty {
+        if !self.types.has_proj(t) {
+            return t;
+        }
+        return self.normalize_rec(t, env, 0);
+    }
+
+    fn normalize_list(&mut +self, l: TyList, env: [Pred; &], depth: u32): TyList {
+        let mut out: [Ty; ..+] = [];
+        let mut same = true;
+        for i in 0..l.len() {
+            let x = self.types.at(l, i);
+            let y = self.normalize_rec(x, env, depth);
+            same = same && x == y;
+            out.push(y);
+        }
+        if same {
+            return l;
+        }
+        return self.types.mk_list(out[..]);
+    }
+
+    fn normalize_rec(&mut +self, t: Ty, env: [Pred; &], depth: u32): Ty {
+        if depth > 32 || !self.types.has_proj(t) {
+            return t;
+        }
+        return match self.types.kind(t) {
+            TyKind::Proj(item, args) => {
+                let a2 = self.normalize_list(args, env, depth + 1);
+                match self.project(item, a2, env) {
+                    Some(r) => self.normalize_rec(r, env, depth + 1),
+                    None => if a2 == args { t } else { self.types.mk(TyKind::Proj(item, a2)) },
+                }
+            }
+            TyKind::Tuple(l) => {
+                let l2 = self.normalize_list(l, env, depth + 1);
+                if l2 == l { t } else { self.types.mk(TyKind::Tuple(l2)) }
+            }
+            TyKind::Adt(d, l) => {
+                let l2 = self.normalize_list(l, env, depth + 1);
+                if l2 == l { t } else { self.types.mk(TyKind::Adt(d, l2)) }
+            }
+            TyKind::Closure(d, l) => {
+                let l2 = self.normalize_list(l, env, depth + 1);
+                if l2 == l { t } else { self.types.mk(TyKind::Closure(d, l2)) }
+            }
+            TyKind::Opaque(d, i, l) => {
+                let l2 = self.normalize_list(l, env, depth + 1);
+                if l2 == l { t } else { self.types.mk(TyKind::Opaque(d, i, l2)) }
+            }
+            TyKind::Dyn(d, l, f) => {
+                let l2 = self.normalize_list(l, env, depth + 1);
+                if l2 == l { t } else { self.types.mk(TyKind::Dyn(d, l2, f)) }
+            }
+            TyKind::Array(e, k) => {
+                let e2 = self.normalize_rec(e, env, depth + 1);
+                if e2 == e { t } else { self.types.mk(TyKind::Array(e2, k)) }
+            }
+            TyKind::Grow(e) => {
+                let e2 = self.normalize_rec(e, env, depth + 1);
+                if e2 == e { t } else { self.types.mk(TyKind::Grow(e2)) }
+            }
+            TyKind::Ptr(e, m) => {
+                let e2 = self.normalize_rec(e, env, depth + 1);
+                if e2 == e { t } else { self.types.mk(TyKind::Ptr(e2, m)) }
+            }
+            TyKind::FnPtr(ps, modes, r) => {
+                let ps2 = self.normalize_list(ps, env, depth + 1);
+                let r2 = self.normalize_rec(r, env, depth + 1);
+                if ps2 == ps && r2 == r { t } else { self.types.mk(TyKind::FnPtr(ps2, modes, r2)) }
+            }
+            _ => t,
+        };
+    }
+
+    /// Whether any type of `l` contains a projection.
+    pub fn any_proj(&self, l: TyList): bool {
+        for t in self.types.list(l) {
+            if self.types.has_proj(t) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// `trait_ref` with its arguments normalized.
+    pub fn normalize_trait_ref(&mut +self, tr: TraitRef, env: [Pred; &]): TraitRef {
+        let l = self.normalize_list(tr.args, env, 0);
+        return TraitRef { trait_id: tr.trait_id, args: l };
+    }
+
+    /// The value of associated constant `item` (declared in a trait) for
+    /// the self type `args[0]` (with the trait's arguments after it): the
+    /// impl's, or the trait's default. `None` if no impl gives one (or the
+    /// type is not known here).
+    pub fn assoc_const_value(&mut +self, item: DefId, args: TyList): Option::<ConstVal> {
+        let Some(d) = self.assoc_const_def(item, args) else { return None; };
+        return match self.defs[d.index()].data {
+            DefData::Const(c) => c.value,
+            _ => None,
+        };
+    }
+
+    /// The definition giving associated constant `item` its value for
+    /// `args` (see `assoc_const_value`): the impl's constant, or the
+    /// trait's declaration if it has a default.
+    pub fn assoc_const_def(&mut +self, item: DefId, args: TyList): Option::<DefId> {
+        if args.len() == 0 {
+            return None;
+        }
+        let none: [Pred; 0] = [];
+        let trait_id = self.assoc_trait(item);
+        let s0 = self.types.at(args, 0);
+        let self_ty = self.reveal(s0);
+        let rest = self.types.list(args)[1..].to_grow();
+        let targs = self.types.mk_list(rest[..]);
+        let tr = TraitRef { trait_id, args: targs };
+        let name = self.defs[item.index()].name;
+        if let Some(found) = self.find_impl(self_ty, tr, none[..]) {
+            let (imp, _) = found;
+            if let Some(c) = self.impl_consts.get((imp, name)) {
+                return Some(c);
+            }
+        }
+        if let DefData::Const(c) = self.defs[item.index()].data {
+            if c.value.is_some() {
+                return Some(item);
+            }
+        }
+        return None;
+    }
+
+    /// The type of associated constant `item` for `args` (the self type,
+    /// then the trait's arguments).
+    pub fn assoc_const_ty(&mut +self, item: DefId, args: TyList): Ty {
+        return match self.defs[item.index()].data {
+            DefData::Const(c) => self.types.subst(c.ty, args),
+            _ => self.types.error(),
+        };
+    }
+
+    /// The associated constants in the vtable of `dyn tr`, in the order of
+    /// their words (after the methods): those of each of `dyn_traits(tr)`,
+    /// each trait's in declaration order, with the trait (as `traits`).
+    pub fn dyn_assoc_consts(&mut +self, tr: TraitRef, out: &mut +[DefId; ..+], traits: &mut +[TraitRef; ..+]) {
+        let mut ts: [TraitRef; ..+] = [];
+        self.dyn_traits(tr, &mut ts);
+        for t in ts {
+            let td = self.trait_data(t.trait_id);
+            for a in self.trait_assocs.list(td.assoc) {
+                if a.is_const {
+                    out.push(a.def);
+                    traits.push(t);
+                }
+            }
+        }
+    }
+}

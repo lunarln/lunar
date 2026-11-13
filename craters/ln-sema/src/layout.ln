@@ -146,9 +146,9 @@ impl Program {
                 let fs = self.closure_fields(def, args);
                 self.fields_layout(fs, d1)
             },
-            TyKind::Opaque(..) => {
+            TyKind::Opaque(..) | TyKind::Proj(..) => {
                 let r = self.reveal(t);
-                if self.types.has_error(r) {
+                if r == t || self.types.has_error(r) {
                     return None;
                 }
                 self.layout_depth(r, d1)

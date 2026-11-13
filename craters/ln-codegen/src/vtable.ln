@@ -1,11 +1,13 @@
 // Trait objects: vtables (laid out as `ln_sema::objects` describes), `dyn`
 // values (`{ data, vtable }`) and calls through them.
 
-use core::arena::List;
+use core::arena::{Id, List};
 use core::ffi::c_string;
 use core::intern::Symbol;
+use ln_sema::defs::{ConstVal, DefId};
 use ln_sema::objects::VtEntry;
 use ln_sema::program::Program;
+use ln_sema::thir::Expr;
 use ln_sema::traits::MethodImpl;
 use ln_sema::ty::{TraitRef, Ty, TyKind, TyList};
 use crater::Cg;
@@ -51,12 +53,74 @@ impl Cg {
                 }
                 VtEntry::Super(s) => self.vtable(p, t, s),
                 VtEntry::Method(s, m) => self.vtable_method(p, t, s, m),
+                VtEntry::Const(s, item) => self.vtable_const(p, t, s, item),
             };
             words.push(w);
         }
         let init = unsafe { LLVMConstArray2(ptr, words[..].as_ptr(), words.len() as u64) };
         unsafe { LLVMSetInitializer(g, init) };
         return g;
+    }
+
+    /// A pointer to the value of associated constant `item` of trait `s`
+    /// for type `t`, for a vtable.
+    fn vtable_const(&mut self, p: &mut +Program, t: Ty, s: TraitRef, item: DefId): ValueRef {
+        let mut a: [Ty; ..+] = [t];
+        a.extend(p.types.list(s.args));
+        let al = p.types.mk_list(a[..]);
+        let ct0 = p.assoc_const_ty(item, al);
+        let ct = p.reveal(ct0);
+        let Some(v) = p.assoc_const_value(item, al) else {
+            let ts = p.ty_str(t);
+            let n = p.name(item).to_string();
+            let mut msg = String::new();
+            msg.write("no value for constant `{n}` of `{ts}` in a vtable");
+            self.ice(p, msg.as_str());
+            return self.const_null(self.ptr_ty());
+        };
+        return match self.const_global(p, v, ct) {
+            Ok(g) => g,
+            Err(err) => {
+                self.ice(p, err.as_str());
+                self.const_null(self.ptr_ty())
+            }
+        };
+    }
+
+    /// The value of associated constant `item` for `args` (the self type
+    /// and the trait's arguments, of this instance).
+    pub fn assoc_const_val(&mut self, p: &mut +Program, item: DefId, args: TyList): Option::<ConstVal> {
+        let targs = self.t_list(p, args);
+        if let Some(v) = p.assoc_const_value(item, targs) {
+            return Some(v);
+        }
+        let st = p.types.at(targs, 0);
+        let ts = p.ty_str(st);
+        let n = p.name(item).to_string();
+        let mut msg = String::new();
+        msg.write("no value for constant `{n}` of `{ts}`");
+        self.ice(p, msg.as_str());
+        return None;
+    }
+
+    /// The address of the value of associated constant `item` of the value
+    /// the `dyn` `base` views: the word of its vtable that points at it.
+    pub fn dyn_const_ptr(&mut self, p: &mut +Program, base: Id::<Expr>, item: DefId): Option::<ValueRef> {
+        let dt = self.ety(p, base);
+        let TyKind::Dyn(d, dargs, _) = p.types.kind(dt) else {
+            self.ice(p, "a `dyn` constant read from a value that is not `dyn`");
+            return None;
+        };
+        let principal = p.dyn_trait_ref(d, dargs);
+        let Some(found) = p.vtable_const_index(principal, item) else {
+            self.ice(p, "a constant that is not in the vtable");
+            return None;
+        };
+        let (index, _) = found;
+        let v = self.value(p, base)?;
+        let vt = self.extract(v, 1, z("vtable\0"));
+        let slot = self.gep(self.ptr_ty(), vt, self.const_int(self.usize_ty(), index as u64), z("const_slot\0"));
+        return Some(self.load_ty(self.ptr_ty(), slot, z("const\0")));
     }
 
     /// The function of method `m` of trait `s` for type `t`, for a vtable.
@@ -83,7 +147,8 @@ impl Cg {
             return self.undef(self.dyn_ty());
         };
         let inner = p.types.strip_grow(t);
-        let vt = self.vtable(p, inner, TraitRef { trait_id: d, args });
+        let principal = p.dyn_trait_ref(d, args);
+        let vt = self.vtable(p, inner, principal);
         let a = self.insert(self.undef(self.dyn_ty()), ptr, 0);
         return self.insert(a, vt, 1);
     }
@@ -99,8 +164,8 @@ impl Cg {
             self.ice(p, "upcast to a type that is not `dyn`");
             return v;
         };
-        let src = TraitRef { trait_id: d0, args: a0 };
-        let dst = TraitRef { trait_id: d1, args: a1 };
+        let src = p.dyn_trait_ref(d0, a0);
+        let dst = p.dyn_trait_ref(d1, a1);
         let Some(index) = p.vtable_super_index(src, dst) else {
             if src == dst {
                 return v;

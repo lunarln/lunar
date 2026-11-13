@@ -584,7 +584,7 @@ fn uses_raw_pointers(p: &Program, e: Id::<Expr>): bool {
 /// unknowns, so its impls can be looked up.
 fn is_concrete(p: &Program, t: Ty): bool {
     return !p.types.any(t, &|k| match k {
-        TyKind::Param(..) | TyKind::Opaque(..) | TyKind::Infer(_) | TyKind::Error => true,
+        TyKind::Param(..) | TyKind::Opaque(..) | TyKind::Proj(..) | TyKind::Infer(_) | TyKind::Error => true,
         _ => false,
     });
 }
@@ -673,6 +673,14 @@ pub fn ty_has_view(p: &mut +Program, env: [Pred; &], t: Ty, depth: u32): bool {
         // Generic values may be instantiated with views, and `impl Trait`
         // may stand for one, unless bounded by `Dull`.
         TyKind::Param(..) | TyKind::Opaque(..) => !p.is_dull(t, env) && !p.is_detached(t, env),
+        // `T::Item`: what it stands for, or like a generic parameter.
+        TyKind::Proj(..) => {
+            let n = p.normalize(t, env);
+            if n != t {
+                return ty_has_view(p, env, n, depth + 1);
+            }
+            !p.is_dull(t, env) && !p.is_detached(t, env)
+        }
         _ => false,
     };
 }
@@ -861,7 +869,7 @@ impl Cx {
                 }
             }
             // Dull types hold no arrays; anything else generic might.
-            TyKind::Param(..) | TyKind::Infer(_) => !p.is_dull(t, self.env),
+            TyKind::Param(..) | TyKind::Proj(..) | TyKind::Infer(_) => !p.is_dull(t, self.env),
             _ => false,
         };
     }
@@ -891,7 +899,7 @@ impl Cx {
                 self.any_own_view(p, fs, depth + 1)
             }
             TyKind::Grow(t) => self.has_own_view(p, t, depth + 1),
-            TyKind::Param(..) => false,
+            TyKind::Param(..) | TyKind::Proj(..) => false,
             TyKind::Closure(..) | TyKind::Opaque(..) => true,
             _ => false,
         };
@@ -1514,7 +1522,7 @@ impl Cx {
                 let fs = p.adt_field_tys(d, args);
                 self.any_closure(p, fs, depth + 1)
             }
-            TyKind::Param(..) | TyKind::Opaque(..) | TyKind::Infer(_) => !p.is_dull(t, self.env),
+            TyKind::Param(..) | TyKind::Opaque(..) | TyKind::Proj(..) | TyKind::Infer(_) => !p.is_dull(t, self.env),
             _ => false,
         };
     }
@@ -2090,7 +2098,7 @@ impl Cx {
         let roots = self.value_roots(p, v);
         let vt = p.thir.expr(v).ty;
         let no_closure = !p.types.any(vt, &|k| match k {
-            TyKind::Closure(..) | TyKind::Param(..) | TyKind::Opaque(..) => true,
+            TyKind::Closure(..) | TyKind::Param(..) | TyKind::Opaque(..) | TyKind::Proj(..) => true,
             _ => false,
         });
         for r in roots {
@@ -2690,7 +2698,8 @@ impl Cx {
                 self.use_place(p, place, after)
             }
             ExprKind::Continue { id } => self.load_set(self.loop_head.get(id)),
-            ExprKind::Lit(_) | ExprKind::FnRef { .. } | ExprKind::Error => after,
+            ExprKind::Lit(_) | ExprKind::AssocConst { .. } | ExprKind::FnRef { .. } | ExprKind::Error => after,
+            ExprKind::DynConst { base, .. } => self.live(p, base, after),
             ExprKind::Call { callee, args } => self.live_call(p, ex, callee, args, after),
             ExprKind::Closure { captures, .. } => {
                 let mut l = after;
@@ -3046,7 +3055,8 @@ pub fn pat_bindings(thir: &Thir, pat: Id::<Pat>, out: &mut +[LocalId; ..+]) {
 /// Push each direct child expression of `e` onto `out`.
 pub fn visit_children(thir: &Thir, e: Id::<Expr>, out: &mut +[Id::<Expr>; ..+]) {
     match thir.expr(e).kind {
-        ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Lit(_) | ExprKind::FnRef { .. } | ExprKind::Continue { .. } | ExprKind::Error => {}
+        ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Lit(_) | ExprKind::AssocConst { .. } | ExprKind::FnRef { .. } | ExprKind::Continue { .. } | ExprKind::Error => {}
+        ExprKind::DynConst { base, .. } => out.push(base),
         ExprKind::Field { base, .. } => out.push(base),
         ExprKind::Index { base, index } => {
             out.push(base);
@@ -3644,7 +3654,8 @@ impl Moves {
                     }
                 }
             }
-            ExprKind::Lit(_) | ExprKind::FnRef { .. } | ExprKind::Error => {}
+            ExprKind::Lit(_) | ExprKind::AssocConst { .. } | ExprKind::FnRef { .. } | ExprKind::Error => {}
+            ExprKind::DynConst { base, .. } => self.expr(cx, p, base, st),
         }
     }
 

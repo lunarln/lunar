@@ -44,7 +44,7 @@ fn add_def(p: &mut Program, name: str, kind: DefKind, data: DefData): DefId {
 /// A trait that is lang item `lang`, with supertraits `supers`.
 fn add_trait(p: &mut Program, lang: str, supers: [TraitRef; &]): DefId {
     let st = p.trait_refs.add_list(supers);
-    let id = add_def(p, lang, DefKind::Trait, DefData::Trait(TraitData { generics: Generics::none(), supertraits: st, methods: List::empty(), auto: false }));
+    let id = add_def(p, lang, DefKind::Trait, DefData::Trait(TraitData { generics: Generics::none(), supertraits: st, methods: List::empty(), auto: false, assoc: List::empty(), super_eqs: List::empty() }));
     let s = p.sym(lang);
     p.defs[id.index()].attrs.lang = Some(s);
     p.lang.insert(s, id);
@@ -182,7 +182,7 @@ fn impls() {
     let light = add_trait(&mut p, "light", no_supers[..]);
     let dull = add_trait(&mut p, "dull", [trait_ref(light)][..]);
     let add = add_trait(&mut p, "add", no_supers[..]);
-    let x = add_def(&mut p, "X", DefKind::Trait, DefData::Trait(TraitData { generics: Generics::none(), supertraits: List::empty(), methods: List::empty(), auto: false }));
+    let x = add_def(&mut p, "X", DefKind::Trait, DefData::Trait(TraitData { generics: Generics::none(), supertraits: List::empty(), methods: List::empty(), auto: false, assoc: List::empty(), super_eqs: List::empty() }));
     let u8t = p.types.int(IntTy::U8);
     let u32t = p.types.int(IntTy::U32);
     let s = p.types.mk(TyKind::String);

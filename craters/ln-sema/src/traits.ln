@@ -9,6 +9,7 @@
 
 use core::collections::HashMap;
 use core::intern::Symbol;
+use crater::assoc::proj_depth;
 use crater::defs::*;
 use crater::program::Program;
 use crater::thir::ClosureKind;
@@ -78,6 +79,35 @@ impl Program {
                     let st = self.trait_refs.list(t.supertraits)[i];
                     let tr = self.types.subst_trait_ref(st, args);
                     stack.push(Pred { ty: p.ty, trait_ref: tr, span: p.span });
+                }
+                // The supertraits' constraints: `T: Int` gives
+                // `<T as Add>::Output == T`.
+                for i in 0..t.super_eqs.len() {
+                    let e = self.preds.list(t.super_eqs)[i];
+                    let ety = self.types.subst(e.ty, args);
+                    let etr = self.types.subst_trait_ref(e.trait_ref, args);
+                    stack.push(Pred { ty: ety, trait_ref: etr, span: p.span });
+                }
+                // The bounds of its associated types hold for their
+                // projections: `type Item: Light;` gives `T::Item: Light`.
+                // (Not deeper than a few projections: `type A: Tr;` in `Tr`
+                // would go on forever.)
+                let deep = proj_depth(&self.types, p.ty) >= 3;
+                for i in 0..t.assoc.len() {
+                    let a = self.trait_assocs.list(t.assoc)[i];
+                    if a.is_const || deep {
+                        continue;
+                    }
+                    let DefData::AssocTy(ad) = self.defs[a.def.index()].data else { continue; };
+                    if ad.bounds.len() == 0 {
+                        continue;
+                    }
+                    let proj = self.types.mk(TyKind::Proj(a.def, args));
+                    for j in 0..ad.bounds.len() {
+                        let b = self.trait_refs.list(ad.bounds)[j];
+                        let tr = self.types.subst_trait_ref(b, args);
+                        stack.push(Pred { ty: proj, trait_ref: tr, span: p.span });
+                    }
                 }
             }
             out.push(p);
@@ -150,6 +180,15 @@ impl Program {
                 let Some(dull) = self.lang_item("dull") else { return false; };
                 self.env_has(ty, dull, env)
             }
+            // `T::Item`: what it stands for, or what its bounds say.
+            TyKind::Proj(..) => {
+                let n = self.normalize(ty, env);
+                if n != ty {
+                    return self.is_dull_rec(n, env, depth + 1);
+                }
+                let Some(dull) = self.lang_item("dull") else { return false; };
+                self.env_has(ty, dull, env)
+            }
             // A closure is Dull when it holds only Dull values (no borrows).
             TyKind::Closure(def, args) => {
                 let fs = self.closure_fields(def, args);
@@ -191,6 +230,12 @@ impl Program {
         if depth > 64 {
             return true; // recursive types are reported elsewhere
         }
+        if let TyKind::Proj(..) = self.types.kind(ty) {
+            let n = self.normalize(ty, env);
+            if n != ty {
+                return self.is_light_rec(n, env, depth + 1);
+            }
+        }
         return match self.types.kind(ty) {
             TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Error => true,
             TyKind::Str | TyKind::FmtArgs | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::Dyn(..) => true,
@@ -206,7 +251,7 @@ impl Program {
                 self.all_light(fs, env, depth + 1)
             }
             // `T: Dull` implies `T: Light` (`Dull` is a subtrait).
-            TyKind::Param(..) => {
+            TyKind::Param(..) | TyKind::Proj(..) => {
                 let Some(light) = self.lang_item("light") else { return false; };
                 let dull = self.lang_item("dull");
                 let mut el: [Pred; ..+] = [];
@@ -271,6 +316,12 @@ impl Program {
         if depth > 64 {
             return true; // recursive types are reported elsewhere
         }
+        if let TyKind::Proj(..) = self.types.kind(ty) {
+            let n = self.normalize(ty, env);
+            if n != ty {
+                return self.auto_rec(n, env, k, depth + 1);
+            }
+        }
         return match self.types.kind(ty) {
             TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Error => true,
             TyKind::String | TyKind::FnPtr(..) => true,
@@ -309,7 +360,7 @@ impl Program {
                 let fs = self.adt_field_tys(id, args);
                 self.auto_all(fs, env, k, depth + 1)
             }
-            TyKind::Param(..) => {
+            TyKind::Param(..) | TyKind::Proj(..) => {
                 let Some(tr) = self.lang_item(auto_lang(k)) else { return false; };
                 if self.env_has(ty, tr, env) {
                     return true;
@@ -627,6 +678,11 @@ impl Program {
                 let fs = self.closure_fields(def, args);
                 self.any_owner(fs, depth + 1)
             }
+            TyKind::Proj(..) => {
+                let none: [Pred; 0] = [];
+                let n = self.normalize(ty, none[..]);
+                n != ty && self.has_owner_rec(n, depth + 1)
+            }
             _ => false,
         };
     }
@@ -655,7 +711,7 @@ impl Program {
             TyKind::String => true,
             TyKind::Array(_, k) => k.is_owner(),
             // A generic parameter might be instantiated with an owner.
-            TyKind::Param(..) | TyKind::Opaque(..) => !self.is_light(ty, env),
+            TyKind::Param(..) | TyKind::Opaque(..) | TyKind::Proj(..) => !self.is_light(ty, env),
             TyKind::Tuple(ts) => self.any_could_own(ts, env, depth + 1),
             TyKind::Adt(id, args) => {
                 let fs = self.adt_field_tys(id, args);
@@ -693,6 +749,10 @@ impl Program {
             TyKind::String => false,
             TyKind::Array(e, k) => !k.is_owner() && self.is_copy_rec(e, env, depth + 1),
             TyKind::Param(..) | TyKind::Opaque(..) => self.is_light(ty, env),
+            TyKind::Proj(..) => {
+                let n = self.normalize(ty, env);
+                if n != ty { self.is_copy_rec(n, env, depth + 1) } else { self.is_light(ty, env) }
+            }
             TyKind::Tuple(ts) => self.all_copy(ts, env, depth + 1),
             TyKind::Adt(id, args) => {
                 if self.is_lang(id, "unsafe_cell") {
@@ -847,6 +907,18 @@ impl Program {
             if !ok {
                 continue;
             }
+            // Parameters the self type does not determine, but a bound
+            // does: `B` in `impl::<I, F: Fn(I::Item): B, B> It for Map::<I,
+            // F>`, from what `F` is.
+            let mut open = false;
+            for s in subst[..] {
+                if s.is_none() {
+                    open = true;
+                }
+            }
+            if open {
+                self.fill_from_bounds(data, &mut subst, env);
+            }
             let err = self.types.error();
             let mut tys: [Ty; ..+] = [];
             for s in subst {
@@ -872,6 +944,86 @@ impl Program {
         return None;
     }
 
+    /// Bind the parameters of impl `data` that `subst` leaves open from its
+    /// bounds: for a bound `F: Fn(A): B` whose `F` is known, what `F` is
+    /// (a closure's or function pointer's signature, or a bound in `env`)
+    /// gives `B`.
+    fn fill_from_bounds(&mut +self, data: ImplData, subst: &mut +[Option::<Ty>; ..+], env: [Pred; &]) {
+        let mut el: [Pred; ..+] = [];
+        self.elaborate(env, &mut el);
+        for _ in 0..2 {
+            for i in 0..data.generics.preds.len() {
+                let p = self.preds.list(data.generics.preds)[i];
+                if self.is_eq_pred(p) {
+                    continue;
+                }
+                // The bound's arguments with what is known, the open
+                // parameters left as patterns.
+                let mut partial: [Ty; ..+] = [];
+                let mut known_ty = true;
+                for j in 0..subst.len() {
+                    match subst[j] {
+                        Some(t) => partial.push(t),
+                        None => partial.push(self.types.mk(TyKind::Param(j as u32, self.defs[0].name))),
+                    }
+                }
+                let pl = self.types.mk_list(partial[..]);
+                let pty = self.types.subst(p.ty, pl);
+                if let TyKind::Param(j, _) = self.types.kind(p.ty) {
+                    if (j as usize) < subst.len() && subst[j as usize].is_none() {
+                        known_ty = false;
+                    }
+                }
+                if !known_ty {
+                    continue;
+                }
+                let pat0 = self.types.subst_trait_ref(p.trait_ref, pl);
+                let pat = self.normalize_trait_ref(pat0, env);
+                // What `pty` is known to implement.
+                let mut have: [TyList; ..+] = [];
+                for q in el[..] {
+                    if q.ty == pty && q.trait_ref.trait_id == pat.trait_id && !self.is_eq_pred(q) {
+                        have.push(q.trait_ref.args);
+                    }
+                }
+                let fn_like = match self.lang_name(pat.trait_id) {
+                    Some(n) => ClosureKind::from_lang(n).is_some(),
+                    None => false,
+                };
+                if fn_like {
+                    match self.types.kind(pty) {
+                        TyKind::Closure(def, cargs) => {
+                            let sig = self.closure_sig(def, cargs);
+                            have.push(self.types.mk_list([sig][..]));
+                        }
+                        TyKind::FnPtr(..) => have.push(self.types.mk_list([pty][..])),
+                        _ => {}
+                    }
+                }
+                if let TyKind::Opaque(def, oi, oargs) = self.types.kind(pty) {
+                    let mut ob: [Pred; ..+] = [];
+                    self.opaque_bounds(def, oi, oargs, &mut ob);
+                    for q in ob[..] {
+                        if q.trait_ref.trait_id == pat.trait_id && !self.is_eq_pred(q) {
+                            have.push(q.trait_ref.args);
+                        }
+                    }
+                }
+                for h in have[..] {
+                    let mut trial = subst.clone();
+                    if self.match_list(pat.args, h, &mut trial) {
+                        for j in 0..subst.len() {
+                            if subst[j].is_none() && j < trial.len() {
+                                subst[j] = trial[j];
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     /// Whether `ty: tr` holds in environment `env`.
     pub fn implements(&mut +self, ty: Ty, tr: TraitRef, env: [Pred; &]): bool {
         return self.implements_depth(ty, tr, env, 0);
@@ -886,12 +1038,30 @@ impl Program {
                 return true;
             }
         }
+        // A projection equality `<T as Trait>::Item == X` (`ty` is the
+        // projection): what it stands for must be `X`.
+        if self.defs[tr.trait_id.index()].kind == DefKind::AssocTy {
+            if tr.args.len() != 1 {
+                return false;
+            }
+            let lhs = self.normalize(ty, env);
+            let want = self.types.at(tr.args, 0);
+            let rhs = self.normalize(want, env);
+            return lhs == rhs || self.types.has_error(lhs) || self.types.has_error(rhs);
+        }
+        if depth < 8 && (self.types.has_proj(ty) || self.any_proj(tr.args)) {
+            let n = self.normalize(ty, env);
+            let ntr = self.normalize_trait_ref(tr, env);
+            if n != ty || ntr != tr {
+                return self.implements_depth(n, ntr, env, depth + 1);
+            }
+        }
         let k = self.types.kind(ty);
         if let TyKind::Grow(inner) = k {
             return self.implements_depth(inner, tr, env, depth);
         }
         let is_param = match k {
-            TyKind::Param(..) => true,
+            TyKind::Param(..) | TyKind::Proj(..) => true,
             _ => false,
         };
         if is_param || self.types.has_params(ty) {
@@ -906,7 +1076,8 @@ impl Program {
         // `dyn Trait`: its traits (`objects.ln`), and whatever impls
         // (blanket ones) cover it.
         if let TyKind::Dyn(d, dargs, flags) = k {
-            if self.dyn_implements(TraitRef { trait_id: d, args: dargs }, flags & DYN_MUT != 0, tr) {
+            let principal = self.dyn_trait_ref(d, dargs);
+            if self.dyn_implements(principal, flags & DYN_MUT != 0, tr) {
                 return true;
             }
         }
@@ -965,7 +1136,7 @@ impl Program {
         // A trait of a `dyn`: through its vtable, or a default body with
         // `Self` being the `dyn` itself.
         if let TyKind::Dyn(d, dargs, _) = self.types.kind(self_ty) {
-            let principal = TraitRef { trait_id: d, args: dargs };
+            let principal = self.dyn_trait_ref(d, dargs);
             if self.dyn_has_trait(principal, tr) {
                 if let Some(index) = self.vtable_method_index(principal, tr, method) {
                     return Some(MethodImpl::Virtual { index });

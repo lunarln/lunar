@@ -155,7 +155,9 @@ impl::<T> Clone for Receiver::<T> {
     }
 }
 
-impl::<T> Iterator::<T> for Receiver::<T> {
+impl::<T> Iterator for Receiver::<T> {
+    type Item = T;
+
     fn next(&mut self): Option::<T> {
         return self.recv().ok();
     }

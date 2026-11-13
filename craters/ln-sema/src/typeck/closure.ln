@@ -64,7 +64,7 @@ fn sig_parts(types: &Types, sig: Ty): Option::<ExpectedSig> {
 }
 
 /// Whether trait `id` is `Fn`, `FnMut` or `FnOnce`.
-fn is_fn_trait(p: &Program, id: DefId): bool {
+pub fn is_fn_trait(p: &Program, id: DefId): bool {
     return fn_trait_kind(p, id).is_some();
 }
 
@@ -750,7 +750,8 @@ fn collect_uses(p: &Program, e: Expr, first: u32, out: &mut [(LocalId, Use); -..
 /// (`borrowck::visit_children` in Rust).
 pub fn visit_children(p: &Program, e: Expr, out: &mut +[Id::<Expr>; ..+]) {
     match e.kind {
-        ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Lit(_) | ExprKind::FnRef { .. } | ExprKind::Continue { .. } | ExprKind::Error => {}
+        ExprKind::Local(_) | ExprKind::Static(_) | ExprKind::Lit(_) | ExprKind::AssocConst { .. } | ExprKind::FnRef { .. } | ExprKind::Continue { .. } | ExprKind::Error => {}
+        ExprKind::DynConst { base, .. } => out.push(base),
         ExprKind::Field { base, .. } => out.push(base),
         ExprKind::Index { base, index } => {
             out.push(base);

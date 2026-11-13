@@ -21,6 +21,10 @@ pub enum ValueRes {
     Static(DefId),
     Ctor { adt: DefId, variant: u32, args: TyList },
     TraitMethod { trait_ref: TraitRef, self_ty: Ty, def: DefId, method_args: TyList },
+    /// An associated constant of a trait (`item`, declared there) for the
+    /// self type `args[0]` (the trait's arguments after it): `T::N`,
+    /// `<X as Trait>::N`.
+    AssocConst { item: DefId, args: TyList },
 }
 
 /// A resolved method candidate.
@@ -78,6 +82,13 @@ impl Sema {
                     let p = self.p.preds.list(g.preds)[i];
                     let ty = self.p.types.subst(p.ty, args);
                     let tr = self.p.types.subst_trait_ref(p.trait_ref, args);
+                    // `I: Iterator::<Item = X>`: `<I as Iterator>::Item`
+                    // must be `X`, once `I` is known.
+                    if self.p.is_eq_pred(p) {
+                        let want = self.p.types.at(tr.args, 0);
+                        self.oblige_proj(ty, want, span);
+                        continue;
+                    }
                     self.oblige(ty, tr, span);
                 }
             }
@@ -104,6 +115,7 @@ impl Sema {
                 self.check_method_privacy(def, last);
             }
             ValueRes::Const(def) | ValueRes::Static(def) | ValueRes::TraitMethod { def, .. } => self.record_def(last, def),
+            ValueRes::AssocConst { item, .. } => self.record_def(last, item),
             ValueRes::Ctor { adt, variant, .. } => {
                 let v = self.p.variants_of(self.p.adt(adt))[variant as usize].def;
                 self.record_def(last, v);
@@ -152,7 +164,137 @@ impl Sema {
         self.emit();
     }
 
+    /// `<T as Trait>::N` (an associated constant) or `<T as Trait>::f` (a
+    /// method, called with `T` as `Self`).
+    fn resolve_qualified_value(&mut self, q: Id::<ast::Ty>, p: ast::Path, span: Span): Option::<ValueRes> {
+        let self_ty = self.lower_local_ty(q);
+        let n = p.segments.len();
+        let last = self.segment(p, n - 1);
+        let tp = ast::Path { segments: List::from_parts(p.segments.start(), n - 1), span: p.span, qself: None };
+        let cx = self.local_cx();
+        let tr = self.lower_trait_ref(cx, tp)?;
+        self.oblige(self_ty, tr, span);
+        let mut consts: [(TraitRef, DefId); ..+] = [];
+        self.p.bound_assocs(tr, last.ident.name, true, &mut consts);
+        if consts.len() > 0 {
+            let (owner, item) = consts[0];
+            let mut a: [Ty; ..+] = [self_ty];
+            a.extend(self.p.types.list(owner.args));
+            let args = self.p.types.mk_list(a[..]);
+            return Some(ValueRes::AssocConst { item, args });
+        }
+        let Some(mdef) = self.p.trait_method_def(tr.trait_id, last.ident.name) else {
+            let mut m = String::new();
+            m.write("trait `{self.p.name(tr.trait_id)}` has no method or constant `{self.p.text(last.ident.name)}`");
+            self.error_at(codes::name::NO_ASSOC(), last.ident.span, m.as_str());
+            self.emit();
+            return None;
+        };
+        let method_args = self.own_args(mdef, last.args, span);
+        return Some(ValueRes::TraitMethod { trait_ref: tr, self_ty, def: mdef, method_args });
+    }
+
+    /// The associated constant `name` of `ty`: from an inherent impl (a
+    /// plain constant), or a trait of `ty` (its bounds, or the trait impls
+    /// that cover it).
+    fn assoc_const(&mut self, ty: Ty, name: Symbol, span: Span): Option::<ValueRes> {
+        let ty = self.resolve(ty);
+        // Inherent impls.
+        for k in 0..self.p.impls.len() {
+            let imp = self.p.impls[k];
+            let DefData::Impl(d) = self.p.def(imp).data else { continue; };
+            if d.trait_ref.is_some() {
+                continue;
+            }
+            let Some(c) = self.p.impl_consts.get((imp, name)) else { continue; };
+            if self.match_impl(imp, ty).is_some() {
+                return Some(ValueRes::Const(c));
+            }
+        }
+        // Traits: through the bounds in scope, or an impl.
+        let known = self.known_preds(ty);
+        let mut found: [(TraitRef, DefId); ..+] = [];
+        let mut seen: [DefId; ..+] = [];
+        for p in known[..] {
+            if p.ty != ty || self.p.is_eq_pred(p) {
+                continue;
+            }
+            let mut here: [(TraitRef, DefId); ..+] = [];
+            self.p.bound_assocs(p.trait_ref, name, true, &mut here);
+            for h in here[..] {
+                let (_, d) = h;
+                if !seen[..].contains(d) {
+                    seen.push(d);
+                    found.push(h);
+                }
+            }
+        }
+        if found.len() == 0 && !self.p.types.has_infer(ty) {
+            for i in 0..self.p.defs.len() {
+                if self.p.defs[i].kind != DefKind::Trait {
+                    continue;
+                }
+                let tid = DefId::new(i);
+                let Some(a) = self.p.trait_assoc(tid, name, true) else { continue; };
+                // Generic traits: the arguments of an impl that fits.
+                let mut tr = TraitRef { trait_id: tid, args: List::empty() };
+                if self.p.trait_param_count(tid) > 0 {
+                    let mut got: Option::<TraitRef> = None;
+                    for k in 0..self.p.impls.len() {
+                        let imp = self.p.impls[k];
+                        let DefData::Impl(d) = self.p.def(imp).data else { continue; };
+                        let Some(itr) = d.trait_ref else { continue; };
+                        if itr.trait_id != tid {
+                            continue;
+                        }
+                        if let Some(args) = self.match_impl(imp, ty) {
+                            got = Some(self.p.types.subst_trait_ref(itr, args));
+                            break;
+                        }
+                    }
+                    match got {
+                        Some(t) => tr = t,
+                        None => continue,
+                    }
+                } else if !self.p.implements(ty, tr, self.fcx.env[..]) {
+                    continue;
+                }
+                if !seen[..].contains(a.def) {
+                    seen.push(a.def);
+                    found.push((tr, a.def));
+                }
+            }
+        }
+        if found.len() == 0 {
+            return None;
+        }
+        if found.len() > 1 {
+            let ts = self.ty_str(ty);
+            let mut names = String::new();
+            for i in 0..found.len() {
+                if i > 0 {
+                    names.push_str(" and ");
+                }
+                let (t, _) = found[i];
+                names.write("`{self.p.name(t.trait_id)}`");
+            }
+            let mut m = String::new();
+            m.write("`{ts}::{self.p.text(name)}` is ambiguous: both {names} have a constant `{self.p.text(name)}`");
+            self.error_at(codes::trait_::AMBIGUOUS_ASSOC(), span, m.as_str());
+            self.with_help("name the trait: `<Type as Trait>::NAME`");
+            self.emit();
+        }
+        let (owner, item) = found[0];
+        let mut a: [Ty; ..+] = [ty];
+        a.extend(self.p.types.list(owner.args));
+        let args = self.p.types.mk_list(a[..]);
+        return Some(ValueRes::AssocConst { item, args });
+    }
+
     fn resolve_value_path_inner(&mut self, p: ast::Path, span: Span): Option::<ValueRes> {
+        if let Some(q) = p.qself {
+            return self.resolve_qualified_value(q, p, span);
+        }
         let nsegs = p.segments.len();
         if self.p.ast.is_single(p) {
             let id = self.segment(p, 0).ident;
@@ -335,7 +477,7 @@ impl Sema {
                     Some(self.p.types.adt(d, args))
                 }
                 DefKind::TypeAlias => {
-                    let prefix = ast::Path { segments: List::from_parts(p.segments.start(), upto), span: p.span };
+                    let prefix = ast::Path { segments: List::from_parts(p.segments.start(), upto), span: p.span, qself: None };
                     let t = self.p.ast.tys.add(ast::Ty { kind: ast::TyKind::Path(prefix), span: p.span });
                     Some(self.lower_local_ty(t))
                 }
@@ -386,6 +528,10 @@ impl Sema {
                 Some(ValueRes::TraitMethod { trait_ref: tr, self_ty: ty, def: mdef, method_args })
             }
             None => {
+                // An associated constant: `T::N`, `Type::N`.
+                if let Some(c) = self.assoc_const(ty, name, seg.ident.span) {
+                    return Some(c);
+                }
                 let t = self.ty_str(ty);
                 let mut m = String::new();
                 m.write("no function or associated item named `{self.p.text(name)}` found for `{t}`");
@@ -485,13 +631,15 @@ impl Sema {
                 found.push((tr, mdef));
                 continue;
             }
-            if self.p.types.has_infer(ty) {
+            let own = td.generics.names.len();
+            // A type still being inferred (`Range::<{integer}>`) may have
+            // the methods of a trait without parameters whose impl fits it.
+            if self.p.types.has_infer(ty) && (own > 0 || self.is_unbound_var(ty)) {
                 continue;
             }
-            let own = td.generics.names.len();
             if own == 0 {
                 let tr = TraitRef { trait_id: tid, args: List::empty() };
-                if self.p.implements(ty, tr, self.fcx.env[..]) {
+                if self.implements_now(ty, tr) {
                     found.push((tr, mdef));
                 }
                 continue;
@@ -623,7 +771,41 @@ impl Sema {
                 self.emit();
                 self.error_expr(span)
             }
+            ValueRes::AssocConst { item, args } => self.assoc_const_expr(item, args, span),
         };
+    }
+
+    /// The value of associated constant `item` for `args`: a literal when
+    /// the self type is known here, else read once the function is
+    /// instantiated (`ExprKind::AssocConst`).
+    pub fn assoc_const_expr(&mut self, item: DefId, args: TyList, span: Span): Expr {
+        let t0 = self.p.assoc_const_ty(item, args);
+        let ty = self.resolve(t0);
+        let rargs = self.resolve_list(args);
+        let self_ty = self.p.types.at(rargs, 0);
+        let concrete = !self.p.types.has_infer(self_ty) && !self.p.types.has_params(self_ty) && !self.p.types.has_proj(self_ty);
+        if concrete {
+            if let Some(v) = self.p.assoc_const_value(item, rargs) {
+                return self.mk(ExprKind::Lit(v), ty, span);
+            }
+            if let TyKind::Dyn(..) = self.p.types.kind(self_ty) {
+                let n = self.p.name(item).to_string();
+                let mut m = String::new();
+                m.write("a `dyn`'s constants belong to the value it views: read it from the value, `d.{n}`");
+                self.error_at(codes::name::NO_ASSOC(), span, m.as_str());
+                self.emit();
+                return self.error_expr(span);
+            }
+            let ts = self.ty_str(self_ty);
+            let tn = self.p.name(self.p.assoc_trait(item)).to_string();
+            let n = self.p.name(item).to_string();
+            let mut m = String::new();
+            m.write("`{ts}` has no value for `{tn}::{n}`: it does not implement `{tn}`");
+            self.error_at(codes::ty::UNSATISFIED_BOUND(), span, m.as_str());
+            self.emit();
+            return self.error_expr(span);
+        }
+        return self.mk(ExprKind::AssocConst { item, args: rargs }, ty, span);
     }
 
     // ===================================================================== calls
@@ -823,6 +1005,11 @@ impl Sema {
                 let v = self.check_expr(a, None);
                 self.default_var(v.ty);
                 out.push(Arg::Value(self.node(v)));
+            }
+            // What this argument taught may settle projections the next
+            // ones (closures) need.
+            if self.fcx.projs.len() > 0 {
+                self.process_projs();
             }
         }
     }
@@ -1177,7 +1364,7 @@ impl Sema {
         let TyKind::Dyn(d, dargs, flags) = self.p.types.kind(step) else { return None; };
         let Some(tc) = pick.trait_call else { return None; };
         let (tr, _) = tc;
-        let principal = TraitRef { trait_id: d, args: dargs };
+        let principal = self.p.dyn_trait_ref(d, dargs);
         let tr = self.resolve_trait_ref(tr);
         if !self.p.dyn_has_trait(principal, tr) {
             return None;
@@ -1332,8 +1519,8 @@ impl Sema {
             let x = match f.value {
                 Some(e) => self.check_expr(e, Some(ft)),
                 None => {
-                    let seg = self.p.ast.segments.add_list([ast::PathSegment { ident: f.name, args: None }][..]);
-                    let p = ast::Path { segments: seg, span: f.name.span };
+                    let seg = self.p.ast.segments.add_list([ast::PathSegment { ident: f.name, args: None, bindings: List::empty() }][..]);
+                    let p = ast::Path { segments: seg, span: f.name.span, qself: None };
                     self.check_path_value(p, Some(ft), f.name.span)
                 }
             };
