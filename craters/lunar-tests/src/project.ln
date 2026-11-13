@@ -1,0 +1,237 @@
+// Projects end to end: `lunar new`, path and git dependencies, the
+// lockfile, `lunar test`, `lunar update`, workspaces and manifest errors.
+// Every scenario runs in its own temporary directory, outside the
+// repository, with its own `LUNAR_HOME`.
+
+use std::fs;
+use std::process::Command;
+use crater::{exe_suffix, join, lunar_in, printed, scratch, write_file};
+
+/// `lunar args` in `dir`, which must succeed: what it printed.
+pub fn ok(dir: str, home: str, args: [str; &]): String {
+    let o = lunar_in(dir, home, args);
+    let all = printed(&o);
+    if !o.status.success() {
+        panic("`lunar {join_args(args)}` failed in {dir}:\n{all}");
+    }
+    return all;
+}
+
+/// `lunar args` in `dir`, which must fail: what it printed.
+pub fn fails(dir: str, home: str, args: [str; &]): String {
+    let o = lunar_in(dir, home, args);
+    if o.status.success() {
+        panic("`lunar {join_args(args)}` should fail in {dir}:\n{printed(&o)}");
+    }
+    return printed(&o);
+}
+
+fn join_args(args: [str; &]): String {
+    let mut s = String::new();
+    for a in args {
+        if !s.is_empty() {
+            s.push(' ');
+        }
+        s.push_str(a);
+    }
+    return s;
+}
+
+fn git(dir: str, args: [str; &]) {
+    let mut c = Command::new("git");
+    c.args(["-c", "user.email=test@example.com", "-c", "user.name=test", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"][..]);
+    c.args(args);
+    c.current_dir(dir);
+    let o = match c.output() {
+        Ok(o) => o,
+        Err(e) => panic("could not run git: {e}"),
+    };
+    if !o.status.success() {
+        panic("git {join_args(args)}: {o.stderr}");
+    }
+}
+
+fn expect(cond: bool, what: str, out: str) {
+    if !cond {
+        panic("{what}:\n{out}");
+    }
+}
+
+#[test]
+fn path_and_git_dependencies() {
+    let w = scratch("deps");
+    let home = join(w.as_str(), "home");
+    let h = home.as_str();
+    ok(w.as_str(), h, ["new", "app"][..]);
+    ok(w.as_str(), h, ["new", "mathx", "--lib"][..]);
+    ok(w.as_str(), h, ["new", "strutil", "--lib"][..]);
+
+    // strutil: a git repository with a tag.
+    let strutil = join(w.as_str(), "strutil");
+    write_file(join(strutil.as_str(), "src/lib.ln").as_str(), "pub fn shout(mut s: String): String {\n    s.push_str(\"!\");\n    return s;\n}\n");
+    git(strutil.as_str(), ["init", "-q"][..]);
+    git(strutil.as_str(), ["add", "-A"][..]);
+    git(strutil.as_str(), ["commit", "-qm", "init"][..]);
+    git(strutil.as_str(), ["tag", "v0.1.0"][..]);
+
+    // mathx depends on strutil by git, and has an integration test.
+    let mathx = join(w.as_str(), "mathx");
+    write_file(
+        join(mathx.as_str(), "src/lib.ln").as_str(),
+        "pub fn add(a: i32, b: i32): i32 {\n    return a + b;\n}\n\npub fn describe(a: i32, b: i32): String {\n    let mut s = String::from(\"sum is \");\n    s.write(\"{add(a, b)}\");\n    return strutil::shout(s);\n}\n\n#[test]\nfn adds() {\n    std::test::assert_eq(&add(2, 2), &4, \"2 + 2\");\n}\n",
+    );
+    write_file(join(mathx.as_str(), "tests/sums.ln").as_str(), "#[test]\nfn uses_lib() {\n    std::test::assert_eq(&mathx::add(1, 1), &2, \"1 + 1\");\n}\n");
+    let url = crater::slashes(strutil.as_str());
+    ok(mathx.as_str(), h, ["add", "strutil", "--git", url.as_str(), "--tag", "v0.1.0"][..]);
+    let out = ok(mathx.as_str(), h, ["test"][..]);
+    expect(out.as_str().contains("test result: ok. 2 passed"), "dependency tests must not run with the crater's own", out.as_str());
+
+    // app depends on mathx by path.
+    let app = join(w.as_str(), "app");
+    write_file(join(app.as_str(), "src/main.ln").as_str(), "use mathx::describe;\n\nfn main() {\n    println(\"{mathx::add(40, 2)}\");\n    let d = describe(1, 2);\n    println(\"{d}\");\n}\n");
+    ok(app.as_str(), h, ["add", "mathx", "--path", "../mathx"][..]);
+    let out = ok(app.as_str(), h, ["run"][..]);
+    expect(out.as_str().contains("42\n") && out.as_str().contains("sum is 3!\n"), "app's output", out.as_str());
+    let lock = fs::read_to_string(join(app.as_str(), "lunar.lock").as_str()).unwrap();
+    expect(lock.as_str().contains("source = \"path+../mathx\"") && lock.as_str().contains("?tag=v0.1.0#"), "the lockfile", lock.as_str());
+
+    // The lock pins the commit: moving the tag changes nothing until `update`.
+    write_file(join(strutil.as_str(), "src/lib.ln").as_str(), "pub fn shout(mut s: String): String {\n    s.push_str(\"!!\");\n    return s;\n}\n");
+    git(strutil.as_str(), ["commit", "-qam", "louder"][..]);
+    git(strutil.as_str(), ["tag", "-f", "v0.1.0"][..]);
+    let out = ok(app.as_str(), h, ["run"][..]);
+    expect(out.as_str().contains("sum is 3!\n") && !out.as_str().contains("Fetching"), "the locked commit", out.as_str());
+    ok(app.as_str(), h, ["update"][..]);
+    let out = ok(app.as_str(), h, ["run"][..]);
+    expect(out.as_str().contains("sum is 3!!\n"), "after `lunar update`", out.as_str());
+
+    // A dependency's own dependencies are not visible.
+    write_file(join(app.as_str(), "src/main.ln").as_str(), "fn main() {\n    let s = strutil::shout(String::from(\"x\"));\n    println(\"{s}\");\n}\n");
+    let out = fails(app.as_str(), h, ["build"][..]);
+    expect(out.as_str().contains("err(name::unresolved)"), "strutil is not app's dependency", out.as_str());
+
+    let _ = fs::remove_dir_all(w.as_str());
+}
+
+#[test]
+fn manifest_errors() {
+    let w = scratch("errors");
+    let home = join(w.as_str(), "home");
+    let h = home.as_str();
+    ok(w.as_str(), h, ["new", "app"][..]);
+    ok(w.as_str(), h, ["new", "lib2", "--lib"][..]);
+    let app = join(w.as_str(), "app");
+    let a = app.as_str();
+    let manifest = join(a, "lunar.toml");
+    let m = manifest.as_str();
+
+    // Version requirements are checked.
+    write_file(m, "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nlib2 = { path = \"../lib2\", version = \"2\" }\n");
+    let out = fails(a, h, ["build"][..]);
+    expect(out.as_str().contains("requires `lib2` ^2") && out.as_str().contains("version 0.1.0"), "a version requirement", out.as_str());
+
+    // The registry does not exist yet.
+    write_file(m, "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\njson = \"1.2\"\n");
+    let out = fails(a, h, ["build"][..]);
+    expect(out.as_str().contains("registry, which is not available yet"), "a registry dependency", out.as_str());
+
+    // Bad names are reported, with their code, pointing into the manifest.
+    write_file(m, "[package]\nname = \"App\"\nversion = \"0.1.0\"\n");
+    let out = fails(a, h, ["build"][..]);
+    expect(out.as_str().contains("package name `App` is not valid"), "a bad name", out.as_str());
+    expect(out.as_str().contains("err(manifest::bad_name)") && out.as_str().contains("lunar.toml:2"), "a bad name's code and place", out.as_str());
+    write_file(m, "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nmissing = { path = \"../missing\" }\n");
+    let out = fails(a, h, ["build"][..]);
+    expect(out.as_str().contains("err(manifest::not_found)") && out.as_str().contains("lunar.toml:6"), "a missing path dependency", out.as_str());
+    write_file(m, "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nlib2 = { path = \"../lib2\", git = \"x\" }\n");
+    let out = fails(a, h, ["build"][..]);
+    expect(out.as_str().contains("err(manifest::bad_dependency)"), "path and git", out.as_str());
+    write_file(m, "[package]\nname = \"app\"\nversion = \"one\"\n");
+    let out = fails(a, h, ["build"][..]);
+    expect(out.as_str().contains("err(manifest::bad_version)"), "a bad version", out.as_str());
+    write_file(m, "[package\nname = \"app\"\n");
+    let out = fails(a, h, ["build"][..]);
+    expect(out.as_str().contains("err(manifest::parse)"), "bad TOML", out.as_str());
+
+    // A library has no program to run.
+    let out = fails(join(w.as_str(), "lib2").as_str(), h, ["run"][..]);
+    expect(out.as_str().contains("err(manifest::no_target)"), "running a library", out.as_str());
+
+    // Outside any project, commands without a file explain what they need.
+    let out = fails(w.as_str(), h, ["build"][..]);
+    expect(out.as_str().contains("no `lunar.toml`"), "outside a project", out.as_str());
+
+    let _ = fs::remove_dir_all(w.as_str());
+}
+
+#[test]
+fn workspaces() {
+    let w = scratch("workspace");
+    let home = join(w.as_str(), "home");
+    let h = home.as_str();
+    let ws = join(w.as_str(), "ws");
+    let s = ws.as_str();
+    write_file(join(s, "lunar.toml").as_str(), "[workspace]\nmembers = [\"crates/*\", \"tool\"]\n");
+    let crates = join(s, "crates");
+    let _ = fs::create_dir_all(crates.as_str());
+    ok(s, h, ["new", "tool"][..]);
+    ok(crates.as_str(), h, ["new", "core-util", "--lib"][..]);
+    ok(crates.as_str(), h, ["new", "app"][..]);
+    write_file(join(s, "crates/core-util/src/lib.ln").as_str(), "pub fn twice(x: i32): i32 {\n    return x * 2;\n}\n\n#[test]\nfn doubles() {\n    std::test::assert_eq(&twice(2), &4, \"twice\");\n}\n");
+    ok(join(s, "crates/app").as_str(), h, ["add", "core-util", "--path", "../core-util"][..]);
+    write_file(join(s, "crates/app/src/main.ln").as_str(), "fn main() {\n    println(\"app {core_util::twice(21)}\");\n}\n");
+    write_file(join(s, "tool/src/main.ln").as_str(), "fn main() {\n    println(\"tool\");\n}\n");
+
+    // At the root, several members have programs: `run` needs `-p`.
+    let out = fails(s, h, ["run"][..]);
+    expect(out.as_str().contains("err(manifest::workspace)") && out.as_str().contains("-p"), "`run` at the root", out.as_str());
+    let out = ok(s, h, ["run", "-p", "app"][..]);
+    expect(out.as_str().contains("app 42\n"), "`run -p app`", out.as_str());
+    let out = fails(s, h, ["run", "-p", "nope"][..]);
+    expect(out.as_str().contains("err(manifest::workspace)"), "`run -p nope`", out.as_str());
+
+    // In a member, commands act on that member; output and lock are shared.
+    let out = ok(join(s, "tool").as_str(), h, ["run"][..]);
+    expect(out.as_str().contains("tool\n"), "`run` in a member", out.as_str());
+    ok(s, h, ["build"][..]);
+    for name in ["app", "tool"] {
+        let exe = core::fmt::format("{s}/target/debug/{name}{exe_suffix()}");
+        expect(fs::is_file(exe.as_str()), "members are built at the workspace root", exe.as_str());
+    }
+    // Members are not locked (they are part of the workspace), so path-only
+    // workspaces have no lockfile at all, and members never get their own.
+    expect(!fs::exists(join(s, "lunar.lock").as_str()) && !fs::exists(join(s, "crates/app/lunar.lock").as_str()), "no lockfiles", s);
+    expect(!fs::exists(join(s, "crates/app/target").as_str()), "no target/ in a member", s);
+
+    // `test` at the root tests every member.
+    let out = ok(s, h, ["test"][..]);
+    expect(out.as_str().contains("doubles"), "`test` at the root", out.as_str());
+
+    // Member names must be unique.
+    write_file(join(s, "tool/lunar.toml").as_str(), "[package]\nname = \"app\"\nversion = \"0.1.0\"\n");
+    let out = fails(s, h, ["build"][..]);
+    expect(out.as_str().contains("err(manifest::workspace)"), "two members named app", out.as_str());
+    write_file(join(s, "tool/lunar.toml").as_str(), "[package]\nname = \"tool\"\nversion = \"0.1.0\"\n");
+
+    // A listed member must exist, and the error points at it.
+    write_file(join(s, "lunar.toml").as_str(), "[workspace]\nmembers = [\"crates/*\", \"tool\", \"gone\"]\n");
+    let out = fails(join(s, "tool").as_str(), h, ["build"][..]);
+    expect(out.as_str().contains("err(manifest::not_found)") && out.as_str().contains("`gone`"), "a missing member", out.as_str());
+
+    let _ = fs::remove_dir_all(w.as_str());
+}
+
+/// `env!("LUNAR_PKG_NAME")` and `env!("LUNAR_PKG_VERSION")` are the package
+/// being built.
+#[test]
+fn env_names_the_package() {
+    let w = scratch("env");
+    let home = join(w.as_str(), "home");
+    ok(w.as_str(), home.as_str(), ["new", "envy"][..]);
+    let dir = join(w.as_str(), "envy");
+    write_file(join(dir.as_str(), "lunar.toml").as_str(), "[package]\nname = \"envy\"\nversion = \"1.2.3\"\n");
+    write_file(join(dir.as_str(), "src/main.ln").as_str(), "fn main() {\n    let n = env!(\"LUNAR_PKG_NAME\");\n    let v = env!(\"LUNAR_PKG_VERSION\");\n    println(\"{n} {v}\");\n}\n");
+    let out = ok(dir.as_str(), home.as_str(), ["run"][..]);
+    expect(out.as_str().contains("envy 1.2.3\n"), "env! in a package", out.as_str());
+    let _ = fs::remove_dir_all(w.as_str());
+}

@@ -1,0 +1,16 @@
+struct Stack {
+    items: [i32; -..+],
+}
+
+/// Adds two numbers.
+fn add(a: i32, b: i32): i32 {
+    return a + b;
+}
+
+fn main() {
+    let total = add(1, 2);
+    let s = Stack { items: [] };
+    let n = s.items.len();
+    println("{total} {n}");
+    let oops: i32 = undefined_name;
+}

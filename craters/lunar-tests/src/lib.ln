@@ -1,0 +1,356 @@
+// The tests of the `lunar` executable, run against a built compiler:
+//
+//     LUNAR_BIN=path/to/lunar lunar test -p lunar-tests [filter]
+//
+// (from craters/; without LUNAR_BIN, craters/target/release/lunar). They
+// drive it the way people and editors do, through its command line and its
+// language server, and read their cases from the repository:
+//
+// * `lang`: tests/ui, tests/run, tests/fatal, examples, `lunar explain` and
+//   docs/errors, build failures;
+// * `project`: packages, dependencies, lockfiles and workspaces;
+// * `lsp`: the language server: the sessions in tests/lsp/*/session.json
+//   (the scripts craters/lunar/src/ide_tests.ln also replays in process),
+//   diagnostics as published, std documents, projects, editing std;
+// * `robust`: the language server on broken programs (prefixes and
+//   mutilations of every test program) must not crash.
+
+pub mod lsp_client;
+
+#[cfg(test)]
+mod lang;
+#[cfg(test)]
+mod lsp;
+#[cfg(test)]
+mod project;
+#[cfg(test)]
+mod robust;
+
+use std::env;
+use std::fs;
+use std::process::{Command, Output};
+
+/// The repository: the nearest directory above the current one with
+/// `std/core/lib.ln`, with `/` separators.
+pub fn root(): String {
+    let mut d = slashes(env::current_dir().unwrap().as_str());
+    loop {
+        if fs::is_file(join(d.as_str(), "std/core/lib.ln").as_str()) {
+            return d;
+        }
+        let up = parent_of(d.as_str());
+        d = up;
+    }
+}
+
+fn parent_of(d: str): String {
+    return match parent(d) {
+        Some(p) => String::from(p),
+        None => panic("the tests run inside the Lunar repository (no `std/core/lib.ln` above the current directory)"),
+    };
+}
+
+/// The compiler under test: `$LUNAR_BIN`, else the one built in
+/// craters/target/release.
+pub fn bin(): String {
+    if let Some(b) = env::var("LUNAR_BIN") {
+        if b.len() > 0 {
+            return b;
+        }
+    }
+    let mut b = join(root().as_str(), "craters/target/release/lunar");
+    if is_windows() {
+        b.push_str(".exe");
+    }
+    if !fs::is_file(b.as_str()) {
+        panic("no compiler to test: set LUNAR_BIN, or build {b}");
+    }
+    return b;
+}
+
+/// `lunar` with `args`, in the repository, reading its own standard
+/// library (not `$LUNAR_STD_DIR`).
+pub fn lunar(args: [str; &]): Output {
+    let r = root();
+    return lunar_in(r.as_str(), "", args);
+}
+
+/// `lunar` with `args` in `dir`, with `LUNAR_HOME` set to `home` (unless
+/// empty).
+pub fn lunar_in(dir: str, home: str, args: [str; &]): Output {
+    let mut c = command(dir, home);
+    c.args(args);
+    return run(&c);
+}
+
+/// A `lunar` command in `dir`, with `LUNAR_HOME` set to `home` (unless
+/// empty), without `$LUNAR_STD_DIR`.
+pub fn command(dir: str, home: str): Command {
+    let mut c = Command::new(bin().as_str());
+    c.current_dir(dir);
+    c.env_remove("LUNAR_STD_DIR");
+    if home.len() > 0 {
+        c.env("LUNAR_HOME", home);
+    }
+    return c;
+}
+
+/// Run `c` to the end.
+pub fn run(c: &Command): Output {
+    return match c.output() {
+        Ok(o) => o,
+        Err(e) => panic("could not run {bin()}: {e}"),
+    };
+}
+
+/// What `o` printed: its standard output, then its standard error,
+/// without color codes and with `\n` line ends.
+pub fn printed(o: &Output): String {
+    let mut s = String::from(o.stdout.as_str());
+    s.push_str(o.stderr.as_str());
+    return clean(s.as_str());
+}
+
+/// `s` without ANSI escape sequences and with `\n` line ends.
+pub fn clean(s: str): String {
+    let mut out = String::new();
+    let b = s.as_bytes();
+    let mut i: usize = 0;
+    let mut start: usize = 0;
+    while i < b.len() {
+        if b[i] == 27 || b[i] == b'\r' {
+            out.push_str(s[start..i]);
+            if b[i] == 27 {
+                i += 1;
+                while i < b.len() && !((b[i] >= b'a' && b[i] <= b'z') || (b[i] >= b'A' && b[i] <= b'Z')) {
+                    i += 1;
+                }
+            }
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if start < b.len() {
+        out.push_str(s[start..]);
+    }
+    return out;
+}
+
+/// The files in the repository directory `dir` ending in `ext`, as
+/// repository-relative paths, sorted, one per line.
+pub fn files(dir: str, ext: str): String {
+    let r = root();
+    let full = join(r.as_str(), dir);
+    let entries = match fs::read_dir(full.as_str()) {
+        Ok(e) => e,
+        Err(e) => panic("reading {full}: {e}"),
+    };
+    let mut out = String::new();
+    for i in 0..entries.len() {
+        let n = entries.name(i);
+        if n.ends_with(ext) {
+            out.write("{dir}/{n}\n");
+        }
+    }
+    return out;
+}
+
+/// The text of the repository file `rel`.
+pub fn read(rel: str): String {
+    let r = root();
+    let path = join(r.as_str(), rel);
+    return match fs::read_to_string(path.as_str()) {
+        Ok(t) => clean(t.as_str()),
+        Err(e) => panic("reading {path}: {e}"),
+    };
+}
+
+/// A new empty directory for a test, outside the repository.
+pub fn scratch(name: str): String {
+    let mut d = slashes(env::temp_dir().as_str());
+    d.write("/lunar-tests-{name}-{std::process::id()}");
+    let _ = fs::remove_dir_all(d.as_str());
+    write_file(join(d.as_str(), ".keep").as_str(), "");
+    return d;
+}
+
+/// Write `text` to `path`, creating its directories.
+pub fn write_file(path: str, text: str) {
+    if let Some(dir) = parent(path) {
+        if let Err(e) = fs::create_dir_all(dir) {
+            panic("creating {dir}: {e}");
+        }
+    }
+    if let Err(e) = fs::write(path, text.as_bytes()) {
+        panic("writing {path}: {e}");
+    }
+}
+
+/// Copy the directory `from` into `to`.
+pub fn copy_dir(from: str, to: str) {
+    let entries = match fs::read_dir(from) {
+        Ok(e) => e,
+        Err(e) => panic("reading {from}: {e}"),
+    };
+    let _ = fs::create_dir_all(to);
+    for i in 0..entries.len() {
+        let n = entries.name(i);
+        let src = join(from, n);
+        let dst = join(to, n);
+        if fs::is_dir(src.as_str()) {
+            copy_dir(src.as_str(), dst.as_str());
+        } else {
+            match fs::read(src.as_str()) {
+                Ok(bytes) => {
+                    if let Err(e) = fs::write(dst.as_str(), bytes[..]) {
+                        panic("writing {dst}: {e}");
+                    }
+                }
+                Err(e) => panic("reading {src}: {e}"),
+            }
+        }
+    }
+}
+
+/// `s` without `prefix`, if it starts with it.
+pub fn strip(s: str, prefix: str): Option::<str> {
+    if s.starts_with(prefix) {
+        return Some(s[prefix.len()..]);
+    }
+    return None;
+}
+
+/// `s` with every `from` replaced by `to`.
+pub fn replace(s: str, from: str, to: str): String {
+    let mut out = String::new();
+    let mut rest = s;
+    loop {
+        match rest.find(from) {
+            Some(i) => {
+                out.push_str(rest[..i]);
+                out.push_str(to);
+                rest = rest[i + from.len()..];
+            }
+            None => {
+                out.push_str(rest);
+                return out;
+            }
+        }
+    }
+}
+
+/// How many times `needle` occurs in `s` (not overlapping).
+pub fn count(s: str, needle: str): usize {
+    let mut n: usize = 0;
+    let mut rest = s;
+    loop {
+        match rest.find(needle) {
+            Some(i) => {
+                n += 1;
+                rest = rest[i + needle.len()..];
+            }
+            None => return n,
+        }
+    }
+}
+
+/// The values of the `prefix` lines of `src` (`// error: x` gives `x`),
+/// trimmed, one per line.
+pub fn header(src: str, prefix: str): String {
+    let mut out = String::new();
+    for line in src.lines() {
+        if let Some(v) = strip(line.trim(), prefix) {
+            out.push_str(v.trim());
+            out.push('\n');
+        }
+    }
+    return out;
+}
+
+/// `a/b`.
+pub fn join(a: str, b: str): String {
+    let mut s = String::from(a);
+    if !a.ends_with("/") {
+        s.push('/');
+    }
+    s.push_str(b);
+    return s;
+}
+
+/// The directory of `path`, if it has one.
+pub fn parent(path: str): Option::<str> {
+    let b = path.as_bytes();
+    let mut end = b.len();
+    while end > 1 && (b[end - 1] == b'/' || b[end - 1] == b'\\') {
+        end -= 1;
+    }
+    let mut i = end;
+    while i > 0 {
+        i -= 1;
+        if b[i] == b'/' || b[i] == b'\\' {
+            if i == 0 {
+                return Some(path[..1]);
+            }
+            // `C:/` keeps its slash.
+            if i == 2 && b[1] == b':' {
+                return Some(path[..3]);
+            }
+            return Some(path[..i]);
+        }
+    }
+    return None;
+}
+
+/// `path` with `/` for `\`.
+pub fn slashes(path: str): String {
+    let mut s = String::new();
+    for c in path.chars() {
+        s.push(if c == '\\' { '/' } else { c });
+    }
+    return s;
+}
+
+/// The extension of executables: `.exe` on Windows.
+pub fn exe_suffix(): str {
+    return if is_windows() { ".exe" } else { "" };
+}
+
+#[cfg(windows)]
+pub fn is_windows(): bool {
+    return true;
+}
+
+#[cfg(unix)]
+pub fn is_windows(): bool {
+    return false;
+}
+
+/// Failures collected over many cases, reported together.
+pub struct Failures {
+    text: String,
+    count: usize,
+}
+
+impl Failures {
+    pub fn new(): Failures {
+        return Failures { text: String::new(), count: 0 };
+    }
+
+    /// Record a failure.
+    pub fn add(&mut +self, message: FmtArgs) {
+        if self.count > 0 {
+            self.text.push_str("\n\n");
+        }
+        self.text.write(message);
+        self.count += 1;
+    }
+
+    /// Fail the test if anything failed.
+    pub fn check(&self) {
+        if self.count > 0 {
+            panic("{self.count} failure{if self.count == 1 { "" } else { "s" }}:\n\n{self.text}");
+        }
+    }
+}

@@ -1,0 +1,714 @@
+// The language server, over `lunar lsp --stdio` as an editor runs it.
+//
+// `sessions` replays every `tests/lsp/CASE/session.json`: the scripts that
+// craters/lunar/src/ide_tests.ln also replays through the server in
+// process (that file describes the format). One format, two runs: in
+// process with `lunar test -p lunar`, and here against the built
+// executable. To add a case, add a directory with its sources and a
+// `session.json`.
+//
+// The other tests need what a script cannot say: diagnostics as they are
+// published, documents of the standard library, projects with
+// dependencies, a copy of std being edited, and layouts compared with
+// what code generation does.
+
+use std::env;
+use std::fs;
+use ln_json::{Json, Kind, Value};
+use crater::lsp_client::{Server, field, nth, parse_or_panic, position, quote, uri_of};
+use crater::{Failures, clean, join, lunar_in, root, scratch, write_file, printed};
+
+/// Every case in tests/lsp (`LSP_CASE=name` picks those whose names
+/// contain it).
+#[test]
+fn sessions() {
+    let mut f = Failures::new();
+    let r = root();
+    let dir = join(r.as_str(), "tests/lsp");
+    let entries = match fs::read_dir(dir.as_str()) {
+        Ok(e) => e,
+        Err(e) => panic("reading {dir}: {e}"),
+    };
+    let filter = match env::var("LSP_CASE") {
+        Some(v) => v,
+        None => String::new(),
+    };
+    let mut ran: usize = 0;
+    for i in 0..entries.len() {
+        let name = entries.name(i);
+        if filter.len() > 0 && !name.contains(filter.as_str()) {
+            continue;
+        }
+        let case = join(dir.as_str(), name);
+        if !fs::is_file(join(case.as_str(), "session.json").as_str()) {
+            continue;
+        }
+        run_case(name, case.as_str(), &mut f);
+        ran += 1;
+    }
+    if ran == 0 {
+        f.add("no cases in tests/lsp");
+    }
+    f.check();
+}
+
+/// The texts of a case's files as the session has changed them.
+struct Texts {
+    names: String,
+    texts: String,
+    /// (name lo, name hi, text lo, text hi), the latest last.
+    list: [(u32, u32, u32, u32); ..+],
+}
+
+impl Texts {
+    fn get(&self, name: str): Option::<str> {
+        let mut i = self.list.len();
+        while i > 0 {
+            i -= 1;
+            let (a, b, c, d) = self.list[i];
+            if self.names.as_str()[a as usize..b as usize] == name {
+                return Some(self.texts.as_str()[c as usize..d as usize]);
+            }
+        }
+        return None;
+    }
+
+    fn set(&mut +self, name: str, text: str) {
+        let a = self.names.len() as u32;
+        self.names.push_str(name);
+        let b = self.names.len() as u32;
+        let c = self.texts.len() as u32;
+        self.texts.push_str(text);
+        self.list.push((a, b, c, self.texts.len() as u32));
+    }
+}
+
+/// Byte offset of the `n`th occurrence of `needle` in `text`, plus `at`.
+fn find_nth(text: str, needle: str, n: usize, at: usize): Option::<usize> {
+    return match nth(text, needle, n) {
+        Some(i) => Some(i + at),
+        None => None,
+    };
+}
+
+/// `v` of `src` into `out`, with `$uri:FILE` and `["$pos", ...]` replaced.
+fn subst(src: &Json, v: Value, out: &mut +Json, dir: str, texts: &Texts): Result::<Value, String> {
+    return match src.kind(v) {
+        Kind::String => {
+            let s = src.as_str(v).unwrap();
+            if s.starts_with("$uri:") {
+                let path = join(dir, s[5..]);
+                Ok(out.string(uri_of(path.as_str()).as_str()))
+            } else {
+                Ok(out.copy_from(src, v))
+            }
+        }
+        Kind::Array => {
+            let is_pos = match src.first(v) {
+                Some(first) => src.as_str(first) == Some("$pos"),
+                None => false,
+            };
+            if is_pos {
+                let file = String::from(src.as_str(src.at(v, 1).unwrap()).unwrap_or(""));
+                let needle = String::from(src.as_str(src.at(v, 2).unwrap()).unwrap_or(""));
+                let n = src.as_u64(src.at(v, 3).unwrap()).unwrap_or(0) as usize;
+                let at = src.as_u64(src.at(v, 4).unwrap()).unwrap_or(0) as usize;
+                let text = match texts.get(file.as_str()) {
+                    Some(t) => t,
+                    None => return Err(core::fmt::format("`$pos` in `{file}`, which is not open")),
+                };
+                let off = match find_nth(text, needle.as_str(), n, at) {
+                    Some(o) => o,
+                    None => return Err(core::fmt::format("occurrence {n} of {needle:?} not in `{file}`")),
+                };
+                let (l, c) = position(text, off);
+                let o = out.object();
+                let lv = out.uint(l as u64);
+                out.set(o, "line", lv);
+                let cv = out.uint(c as u64);
+                out.set(o, "character", cv);
+                return Ok(o);
+            }
+            let a = out.array();
+            let mut m = src.first(v);
+            while let Some(x) = m {
+                let y = subst(src, x, out, dir, texts)?;
+                out.push(a, y);
+                m = src.next(x);
+            }
+            Ok(a)
+        }
+        Kind::Object => {
+            let o = out.object();
+            let mut m = src.first(v);
+            while let Some(x) = m {
+                let y = subst(src, x, out, dir, texts)?;
+                out.set(o, src.key(x), y);
+                m = src.next(x);
+            }
+            Ok(o)
+        }
+        _ => Ok(out.copy_from(src, v)),
+    };
+}
+
+/// The strings of the JSON array at `keys` of `text`, one per line.
+fn string_list(text: str, keys: [str; &]): String {
+    let j = parse_or_panic(text);
+    let mut out = String::new();
+    if let Some(a) = j.path(j.root(), keys) {
+        let mut m = j.first(a);
+        while let Some(x) = m {
+            out.push_str(j.as_str(x).unwrap_or(""));
+            out.push('\n');
+            m = j.next(x);
+        }
+    }
+    return out;
+}
+
+/// Replay the case `name` in `dir`, adding what is wrong to `f`.
+fn run_case(name: str, dir: str, f: &mut +Failures) {
+    let script_text = match fs::read_to_string(join(dir, "session.json").as_str()) {
+        Ok(t) => t,
+        Err(e) => {
+            f.add("{name}: cannot read session.json: {e}");
+            return;
+        }
+    };
+    let script = match ln_json::parse(script_text.as_str()) {
+        Ok(j) => j,
+        Err(e) => {
+            f.add("{name}: session.json: {e}");
+            return;
+        }
+    };
+    let steps = match script.get(script.root(), "steps") {
+        Some(s) => s,
+        None => {
+            f.add("{name}: no `steps`");
+            return;
+        }
+    };
+    let home = scratch(core::fmt::format("lsp-home-{name}").as_str());
+    let mut s = Server::start(dir, home.as_str());
+    let types = string_list(s.init.as_str(), ["result", "capabilities", "semanticTokensProvider", "legend", "tokenTypes"][..]);
+    let mods = string_list(s.init.as_str(), ["result", "capabilities", "semanticTokensProvider", "legend", "tokenModifiers"][..]);
+    let mut texts = Texts { names: String::new(), texts: String::new(), list: [] };
+    let mut version: i64 = 1;
+    let mut k: usize = 0;
+    let mut m = script.first(steps);
+    while let Some(step) = m {
+        m = script.next(step);
+        if let Some(o) = script.get(step, "open") {
+            let file = String::from(script.as_str(o).unwrap_or(""));
+            let path = join(dir, file.as_str());
+            let text = match fs::read_to_string(path.as_str()) {
+                Ok(t) => t,
+                Err(e) => {
+                    f.add("{name}: cannot open {file}: {e}");
+                    s.stop();
+                    return;
+                }
+            };
+            texts.set(file.as_str(), text.as_str());
+            s.open(uri_of(path.as_str()).as_str(), text.as_str());
+            continue;
+        }
+        if let Some(c) = script.get(step, "change") {
+            let file = String::from(script.as_str(c).unwrap_or(""));
+            let old = match texts.get(file.as_str()) {
+                Some(t) => String::from(t),
+                None => {
+                    f.add("{name}: change of {file}, which is not open");
+                    s.stop();
+                    return;
+                }
+            };
+            let mut new_text = String::new();
+            if let Some(r) = script.get(step, "replace") {
+                let from = script.as_str(script.at(r, 0).unwrap()).unwrap_or("");
+                let to = script.as_str(script.at(r, 1).unwrap()).unwrap_or("");
+                match old.as_str().find(from) {
+                    Some(i) => {
+                        new_text.push_str(old.as_str()[..i]);
+                        new_text.push_str(to);
+                        new_text.push_str(old.as_str()[i + from.len()..]);
+                    }
+                    None => {
+                        f.add("{name}: {from:?} is not in {file}");
+                        s.stop();
+                        return;
+                    }
+                }
+            } else if let Some(t) = script.get(step, "text") {
+                new_text.push_str(script.as_str(t).unwrap_or(""));
+            }
+            texts.set(file.as_str(), new_text.as_str());
+            version += 1;
+            s.change(uri_of(join(dir, file.as_str()).as_str()).as_str(), version, new_text.as_str());
+            continue;
+        }
+        if let Some(rq) = script.get(step, "request") {
+            k += 1;
+            let method = String::from(script.as_str(rq).unwrap_or(""));
+            let mut j = Json::new();
+            let params = match script.get(step, "params") {
+                Some(p) => match subst(&script, p, &mut j, dir, &texts) {
+                    Ok(v) => j.to_string(v),
+                    Err(e) => {
+                        f.add("{name}: {method}: {e}");
+                        s.stop();
+                        return;
+                    }
+                },
+                None => String::from("{}"),
+            };
+            let response = s.request(method.as_str(), params.as_str());
+            let what = core::fmt::format("{name}: request {k} ({method})");
+            check(&script, step, response.as_str(), what.as_str(), &texts, types.as_str(), mods.as_str(), f);
+            continue;
+        }
+        f.add("{name}: a step that is not `open`, `change` or `request`");
+        s.stop();
+        return;
+    }
+    s.stop();
+    let _ = fs::remove_dir_all(home.as_str());
+}
+
+/// Check the `response` to the request `step` asked for.
+fn check(script: &Json, step: Value, response: str, what: str, texts: &Texts, types: str, mods: str, f: &mut +Failures) {
+    let msg = parse_or_panic(response);
+    let is_error = msg.get(msg.root(), "error").is_some();
+    let answer = match msg.get(msg.root(), "result") {
+        Some(r) => msg.to_string(r),
+        None => match msg.get(msg.root(), "error") {
+            Some(e) => msg.to_string(e),
+            None => String::new(),
+        },
+    };
+    let want_error = match script.get(step, "error") {
+        Some(e) => script.as_bool(e).unwrap_or(false),
+        None => false,
+    };
+    if is_error != want_error {
+        f.add("{what}: {if is_error { "an error" } else { "no error" }}: {answer}");
+    }
+    if let Some(es) = script.get(step, "expect") {
+        let mut e = script.first(es);
+        while let Some(x) = e {
+            let s = script.as_str(x).unwrap_or("");
+            if !answer.as_str().contains(s) {
+                f.add("{what}: no {s} in {answer}");
+            }
+            e = script.next(x);
+        }
+    }
+    if let Some(es) = script.get(step, "absent") {
+        let mut e = script.first(es);
+        while let Some(x) = e {
+            let s = script.as_str(x).unwrap_or("");
+            if answer.as_str().contains(s) {
+                f.add("{what}: {s} in {answer}");
+            }
+            e = script.next(x);
+        }
+    }
+    // `[FILE, NEEDLE, N, AT, LEN]`: a range of the answer; `[FILE, NEEDLE,
+    // N, AT]`: a position of it.
+    for which in ["ranges", "positions"] {
+        let rs = match script.get(step, which) {
+            Some(r) => r,
+            None => continue,
+        };
+        let mut e = script.first(rs);
+        while let Some(x) = e {
+            e = script.next(x);
+            let file = script.as_str(script.at(x, 0).unwrap()).unwrap_or("");
+            let needle = script.as_str(script.at(x, 1).unwrap()).unwrap_or("");
+            let n = script.as_u64(script.at(x, 2).unwrap()).unwrap_or(0) as usize;
+            let at = script.as_u64(script.at(x, 3).unwrap()).unwrap_or(0) as usize;
+            let text = match texts.get(file) {
+                Some(t) => t,
+                None => continue,
+            };
+            let off = match find_nth(text, needle, n, at) {
+                Some(o) => o,
+                None => {
+                    f.add("{what}: {which}: {needle:?} not found");
+                    continue;
+                }
+            };
+            let (l0, c0) = position(text, off);
+            let mut want = String::new();
+            if which == "ranges" {
+                let len = script.as_u64(script.at(x, 4).unwrap()).unwrap_or(0) as usize;
+                let (l1, c1) = position(text, off + len);
+                want.write("{{\"end\":{{\"character\":{c1},\"line\":{l1}}},\"start\":{{\"character\":{c0},\"line\":{l0}}}}}");
+            } else {
+                want.write("\"position\":{{\"character\":{c0},\"line\":{l0}}}");
+            }
+            if !answer.as_str().contains(want.as_str()) {
+                f.add("{what}: no {want} ({needle:?}) in {answer}");
+            }
+        }
+    }
+    // `[TEXT, N]`: the answer has `TEXT` exactly `N` times.
+    if let Some(cs) = script.get(step, "count") {
+        let text = script.as_str(script.at(cs, 0).unwrap()).unwrap_or("");
+        let want = script.as_u64(script.at(cs, 1).unwrap()).unwrap_or(0) as usize;
+        let n = crater::count(answer.as_str(), text);
+        if n != want {
+            f.add("{what}: {text} {n} times, expected {want}, in {answer}");
+        }
+    }
+    if let Some(ts) = script.get(step, "tokens") {
+        check_tokens(script, ts, &msg, what, texts, types, mods, f);
+    }
+}
+
+/// `[FILE, NEEDLE, N, AT, TYPE, [MODIFIER or !MODIFIER, ...]]`: the semantic
+/// token starting at that position.
+fn check_tokens(script: &Json, ts: Value, msg: &Json, what: str, texts: &Texts, types: str, mods: str, f: &mut +Failures) {
+    let data = match msg.path(msg.root(), ["result", "data"][..]) {
+        Some(d) => d,
+        None => {
+            f.add("{what}: no token data");
+            return;
+        }
+    };
+    // Absolute (line, start, length, type, modifiers).
+    let mut toks: [(u32, u32, u32, u32, u32); ..+] = [];
+    let mut line: u32 = 0;
+    let mut col: u32 = 0;
+    let n = msg.len(data);
+    let mut q: usize = 0;
+    while q + 4 < n {
+        let dl = msg.as_u64(msg.at(data, q).unwrap()).unwrap_or(0) as u32;
+        let dc = msg.as_u64(msg.at(data, q + 1).unwrap()).unwrap_or(0) as u32;
+        let len = msg.as_u64(msg.at(data, q + 2).unwrap()).unwrap_or(0) as u32;
+        let ty = msg.as_u64(msg.at(data, q + 3).unwrap()).unwrap_or(0) as u32;
+        let md = msg.as_u64(msg.at(data, q + 4).unwrap()).unwrap_or(0) as u32;
+        if dl > 0 {
+            line += dl;
+            col = dc;
+        } else {
+            col += dc;
+        }
+        toks.push((line, col, len, ty, md));
+        q += 5;
+    }
+    let mut e = script.first(ts);
+    while let Some(x) = e {
+        e = script.next(x);
+        let file = script.as_str(script.at(x, 0).unwrap()).unwrap_or("");
+        let needle = script.as_str(script.at(x, 1).unwrap()).unwrap_or("");
+        let nth = script.as_u64(script.at(x, 2).unwrap()).unwrap_or(0) as usize;
+        let at = script.as_u64(script.at(x, 3).unwrap()).unwrap_or(0) as usize;
+        let want = script.as_str(script.at(x, 4).unwrap()).unwrap_or("");
+        let text = match texts.get(file) {
+            Some(t) => t,
+            None => continue,
+        };
+        let off = match find_nth(text, needle, nth, at) {
+            Some(o) => o,
+            None => {
+                f.add("{what}: token check: {needle:?} not found");
+                continue;
+            }
+        };
+        let (l, c) = position(text, off);
+        let mut got: Option::<(u32, u32)> = None;
+        for t in toks[..] {
+            let (tl, tc, _, ty, md) = t;
+            if tl as usize == l && tc as usize == c {
+                got = Some((ty, md));
+            }
+        }
+        let (ty, md) = match got {
+            Some(g) => g,
+            None => {
+                if want != "none" {
+                    f.add("{what}: no token at {needle:?} ({l}:{c}), expected {want}");
+                }
+                continue;
+            }
+        };
+        let got_name = nth_line(types, ty as usize);
+        if got_name != want {
+            f.add("{what}: the token at {needle:?} is {got_name}, expected {want}");
+        }
+        if let Some(ms) = script.at(x, 5) {
+            let mut mm = script.first(ms);
+            while let Some(y) = mm {
+                mm = script.next(y);
+                let mname = script.as_str(y).unwrap_or("");
+                let negate = mname.starts_with("!");
+                let mname = if negate { mname[1..] } else { mname };
+                let mut bit: u32 = 0;
+                let mut bi: u32 = 0;
+                for mline in mods.lines() {
+                    if mline == mname {
+                        bit = 1 << bi;
+                    }
+                    bi += 1;
+                }
+                let has = md & bit != 0;
+                if has == negate {
+                    f.add("{what}: the token at {needle:?}: modifier {mname} {if negate { "set" } else { "missing" }} ({md})");
+                }
+            }
+        }
+    }
+}
+
+/// Line `i` of `text`, or `?`.
+fn nth_line(text: str, i: usize): str {
+    let mut k: usize = 0;
+    for l in text.lines() {
+        if k == i {
+            return l;
+        }
+        k += 1;
+    }
+    return "?";
+}
+
+/// Diagnostics are published as the document is opened and changed: an
+/// error, then, once fixed, only a warning.
+#[test]
+fn diagnostics_as_you_type() {
+    let dir = scratch("lsp-diagnostics");
+    let path = join(dir.as_str(), "main.ln");
+    // The editor's buffer, not the disk, is analyzed.
+    write_file(path.as_str(), "");
+    let text = "fn main() {\n    let n: i32 = 1;\n    let oops: i32 = undefined_name;\n}\n";
+    let uri = uri_of(path.as_str());
+    let mut s = Server::start(dir.as_str(), "");
+    s.open(uri.as_str(), text);
+    let d = s.diagnostics(uri.as_str());
+    if !d.as_str().contains("\"code\":\"name::unresolved\"") || !d.as_str().contains("\"severity\":1") {
+        panic("expected an unresolved-name error, got {d}");
+    }
+    s.change(uri.as_str(), 2, "fn main() {\n    let n: i32 = 1;\n    let oops: i32 = n;\n}\n");
+    let d = s.diagnostics(uri.as_str());
+    if d.as_str().contains("\"severity\":1") {
+        panic("errors remain after the fix: {d}");
+    }
+    if !d.as_str().contains("lint::unused_variable") {
+        panic("expected a warning about `oops`, got {d}");
+    }
+    s.stop();
+}
+
+/// The standard library as virtual `lunar-std:` documents, for editors
+/// that ask for them: their text, and hovers in them, with the URI as
+/// written and percent-encoded (as VS Code sends it).
+#[test]
+fn std_documents() {
+    let dir = scratch("lsp-std-docs");
+    let mut s = Server::start(dir.as_str(), "");
+    // A program that uses std, so that the server has analyzed it.
+    let main = uri_of(join(dir.as_str(), "main.ln").as_str());
+    s.open(main.as_str(), "fn main() {\n    println(\"hi\");\n}\n");
+    s.diagnostics(main.as_str());
+    // Go to definition leads into std's files.
+    let d = s.at("textDocument/definition", main.as_str(), 1, 6);
+    if !field(d.as_str(), ["result", "uri"][..]).as_str().ends_with("/std/std/io.ln") {
+        panic("definition of println: {d}");
+    }
+    for uri in ["lunar-std:std::io", "lunar-std:std%3A%3Aio"] {
+        let mut p = String::from("{\"uri\":");
+        p.push_str(quote(uri).as_str());
+        p.push('}');
+        let r = s.request("lunar/stdSource", p.as_str());
+        let text = field(r.as_str(), ["result"][..]);
+        let at = match text.as_str().find("pub fn println(") {
+            Some(i) => i + 8,
+            None => panic("the source of {uri} has no `pub fn println(`: {r}"),
+        };
+        let (l, c) = position(text.as_str(), at);
+        let h = s.at("textDocument/hover", uri, l, c);
+        if !field(h.as_str(), ["result", "contents", "value"][..]).as_str().contains("fn println(") {
+            panic("hover on println in {uri}: {h}");
+        }
+    }
+    s.stop();
+}
+
+/// A module file opened on its own is analyzed as part of the crate of
+/// the (unopened) file that declares it, so `super::` resolves.
+#[test]
+fn module_file_opened_alone_uses_its_crate() {
+    let dir = scratch("lsp-mod");
+    let util = "pub fn answer(): i32 {\n    return super::helper() + 1;\n}\n";
+    let shapes = "pub fn sides(): i32 {\n    return crater::util::answer() - 38;\n}\n";
+    write_file(join(dir.as_str(), "main.ln").as_str(), "mod util;\nmod shapes;\n\nfn helper(): i32 {\n    return 41;\n}\n\nfn main() {\n    println(\"{util::answer()} {shapes::sides()}\");\n}\n");
+    write_file(join(dir.as_str(), "util.ln").as_str(), util);
+    write_file(join(dir.as_str(), "shapes/mod.ln").as_str(), shapes);
+    let mut s = Server::start(dir.as_str(), "");
+    for f in [("util.ln", util), ("shapes/mod.ln", shapes)] {
+        let (rel, text) = f;
+        let uri = uri_of(join(dir.as_str(), rel).as_str());
+        s.open(uri.as_str(), text);
+        let d = s.diagnostics(uri.as_str());
+        if d.as_str() != "[]" {
+            panic("{rel}: unexpected diagnostics {d}");
+        }
+    }
+    s.stop();
+}
+
+/// The sizes shown in hovers on type declarations match what code
+/// generation uses (`core::mem::size_of` / `align_of`).
+#[test]
+fn hover_layouts_match_codegen() {
+    let dir = scratch("lsp-layout");
+    let decls = "struct Small {\n    a: u8,\n    b: u8,\n}\n\nstruct Mixed {\n    a: u8,\n    b: u64,\n    c: u16,\n}\n\nstruct Nested {\n    m: Mixed,\n    s: [u8; &],\n    t: (bool, char),\n}\n\nstruct Unit;\n\nenum Tag {\n    A,\n    B,\n}\n\nenum Shape {\n    Circle(f64),\n    Rect { w: f32, h: f32, z: u8 },\n    Empty,\n}\n\nstruct Pair(u32, String);\n\nstruct Holder {\n    s: String,\n    v: [f64; -..+],\n    o: Option::<u64>,\n    x: [u16; 3],\n}\n";
+    let types = ["Small", "Mixed", "Nested", "Unit", "Tag", "Shape", "Pair", "Holder"];
+    let mut src = String::from(decls);
+    src.push_str("\nfn main() {\n");
+    for t in types {
+        src.write("    println(\"{{core::mem::size_of::<{t}>()}} {{core::mem::align_of::<{t}>()}}\");\n");
+    }
+    src.push_str("}\n");
+    let file = join(dir.as_str(), "layout.ln");
+    write_file(file.as_str(), src.as_str());
+    let o = lunar_in(dir.as_str(), "", ["run", file.as_str()][..]);
+    if !o.status.success() {
+        panic("{printed(&o)}");
+    }
+    let actual = clean(o.stdout.as_str());
+    let mut lines = actual.as_str().lines();
+
+    let mut f = Failures::new();
+    let uri = uri_of(file.as_str());
+    let mut s = Server::start(dir.as_str(), "");
+    s.open(uri.as_str(), src.as_str());
+    s.diagnostics(uri.as_str());
+    for t in types {
+        let line = match lines.next() {
+            Some(l) => l,
+            None => "",
+        };
+        let decl = core::fmt::format(" {t}");
+        let at = match src.as_str().find(decl.as_str()) {
+            Some(i) => i + 1,
+            None => panic("no declaration of {t}"),
+        };
+        let (l, c) = position(src.as_str(), at);
+        let h = s.at("textDocument/hover", uri.as_str(), l, c);
+        let text = field(h.as_str(), ["result", "contents", "value"][..]);
+        // `// size = 24 (0x18), align = 0x8`
+        let shown = layout_comment(text.as_str());
+        if shown.as_str() != line {
+            f.add("{t}: the hover says `{shown}`, code generation `{line}`:\n{text}");
+        }
+    }
+    s.stop();
+    f.check();
+}
+
+/// `SIZE ALIGN` from a hover's `// size = 24 (0x18), align = 0x8`.
+fn layout_comment(hover: str): String {
+    let i = match hover.find("// size = ") {
+        Some(i) => i + 10,
+        None => return String::from("<no layout>"),
+    };
+    let rest = hover[i..];
+    // `24 (0x18),` or, when small, `2,`.
+    let mut e: usize = 0;
+    let rb = rest.as_bytes();
+    while e < rb.len() && rb[e] >= b'0' && rb[e] <= b'9' {
+        e += 1;
+    }
+    let size = rest[..e];
+    let a = match rest.find("align = 0x") {
+        Some(a) => a + 10,
+        None => return String::from("<no align>"),
+    };
+    let hex = rest[a..];
+    let mut align: u64 = 0;
+    for b in hex.as_bytes() {
+        let d = if b >= b'0' && b <= b'9' { (b - b'0') as u64 } else if b >= b'a' && b <= b'f' { (b - b'a' + 10) as u64 } else { break };
+        align = align * 16 + d;
+    }
+    return core::fmt::format("{size} {align}");
+}
+
+/// The language server analyzes a project's files with their dependencies.
+#[test]
+fn language_server_sees_dependencies() {
+    let w = scratch("lsp-deps");
+    let home = join(w.as_str(), "home");
+    crater::project::ok(w.as_str(), home.as_str(), ["new", "app"][..]);
+    crater::project::ok(w.as_str(), home.as_str(), ["new", "mathx", "--lib"][..]);
+    let app = join(w.as_str(), "app");
+    crater::project::ok(app.as_str(), home.as_str(), ["add", "mathx", "--path", "../mathx"][..]);
+    let main = join(app.as_str(), "src/main.ln");
+    let text = "fn main() {\n    println(\"{mathx::add(40, 2)}\");\n}\n";
+    write_file(main.as_str(), text);
+
+    let mut s = Server::start(w.as_str(), home.as_str());
+    let uri = uri_of(main.as_str());
+    s.open(uri.as_str(), text);
+    let d = s.diagnostics(uri.as_str());
+    if d.as_str() != "[]" {
+        panic("the dependency should resolve: {d}");
+    }
+    // `add` in `mathx::add(40, 2)`, line 1.
+    let def = s.at("textDocument/definition", uri.as_str(), 1, 23);
+    let target = field(def.as_str(), ["result", "uri"][..]);
+    if !target.as_str().ends_with("mathx/src/lib.ln") {
+        panic("definition of mathx::add: {def}");
+    }
+    s.stop();
+}
+
+/// Files of a standard library source tree (this repository's `std/`) are
+/// analyzed as the standard library, from disk and open buffers, not as
+/// programs of their own.
+#[test]
+fn language_server_edits_std() {
+    let w = scratch("lsp-std");
+    let r = root();
+    // A copy of the std tree, so edits stay out of the repository.
+    let std_root = join(w.as_str(), "std");
+    crater::copy_dir(join(r.as_str(), "std").as_str(), std_root.as_str());
+    let str_ln = join(std_root.as_str(), "core/str.ln");
+    let text = clean(fs::read_to_string(str_ln.as_str()).unwrap().as_str());
+
+    let mut s = Server::start(w.as_str(), join(w.as_str(), "home").as_str());
+    let uri = uri_of(str_ln.as_str());
+    s.open(uri.as_str(), text.as_str());
+    let d = s.diagnostics(uri.as_str());
+    if d.as_str() != "[]" {
+        panic("the unmodified std has errors: {d}");
+    }
+    let at = match text.as_str().find("pub fn len(self)") {
+        Some(i) => i + 7,
+        None => panic("no `pub fn len(self)` in core/str.ln"),
+    };
+    let (l, c) = position(text.as_str(), at);
+    let h = s.at("textDocument/hover", uri.as_str(), l, c);
+    if !h.as_str().contains("len") {
+        panic("hover in std: {h}");
+    }
+
+    // An edit shows up as an error in the edited file.
+    let old = "return intrinsics::str_len(self);";
+    let at = match text.as_str().find(old) {
+        Some(i) => i,
+        None => panic("core/str.ln no longer has `{old}`"),
+    };
+    let mut broken = String::from(text.as_str()[..at]);
+    broken.push_str("return intrinsics::str_len(self) + true;");
+    broken.push_str(text.as_str()[at + old.len()..]);
+    s.change(uri.as_str(), 2, broken.as_str());
+    let d = s.diagnostics(uri.as_str());
+    if d.as_str() == "[]" {
+        panic("the edit is not reported as an error");
+    }
+    s.stop();
+}

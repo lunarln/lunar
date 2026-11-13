@@ -1,0 +1,372 @@
+// A language server client: `lunar lsp --stdio` started with pipes,
+// messages framed with `Content-Length`, as JSON text.
+
+use std::process::Child;
+use ln_json::{Json, parse, write_string};
+use crater::{command, slashes};
+
+/// A running `lunar lsp`.
+pub struct Server {
+    child: Child,
+    /// Bytes read and not yet taken (from `pos`).
+    buf: [u8; -..+],
+    pos: usize,
+    next_id: i64,
+    /// Notifications received while waiting for responses, one per line
+    /// (compact JSON has no line breaks), oldest first.
+    notes: String,
+    /// Every message received, one per line.
+    pub log: String,
+    /// The response to `initialize`.
+    pub init: String,
+}
+
+impl Server {
+    /// Start `lunar lsp --stdio` in `dir` with `LUNAR_HOME` = `home`
+    /// (unless empty), and initialize it.
+    pub fn start(dir: str, home: str): Server {
+        let mut c = command(dir, home);
+        // `--stdio` is what vscode-languageclient appends.
+        c.args(["lsp", "--stdio"][..]);
+        let child = match c.spawn() {
+            Ok(ch) => ch,
+            Err(e) => panic("could not start the language server: {e}"),
+        };
+        let mut s = Server { child, buf: [], pos: 0, next_id: 0, notes: String::new(), log: String::new(), init: String::new() };
+        let init = s.request("initialize", "{\"processId\":null,\"rootUri\":null,\"capabilities\":{\"textDocument\":{\"completion\":{\"completionItem\":{\"snippetSupport\":true}}}}}");
+        s.init = init;
+        s.notify("initialized", "{}");
+        return s;
+    }
+
+    fn send(&mut self, body: str) {
+        let mut m = String::new();
+        m.write("Content-Length: {body.len()}\r\n\r\n");
+        m.push_str(body);
+        if !self.child.write(m.as_bytes()) {
+            panic("the language server does not take messages any more");
+        }
+    }
+
+    /// Read more of the server's output; false at its end.
+    fn fill(&mut self): bool {
+        let mut chunk: [u8; 16384] = [0; 16384];
+        let n = self.child.read(chunk[..]);
+        if n == 0 {
+            return false;
+        }
+        if self.pos == self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+        }
+        self.buf.extend(chunk[..n]);
+        return true;
+    }
+
+    /// The next message, or `None` when the server has closed its output.
+    pub fn recv(&mut self): Option::<String> {
+        loop {
+            if let Some(text) = self.take() {
+                self.log.push_str(text.as_str());
+                self.log.push('\n');
+                return Some(text);
+            }
+            if !self.fill() {
+                return None;
+            }
+        }
+    }
+
+    /// The next whole message already read, if there is one.
+    fn take(&mut self): Option::<String> {
+        let mut body: Option::<(usize, usize)> = None;
+        let avail = self.buf[self.pos..];
+        if let Some(h) = find(avail, "\r\n\r\n") {
+            let head = match str::from_utf8(avail[..h]) {
+                Some(t) => t,
+                None => panic("the server sent a header that is not UTF-8"),
+            };
+            let len = content_length(head);
+            if avail.len() >= h + 4 + len {
+                body = Some((self.pos + h + 4, self.pos + h + 4 + len));
+            }
+        }
+        let (lo, hi) = body?;
+        let text = match str::from_utf8(self.buf[lo..hi]) {
+            Some(t) => String::from(t),
+            None => panic("the server sent a message that is not UTF-8"),
+        };
+        self.pos = hi;
+        return Some(text);
+    }
+
+    /// Send a notification. `params` is JSON.
+    pub fn notify(&mut self, method: str, params: str) {
+        let mut m = String::from("{\"jsonrpc\":\"2.0\",\"method\":");
+        write_string(&mut m, method);
+        m.push_str(",\"params\":");
+        m.push_str(params);
+        m.push('}');
+        self.send(m.as_str());
+    }
+
+    /// Send a request (`params` is JSON) and wait for its response, which
+    /// is returned. Notifications meanwhile are kept for `notification`.
+    pub fn request(&mut self, method: str, params: str): String {
+        self.next_id += 1;
+        let id = self.next_id;
+        let mut m = String::new();
+        m.write("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":");
+        write_string(&mut m, method);
+        m.push_str(",\"params\":");
+        m.push_str(params);
+        m.push('}');
+        self.send(m.as_str());
+        loop {
+            let msg = match self.recv() {
+                Some(t) => t,
+                None => panic("the language server exited instead of answering `{method}`"),
+            };
+            let j = parse_or_panic(msg.as_str());
+            let is_response = match j.get(j.root(), "id") {
+                Some(v) => j.as_i64(v) == Some(id) && j.get(j.root(), "method").is_none(),
+                None => false,
+            };
+            if is_response {
+                return msg;
+            }
+            self.notes.push_str(msg.as_str());
+            self.notes.push('\n');
+        }
+    }
+
+    /// Wait for the next notification `method` whose `params.uri` is
+    /// `uri` (any, if empty), and take it.
+    pub fn notification(&mut self, method: str, uri: str): String {
+        loop {
+            // Kept notifications first, oldest first.
+            if let Some(msg) = self.take_note(method, uri) {
+                return msg;
+            }
+            let msg = match self.recv() {
+                Some(t) => t,
+                None => panic("the language server exited before sending `{method}` for `{uri}`"),
+            };
+            self.notes.push_str(msg.as_str());
+            self.notes.push('\n');
+        }
+    }
+
+    /// The first kept notification `method` for `uri`, taken out.
+    fn take_note(&mut self, method: str, uri: str): Option::<String> {
+        let mut found: Option::<(usize, usize)> = None;
+        let mut start: usize = 0;
+        let notes = self.notes.as_str();
+        for line in notes.lines() {
+            let end = start + line.len();
+            if found.is_none() && matches(line, method, uri) {
+                found = Some((start, end));
+            }
+            start = end + 1;
+        }
+        let (lo, hi) = found?;
+        let msg = String::from(notes[lo..hi]);
+        let mut rest = String::from(notes[..lo]);
+        rest.push_str(notes[hi + 1..]);
+        self.notes = rest;
+        return Some(msg);
+    }
+
+    /// Open the document `uri` with `text`.
+    pub fn open(&mut self, uri: str, text: str) {
+        let mut p = String::from("{\"textDocument\":{\"uri\":");
+        write_string(&mut p, uri);
+        p.push_str(",\"languageId\":\"lunar\",\"version\":1,\"text\":");
+        write_string(&mut p, text);
+        p.push_str("}}");
+        self.notify("textDocument/didOpen", p.as_str());
+    }
+
+    /// Replace the text of the document `uri`.
+    pub fn change(&mut self, uri: str, version: i64, text: str) {
+        let mut p = String::from("{\"textDocument\":{\"uri\":");
+        write_string(&mut p, uri);
+        p.write(",\"version\":{version}}},\"contentChanges\":[{{\"text\":");
+        write_string(&mut p, text);
+        p.push_str("}]}");
+        self.notify("textDocument/didChange", p.as_str());
+    }
+
+    /// The diagnostics published next for `uri`, as a JSON array.
+    pub fn diagnostics(&mut self, uri: str): String {
+        let msg = self.notification("textDocument/publishDiagnostics", uri);
+        let j = parse_or_panic(msg.as_str());
+        return match j.path(j.root(), ["params", "diagnostics"][..]) {
+            Some(d) => j.to_string(d),
+            None => panic("diagnostics without a list: {msg}"),
+        };
+    }
+
+    /// A request at a position: `method` (hover, definition, ...) at
+    /// `line`:`character` of `uri`. The response.
+    pub fn at(&mut self, method: str, uri: str, line: usize, character: usize): String {
+        let mut p = String::from("{\"textDocument\":{\"uri\":");
+        write_string(&mut p, uri);
+        p.write("}},\"position\":{{\"line\":{line},\"character\":{character}}}}}");
+        return self.request(method, p.as_str());
+    }
+
+    /// Shut the server down; it must exit successfully.
+    pub fn stop(&mut self) {
+        self.request("shutdown", "null");
+        self.notify("exit", "null");
+        match self.child.wait() {
+            Ok(s) => {
+                if !s.success() {
+                    panic("the language server exited with {s}");
+                }
+            }
+            Err(e) => panic("waiting for the language server: {e}"),
+        }
+    }
+
+    /// Wait for the server to exit (after a crash, say): its status.
+    pub fn wait(&mut self): std::process::ExitStatus {
+        return match self.child.wait() {
+            Ok(s) => s,
+            Err(e) => panic("waiting for the language server: {e}"),
+        };
+    }
+}
+
+/// Whether the message `line` is the notification `method` for `uri`.
+fn matches(line: str, method: str, uri: str): bool {
+    let j = parse_or_panic(line);
+    let m = match j.get(j.root(), "method") {
+        Some(m) => m,
+        None => return false,
+    };
+    if j.as_str(m) != Some(method) {
+        return false;
+    }
+    if uri.is_empty() {
+        return true;
+    }
+    return match j.path(j.root(), ["params", "uri"][..]) {
+        Some(u) => j.as_str(u) == Some(uri),
+        None => false,
+    };
+}
+
+pub fn parse_or_panic(text: str): Json {
+    return match parse(text) {
+        Ok(j) => j,
+        Err(e) => panic("the server sent JSON that does not parse ({e}): {text}"),
+    };
+}
+
+/// The string field at `keys` of the JSON `text`, or "".
+pub fn field(text: str, keys: [str; &]): String {
+    let j = parse_or_panic(text);
+    return match j.path(j.root(), keys) {
+        Some(v) => match j.as_str(v) {
+            Some(s) => String::from(s),
+            None => String::new(),
+        },
+        None => String::new(),
+    };
+}
+
+/// `s` as a JSON string literal.
+pub fn quote(s: str): String {
+    let mut o = String::new();
+    write_string(&mut o, s);
+    return o;
+}
+
+/// The `file:` URI of `path`, percent-encoded as the server writes it.
+pub fn uri_of(path: str): String {
+    let p = slashes(path);
+    let mut u = String::from("file://");
+    if !p.as_str().starts_with("/") {
+        u.push('/');
+    }
+    let hex = "0123456789ABCDEF".as_bytes();
+    for c in p.as_bytes() {
+        let plain = c > 32 && c < 127 && c != b'"' && c != b'#' && c != b'<' && c != b'>' && c != b'?' && c != b'`' && c != b'{' && c != b'}' && c != b'%';
+        if plain {
+            u.push(c as char);
+        } else {
+            u.push('%');
+            u.push(hex[(c >> 4) as usize] as char);
+            u.push(hex[(c & 15) as usize] as char);
+        }
+    }
+    return u;
+}
+
+/// The line and character (in UTF-16 units, as LSP counts) of byte `at`
+/// in `text`.
+pub fn position(text: str, at: usize): (usize, usize) {
+    let b = text.as_bytes();
+    let end = if at > b.len() { b.len() } else { at };
+    let mut line: usize = 0;
+    let mut start: usize = 0;
+    for i in 0..end {
+        if b[i] == b'\n' {
+            line += 1;
+            start = i + 1;
+        }
+    }
+    let mut col: usize = 0;
+    for c in text[start..end].chars() {
+        col += if (c as u32) > 65535 { 2 } else { 1 };
+    }
+    return (line, col);
+}
+
+/// Where `needle` occurs for the `n`th time in `text` (from 0).
+pub fn nth(text: str, needle: str, n: usize): Option::<usize> {
+    let mut from: usize = 0;
+    let mut k: usize = 0;
+    loop {
+        let i = text[from..].find(needle)?;
+        if k == n {
+            return Some(from + i);
+        }
+        k += 1;
+        from = from + i + 1;
+    }
+}
+
+fn find(hay: [u8; &], needle: str): Option::<usize> {
+    let n = needle.as_bytes();
+    if hay.len() < n.len() {
+        return None;
+    }
+    for i in 0..hay.len() - n.len() + 1 {
+        let mut same = true;
+        for k in 0..n.len() {
+            if hay[i + k] != n[k] {
+                same = false;
+                break;
+            }
+        }
+        if same {
+            return Some(i);
+        }
+    }
+    return None;
+}
+
+fn content_length(head: str): usize {
+    for line in head.lines() {
+        let l = line.trim();
+        if l.starts_with("Content-Length:") {
+            if let Some(n) = l[15..].trim().parse_i64() {
+                return n as usize;
+            }
+        }
+    }
+    panic("a message without Content-Length: {head}");
+}
