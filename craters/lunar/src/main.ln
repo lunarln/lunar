@@ -30,15 +30,20 @@
 mod cli;
 mod commands;
 mod compile;
+mod complete;
 #[cfg(test)]
 mod debuginfo_tests;
 mod explain;
 mod git;
 mod ide;
+#[cfg(test)]
+mod ide_tests;
 mod link;
 mod lsp;
 mod paths;
 mod project;
+mod refs;
+mod symbols;
 mod sysroot;
 mod testing;
 mod ui;

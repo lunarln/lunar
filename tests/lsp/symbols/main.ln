@@ -1,0 +1,40 @@
+/// Where things are.
+mod geometry {
+    pub struct Vector {
+        pub dx: i32,
+        pub dy: i32,
+    }
+
+    impl Vector {
+        pub fn length2(&self): i32 {
+            return self.dx * self.dx + self.dy * self.dy;
+        }
+    }
+}
+
+enum Answer {
+    Yes,
+    No(i32),
+}
+
+trait Ask {
+    fn ask(&self): Answer;
+}
+
+const ANSWER: i32 = 42;
+
+fn scale(value: i32, factor: i32): i32 {
+    return value * factor;
+}
+
+fn main() {
+    let a = scale(2, 3);
+    let value = 4;
+    let b: i32 = scale(value, a);
+    let (c, d) = (1, true);
+    let mut names: [str; -..+] = [];
+    names.push("x");
+    let v = geometry::Vector { dx: 1, dy: 2 };
+    let n = v.length2();
+    println("{a} {b} {c} {d} {n} {ANSWER}");
+}

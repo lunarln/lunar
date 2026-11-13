@@ -29,12 +29,16 @@ use std::io;
 use ln_ast::Span;
 use ln_json::{Json, Kind, Value};
 use ln_sema::codes;
+use ln_sema::defs::{DefData, DefId};
 use ln_sema::diag::{Diag, Severity, is_dummy};
 use ln_sema::loader::{CraterDep, Craters, Overlay, load_crate, path_key};
-use ln_sema::program::Program;
+use ln_sema::program::{Program, RefTarget};
 use ln_sema::sema::{Options, Sema, analyze};
+use crater::complete;
 use crater::git;
 use crater::ide;
+use crater::refs;
+use crater::symbols;
 use crater::paths::{absolute, canonical, join, normalize, parent};
 use crater::project::{Project, ProjectError, Target, find_project};
 use crater::sysroot;
@@ -51,11 +55,15 @@ pub fn serve(): i32 {
         }
     };
     let mut inp = Input { buf: [], pos: 0, eof: false };
-    if let Err(e) = initialize(&mut inp) {
-        eprintln("error: language server failed: {e}");
-        return 1;
-    }
-    let mut server = Server::new(std_dir);
+    let mut wire = Wire::stdout();
+    let snippets = match initialize(&mut wire, &mut inp) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln("error: language server failed: {e}");
+            return 1;
+        }
+    };
+    let mut server = Server::new(std_dir, wire, snippets);
     return match server.main_loop(&mut inp) {
         Ok(()) => 0,
         Err(e) => {
@@ -63,6 +71,21 @@ pub fn serve(): i32 {
             1
         }
     };
+}
+
+/// Run a whole session in process (for tests): `input` is what the client
+/// sends (framed messages), the result what the server answered, or why
+/// it failed.
+pub fn serve_script(input: str, std_dir: str): Result::<String, String> {
+    let mut inp = Input { buf: [], pos: 0, eof: true };
+    inp.buf.extend(input.as_bytes());
+    let mut wire = Wire { capture: true, buf: String::new() };
+    let snippets = initialize(&mut wire, &mut inp)?;
+    let mut server = Server::new(String::from(std_dir), wire, snippets);
+    let r = server.main_loop(&mut inp);
+    let out = core::mem::replace(&mut server.st.wire.buf, String::new());
+    r?;
+    return Ok(out);
 }
 
 // ===================================================================== transport
@@ -256,8 +279,20 @@ fn lossy(b: [u8; &]): String {
     return out;
 }
 
+/// Where messages go: standard output, or (for tests) a buffer.
+pub struct Wire {
+    pub capture: bool,
+    pub buf: String,
+}
+
+impl Wire {
+    pub fn stdout(): Wire {
+        return Wire { capture: false, buf: String::new() };
+    }
+}
+
 /// Write a message (`jsonrpc` first, then the members of `v`).
-fn send(j: &Json, v: Value): Result::<(), String> {
+fn send(w: &mut +Wire, j: &Json, v: Value): Result::<(), String> {
     let mut body = String::from("{\"jsonrpc\":\"2.0\"");
     let mut m = j.first(v);
     while let Some(x) = m {
@@ -271,6 +306,10 @@ fn send(j: &Json, v: Value): Result::<(), String> {
     let mut msg = String::new();
     msg.write("Content-Length: {body.len()}\r\n\r\n");
     msg.push_str(body.as_str());
+    if w.capture {
+        w.buf.push_str(msg.as_str());
+        return Ok(());
+    }
     if !io::write_bytes(1, msg.as_bytes()) {
         return Err(String::from("cannot write to standard output"));
     }
@@ -349,7 +388,7 @@ fn is_exit(j: &Json): bool {
 }
 
 /// A response to the request `req`: its `result`, or an error.
-fn respond(req: &Json, out: &mut Json, result: Option::<Value>, error_code: i64, error: str): Result::<(), String> {
+fn respond(w: &mut +Wire, req: &Json, out: &mut Json, result: Option::<Value>, error_code: i64, error: str): Result::<(), String> {
     let m = out.object();
     let id = out.copy_from(req, req.get(req.root(), "id").unwrap());
     out.set(m, "id", id);
@@ -364,12 +403,14 @@ fn respond(req: &Json, out: &mut Json, result: Option::<Value>, error_code: i64,
             out.set(m, "error", e);
         }
     }
-    return send(out, m);
+    return send(w, out, m);
 }
 
 /// Wait for `initialize`, answer it with the server's capabilities, and
 /// wait for `initialized` (`lsp-server`'s `Connection::initialize`).
-fn initialize(inp: &mut Input): Result::<(), String> {
+/// Whether the client takes snippets in completions.
+fn initialize(w: &mut +Wire, inp: &mut Input): Result::<bool, String> {
+    let mut snippets = false;
     loop {
         let mut body = String::new();
         if let Got::End = read_message(inp, &mut body)? {
@@ -379,24 +420,24 @@ fn initialize(inp: &mut Input): Result::<(), String> {
         let kind = kind_of(&req).unwrap();
         let method = method_of(&req);
         if kind == MsgKind::Request && method == "initialize" {
+            if let Some(v) = req.path(req.root(), ["params", "capabilities", "textDocument", "completion", "completionItem", "snippetSupport"][..]) {
+                snippets = req.as_bool(v).unwrap_or(false);
+            }
             let mut out = Json::new();
-            // Full text synchronization, hover, go to definition.
-            let caps = out.object();
-            let t = out.bool(true);
-            out.set(caps, "definitionProvider", t);
-            let t = out.bool(true);
-            out.set(caps, "hoverProvider", t);
-            let full = out.int(1);
-            out.set(caps, "textDocumentSync", full);
+            let caps = capabilities(&mut out);
             let result = out.object();
             out.set(result, "capabilities", caps);
-            respond(&req, &mut out, Some(result), 0, "")?;
+            let info = out.object();
+            let name = out.string("lunar");
+            out.set(info, "name", name);
+            out.set(result, "serverInfo", info);
+            respond(w, &req, &mut out, Some(result), 0, "")?;
             break;
         }
         if kind == MsgKind::Request {
             let mut out = Json::new();
             let msg = core::fmt::format("expected initialize request, got request `{method}`");
-            respond(&req, &mut out, None, -32002, msg.as_str())?;
+            respond(w, &req, &mut out, None, -32002, msg.as_str())?;
             continue;
         }
         if kind == MsgKind::Notification && method != "exit" {
@@ -410,9 +451,114 @@ fn initialize(inp: &mut Input): Result::<(), String> {
     }
     let n = parse_message(body.as_str())?;
     if kind_of(&n) == Some(MsgKind::Notification) && method_of(&n) == "initialized" {
-        return Ok(());
+        return Ok(snippets);
     }
     return Err(core::fmt::format("expected initialized notification, got: {body}"));
+}
+
+/// What the server can do: full text synchronization, hover, go to
+/// definition, completion, signature help, references, highlights,
+/// renaming, semantic tokens, symbols, inlay hints and quick fixes.
+fn capabilities(out: &mut +Json): Value {
+    let caps = out.object();
+    let t = out.bool(true);
+    out.set(caps, "definitionProvider", t);
+    let t = out.bool(true);
+    out.set(caps, "hoverProvider", t);
+    let full = out.int(1);
+    out.set(caps, "textDocumentSync", full);
+    // Completion, on `.` and `:` (the second of `::`) too.
+    let comp = out.object();
+    let triggers = out.array();
+    let dot = out.string(".");
+    out.push(triggers, dot);
+    let colon = out.string(":");
+    out.push(triggers, colon);
+    out.set(comp, "triggerCharacters", triggers);
+    let t = out.bool(true);
+    out.set(comp, "resolveProvider", t);
+    out.set(caps, "completionProvider", comp);
+    let sig = out.object();
+    let st = out.array();
+    let open = out.string("(");
+    out.push(st, open);
+    let comma = out.string(",");
+    out.push(st, comma);
+    out.set(sig, "triggerCharacters", st);
+    let rt = out.array();
+    let comma = out.string(",");
+    out.push(rt, comma);
+    out.set(sig, "retriggerCharacters", rt);
+    out.set(caps, "signatureHelpProvider", sig);
+    let t = out.bool(true);
+    out.set(caps, "referencesProvider", t);
+    let t = out.bool(true);
+    out.set(caps, "documentHighlightProvider", t);
+    let rn = out.object();
+    let t = out.bool(true);
+    out.set(rn, "prepareProvider", t);
+    out.set(caps, "renameProvider", rn);
+    let t = out.bool(true);
+    out.set(caps, "documentSymbolProvider", t);
+    let t = out.bool(true);
+    out.set(caps, "workspaceSymbolProvider", t);
+    let t = out.bool(true);
+    out.set(caps, "inlayHintProvider", t);
+    let ca = out.object();
+    let kinds = out.array();
+    let qf = out.string("quickfix");
+    out.push(kinds, qf);
+    out.set(ca, "codeActionKinds", kinds);
+    out.set(caps, "codeActionProvider", ca);
+    // Semantic tokens: whole documents (with deltas) and ranges.
+    let sem = out.object();
+    let legend = out.object();
+    let types = out.array();
+    for t in symbols::token_types() {
+        let v = out.string(t);
+        out.push(types, v);
+    }
+    out.set(legend, "tokenTypes", types);
+    let mods = out.array();
+    for m in symbols::token_modifiers() {
+        let v = out.string(m);
+        out.push(mods, v);
+    }
+    out.set(legend, "tokenModifiers", mods);
+    out.set(sem, "legend", legend);
+    let fullo = out.object();
+    let t = out.bool(true);
+    out.set(fullo, "delta", t);
+    out.set(sem, "full", fullo);
+    let t = out.bool(true);
+    out.set(sem, "range", t);
+    out.set(caps, "semanticTokensProvider", sem);
+    return caps;
+}
+
+/// Wait a few milliseconds.
+#[cfg(windows)]
+fn nap() {
+    unsafe {
+        Sleep(4);
+    }
+}
+
+#[cfg(windows)]
+extern "C" {
+    fn Sleep(ms: u32);
+}
+
+#[cfg(not(windows))]
+fn nap() {
+    unsafe {
+        usleep(4000);
+    }
+}
+
+#[cfg(not(windows))]
+extern "C" {
+    fn usleep(us: u32): i32;
 }
 
 // ===================================================================== analyses
@@ -425,11 +571,13 @@ struct Analysis {
     ok: bool,
     /// It is a standard library source tree, whose files are the user's.
     std_tree: bool,
+    /// Its declarations, indexed when completion first needs them.
+    idx: ide::DeclIndex,
 }
 
 /// No analysis.
 fn empty_analysis(): Analysis {
-    return Analysis { s: Sema::new(Program::new(), Craters::new(), Options::host(false)), ok: false, std_tree: false };
+    return Analysis { s: Sema::new(Program::new(), Craters::new(), Options::host(false)), ok: false, std_tree: false, idx: ide::DeclIndex::new() };
 }
 
 /// Analyze `root` as the crater it is in its package (`src/main.ln`,
@@ -603,14 +751,14 @@ fn finish_analysis(p: Program, cs: Craters, std_dir: String, std_tree: bool): An
                 let m = p.sym(core::fmt::format("standard library crater `{n}` not found at {root}").as_str());
                 p.diags.error(codes::build::IO(), ln_sema::diag::dummy_span(), m);
                 p.diags.finish();
-                return Analysis { s: Sema::new(p, cs, Options::host(false)), ok: false, std_tree };
+                return Analysis { s: Sema::new(p, cs, Options::host(false)), ok: false, std_tree, idx: ide::DeclIndex::new() };
             }
         }
     }
     let mut opts = Options::host(false);
     opts.keep_going = true;
     let s = analyze(p, cs, opts);
-    return Analysis { s, ok: true, std_tree };
+    return Analysis { s, ok: true, std_tree, idx: ide::DeclIndex::new() };
 }
 
 /// An analysis of files that could not all be read.
@@ -619,7 +767,7 @@ fn not_read(p: Program, cs: Craters, path: String): Analysis {
     let m = p.sym(core::fmt::format("could not read `{path}`").as_str());
     p.diags.error(codes::build::IO(), ln_sema::diag::dummy_span(), m);
     p.diags.finish();
-    return Analysis { s: Sema::new(p, cs, Options::host(false)), ok: false, std_tree: false };
+    return Analysis { s: Sema::new(p, cs, Options::host(false)), ok: false, std_tree: false, idx: ide::DeclIndex::new() };
 }
 
 /// The file and offset of a position in `path`, if `a` has the file.
@@ -768,6 +916,779 @@ impl Slots {
             _ => definition_in(&self.a3, st, file, offset, out),
         };
     }
+
+    /// `answer` with the analysis of slot `i`.
+    fn answer(&mut self, i: usize, st: &mut State, req: &Json, method: str, path: str, into: Option::<Value>, out: &mut Json): Result::<Value, String> {
+        return match i {
+            0 => answer(&mut self.a0, st, req, method, path, into, out),
+            1 => answer(&mut self.a1, st, req, method, path, into, out),
+            2 => answer(&mut self.a2, st, req, method, path, into, out),
+            _ => answer(&mut self.a3, st, req, method, path, into, out),
+        };
+    }
+}
+
+// ===================================================================== answers
+
+/// Requests answered from one analysis without re-analyzing first (with
+/// the document's current text).
+fn is_lazy(method: str): bool {
+    return method == "textDocument/completion" || method == "textDocument/signatureHelp";
+}
+
+fn is_document_request(method: str): bool {
+    let ms = ["textDocument/completion", "textDocument/signatureHelp", "textDocument/references", "textDocument/documentHighlight", "textDocument/prepareRename", "textDocument/rename", "textDocument/semanticTokens/full", "textDocument/semanticTokens/full/delta", "textDocument/semanticTokens/range", "textDocument/documentSymbol", "textDocument/inlayHint", "textDocument/codeAction"];
+    for m in ms {
+        if m == method {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The `line` and `character` of the request's `position`.
+fn request_position(req: &Json): Result::<(u32, u32), String> {
+    let pos = match req.path(req.root(), ["params", "position"][..]) {
+        Some(p) => p,
+        None => return Err(String::from("missing field `position`")),
+    };
+    return position_numbers(req, pos);
+}
+
+fn position_numbers(req: &Json, pos: Value): Result::<(u32, u32), String> {
+    let line = match req.get(pos, "line") {
+        Some(l) => req.as_u64(l),
+        None => None,
+    };
+    let character = match req.get(pos, "character") {
+        Some(c) => req.as_u64(c),
+        None => None,
+    };
+    if line.is_none() || character.is_none() || line.unwrap() > 4294967295 || character.unwrap() > 4294967295 {
+        return Err(String::from("invalid `position`: expected `line` and `character` numbers"));
+    }
+    return Ok((line.unwrap() as u32, character.unwrap() as u32));
+}
+
+/// The offsets (in `text`) of the request's `range`, or the whole text.
+fn request_range(req: &Json, text: str): Result::<(u32, u32), String> {
+    let r = match req.path(req.root(), ["params", "range"][..]) {
+        Some(r) => r,
+        None => return Ok((0, text.len() as u32)),
+    };
+    let (l0, c0) = match req.get(r, "start") {
+        Some(p) => position_numbers(req, p)?,
+        None => return Err(String::from("missing field `range.start`")),
+    };
+    let (l1, c1) = match req.get(r, "end") {
+        Some(p) => position_numbers(req, p)?,
+        None => return Err(String::from("missing field `range.end`")),
+    };
+    return Ok((ide::offset_of(text, l0, c0), ide::offset_of(text, l1, c1)));
+}
+
+/// An LSP range in `text` (a document's current text) from offsets.
+fn text_range(j: &mut Json, text: str, lo: u32, hi: u32): Value {
+    let (l0, c0) = ide::position_of(text, lo);
+    let (l1, c1) = ide::position_of(text, hi);
+    return range_of(j, l0, c0, l1, c1);
+}
+
+/// Answer `method` for the document at `path` from analysis `a`. The
+/// `lunar/...ByKey` methods add to `into` the uses, in this analysis, of
+/// what `st.ref_key` names; `workspace/symbol` adds its symbols to
+/// `into`; `completionItem/resolve` completes the item `into`.
+fn answer(a: &mut Analysis, st: &mut State, req: &Json, method: str, path: str, into: Option::<Value>, out: &mut Json): Result::<Value, String> {
+    if !a.ok {
+        return Ok(out.null());
+    }
+    if method == "workspace/symbol" {
+        let query = match req.path(req.root(), ["params", "query"][..]) {
+            Some(q) => String::from(req.as_str(q).unwrap_or("")),
+            None => String::new(),
+        };
+        let arr = into.unwrap();
+        let std_key = path_key(st.std_dir.as_str());
+        let mut found: [symbols::Found; ..+] = [];
+        symbols::workspace_symbols(&a.s.p, if a.std_tree { "" } else { std_key.as_str() }, query.as_str(), 256, &mut found);
+        for f in found {
+            let d = a.s.p.def(f.def);
+            if let Some(loc) = st.location(out, &a.s.p, d.span) {
+                let o = out.object();
+                let name = out.string(a.s.p.text(d.name));
+                out.set(o, "name", name);
+                let kind = out.uint(f.kind as u64);
+                out.set(o, "kind", kind);
+                out.set(o, "location", loc);
+                let container = a.s.p.path_of(d.module);
+                let c = out.string(container.as_str());
+                out.set(o, "containerName", c);
+                out.push(arr, o);
+            }
+        }
+        return Ok(arr);
+    }
+    let file = match ide::file_for_path(&a.s.p, path) {
+        Some(f) => f,
+        None => return Ok(out.null()),
+    };
+    let start = a.s.p.sources.files[file as usize].start;
+    if method == "completionItem/resolve" {
+        let item = into.unwrap();
+        let def = match out.path(item, ["data", "def"][..]) {
+            Some(d) => out.as_u64(d),
+            None => None,
+        };
+        let label = match out.get(item, "label") {
+            Some(l) => String::from(out.as_str(l).unwrap_or("")),
+            None => String::new(),
+        };
+        if let Some(d) = def {
+            if (d as usize) < a.s.p.defs.len() {
+                let id = DefId::new(d as usize);
+                let name = String::from(a.s.p.name(id));
+                if label.as_str() == name.as_str() || label.as_str().starts_with(name.as_str()) {
+                    let doc = complete::docs_of(&mut a.s, id);
+                    if doc.len() > 0 {
+                        let md = markdown(out, doc.as_str());
+                        out.set(item, "documentation", md);
+                    }
+                }
+            }
+        }
+        return Ok(item);
+    }
+    if method == "textDocument/completion" || method == "textDocument/signatureHelp" {
+        let (line, ch) = request_position(req)?;
+        let key = st.key_of(path);
+        let text = match st.docs.get(key) {
+            Some(t) => String::from(t),
+            None => String::from(a.s.p.sources.file_text(file)),
+        };
+        let cursor = ide::offset_of(text.as_str(), line, ch);
+        let cx = complete::context(&mut a.s, file, text.as_str(), cursor, st.snippets);
+        if method == "textDocument/signatureHelp" {
+            let sig = match complete::signature_help(&mut a.s, cx, text.as_str()) {
+                Some(s) => s,
+                None => return Ok(out.null()),
+            };
+            let res = out.object();
+            let sigs = out.array();
+            let so = out.object();
+            let l = out.string(sig.label.as_str());
+            out.set(so, "label", l);
+            if sig.doc.len() > 0 {
+                let md = markdown(out, sig.doc.as_str());
+                out.set(so, "documentation", md);
+            }
+            let ps = out.array();
+            for x in sig.params {
+                let (lo, hi) = x;
+                let po = out.object();
+                let lab = out.array();
+                let a0 = out.uint(lo as u64);
+                out.push(lab, a0);
+                let a1 = out.uint(hi as u64);
+                out.push(lab, a1);
+                out.set(po, "label", lab);
+                out.push(ps, po);
+            }
+            out.set(so, "parameters", ps);
+            out.push(sigs, so);
+            out.set(res, "signatures", sigs);
+            let z = out.uint(0);
+            out.set(res, "activeSignature", z);
+            let ap = out.uint(sig.active as u64);
+            out.set(res, "activeParameter", ap);
+            return Ok(res);
+        }
+        let mut items = complete::Items::new();
+        if a.idx.built {
+            items.idx = core::mem::replace(&mut a.idx, ide::DeclIndex::new());
+        } else {
+            items.idx = ide::DeclIndex::of(&a.s.craters, &a.s.p);
+        }
+        complete::complete(&mut a.s, cx, text.as_str(), &mut items);
+        a.idx = core::mem::replace(&mut items.idx, ide::DeclIndex::new());
+        // The best (by group, then as found) if there are very many; long
+        // lists leave documentation to `completionItem/resolve`.
+        let mut order: [u64; -..+] = [];
+        for i in 0..items.list.len() {
+            order.push(((items.list[i].sort as u64) << 32) | i as u64);
+        }
+        order.sort();
+        let limit: usize = 1000;
+        let mut incomplete = items.incomplete;
+        if order.len() > limit {
+            order.truncate(limit);
+            incomplete = true;
+        }
+        let with_docs = order.len() <= 200;
+        let res = out.object();
+        let inc = out.bool(incomplete);
+        out.set(res, "isIncomplete", inc);
+        let arr = out.array();
+        let range = text_range(out, text.as_str(), items.replace_lo, items.replace_hi);
+        let uri = st.uri_of(path);
+        for oi in order {
+            let i = (oi & 4294967295) as usize;
+            let it = items.list[i];
+            let o = out.object();
+            let l = out.string(items.label(i));
+            out.set(o, "label", l);
+            let k = out.uint(it.kind as u64);
+            out.set(o, "kind", k);
+            if items.detail(i).len() > 0 {
+                let d = out.string(items.detail(i));
+                out.set(o, "detail", d);
+            }
+            if with_docs && items.doc(i).len() > 0 {
+                let md = markdown(out, items.doc(i));
+                out.set(o, "documentation", md);
+            }
+            let mut sort = String::new();
+            sort.write("{it.sort}{items.label(i)}");
+            let so = out.string(sort.as_str());
+            out.set(o, "sortText", so);
+            let te = out.object();
+            let r = out.copy(range);
+            out.set(te, "range", r);
+            let nt = out.string(items.insert(i));
+            out.set(te, "newText", nt);
+            out.set(o, "textEdit", te);
+            if it.snippet {
+                let f = out.uint(2);
+                out.set(o, "insertTextFormat", f);
+            }
+            if it.def > 0 {
+                let data = out.object();
+                let u = out.string(uri.as_str());
+                out.set(data, "uri", u);
+                let d = out.uint((it.def - 1) as u64);
+                out.set(data, "def", d);
+                out.set(o, "data", data);
+            }
+            out.push(arr, o);
+        }
+        out.set(res, "items", arr);
+        return Ok(res);
+    }
+    let text = String::from(a.s.p.sources.file_text(file));
+    if method == "lunar/refsByKey" || method == "lunar/renameByKey" {
+        let into = into.unwrap();
+        let t = match find_key(&a.s.p, &st.ref_key) {
+            Some(t) => t,
+            None => return Ok(into),
+        };
+        if method == "lunar/refsByKey" {
+            let include = match req.path(req.root(), ["params", "context", "includeDeclaration"][..]) {
+                Some(v) => req.as_bool(v).unwrap_or(true),
+                None => true,
+            };
+            let mut fam: [RefTarget; ..+] = [];
+            refs::family(&a.s.p, t, &mut fam);
+            let mut us: [refs::Use; ..+] = [];
+            refs::uses(&a.s.p, fam[..], &mut us);
+            for u in us {
+                if u.decl && !include {
+                    continue;
+                }
+                if let Some(l) = st.location(out, &a.s.p, u.span) {
+                    out.push(into, l);
+                }
+            }
+        } else {
+            let new_name = new_name_of(req)?;
+            let mut edits = refs::Edits::new();
+            refs::rename_edits(&a.s.p, t, new_name.as_str(), &mut edits);
+            push_edits(st, &a.s.p, &edits, into, out);
+        }
+        return Ok(into);
+    }
+    if method == "textDocument/references" || method == "textDocument/documentHighlight" || method == "textDocument/prepareRename" || method == "textDocument/rename" {
+        let (line, ch) = request_position(req)?;
+        let offset = start + ide::offset_of(text.as_str(), line, ch);
+        let (span, t) = match ide::ref_at(&a.s.p, file, offset) {
+            Some(x) => x,
+            None => {
+                if method == "textDocument/prepareRename" || method == "textDocument/rename" {
+                    return Err(String::from("no name to rename here"));
+                }
+                return Ok(if method == "textDocument/references" || method == "textDocument/documentHighlight" { out.array() } else { out.null() });
+            }
+        };
+        let name = refs::target_name(&a.s.p, t);
+        // What other analyses of the same files call it.
+        st.ref_key = key_of_target(&a.s.p, t);
+        if method == "textDocument/references" {
+            let include = match req.path(req.root(), ["params", "context", "includeDeclaration"][..]) {
+                Some(v) => req.as_bool(v).unwrap_or(true),
+                None => true,
+            };
+            let arr = out.array();
+            let mut fam: [RefTarget; ..+] = [];
+            refs::family(&a.s.p, t, &mut fam);
+            let mut us: [refs::Use; ..+] = [];
+            refs::uses(&a.s.p, fam[..], &mut us);
+            for u in us {
+                if u.decl && !include {
+                    continue;
+                }
+                if let Some(l) = st.location(out, &a.s.p, u.span) {
+                    out.push(arr, l);
+                }
+            }
+            return Ok(arr);
+        }
+        if method == "textDocument/documentHighlight" {
+            let arr = out.array();
+            let mut fam: [RefTarget; ..+] = [];
+            refs::family(&a.s.p, t, &mut fam);
+            let mut us: [refs::Use; ..+] = [];
+            refs::uses(&a.s.p, fam[..], &mut us);
+            for u in us {
+                if !ide::in_file(&a.s.p, u.span, file) {
+                    continue;
+                }
+                let o = out.object();
+                let r = range_json(out, &a.s.p, u.span);
+                out.set(o, "range", r);
+                let k = out.uint(if u.decl { 3 } else { 2 });
+                out.set(o, "kind", k);
+                out.push(arr, o);
+            }
+            return Ok(arr);
+        }
+        let std_key = if a.std_tree { String::new() } else { path_key(st.std_dir.as_str()) };
+        if let Some(why) = refs::rename_refusal(&a.s.p, std_key.as_str(), t, name.as_str()) {
+            return Err(core::fmt::format("cannot rename `{name}`: {why}"));
+        }
+        if method == "textDocument/prepareRename" {
+            let res = out.object();
+            let ns = a.s.p.name_span(span, name.as_str());
+            let r = range_json(out, &a.s.p, ns);
+            out.set(res, "range", r);
+            let ph = out.string(name.as_str());
+            out.set(res, "placeholder", ph);
+            return Ok(res);
+        }
+        let new_name = new_name_of(req)?;
+        let arr = out.array();
+        let mut edits = refs::Edits::new();
+        refs::rename_edits(&a.s.p, t, new_name.as_str(), &mut edits);
+        push_edits(st, &a.s.p, &edits, arr, out);
+        return Ok(arr);
+    }
+    if method == "textDocument/semanticTokens/full" || method == "textDocument/semanticTokens/full/delta" || method == "textDocument/semanticTokens/range" {
+        let mut toks: [symbols::SemTok; ..+] = [];
+        symbols::semantic_tokens(&a.s.p, file, &mut toks);
+        let (lo, hi) = if method == "textDocument/semanticTokens/range" { request_range(req, text.as_str())? } else { (0, text.len() as u32) };
+        let mut data: [u32; -..+] = [];
+        symbols::encode_tokens(text.as_str(), toks[..], lo, hi, &mut data);
+        let res = out.object();
+        if method == "textDocument/semanticTokens/range" {
+            let arr = u32_array(out, data[..]);
+            out.set(res, "data", arr);
+            return Ok(res);
+        }
+        let key = st.key_of(path);
+        // A delta against what the client has, if it is what was sent.
+        let mut delta = false;
+        if method == "textDocument/semanticTokens/full/delta" {
+            let prev_id = match req.path(req.root(), ["params", "previousResultId"][..]) {
+                Some(v) => String::from(req.as_str(v).unwrap_or("")),
+                None => String::new(),
+            };
+            if let Some(i) = st.sem.find(key) {
+                let e = st.sem.list[i];
+                if core::fmt::format("{e.id}").as_str() == prev_id.as_str() {
+                    let prev = st.sem.data[e.lo as usize..e.hi as usize];
+                    let n0 = prev.len();
+                    let n1 = data.len();
+                    let mut p0: usize = 0;
+                    while p0 < n0 && p0 < n1 && prev[p0] == data[p0] {
+                        p0 += 1;
+                    }
+                    let mut s0: usize = 0;
+                    while s0 < n0 - p0 && s0 < n1 - p0 && prev[n0 - 1 - s0] == data[n1 - 1 - s0] {
+                        s0 += 1;
+                    }
+                    let edits = out.array();
+                    if p0 < n0 - s0 || p0 < n1 - s0 {
+                        let ed = out.object();
+                        let st0 = out.uint(p0 as u64);
+                        out.set(ed, "start", st0);
+                        let dc = out.uint((n0 - s0 - p0) as u64);
+                        out.set(ed, "deleteCount", dc);
+                        let d = u32_array(out, data[p0..n1 - s0]);
+                        out.set(ed, "data", d);
+                        out.push(edits, ed);
+                    }
+                    out.set(res, "edits", edits);
+                    delta = true;
+                }
+            }
+        }
+        if !delta {
+            let arr = u32_array(out, data[..]);
+            out.set(res, "data", arr);
+        }
+        let id = st.sem.put(key, data[..]);
+        let ids = core::fmt::format("{id}");
+        let idv = out.string(ids.as_str());
+        out.set(res, "resultId", idv);
+        return Ok(res);
+    }
+    if method == "textDocument/documentSymbol" {
+        let mut ol = symbols::Outline::new();
+        symbols::outline(&a.s.craters, &a.s.p, file, &mut ol);
+        let arr = out.array();
+        let mut objs: [Value; ..+] = [];
+        let mut kids: [Option::<Value>; ..+] = [];
+        for i in 0..ol.list.len() {
+            let sy = ol.list[i];
+            let o = out.object();
+            let n = out.string(ol.name(i));
+            out.set(o, "name", n);
+            if ol.detail(i).len() > 0 {
+                let d = out.string(ol.detail(i));
+                out.set(o, "detail", d);
+            }
+            let k = out.uint(sy.kind as u64);
+            out.set(o, "kind", k);
+            let r = range_json(out, &a.s.p, sy.range);
+            out.set(o, "range", r);
+            let sr = range_json(out, &a.s.p, sy.sel);
+            out.set(o, "selectionRange", sr);
+            objs.push(o);
+            kids.push(None);
+            if sy.parent == 0 {
+                out.push(arr, o);
+            } else {
+                let pi = (sy.parent - 1) as usize;
+                let c = match kids[pi] {
+                    Some(c) => c,
+                    None => {
+                        let c = out.array();
+                        out.set(objs[pi], "children", c);
+                        kids[pi] = Some(c);
+                        c
+                    }
+                };
+                out.push(c, o);
+            }
+        }
+        return Ok(arr);
+    }
+    if method == "textDocument/inlayHint" {
+        let (lo, hi) = request_range(req, text.as_str())?;
+        let mut hs = symbols::Hints::new();
+        symbols::inlay_hints(&mut a.s, file, start + lo, start + hi, &mut hs);
+        let arr = out.array();
+        for i in 0..hs.list.len() {
+            let h = hs.list[i];
+            let o = out.object();
+            let (l, c) = ide::position_of(text.as_str(), h.at - start);
+            let pos = position_json(out, l, c);
+            out.set(o, "position", pos);
+            let lab = out.string(hs.label(i));
+            out.set(o, "label", lab);
+            let k = out.uint(if h.is_type { 1 } else { 2 });
+            out.set(o, "kind", k);
+            if !h.is_type {
+                let t = out.bool(true);
+                out.set(o, "paddingRight", t);
+            }
+            out.push(arr, o);
+        }
+        return Ok(arr);
+    }
+    if method == "textDocument/codeAction" {
+        let (lo, hi) = request_range(req, text.as_str())?;
+        let arr = out.array();
+        let uri = st.uri_of(path);
+        for d in a.s.p.diags.list {
+            if d.suggestions.len() == 0 || is_dummy(d.span) {
+                continue;
+            }
+            let ds = a.s.p.source_span(d.span);
+            if a.s.p.sources.file_of(ds.lo) != file || ds.hi < start + lo || ds.lo > start + hi {
+                continue;
+            }
+            let sugs = a.s.p.diags.suggestions.list(d.suggestions).to_grow();
+            for sg in sugs[..] {
+                let sp = match a.s.p.origin(sg.span) {
+                    Some(x) => x,
+                    None => continue,
+                };
+                if !ide::in_file(&a.s.p, sp, file) && !(sp.lo == sp.hi && a.s.p.sources.file_of(sp.lo) == file) {
+                    continue;
+                }
+                let o = out.object();
+                let title = out.string(a.s.p.text(sg.title));
+                out.set(o, "title", title);
+                let kind = out.string("quickfix");
+                out.set(o, "kind", kind);
+                let diags = out.array();
+                let dj = st.lsp_diag(out, &a.s.p, d);
+                out.push(diags, dj);
+                out.set(o, "diagnostics", diags);
+                let pref = out.bool(sugs.len() == 1);
+                out.set(o, "isPreferred", pref);
+                // The fix may be in another file than the diagnostic.
+                let loc = match st.location(out, &a.s.p, sp) {
+                    Some(l) => l,
+                    None => continue,
+                };
+                let fix_uri = match out.get(loc, "uri") {
+                    Some(u) => String::from(out.as_str(u).unwrap_or(uri.as_str())),
+                    None => String::from(uri.as_str()),
+                };
+                let edit = out.object();
+                let changes = out.object();
+                let list = out.array();
+                let te = out.object();
+                let r = range_json(out, &a.s.p, sp);
+                out.set(te, "range", r);
+                let nt = out.string(a.s.p.text(sg.text));
+                out.set(te, "newText", nt);
+                out.push(list, te);
+                out.set(changes, fix_uri.as_str(), list);
+                out.set(edit, "changes", changes);
+                out.set(o, "edit", edit);
+                out.push(arr, o);
+            }
+        }
+        return Ok(arr);
+    }
+    return Ok(out.null());
+}
+
+/// `params.newName`, if it can name something.
+fn new_name_of(req: &Json): Result::<String, String> {
+    let n = match req.path(req.root(), ["params", "newName"][..]) {
+        Some(v) => String::from(req.as_str(v).unwrap_or("")),
+        None => return Err(String::from("missing field `newName`")),
+    };
+    if !refs::valid_name(n.as_str()) {
+        return Err(core::fmt::format("`{n}` is not a valid name"));
+    }
+    return Ok(n);
+}
+
+/// Rename edits as `{ uri, range, newText }` objects, into `arr`.
+fn push_edits(st: &State, p: &Program, edits: &refs::Edits, arr: Value, out: &mut Json) {
+    for i in 0..edits.list.len() {
+        let e = edits.list[i];
+        if let Some(l) = st.location(out, p, e.span) {
+            let o = out.object();
+            if let Some(u) = out.get(l, "uri") {
+                let uv = out.copy(u);
+                out.set(o, "uri", uv);
+            }
+            if let Some(r) = out.get(l, "range") {
+                let rv = out.copy(r);
+                out.set(o, "range", rv);
+            }
+            let t = out.string(edits.text_of(i));
+            out.set(o, "newText", t);
+            out.push(arr, o);
+        }
+    }
+}
+
+/// Drop repeated entries of array `arr` (the same location, or the same
+/// edit), keeping the first.
+fn dedupe_by(out: &mut Json, arr: Value, _edits: bool) {
+    let mut seen: [u32; ..+] = [];
+    let mut texts = String::new();
+    let mut ends: [u32; ..+] = [];
+    let mut keep: [Value; ..+] = [];
+    let mut m = out.first(arr);
+    while let Some(x) = m {
+        let s = out.to_string(x);
+        let mut dup = false;
+        let mut lo: u32 = 0;
+        for k in 0..ends.len() {
+            if texts.as_str()[lo as usize..ends[k] as usize] == s.as_str() {
+                dup = true;
+                break;
+            }
+            lo = ends[k];
+        }
+        if !dup {
+            texts.push_str(s.as_str());
+            ends.push(texts.len() as u32);
+            keep.push(x);
+            seen.push(0);
+        }
+        m = out.next(x);
+    }
+    out.clear(arr);
+    for x in keep {
+        out.push(arr, x);
+    }
+}
+
+/// A `WorkspaceEdit` from `{ uri, range, newText }` objects.
+fn workspace_edit(out: &mut Json, flat: Value): Value {
+    let changes = out.object();
+    let mut uris = String::new();
+    let mut ends: [u32; ..+] = [];
+    let mut lists: [Value; ..+] = [];
+    let mut m = out.first(flat);
+    while let Some(x) = m {
+        m = out.next(x);
+        let u = match out.get(x, "uri") {
+            Some(u) => String::from(out.as_str(u).unwrap_or("")),
+            None => continue,
+        };
+        let mut at: Option::<usize> = None;
+        let mut lo: u32 = 0;
+        for k in 0..ends.len() {
+            if uris.as_str()[lo as usize..ends[k] as usize] == u.as_str() {
+                at = Some(k);
+                break;
+            }
+            lo = ends[k];
+        }
+        let list = match at {
+            Some(k) => lists[k],
+            None => {
+                let l = out.array();
+                out.set(changes, u.as_str(), l);
+                uris.push_str(u.as_str());
+                ends.push(uris.len() as u32);
+                lists.push(l);
+                l
+            }
+        };
+        let te = out.object();
+        if let Some(r) = out.get(x, "range") {
+            let rv = out.copy(r);
+            out.set(te, "range", rv);
+        }
+        if let Some(t) = out.get(x, "newText") {
+            let tv = out.copy(t);
+            out.set(te, "newText", tv);
+        }
+        out.push(list, te);
+    }
+    let edit = out.object();
+    out.set(edit, "changes", changes);
+    return edit;
+}
+
+fn u32_array(out: &mut Json, data: [u32; &]): Value {
+    let arr = out.array();
+    for x in data {
+        let v = out.uint(x as u64);
+        out.push(arr, v);
+    }
+    return arr;
+}
+
+/// Markdown content.
+fn markdown(out: &mut Json, text: str): Value {
+    let o = out.object();
+    let k = out.string("markdown");
+    out.set(o, "kind", k);
+    let v = out.string(text);
+    out.set(o, "value", v);
+    return o;
+}
+
+/// How another analysis of the same files finds target `t`: by where its
+/// name is declared (definitions and fields; locals stay in one crate).
+fn key_of_target(p: &Program, t: RefTarget): RefKey {
+    let (span, field) = match t {
+        RefTarget::Def(d) => (p.def(d).span, false),
+        RefTarget::Field { .. } => match refs::decl_span(p, t) {
+            Some(s) => (s, true),
+            None => return RefKey::none(),
+        },
+        _ => return RefKey::none(),
+    };
+    if is_dummy(span) || p.sources.files.len() == 0 {
+        return RefKey::none();
+    }
+    let f = p.sources.files[p.sources.file_of(span.lo) as usize];
+    if f.expansion_site.is_some() {
+        return RefKey::none();
+    }
+    return RefKey { valid: true, field, path: path_key(p.text(f.name)), lo: span.lo - f.start, name: refs::target_name(p, t) };
+}
+
+/// What `key` names in `p`.
+fn find_key(p: &Program, key: &RefKey): Option::<RefTarget> {
+    if !key.valid {
+        return None;
+    }
+    // The file first.
+    let mut file: Option::<u32> = None;
+    for i in 0..p.sources.files.len() {
+        let f = p.sources.files[i];
+        if f.expansion_site.is_none() && path_key(p.text(f.name)).as_str() == key.path.as_str() {
+            file = Some(i as u32);
+            break;
+        }
+    }
+    let file = file?;
+    let at = p.sources.files[file as usize].start + key.lo;
+    for i in 0..p.defs.len() {
+        let d = p.defs[i];
+        if !key.field {
+            if d.span.lo == at && p.text(d.name) == key.name.as_str() {
+                return Some(RefTarget::Def(DefId::new(i)));
+            }
+            continue;
+        }
+        if let DefData::Adt(adt) = d.data {
+            let vs = p.variants.list(adt.variants);
+            for vi in 0..vs.len() {
+                let fs = p.fields.list(vs[vi].fields);
+                for fi in 0..fs.len() {
+                    if fs[fi].span.lo == at && p.text(fs[fi].name) == key.name.as_str() {
+                        return Some(RefTarget::Field { adt: DefId::new(i), variant: vi as u32, field: fi as u32 });
+                    }
+                }
+            }
+        }
+    }
+    return None;
+}
+
+/// The other crate roots of the package whose library is rooted at
+/// `root`: its binary and test files (they depend on the library).
+fn package_dependents(st: &mut State, root: str, out: &mut +[Symbol; ..+]) {
+    let dir = match parent(root) {
+        Some(d) => d,
+        None => return,
+    };
+    if find_project(dir.as_str()).is_none() {
+        return;
+    }
+    let mut proj = Project::new();
+    if proj.find_workspace(dir.as_str()).is_err() || proj.resolve(false).is_err() {
+        return;
+    }
+    let key = match canonical(root) {
+        Ok(c) => path_key(c.as_str()),
+        Err(_) => path_key(root),
+    };
+    for i in 0..proj.members {
+        if !same_key(proj.lib_root(i), key.as_str()) {
+            continue;
+        }
+        if let Some(m) = proj.main_root(i) {
+            out.push(st.sym(m.as_str()));
+        }
+        let mut tests: [Symbol; ..+] = [];
+        proj.test_files(i, &mut tests);
+        for t in tests {
+            out.push(st.sym(proj.text(t)));
+        }
+    }
 }
 
 // ===================================================================== the server
@@ -854,9 +1775,105 @@ struct State {
     /// The URI the client used for each file it opened, by path key:
     /// replies must use its spelling or it will not know the document.
     uris: HashMap::<Symbol, Symbol>,
+    /// Where messages go.
+    wire: Wire,
+    /// The client takes snippets in completions.
+    snippets: bool,
+    /// The semantic tokens last sent for each document (for deltas).
+    sem: SemCache,
+    /// What the last references or rename request was about, to find it
+    /// in the analyses of other crates.
+    ref_key: RefKey,
+}
+
+/// A definition or field, as other analyses of the same files know it: the
+/// path key of its file, the offset of its name there, and the name.
+struct RefKey {
+    valid: bool,
+    field: bool,
+    path: String,
+    lo: u32,
+    name: String,
+}
+
+impl RefKey {
+    fn none(): RefKey {
+        return RefKey { valid: false, field: false, path: String::new(), lo: 0, name: String::new() };
+    }
+}
+
+/// The semantic tokens last sent per document: its key, the result id,
+/// and the data (in `data`).
+struct SemCache {
+    list: [SemEntry; -..+],
+    data: [u32; -..+],
+    dead: usize,
+    next_id: u32,
+}
+
+struct SemEntry {
+    key: Symbol,
+    id: u32,
+    lo: u32,
+    hi: u32,
+}
+
+impl SemCache {
+    fn find(&self, key: Symbol): Option::<usize> {
+        for i in 0..self.list.len() {
+            if self.list[i].key == key {
+                return Some(i);
+            }
+        }
+        return None;
+    }
+
+    /// Keep `data` as the tokens of `key`: their result id.
+    fn put(&mut self, key: Symbol, data: [u32; &]): u32 {
+        if let Some(i) = self.find(key) {
+            let e = self.list[i];
+            self.dead += (e.hi - e.lo) as usize;
+            let last = self.list.len() - 1;
+            self.list[i] = self.list[last];
+            self.list.pop();
+        }
+        if self.dead > 1048576 && self.dead * 2 > self.data.len() {
+            let mut fresh: [u32; -..+] = [];
+            for i in 0..self.list.len() {
+                let e = self.list[i];
+                let lo = fresh.len() as u32;
+                fresh.extend(self.data[e.lo as usize..e.hi as usize]);
+                self.list[i] = SemEntry { key: e.key, id: e.id, lo, hi: fresh.len() as u32 };
+            }
+            self.data = fresh;
+            self.dead = 0;
+        }
+        self.next_id += 1;
+        let lo = self.data.len() as u32;
+        self.data.extend(data);
+        self.list.push(SemEntry { key, id: self.next_id, lo, hi: self.data.len() as u32 });
+        return self.next_id;
+    }
 }
 
 impl State {
+    /// A state with nothing in it (to stand in while the real one is lent).
+    fn blank(): State {
+        return State {
+            std_dir: String::new(),
+            names: Interner::new(),
+            docs: Docs { text: String::new(), list: [], dead: 0 },
+            crates: HashMap::new(),
+            file_root: HashMap::new(),
+            published: [],
+            uris: HashMap::new(),
+            wire: Wire::stdout(),
+            snippets: false,
+            sem: SemCache { list: [], data: [], dead: 0, next_id: 0 },
+            ref_key: RefKey::none(),
+        };
+    }
+
     fn sym(&mut +self, s: str): Symbol {
         return self.names.intern(s);
     }
@@ -972,7 +1989,8 @@ impl State {
             if !keep.contains(p.uri) {
                 let mut j = Json::new();
                 let empty = j.array();
-                publish(&mut j, self.text(p.uri), empty)?;
+                let uri = String::from(self.text(p.uri));
+                publish(&mut self.wire, &mut j, uri.as_str(), empty)?;
             }
             let last = self.published.len() - 1;
             self.published[i] = self.published[last];
@@ -1109,7 +2127,7 @@ struct Located {
 }
 
 impl Server {
-    fn new(std_dir: String): Server {
+    fn new(std_dir: String, kept wire: Wire, snippets: bool): Server {
         return Server {
             st: State {
                 std_dir,
@@ -1119,6 +2137,10 @@ impl Server {
                 file_root: HashMap::new(),
                 published: [],
                 uris: HashMap::new(),
+                wire,
+                snippets,
+                sem: SemCache { list: [], data: [], dead: 0, next_id: 0 },
+                ref_key: RefKey::none(),
             },
             slots: Slots {
                 a0: empty_analysis(),
@@ -1133,6 +2155,8 @@ impl Server {
     }
 
     fn main_loop(&mut self, inp: &mut Input): Result::<(), String> {
+        // Files changed since their crates were last analyzed.
+        let mut dirty: [Symbol; -..+] = [];
         loop {
             // Everything already waiting is handled before re-analyzing.
             let mut texts = String::new();
@@ -1161,11 +2185,10 @@ impl Server {
                         break;
                     }
                 }
-                if !inp.has_message() && !io::input_available(0) {
+                if !inp.has_message() && (inp.eof || !io::input_available(0)) {
                     break;
                 }
             }
-            let mut dirty: [Symbol; -..+] = [];
             let mut k: usize = 0;
             while k < batch.len() {
                 let (lo, hi) = batch[k];
@@ -1176,7 +2199,7 @@ impl Server {
                     if method_of(&msg) == "shutdown" {
                         let mut out = Json::new();
                         let null = out.null();
-                        respond(&msg, &mut out, Some(null), 0, "")?;
+                        respond(&mut self.st.wire, &msg, &mut out, Some(null), 0, "")?;
                         // The next message must be `exit`.
                         let mut next = String::new();
                         if k < batch.len() {
@@ -1197,9 +2220,13 @@ impl Server {
                         }
                         return Err(core::fmt::format("unexpected message during shutdown: {next}"));
                     }
-                    // Answer against up-to-date analyses.
-                    self.reanalyze(dirty[..])?;
-                    dirty.clear();
+                    // Answer against up-to-date analyses; completion and
+                    // signature help do with the last one of the crate (and
+                    // the current text), so typing does not wait.
+                    if !(is_lazy(method_of(&msg)) && self.analyzed(&msg)) {
+                        self.reanalyze(dirty[..])?;
+                        dirty.clear();
+                    }
                     self.request(&msg)?;
                 } else if kind == MsgKind::Notification {
                     if let Some(path) = self.notification(&msg)? {
@@ -1209,7 +2236,20 @@ impl Server {
                     }
                 }
             }
+            // While typing goes on (or a request about it is on its way),
+            // wait with the analysis: a moment without input first.
+            if dirty.len() > 0 && !inp.eof && !failed && !ended {
+                let mut waited = 0;
+                while waited < 8 && !inp.has_message() && !io::input_available(0) {
+                    nap();
+                    waited += 1;
+                }
+                if inp.has_message() || io::input_available(0) {
+                    continue;
+                }
+            }
             self.reanalyze(dirty[..])?;
+            dirty.clear();
             if failed {
                 return Err(failure);
             }
@@ -1400,7 +2440,7 @@ impl Server {
                     j.push(list, v);
                 }
             }
-            publish(&mut j, uri.as_str(), list)?;
+            publish(&mut self.st.wire, &mut j, uri.as_str(), list)?;
             let us = self.st.sym(uri.as_str());
             now.push(us);
         }
@@ -1416,28 +2456,205 @@ impl Server {
 
     fn request(&mut self, req: &Json): Result::<(), String> {
         let method = String::from(method_of(req));
+        let m = method.as_str();
         let mut out = Json::new();
         let params = req.get(req.root(), "params");
-        if method.as_str() == "textDocument/hover" {
-            return match self.hover(req, params, &mut out) {
-                Ok(v) => respond(req, &mut out, Some(v), 0, ""),
-                Err(e) => respond(req, &mut out, None, -32602, e.as_str()),
+        let r = if m == "textDocument/hover" {
+            self.hover(req, params, &mut out)
+        } else if m == "textDocument/definition" {
+            self.definition(req, params, &mut out)
+        } else if m == "lunar/stdSource" {
+            self.st.std_source(req, params, &mut out)
+        } else if m == "workspace/symbol" {
+            self.workspace_symbol(req, &mut out)
+        } else if m == "completionItem/resolve" {
+            self.resolve_completion(req, &mut out)
+        } else if is_document_request(m) {
+            self.document_request(req, m, &mut out)
+        } else {
+            let msg = core::fmt::format("unsupported request `{method}`");
+            return respond(&mut self.st.wire, req, &mut out, None, -32601, msg.as_str());
+        };
+        return match r {
+            Ok(v) => respond(&mut self.st.wire, req, &mut out, Some(v), 0, ""),
+            Err(e) => respond(&mut self.st.wire, req, &mut out, None, -32602, e.as_str()),
+        };
+    }
+
+    /// Whether the analysis of the document of `msg` (a request) is kept.
+    fn analyzed(&mut self, msg: &Json): bool {
+        let uri = match msg.path(msg.root(), ["params", "textDocument", "uri"][..]) {
+            Some(u) => String::from(msg.as_str(u).unwrap_or("")),
+            None => return false,
+        };
+        let path = match to_path(uri.as_str()) {
+            Some(p) => p,
+            None => return false,
+        };
+        let key = self.st.key_of(path.as_str());
+        return match self.st.file_root.get(key) {
+            Some(r) => self.slots.slot_of(r).is_some(),
+            None => false,
+        };
+    }
+
+    /// The analysis (slot) of a document and its path, analyzing its crate
+    /// again if its analysis is not kept.
+    fn locate_doc(&mut self, uri: str): Result::<Option::<(usize, String)>, String> {
+        if uri.starts_with("lunar-std:") {
+            let module = std_module_of(uri);
+            let path = match self.st.std_file_of(module.as_str()) {
+                Some(p) => p,
+                None => return Ok(None),
             };
+            for i in 0..4 {
+                if self.slots.roots[i].is_none() || !self.slots.ok(i) {
+                    continue;
+                }
+                if self.slots.find(i, path.as_str(), 0, 0).is_some() {
+                    self.slots.touch(i);
+                    return Ok(Some((i, path)));
+                }
+            }
+            return Ok(None);
         }
-        if method.as_str() == "textDocument/definition" {
-            return match self.definition(req, params, &mut out) {
-                Ok(v) => respond(req, &mut out, Some(v), 0, ""),
-                Err(e) => respond(req, &mut out, None, -32602, e.as_str()),
-            };
+        let path = match to_path(uri) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let key = self.st.key_of(path.as_str());
+        let root = match self.st.file_root.get(key) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let slot = match self.slots.slot_of(root) {
+            Some(i) => i,
+            None => match self.st.crates.get(root) {
+                Some(rp) => self.analyze_root(rp)?,
+                None => return Ok(None),
+            },
+        };
+        self.slots.touch(slot);
+        return Ok(Some((slot, path)));
+    }
+
+    /// A request about a document (`textDocument/...`).
+    fn document_request(&mut self, req: &Json, method: str, out: &mut Json): Result::<Value, String> {
+        let uri = match req.path(req.root(), ["params", "textDocument", "uri"][..]) {
+            Some(u) => match req.as_str(u) {
+                Some(s) => String::from(s),
+                None => return Err(String::from("invalid type: expected a string for `textDocument.uri`")),
+            },
+            None => return Err(String::from("missing field `textDocument`")),
+        };
+        let (slot, path) = match self.locate_doc(uri.as_str())? {
+            Some(x) => x,
+            None => {
+                return Ok(if method == "textDocument/references" || method == "textDocument/documentHighlight" || method == "textDocument/documentSymbol" || method == "textDocument/inlayHint" || method == "textDocument/codeAction" {
+                    out.array()
+                } else {
+                    out.null()
+                });
+            }
+        };
+        self.st.ref_key = RefKey::none();
+        let v = self.ask(slot, req, method, path.as_str(), None, out)?;
+        if method == "textDocument/references" || method == "textDocument/rename" {
+            if self.st.ref_key.valid {
+                self.dependents(slot, req, method, path.as_str(), v, out)?;
+            }
+            dedupe_by(out, v, method == "textDocument/rename");
+            if method == "textDocument/rename" {
+                return Ok(workspace_edit(out, v));
+            }
         }
-        if method.as_str() == "lunar/stdSource" {
-            return match self.st.std_source(req, params, &mut out) {
-                Ok(v) => respond(req, &mut out, Some(v), 0, ""),
-                Err(e) => respond(req, &mut out, None, -32602, e.as_str()),
-            };
+        return Ok(v);
+    }
+
+    /// For references and renaming: the uses in the other crates of the
+    /// package that depend on the document's crate (its binary and tests,
+    /// for a library), appended to `into`.
+    fn dependents(&mut self, slot: usize, req: &Json, method: str, path: str, into: Value, out: &mut Json): Result::<(), String> {
+        let root_key = match self.slots.roots[slot] {
+            Some(k) => k,
+            None => return Ok(()),
+        };
+        let root = match self.st.crates.get(root_key) {
+            Some(r) => String::from(self.st.text(r)),
+            None => return Ok(()),
+        };
+        let mut others: [Symbol; ..+] = [];
+        package_dependents(&mut self.st, root.as_str(), &mut others);
+        let extra = if method == "textDocument/references" { "lunar/refsByKey" } else { "lunar/renameByKey" };
+        for r in others {
+            let rk = self.st.key_of(self.st.text(r));
+            if rk == root_key {
+                continue;
+            }
+            match self.slots.slot_of(rk) {
+                Some(i) => {
+                    self.ask(i, req, extra, path, Some(into), out)?;
+                }
+                None => {
+                    let ov = self.st.overlay();
+                    let rp = String::from(self.st.text(r));
+                    let mut a = analyze_in_project(ov, String::from(self.st.std_dir.as_str()), rp);
+                    answer(&mut a, &mut self.st, req, extra, path, Some(into), out)?;
+                }
+            }
         }
-        let msg = core::fmt::format("unsupported request `{method}`");
-        return respond(req, &mut out, None, -32601, msg.as_str());
+        return Ok(());
+    }
+
+    /// `workspace/symbol`: matching definitions in every analysis kept.
+    fn workspace_symbol(&mut self, req: &Json, out: &mut Json): Result::<Value, String> {
+        let all = out.array();
+        for i in 0..4 {
+            if self.slots.roots[i].is_none() || !self.slots.ok(i) {
+                continue;
+            }
+            self.ask(i, req, "workspace/symbol", "", Some(all), out)?;
+        }
+        dedupe_by(out, all, false);
+        return Ok(all);
+    }
+
+    /// `completionItem/resolve`: the item, with its documentation.
+    fn resolve_completion(&mut self, req: &Json, out: &mut Json): Result::<Value, String> {
+        let item = match req.get(req.root(), "params") {
+            Some(p) => out.copy_from(req, p),
+            None => return Err(String::from("missing `params`")),
+        };
+        if out.get(item, "documentation").is_some() {
+            return Ok(item);
+        }
+        let uri = match out.path(item, ["data", "uri"][..]) {
+            Some(u) => String::from(out.as_str(u).unwrap_or("")),
+            None => return Ok(item),
+        };
+        let path = match to_path(uri.as_str()) {
+            Some(p) => p,
+            None => return Ok(item),
+        };
+        let key = self.st.key_of(path.as_str());
+        let slot = match self.st.file_root.get(key) {
+            Some(r) => match self.slots.slot_of(r) {
+                Some(i) => i,
+                None => return Ok(item),
+            },
+            None => return Ok(item),
+        };
+        self.ask(slot, req, "completionItem/resolve", path.as_str(), Some(item), out)?;
+        return Ok(item);
+    }
+
+    /// `answer` from the analysis of `slot` (the state is taken out of the
+    /// server for the call, as both are lent in-out).
+    fn ask(&mut self, slot: usize, req: &Json, method: str, path: str, into: Option::<Value>, out: &mut Json): Result::<Value, String> {
+        let mut st = core::mem::replace(&mut self.st, State::blank());
+        let r = self.slots.answer(slot, &mut st, req, method, path, into, out);
+        self.st = st;
+        return r;
     }
 
     fn hover(&mut self, req: &Json, params: Option::<Value>, out: &mut Json): Result::<Value, String> {
@@ -1562,7 +2779,7 @@ fn position(req: &Json, params: Option::<Value>): Result::<(String, u32, u32), S
 // ===================================================================== JSON
 
 /// `textDocument/publishDiagnostics` for `uri`.
-fn publish(j: &mut Json, uri: str, diagnostics: Value): Result::<(), String> {
+fn publish(w: &mut +Wire, j: &mut Json, uri: str, diagnostics: Value): Result::<(), String> {
     let m = j.object();
     let method = j.string("textDocument/publishDiagnostics");
     j.set(m, "method", method);
@@ -1571,7 +2788,7 @@ fn publish(j: &mut Json, uri: str, diagnostics: Value): Result::<(), String> {
     let u = j.string(uri);
     j.set(params, "uri", u);
     j.set(m, "params", params);
-    return send(j, m);
+    return send(w, j, m);
 }
 
 /// An LSP range for `span` (in its file).
@@ -1671,7 +2888,7 @@ fn hex_digit(c: u8): Option::<u8> {
 }
 
 /// A `file:` URI for `path`, encoded as the `url` crate encodes paths.
-fn uri_from_path(path: str): String {
+pub fn uri_from_path(path: str): String {
     let mut out = String::from("file://");
     let norm = normalize(path);
     if !norm.as_str().starts_with("/") {

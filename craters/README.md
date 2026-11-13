@@ -83,21 +83,48 @@ failed builds show no `lunar explain` hint.
 | `ln-toml`    | the `toml` and `toml_edit` crates | what manifests and lockfiles need: the whole TOML syntax, every key and value with its place in the text; `edit` sets and removes keys in place, keeping comments and layout as `toml_edit` does |
 | `ln-semver`  | the `semver` crate (1.0) | versions, requirements (`^`, `~`, `=`, `<`, `>`, wildcards, several comparators), matching with its pre-release rules, its display and error messages |
 | `ln-json`    | what the language server gets from `serde_json` | JSON documents as arenas of linked nodes: strict parsing (escapes, `\u` surrogate pairs, numbers kept as written), building, compact writing with serde_json's escapes; tests in `src/tests.ln` |
-| `lunar`      | `crates/ln-driver` | the `lunar` command (above): `cli.ln` (clap's parsing, help and errors), `commands.ln` (`main.rs`), `project.ln` and `git.ln` (`project.rs`), `compile.ln` (`lib.rs`), `explain.ln`, `link.ln`, `testing.ln`, `sysroot.ln`, and the language server, `lsp.ln` and `ide.ln` (below). Hidden modes for `selfhost.rs`: `--lex FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--render [--color] FILE...` the diagnostics drawn as `lunar check` draws them, `--craters DIR` the craters a package build loads |
+| `lunar`      | `crates/ln-driver` | the `lunar` command (above): `cli.ln` (clap's parsing, help and errors), `commands.ln` (`main.rs`), `project.ln` and `git.ln` (`project.rs`), `compile.ln` (`lib.rs`), `explain.ln`, `link.ln`, `testing.ln`, `sysroot.ln`, and the language server, `lsp.ln`, `ide.ln`, `complete.ln`, `refs.ln` and `symbols.ln` (below). Hidden modes for `selfhost.rs`: `--lex FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--render [--color] FILE...` the diagnostics drawn as `lunar check` draws them, `--craters DIR` the craters a package build loads |
 
 ### The language server
 
-`lunar lsp [--stdio]` (`lunar/src/{lsp,ide}.ln`, and `ln_ast::pretty` for
-declarations): `lsp-server`'s framing and lifecycle, full text
-synchronization, diagnostics as you type (for std itself too, when a file
-of a std source tree is open), hover with the Rust server's text, and go to
-definition. Open documents reach the loader as `Craters::overlay`. The
-standard library comes from the sysroot, so definitions in it are `file:`
-locations; `lunar-std:` URIs and `lunar/stdSource` still work. It keeps the
-analyses of the four crates used last and analyzes others again when asked
-about them. The LSP tests in `crates/ln-driver/tests` (`lang`, `project`,
-`hover`, `lsp_session`) run against it with `LUNAR_BIN`; `lsp_session`
-compares its answers with the Rust server's.
+`lunar lsp [--stdio]` (`lunar/src/lsp.ln` for the protocol; the queries in
+`ide.ln`, `complete.ln`, `refs.ln` and `symbols.ln`; `ln_ast::pretty` for
+declarations; `ln_sema::query` for the methods of a type):
+`lsp-server`'s framing and lifecycle, full text synchronization, and
+
+* diagnostics as you type (for std itself too, when a file of a std source
+  tree is open), with quick fixes (`textDocument/codeAction`) from the exact
+  suggestions diagnostics carry (`Diags::suggest`);
+* hover with the Rust server's text, and go to definition;
+* completion (`.` and `:` trigger it): locals in scope, items in scope and
+  through paths, fields and methods by the receiver's type (inherent and
+  trait methods, autoslicing), struct literal fields, `use` paths, keywords
+  by place, snippets for calls, each with its declaration and docs
+  (`completionItem/resolve` for long lists). It answers from the current
+  text and the crate's last analysis, without waiting for a new one: the
+  receiver's type is the expression the analysis typed at the same place,
+  else followed along the tokens (locals, paths, fields, method results,
+  indexing, `?`); see `complete.ln` for what is approximate;
+* signature help, with parameters as written (`&mut +T`, `kept`);
+* references and document highlights, and rename (with `prepareRename`):
+  locals, items, fields, methods (a trait method with its implementations)
+  and variants, across files and into the package's binary and tests for a
+  library; names in macro arguments count where they are written
+  (`Program::origins`); the standard library and keywords cannot be
+  renamed;
+* semantic tokens (full, delta and range), document symbols, workspace
+  symbols, and inlay hints (`let` types, parameter names).
+
+Open documents reach the loader as `Craters::overlay`. The standard library
+comes from the sysroot, so definitions in it are `file:` locations;
+`lunar-std:` URIs and `lunar/stdSource` still work. It keeps the analyses
+of the four crates used last and analyzes others again when asked about
+them; after changes it waits for a moment without input before analyzing
+again. The session scripts in `tests/lsp/` (at the root of the repository)
+test every feature: `lunar test -p lunar` replays them in process. The LSP
+tests in `crates/ln-driver/tests` (`lang`, `project`, `hover`,
+`lsp_session`) run against it with `LUNAR_BIN`; `lsp_session` compares its
+answers with the Rust server's.
 
 ## The passes
 
@@ -110,7 +137,7 @@ compares its answers with the Rust server's.
 | code generation | `crates/ln-codegen` | `ln-codegen/src/{lib,func,ops,init,llvm}.ln` | done; the state of the function being lowered (Rust's `FnCg`) lives in `Cg` |
 | debug information | (none in Rust) | `ln-codegen/src/debug.ln` | CodeView / DWARF through LLVM's DIBuilder: functions, lines, variables in lexical blocks, types |
 | driver | `crates/ln-driver` (all but `lsp.rs`, `ide.rs`) | `lunar/src/*.ln` | done; std and `docs/errors` are read from the sysroot, not embedded |
-| language server | `lsp.rs`, `ide.rs`, `ln-ast/src/pretty.rs` | `lunar/src/{lsp,ide}.ln`, `ln-ast/src/pretty.ln` | done; the same answers as the Rust server (`tests/lsp_session.rs`) |
+| language server | `lsp.rs`, `ide.rs`, `ln-ast/src/pretty.rs` | `lunar/src/{lsp,ide,complete,refs,symbols}.ln`, `ln-ast/src/pretty.ln`, `ln-sema/src/query.ln` | done, and beyond the Rust server: the same answers where both answer (`tests/lsp_session.rs`); completion, signature help, references, rename, semantic tokens, symbols, inlay hints and quick fixes (`tests/lsp/`) |
 
 ### Data model
 

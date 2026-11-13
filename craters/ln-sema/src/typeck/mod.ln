@@ -484,12 +484,24 @@ impl Sema {
             (TyKind::Array(_, k), TyKind::Array(_, k2)) => {
                 if k.is_slice() && !k2.is_slice() {
                     self.with_help("take a slice of the array with `[..]`");
+                    let (at, text) = self.p.postfix_edit(span, "[..]");
+                    self.suggest_fix(at, text.as_str(), "Take a slice with `[..]`");
                 } else if k.is_owner() && k2.is_owner() {
                     self.with_note("array kinds only convert implicitly when passed to a parameter");
                 }
             }
-            (TyKind::Str, TyKind::String) => self.with_help("use `.as_str()` to view a `String` as `str`"),
-            (TyKind::String, TyKind::Str) => self.with_help("use `String::from(...)` to build an owned `String`"),
+            (TyKind::Str, TyKind::String) => {
+                self.with_help("use `.as_str()` to view a `String` as `str`");
+                let (at, text) = self.p.postfix_edit(span, ".as_str()");
+                self.suggest_fix(at, text.as_str(), "View it with `.as_str()`");
+            }
+            (TyKind::String, TyKind::Str) => {
+                self.with_help("use `String::from(...)` to build an owned `String`");
+                if !is_dummy(span) && span.hi >= span.lo {
+                    let text = core::fmt::format("String::from({self.p.sources.snippet(span)})");
+                    self.suggest_fix(span, text.as_str(), "Build a `String` with `String::from`");
+                }
+            }
             (TyKind::Closure(..), TyKind::Closure(..)) => {
                 self.with_note("every closure has a type of its own, even when two are written alike");
                 if opaque {
@@ -1080,6 +1092,11 @@ impl Sema {
                     let mut h = String::new();
                     h.write("declare it `mut {n}` to change this function's own copy, or `{n}: &mut ...` to change the caller's");
                     self.with_help(h.as_str());
+                    if n.as_str() != "self" {
+                        let ns = self.p.name_span(sp, n.as_str());
+                        let title = core::fmt::format("Declare it `mut {n}`");
+                        self.suggest_fix(Span::new(ns.lo, ns.lo), "mut ", title.as_str());
+                    }
                 }
                 LocalKind::Param { .. } => {
                     let inner = self.p.types.strip_grow(local.ty);
@@ -1091,12 +1108,25 @@ impl Sema {
                     let mut h2 = String::new();
                     h2.write("or take ownership and change your own: `mut {n}: {ty}`");
                     self.with_help(h2.as_str());
+                    let ns = self.p.name_span(sp, n.as_str());
+                    if n.as_str() != "self" && ns != sp {
+                        let whole = Span::new(ns.lo, sp.hi);
+                        let a = core::fmt::format("{n}: &mut {ty}");
+                        let ta = core::fmt::format("Take it in-out: `{a}`");
+                        self.suggest_fix(whole, a.as_str(), ta.as_str());
+                        let b = core::fmt::format("mut {n}: {ty}");
+                        let tb = core::fmt::format("Take ownership: `{b}`");
+                        self.suggest_fix(whole, b.as_str(), tb.as_str());
+                    }
                 }
                 _ => {
                     self.error_at(codes::ty::IMMUTABLE(), span, m.as_str());
                     let mut h = String::new();
                     h.write("declare it with `let mut {n}`");
                     self.with_help(h.as_str());
+                    let ns = self.p.name_span(sp, n.as_str());
+                    let title = core::fmt::format("Declare it `mut {n}`");
+                    self.suggest_fix(Span::new(ns.lo, ns.lo), "mut ", title.as_str());
                 }
             }
             let mut s = String::new();

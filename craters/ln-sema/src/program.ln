@@ -172,6 +172,10 @@ pub struct Program {
     pub main: Option::<DefId>,
     pub tests: [DefId; ..+],
     pub refs: [Ref; ..+],
+    /// Where the tokens of macro expansions were written (editor tooling):
+    /// by a token's offset in its expansion file, the span of the token it
+    /// copies (in the invocation, or in the macro's body).
+    pub origins: HashMap::<u32, Span>,
     pub closures: HashMap::<DefId, ClosureInfo>,
     pub opaques: HashMap::<(DefId, u32), OpaqueInfo>,
     /// For each named function, which of its parameters the value it
@@ -217,6 +221,7 @@ impl Program {
             main: None,
             tests: [],
             refs: [],
+            origins: HashMap::new(),
             closures: HashMap::new(),
             opaques: HashMap::new(),
             ret_from: HashMap::new(),
@@ -648,6 +653,153 @@ impl Program {
         return out;
     }
 
+    /// The identifier `name` inside `span` (the span of a declaration such
+    /// as `mut x`, `kept s: str` or `x: i32`): its first occurrence as a
+    /// whole word, or `span` itself if it is not there.
+    pub fn name_span(&self, span: Span, name: str): Span {
+        if span.lo == 4294967295 || span.hi < span.lo || (span.hi as usize) > self.sources.text.len() || name.len() == 0 {
+            return span;
+        }
+        let text = self.sources.text.as_str()[span.lo as usize..span.hi as usize];
+        let b = text.as_bytes();
+        let mut from: usize = 0;
+        while let Some(i) = text[from..].find(name) {
+            let at = from + i;
+            let end = at + name.len();
+            let before_ok = at == 0 || !is_ident_byte(b[at - 1]);
+            let after_ok = end >= b.len() || !is_ident_byte(b[end]);
+            if before_ok && after_ok {
+                return Span::new(span.lo + at as u32, span.lo + end as u32);
+            }
+            from = at + 1;
+        }
+        return span;
+    }
+
+    /// The `mut ` before the identifier `name` in `span` (`mut x`,
+    /// `mut x: i32`), up to the name, if there is one.
+    pub fn mut_before(&self, span: Span, name: str): Option::<Span> {
+        let ns = self.name_span(span, name);
+        if ns == span || ns.lo < span.lo + 4 {
+            return None;
+        }
+        let text = self.sources.text.as_str()[span.lo as usize..ns.lo as usize];
+        let b = text.as_bytes();
+        let mut i = b.len();
+        while i > 0 && (b[i - 1] == b' ' || b[i - 1] == b'\t' || b[i - 1] == b'\n' || b[i - 1] == b'\r') {
+            i -= 1;
+        }
+        if i < 3 || text[i - 3..i] != "mut" || (i > 3 && is_ident_byte(b[i - 4])) {
+            return None;
+        }
+        return Some(Span::new(span.lo + (i - 3) as u32, ns.lo));
+    }
+
+    /// The edit that adds `bound` to the bounds of generic parameter `name`
+    /// declared in `generics` (the span of `::<...>`): ` + Light` after
+    /// its last bound, or `: Light` after its name.
+    pub fn add_bound_edit(&self, generics: Span, name: str, bound: str): Option::<(Span, String)> {
+        let ns = self.name_span(generics, name);
+        if ns == generics {
+            return None;
+        }
+        let b = self.sources.text.as_bytes();
+        let end = generics.hi as usize;
+        let mut i = ns.hi as usize;
+        while i < end && (b[i] == b' ' || b[i] == b'\t') {
+            i += 1;
+        }
+        if i >= end || b[i] != b':' {
+            return Some((Span::new(ns.hi, ns.hi), core::fmt::format(": {bound}")));
+        }
+        // The end of its bounds: a `,` or the closing `>` at depth 0.
+        let mut depth: i32 = 0;
+        let mut last = i + 1;
+        while i < end {
+            let c = b[i];
+            if c == b'<' || c == b'(' || c == b'[' {
+                depth += 1;
+            } else if c == b'>' || c == b')' || c == b']' {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            } else if c == b',' && depth == 0 {
+                break;
+            }
+            if c != b' ' && c != b'\t' && c != b'\n' && c != b'\r' {
+                last = i + 1;
+            }
+            i += 1;
+        }
+        return Some((Span::new(last as u32, last as u32), core::fmt::format(" + {bound}")));
+    }
+
+    /// The edit that applies a postfix (`.as_str()`, `[..]`) to the
+    /// expression at `span`: appended, or around parentheses when the
+    /// expression has operators or spaces outside brackets and strings.
+    pub fn postfix_edit(&self, span: Span, suffix: str): (Span, String) {
+        if span.lo == 4294967295 || span.hi < span.lo || (span.hi as usize) > self.sources.text.len() {
+            return (span, String::from(suffix));
+        }
+        let text = self.sources.text.as_str()[span.lo as usize..span.hi as usize];
+        let b = text.as_bytes();
+        let mut depth: i32 = 0;
+        let mut simple = b.len() > 0 && b[0] != b'&' && b[0] != b'-' && b[0] != b'!' && b[0] != b'*';
+        let mut i: usize = 0;
+        while i < b.len() && simple {
+            let c = b[i];
+            if c == b'"' {
+                // Skip the string literal.
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            } else if c == b'(' || c == b'[' || c == b'{' {
+                depth += 1;
+            } else if c == b')' || c == b']' || c == b'}' {
+                depth -= 1;
+            } else if depth == 0 && !is_ident_byte(c) && c != b'.' && c != b':' && c != b'?' && c != b'<' && c != b'>' {
+                simple = false;
+            }
+            i += 1;
+        }
+        if simple {
+            return (Span::new(span.hi, span.hi), String::from(suffix));
+        }
+        return (span, core::fmt::format("({text}){suffix}"));
+    }
+
+    /// Where the text at `span` was written, if it is in a macro expansion
+    /// and copies one token of source (an identifier from the invocation
+    /// or the macro's body): that token, in a file of its own. A span
+    /// outside expansions is itself.
+    pub fn origin(&self, span: Span): Option::<Span> {
+        let mut s = span;
+        for _ in 0..64 {
+            if s.lo == 4294967295 || self.sources.files.len() == 0 {
+                return None;
+            }
+            let f = self.sources.files[self.sources.file_of(s.lo) as usize];
+            if f.expansion_site.is_none() {
+                return Some(s);
+            }
+            match self.origins.get(s.lo) {
+                Some(o) => {
+                    if o.hi - o.lo != s.hi - s.lo {
+                        return None;
+                    }
+                    s = o;
+                }
+                None => return None,
+            }
+        }
+        return None;
+    }
+
     /// Where `span` is in code the user wrote: spans inside macro
     /// expansions map to the invocation (repeatedly, for nested ones).
     pub fn source_span(&self, span: Span): Span {
@@ -661,6 +813,11 @@ impl Program {
         }
         return s;
     }
+}
+
+/// Whether `c` can be part of an identifier.
+pub fn is_ident_byte(c: u8): bool {
+    return (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'_' || c >= 128;
 }
 
 /// Replaces `impl Trait` types by the types behind them.

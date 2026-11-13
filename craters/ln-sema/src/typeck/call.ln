@@ -423,7 +423,7 @@ impl Sema {
 
     /// Unify an impl's self type (with fresh variables for its generics)
     /// against `ty`; commits and returns the impl args on success.
-    fn match_impl(&mut self, imp: DefId, ty: Ty): Option::<TyList> {
+    pub fn match_impl(&mut self, imp: DefId, ty: Ty): Option::<TyList> {
         let d = self.p.impl_data(imp);
         let snap = self.snapshot();
         let args = self.fresh_vars(d.generics.count());
@@ -856,22 +856,30 @@ impl Sema {
         let mut shown = String::new();
         pretty_expr(&self.p, arg, &mut shown);
         let mut h = String::new();
+        // The fix replaces the marker (what is before the lent expression).
+        let inner = self.ast_span(arg);
+        let marker_span = Span::new(span.lo, if inner.lo >= span.lo && inner.lo <= span.hi { inner.lo } else { span.lo });
+        let mut fix = "";
         if in_out && marker.is_none() {
             self.error_at(codes::borrow::MISSING_MARKER(), span, "this argument is passed in-out, but the call does not say so");
             self.with_label("the parameter is `&mut`");
             h.write("write `&mut {shown}`");
+            fix = "&mut ";
         } else if borrow && marker.is_none() {
             self.error_at(codes::borrow::MISSING_MARKER(), span, "this argument is borrowed, but the call does not say so");
             self.with_label("the parameter is `&`");
             h.write("write `&{shown}`");
+            fix = "&";
         } else if in_out {
             self.error_at(codes::borrow::WRONG_MARKER(), span, "`&` lends read-only, but this parameter is in-out");
             self.with_label("the parameter is `&mut`");
             h.write("write `&mut {shown}`");
+            fix = "&mut ";
         } else if borrow {
             self.error_at(codes::borrow::WRONG_MARKER(), span, "`&mut` lends for changing, but this parameter only borrows");
             self.with_label("the parameter is `&`");
             h.write("write `&{shown}`");
+            fix = "&";
         } else {
             let lend = if marker == Some(true) { "&mut" } else { "&" };
             let mut m = String::new();
@@ -881,6 +889,8 @@ impl Sema {
             h.write("pass `{shown}` itself (it is moved, or copied if it is Dull)");
         }
         self.with_help(h.as_str());
+        let title = if fix.len() == 0 { String::from("Remove the marker") } else { core::fmt::format("Lend it with `{fix.trim()}`") };
+        self.suggest_fix(marker_span, fix, title.as_str());
         self.emit();
     }
 
@@ -951,7 +961,7 @@ impl Sema {
     // ===================================================================== method calls
 
     /// Receiver types to try, in order (autoslicing through array kinds).
-    fn method_steps(&mut self, t: Ty): [Ty; ..+] {
+    pub fn method_steps(&mut self, t: Ty): [Ty; ..+] {
         let mut out: [Ty; ..+] = [t];
         match self.p.types.kind(t) {
             TyKind::Array(e, k) => {
@@ -1229,6 +1239,9 @@ impl Sema {
                 continue;
             }
             let fd = self.p.fields.list(v.fields)[idx];
+            // The field's name (for editors; a shorthand `x` also names a
+            // local, recorded after it).
+            self.p.refs.push(crater::program::Ref { span: f.name.span, target: crater::program::RefTarget::Field { adt, variant, field: idx as u32 } });
             let here = self.module();
             if !fd.is_pub && !self.p.is_enum(adt) && !self.is_ancestor_or_self(owner_mod, here) {
                 let mut m = String::new();

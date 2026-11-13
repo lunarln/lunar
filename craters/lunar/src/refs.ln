@@ -1,0 +1,349 @@
+// References, document highlights and renaming: every place that names the
+// same thing as the name under the cursor, from the names the analysis
+// recorded (`Program::refs`) and the declarations themselves.
+//
+// A method is one family with the trait method it implements and every
+// other implementation of it, as rust-analyzer has it: renaming one renames
+// them all. Names inside macro expansions count where their tokens were
+// written (`Program::origin`).
+
+use ln_ast::Span;
+use ln_sema::defs::{DefData, DefId, DefKind};
+use ln_sema::diag::is_dummy;
+use ln_sema::program::{Program, RefTarget};
+use crater::ide;
+
+/// One place a name is used.
+pub struct Use {
+    pub span: Span,
+    /// It is a declaration (the name of an item, field, local, ...).
+    pub decl: bool,
+}
+
+/// Whether two targets are the same thing.
+pub fn same_target(a: RefTarget, b: RefTarget): bool {
+    return match a {
+        RefTarget::Def(x) => match b {
+            RefTarget::Def(y) => x == y,
+            _ => false,
+        },
+        RefTarget::Field { adt, variant, field } => match b {
+            RefTarget::Field { adt: a2, variant: v2, field: f2 } => adt == a2 && variant == v2 && field == f2,
+            _ => false,
+        },
+        RefTarget::Local { body, local } => match b {
+            RefTarget::Local { body: b2, local: l2 } => body == b2 && local == l2,
+            _ => false,
+        },
+        RefTarget::TyParam(s) => match b {
+            RefTarget::TyParam(s2) => s == s2,
+            _ => false,
+        },
+    };
+}
+
+/// Local `local` of body `body`, if the analysis kept it.
+pub fn local_of(p: &Program, body: DefId, local: ln_sema::thir::LocalId): Option::<ln_sema::thir::Local> {
+    let b = p.bodies.get(body)?;
+    if local.index() >= b.locals.len() {
+        return None;
+    }
+    return Some(p.thir.local(b, local));
+}
+
+/// The name a target is declared under.
+pub fn target_name(p: &Program, t: RefTarget): String {
+    return match t {
+        RefTarget::Def(d) => String::from(p.name(d)),
+        RefTarget::Field { adt, variant, field } => {
+            let v = p.variants_of(p.adt(adt))[variant as usize];
+            String::from(p.text(p.fields_of(v)[field as usize].name))
+        }
+        RefTarget::Local { body, local } => match local_of(p, body, local) {
+            Some(l) => String::from(p.text(l.name)),
+            None => String::new(),
+        },
+        RefTarget::TyParam(decl) => if is_dummy(decl) { String::new() } else { String::from(p.sources.snippet(decl)) },
+    };
+}
+
+/// Where a target is declared: the span of its name.
+pub fn decl_span(p: &Program, t: RefTarget): Option::<Span> {
+    let span = match t {
+        RefTarget::Def(d) => p.def(d).span,
+        RefTarget::Field { adt, variant, field } => {
+            let v = p.variants_of(p.adt(adt))[variant as usize];
+            p.fields_of(v)[field as usize].span
+        }
+        RefTarget::Local { body, local } => match local_of(p, body, local) {
+            Some(l) => p.name_span(l.span, p.text(l.name)),
+            None => return None,
+        },
+        RefTarget::TyParam(decl) => decl,
+    };
+    if is_dummy(span) || span.hi <= span.lo {
+        return None;
+    }
+    return Some(span);
+}
+
+/// `t` and the targets renamed with it: for a method of a trait or of a
+/// trait's implementation, the trait's method and every implementation
+/// of it.
+pub fn family(p: &Program, t: RefTarget, out: &mut +[RefTarget; ..+]) {
+    out.push(t);
+    let d = match t {
+        RefTarget::Def(d) => d,
+        _ => return,
+    };
+    let info = p.def(d);
+    if info.kind != DefKind::Fn {
+        return;
+    }
+    let parent = match info.parent {
+        Some(x) => x,
+        None => return,
+    };
+    let tr = match p.def(parent).data {
+        DefData::Trait(_) => parent,
+        DefData::Impl(i) => match i.trait_ref {
+            Some(r) => r.trait_id,
+            None => return,
+        },
+        _ => return,
+    };
+    let td = p.trait_data(tr);
+    for m in p.trait_methods.list(td.methods) {
+        if m.name == info.name {
+            add_target(out, RefTarget::Def(m.def));
+        }
+    }
+    for imp in p.impls {
+        if let DefData::Impl(i) = p.def(imp).data {
+            if let Some(r) = i.trait_ref {
+                if r.trait_id == tr {
+                    if let Some(m) = p.impl_method(imp, info.name) {
+                        add_target(out, RefTarget::Def(m));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn add_target(out: &mut +[RefTarget; ..+], t: RefTarget) {
+    for x in out[..] {
+        if same_target(x, t) {
+            return;
+        }
+    }
+    out.push(t);
+}
+
+/// Every use of `targets` (and their declarations), in written code: the
+/// spans of the names, without repeats.
+pub fn uses(p: &Program, targets: [RefTarget; &], out: &mut +[Use; ..+]) {
+    let first = out.len();
+    for t in targets {
+        if let Some(s) = decl_span(p, t) {
+            add_use(p, out, first, s, true);
+        }
+    }
+    for r in p.refs {
+        let mut hit = false;
+        for t in targets {
+            if same_target(r.target, t) {
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
+            continue;
+        }
+        let name = target_name(p, r.target);
+        let s = p.name_span(r.span, name.as_str());
+        add_use(p, out, first, s, false);
+    }
+}
+
+/// Add the use at `s` (mapped out of macro expansions), unless it is
+/// there already; a declaration wins over a use of the same span.
+fn add_use(p: &Program, out: &mut +[Use; ..+], first: usize, s: Span, decl: bool) {
+    let span = match p.origin(s) {
+        Some(o) => o,
+        None => return,
+    };
+    if is_dummy(span) || span.hi <= span.lo {
+        return;
+    }
+    for i in first..out.len() {
+        if out[i].span == span {
+            if decl {
+                out[i].decl = true;
+            }
+            return;
+        }
+    }
+    out.push(Use { span, decl });
+}
+
+/// The uses of what the name at `offset` (global) in `file` refers to:
+/// the name's span and target, and every use of its family.
+pub fn references(p: &Program, file: u32, offset: u32, out: &mut +[Use; ..+]): Option::<(Span, RefTarget)> {
+    let (span, t) = ide::ref_at(p, file, offset)?;
+    let mut fam: [RefTarget; ..+] = [];
+    family(p, t, &mut fam);
+    uses(p, fam[..], out);
+    return Some((span, t));
+}
+
+/// Whether the use at `span` is a field shorthand (`P { x }`, `P { x, .. }`
+/// as a pattern): the same name is a field and a local.
+pub fn is_shorthand(p: &Program, span: Span): bool {
+    let mut field = false;
+    let mut local = false;
+    for r in p.refs {
+        let s = match p.origin(r.span) {
+            Some(o) => o,
+            None => continue,
+        };
+        if s.lo > span.lo || s.hi < span.hi {
+            continue;
+        }
+        match r.target {
+            RefTarget::Field { .. } => field = field || s == span,
+            RefTarget::Local { body, local: l } => {
+                if let Some(loc) = local_of(p, body, l) {
+                    if p.name_span(s, p.text(loc.name)) == span {
+                        local = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    return field && local;
+}
+
+// ===================================================================== renaming
+
+/// Why a name cannot be renamed, if it cannot: keywords, the standard
+/// library, and names only a macro wrote.
+pub fn rename_refusal(p: &Program, std_key: str, t: RefTarget, name: str): Option::<String> {
+    if name == "self" || name == "Self" || name == "crater" || name == "super" || is_keyword(name) {
+        return Some(String::from("keywords cannot be renamed"));
+    }
+    let decl = match decl_span(p, t) {
+        Some(s) => s,
+        None => return Some(core::fmt::format("`{name}` is not declared in the source")),
+    };
+    let s = match p.origin(decl) {
+        Some(s) => s,
+        None => return Some(core::fmt::format("`{name}` is declared inside a macro expansion")),
+    };
+    if let RefTarget::Def(d) = t {
+        if p.def(d).kind == DefKind::Mod {
+            return Some(String::from("renaming modules (and their files) is not supported"));
+        }
+        if p.def(d).kind == DefKind::Impl {
+            return Some(String::from("an `impl` has no name"));
+        }
+    }
+    let f = p.sources.files[p.sources.file_of(s.lo) as usize];
+    let path = ln_sema::loader::path_key(p.text(f.name));
+    if std_key.len() > 0 && path.as_str().starts_with(std_key) {
+        return Some(core::fmt::format("`{name}` is part of the standard library"));
+    }
+    return None;
+}
+
+/// Whether `name` is a keyword (it cannot be a new name either).
+pub fn is_keyword(name: str): bool {
+    let kws = ["as", "break", "const", "continue", "crater", "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "macro", "match", "mod", "move", "mut", "pub", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "while"];
+    for k in kws {
+        if k == name {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Whether `name` can name something: an identifier that is not a keyword.
+pub fn valid_name(name: str): bool {
+    let b = name.as_bytes();
+    if b.len() == 0 || is_keyword(name) || name == "_" {
+        return false;
+    }
+    if b[0] >= b'0' && b[0] <= b'9' {
+        return false;
+    }
+    for c in b {
+        let ok = (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'_';
+        if !ok {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Text edits: replace each span with a text (end to end in `text`).
+pub struct Edits {
+    pub list: [EditAt; ..+],
+    pub text: String,
+}
+
+pub struct EditAt {
+    pub span: Span,
+    lo: u32,
+    hi: u32,
+}
+
+impl Edits {
+    pub fn new(): Edits {
+        return Edits { list: [], text: String::new() };
+    }
+
+    pub fn add(&mut +self, span: Span, text: str) {
+        let lo = self.text.len() as u32;
+        self.text.push_str(text);
+        self.list.push(EditAt { span, lo, hi: self.text.len() as u32 });
+    }
+
+    /// The replacement of edit `i`.
+    pub fn text_of(&self, i: usize): str {
+        let e = self.list[i];
+        return self.text.as_str()[e.lo as usize..e.hi as usize];
+    }
+}
+
+/// The edits that rename `t` (with its family) to `new_name`. A field
+/// shorthand keeps its other meaning: renaming the field `x` of
+/// `P { x }` gives `P { y: x }`, renaming the local gives `P { x: y }`.
+pub fn rename_edits(p: &Program, t: RefTarget, new_name: str, out: &mut +Edits) {
+    let mut fam: [RefTarget; ..+] = [];
+    family(p, t, &mut fam);
+    let mut us: [Use; ..+] = [];
+    uses(p, fam[..], &mut us);
+    let is_field = match t {
+        RefTarget::Field { .. } => true,
+        _ => false,
+    };
+    let is_local = match t {
+        RefTarget::Local { .. } => true,
+        _ => false,
+    };
+    for u in us {
+        let old = p.sources.snippet(u.span);
+        let mut text = String::new();
+        if (is_field || is_local) && is_shorthand(p, u.span) {
+            if is_field {
+                text.write("{new_name}: {old}");
+            } else {
+                text.write("{old}: {new_name}");
+            }
+        } else {
+            text.push_str(new_name);
+        }
+        out.add(u.span, text.as_str());
+    }
+}

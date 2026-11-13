@@ -1,0 +1,23 @@
+{
+  "about": "A package: references and renaming of a library item reach its binary and its tests, which depend on the library; completion through the library's crater name.",
+  "steps": [
+    { "open": "src/lib.ln" },
+    { "request": "textDocument/references",
+      "params": { "textDocument": { "uri": "$uri:src/lib.ln" }, "position": ["$pos", "src/lib.ln", "greet", 0, 1], "context": { "includeDeclaration": true } },
+      "expect": ["lib.ln\"", "main.ln\"", "check.ln\""],
+      "count": ["\"range\":", 3] },
+    { "request": "textDocument/references",
+      "params": { "textDocument": { "uri": "$uri:src/lib.ln" }, "position": ["$pos", "src/lib.ln", "level", 0, 1], "context": { "includeDeclaration": true } },
+      "expect": ["lib.ln\"", "main.ln\""],
+      "count": ["\"range\":", 3] },
+    { "request": "textDocument/rename",
+      "params": { "textDocument": { "uri": "$uri:src/lib.ln" }, "position": ["$pos", "src/lib.ln", "Config", 0, 1], "newName": "Settings" },
+      "expect": ["lib.ln\":[", "main.ln\":["],
+      "count": ["\"newText\":\"Settings\"", 3] },
+    { "open": "src/main.ln" },
+    { "change": "src/main.ln", "replace": ["    println(\"{n}\");", "    pkg::/*C*/"] },
+    { "request": "textDocument/completion",
+      "params": { "textDocument": { "uri": "$uri:src/main.ln" }, "position": ["$pos", "src/main.ln", "/*C*/", 0, 0] },
+      "expect": ["\"label\":\"greet\"", "\"label\":\"Config\"", "Doubles `n`."] }
+  ]
+}

@@ -1,0 +1,86 @@
+/// A point on the plane.
+struct Point {
+    /// Horizontal.
+    pub x: i32,
+    pub y: i32,
+    secret: i32,
+}
+
+impl Point {
+    /// Makes a point.
+    pub fn new(x: i32, y: i32): Point {
+        return Point { x, y, secret: 0 };
+    }
+
+    /// The squared distance from the origin.
+    pub fn norm(&self): i32 {
+        return self.x * self.x + self.y * self.y;
+    }
+
+    pub fn grow(&mut self, by: i32) {
+        self.x += by;
+    }
+}
+
+trait Named {
+    fn name(&self): str;
+}
+
+impl Named for Point {
+    fn name(&self): str {
+        return "point";
+    }
+}
+
+enum Shape {
+    Dot,
+    Circle(i32),
+    Rect { w: i32, h: i32 },
+}
+
+mod geo {
+    pub struct P {
+        pub a: i32,
+        b: i32,
+    }
+
+    pub fn make(): P {
+        return P { a: 1, b: 2 };
+    }
+}
+
+struct Line {
+    len: i32,
+}
+
+impl Line {
+    pub fn norm(&self): i32 {
+        let doubled = self.len * 2;
+        return doubled;
+    }
+}
+
+fn add(a: i32, b: i32): i32 {
+    return a + b;
+}
+
+fn describe::<T: Named>(t: &T): str {
+    return t.name();
+}
+
+fn main() {
+    let p = Point::new(1, 2);
+    let mut total = add(p.x, p.y);
+    {
+        let inner = 5;
+        total += inner;
+    }
+    let mut names: [str; -..+] = [];
+    names.push("a");
+    let s = String::from("hi");
+    let q = geo::make();
+    let shape = Shape::Dot;
+    println("{total} {names.len()} {s} {describe(&p)} {q.a}");
+    // here
+    let later = 1;
+}

@@ -1,0 +1,38 @@
+{
+  "about": "Document symbols (nested: modules, structs and their fields, impls and their methods, enums and variants, traits), workspace symbols (fuzzy, outside the standard library), and inlay hints (types of `let`s without one, parameter names unless the argument says them).",
+  "steps": [
+    { "open": "main.ln" },
+    { "request": "textDocument/documentSymbol",
+      "params": { "textDocument": { "uri": "$uri:main.ln" } },
+      "expect": [
+        "{\"name\":\"geometry\",\"kind\":2,",
+        "\"children\":[{\"name\":\"Vector\",\"kind\":23,",
+        "{\"name\":\"dx\",\"detail\":\"i32\",\"kind\":8,",
+        "{\"name\":\"impl Vector\",\"kind\":19,",
+        "{\"name\":\"length2\",\"detail\":\"fn length2(&self): i32\",\"kind\":6,",
+        "{\"name\":\"Answer\",\"kind\":10,",
+        "{\"name\":\"No\",\"kind\":22,",
+        "{\"name\":\"Ask\",\"kind\":11,",
+        "{\"name\":\"ANSWER\",\"detail\":\"i32\",\"kind\":14,",
+        "{\"name\":\"scale\",\"detail\":\"fn scale(value: i32, factor: i32): i32\",\"kind\":12,"
+      ],
+      "ranges": [["main.ln", "length2", 0, 0, 7], ["main.ln", "Answer", 0, 0, 6]] },
+    { "request": "workspace/symbol",
+      "params": { "query": "len2" },
+      "expect": ["\"name\":\"length2\",\"kind\":6,", "\"containerName\":\"main::geometry\""],
+      "absent": ["\"name\":\"len\""] },
+    { "request": "workspace/symbol",
+      "params": { "query": "Vec" },
+      "expect": ["\"name\":\"Vector\""],
+      "absent": ["\"containerName\":\"core"] },
+    { "request": "textDocument/inlayHint",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 100, "character": 0 } } },
+      "expect": ["\"label\":\": i32\",\"kind\":1}", "\"label\":\": bool\"", "\"label\":\": Vector\"", "\"label\":\"value:\",\"kind\":2,\"paddingRight\":true", "\"label\":\"factor:\""],
+      "positions": [["main.ln", "a = scale", 0, 1], ["main.ln", "2, 3", 0, 0], ["main.ln", "3);", 0, 0], ["main.ln", "c, d", 0, 1], ["main.ln", "d)", 0, 1], ["main.ln", "a);", 0, 0], ["main.ln", "\"x\"", 0, 0]],
+      "count": ["\"label\":\"value:\"", 2],
+      "absent": ["\"label\":\"args:\"", "\"label\":\"self:\""] },
+    { "request": "textDocument/inlayHint",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "range": { "start": { "line": 30, "character": 0 }, "end": { "line": 30, "character": 40 } } },
+      "count": ["\"label\":", 3] }
+  ]
+}

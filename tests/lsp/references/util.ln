@@ -1,0 +1,22 @@
+/// A stack of numbers.
+pub struct Stack {
+    items: [i32; -..+],
+}
+
+impl Stack {
+    pub fn new(): Stack {
+        return Stack { items: [] };
+    }
+
+    pub fn push(&mut self, v: i32) {
+        self.items.push(v);
+    }
+
+    pub fn top(&self): Option::<i32> {
+        return self.items.last();
+    }
+}
+
+pub fn helper(x: i32): i32 {
+    return x + 1;
+}

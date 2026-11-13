@@ -1,0 +1,41 @@
+{
+  "about": "Quick fixes from the exact suggestions diagnostics carry: lending markers, a similar name, `.as_str()`, `let mut`, `_` for unused variables, removing `mut`, `Light` bounds, taking a small Dull value by value.",
+  "steps": [
+    { "open": "main.ln" },
+    { "request": "textDocument/codeAction",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 100, "character": 0 } }, "context": { "diagnostics": [] } },
+      "expect": [
+        "\"title\":\"Lend it with `&mut`\",\"kind\":\"quickfix\"",
+        "\"code\":\"borrow::missing_marker\"",
+        "\"newText\":\"&mut \"",
+        "\"title\":\"Change it to `read_only`\"",
+        "\"newText\":\"read_only\"",
+        "\"title\":\"View it with `.as_str()`\"",
+        "\"newText\":\".as_str()\"",
+        "\"title\":\"Declare it `mut k`\"",
+        "\"title\":\"Prefix `unused` with an underscore\"",
+        "\"newText\":\"_\"",
+        "\"title\":\"Remove the `mut`\"",
+        "\"newText\":\"\"",
+        "\"title\":\"Add `Light` to `T`'s bounds\"",
+        "\"newText\":\": Light\"",
+        "\"newText\":\" + Light\"",
+        "\"title\":\"Take it by value\"",
+        "\"isPreferred\":true"
+      ],
+      "ranges": [
+        ["main.ln", "n);", 0, 0, 0],
+        ["main.ln", "read_onyl", 0, 0, 9],
+        ["main.ln", "owned;", 0, 5, 0],
+        ["main.ln", "k = 1", 0, 0, 0],
+        ["main.ln", "unused", 0, 0, 0],
+        ["main.ln", "mut m", 0, 0, 4],
+        ["main.ln", "count::<T>", 0, 9, 0],
+        ["main.ln", "Clone>", 0, 5, 0],
+        ["main.ln", "&i32", 0, 0, 1]
+      ] },
+    { "request": "textDocument/codeAction",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 5 } }, "context": { "diagnostics": [] } },
+      "expect": ["[]"] }
+  ]
+}

@@ -395,6 +395,11 @@ impl Sema {
                 l
             }
         };
+        // Editors want the name, not `mut name`.
+        let nr = self.p.refs.len();
+        if nr > 0 && self.p.refs[nr - 1].span == span {
+            self.p.refs[nr - 1].span = name.span;
+        }
         let nf = self.fcx.or_frames.len();
         if nf > 0 {
             let alt = self.fcx.or_frames[nf - 1].alt;

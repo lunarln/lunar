@@ -236,6 +236,15 @@ impl Sema {
         self.p.diags.help(m);
     }
 
+    /// Attach an exact fix to the diagnostic being built: replace `span`
+    /// with `text` (see `Diags::suggest`). Its help says it on the
+    /// terminal; `title` names it in an editor.
+    pub fn suggest_fix(&mut self, span: Span, text: str, title: str) {
+        let t = self.p.sym(text);
+        let h = self.p.sym(title);
+        self.p.diags.suggest(span, t, h);
+    }
+
     /// Record the diagnostic being built.
     pub fn emit(&mut self) {
         if !self.drop_current {

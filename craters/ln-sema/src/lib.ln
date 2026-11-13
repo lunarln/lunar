@@ -26,5 +26,6 @@ pub mod traits;
 pub mod layout;
 pub mod borrowck;
 pub mod typeck;
+pub mod query;
 #[cfg(test)]
 mod tests;

@@ -1,0 +1,28 @@
+/// Appends `s` twice.
+fn twice(out: &mut +String, kept s: str, n: i32) {
+    out.push_str(s);
+    out.push_str(s);
+    let _ = n;
+}
+
+struct Counter {
+    n: i32,
+}
+
+impl Counter {
+    /// Adds `by`, `times` times.
+    pub fn bump(&mut self, by: i32, times: i32) {
+        self.n += by * times;
+    }
+}
+
+enum Msg {
+    Move(i32, i32),
+}
+
+fn main() {
+    let mut out = String::new();
+    let mut c = Counter { n: 0 };
+    // here
+    let _ = Msg::Move(1, 2);
+}

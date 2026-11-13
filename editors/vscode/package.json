@@ -1,7 +1,7 @@
 {
   "name": "lunar",
   "displayName": "Lunar",
-  "description": "Lunar language support: syntax highlighting, diagnostics, hover and go to definition",
+  "description": "Lunar language support: syntax highlighting, diagnostics, completion, hover, go to definition, references, rename and more",
   "version": "0.1.0",
   "publisher": "worriedarrow",
   "license": "MIT OR Apache-2.0",
@@ -72,6 +72,22 @@
       {
         "command": "lunar.restartServer",
         "title": "Lunar: Restart Language Server"
+      }
+    ],
+    "semanticTokenModifiers": [
+      {
+        "id": "mutable",
+        "description": "Mutable variables and parameters, and `static mut`"
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "language": "lunar",
+        "scopes": {
+          "*.mutable": [
+            "markup.underline"
+          ]
+        }
       }
     ]
   },

@@ -1,0 +1,42 @@
+fn bump(x: &mut i32) {
+    x += 1;
+}
+
+fn count::<T>(items: [T; &]): usize {
+    return items.len();
+}
+
+fn count2::<T: Clone>(items: [T; &]): usize {
+    return items.len();
+}
+
+fn takes(s: str): usize {
+    return s.len();
+}
+
+fn read_only(n: &i32): i32 {
+    return n;
+}
+
+fn lints() {
+    let unused = 2;
+    let mut m = 3;
+    let _ = m;
+}
+
+fn errors() {
+    let mut n = 1;
+    bump(n);
+    let total = 5;
+    let y = read_onyl(&total);
+    let owned = String::from("a");
+    let view: str = owned;
+    let k = 1;
+    k = 2;
+    let _ = y + total + k + takes(view) as i32;
+}
+
+fn main() {
+    lints();
+    errors();
+}
