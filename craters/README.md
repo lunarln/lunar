@@ -140,6 +140,7 @@ test every feature, in process (`lunar test -p lunar`) and over `lunar lsp`
 |------|---------|
 | front end: loading, macro expansion, collection, name resolution, lowering | `ln-sema/src/{sema,loader,expand,collect,resolve,lower}.ln` |
 | traits, layout | `ln-sema/src/{traits,layout}.ln` (unit checks in `tests.ln`) |
+| trait objects | `ln-sema/src/objects.ln`: dyn compatibility, the traits a `dyn` implements, vtable layout; `ln-codegen/src/vtable.ln`: vtables and calls through them |
 | borrow checker | `ln-sema/src/borrowck.ln` (unit checks on hand-built THIR in `tests.ln`) |
 | type checker | `ln-sema/src/typeck/{mod,expr,call,pat,closure}.ln`; the state of the function being checked is the `Sema::fcx` field |
 | code generation | `ln-codegen/src/{lib,func,ops,init,llvm}.ln`; the state of the function being lowered lives in `Cg` |
