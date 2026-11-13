@@ -2661,7 +2661,54 @@ impl Cx {
                 TyKind::FnPtr(ps, _, _) => Some(ps),
                 _ => None,
             },
-            Callee::Value { .. } => None,
+            Callee::Value { callee: f, kind } => self.value_params(p, p.thir.expr(f).ty, kind),
+        };
+    }
+
+    /// The parameter types a value of type `t` is called with as `kind`
+    /// (`Fn`, `FnMut` or `FnOnce`), when known: a closure's own, or those of
+    /// the `Fn` bound of that kind on a generic parameter or `impl Trait`
+    /// (whatever is called through it implements the bound, so its body
+    /// was checked against the bound's modes, `&mut +` included).
+    fn value_params(&self, p: &mut +Program, t: Ty, kind: ClosureKind): Option::<TyList> {
+        return match p.types.kind(t) {
+            TyKind::Closure(def, args) => {
+                if !p.closures.contains(def) {
+                    return None;
+                }
+                match p.types.kind(p.closure_sig(def, args)) {
+                    TyKind::FnPtr(ps, _, _) => Some(ps),
+                    _ => None,
+                }
+            }
+            TyKind::FnPtr(ps, _, _) => Some(ps),
+            TyKind::Param(..) | TyKind::Opaque(..) => {
+                let mut preds: [Pred; ..+] = [];
+                preds.extend(self.env);
+                if let TyKind::Opaque(d, i, args) = p.types.kind(t) {
+                    p.opaque_preds(d, i, args, &mut preds);
+                }
+                for q in preds {
+                    if q.ty != t || q.trait_ref.args.len() == 0 {
+                        continue;
+                    }
+                    let same = match p.lang_name(q.trait_ref.trait_id) {
+                        Some(n) => match ClosureKind::from_lang(n) {
+                            Some(k) => k == kind,
+                            None => false,
+                        },
+                        None => false,
+                    };
+                    if !same {
+                        continue;
+                    }
+                    if let TyKind::FnPtr(ps, _, _) = p.types.kind(p.types.at(q.trait_ref.args, 0)) {
+                        return Some(ps);
+                    }
+                }
+                None
+            }
+            _ => None,
         };
     }
 

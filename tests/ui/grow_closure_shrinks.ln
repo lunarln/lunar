@@ -1,0 +1,11 @@
+// error: borrow::grow_only
+// A closure passed where `Fn(&mut +String)` is expected takes its
+// parameter as `&mut +`, so it may only grow it.
+fn apply::<F: Fn(&mut +String)>(f: F, s: &mut +String) {
+    f(s);
+}
+
+fn main() {
+    let mut s = String::from("hi");
+    apply(|x| x.clear(), &mut s);
+}

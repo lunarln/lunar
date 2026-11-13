@@ -1,0 +1,10 @@
+// error: borrow::shrink_while_borrowed
+// Calling a closure whose parameter is a plain `&mut` may shrink the
+// argument, ending views into it.
+fn main() {
+    let mut s = String::from("hi");
+    let view = s.as_str();
+    let cut = |x: &mut String| x.clear();
+    cut(&mut s);
+    println("{view}");
+}
