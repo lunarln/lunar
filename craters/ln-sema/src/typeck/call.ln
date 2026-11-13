@@ -631,13 +631,15 @@ impl Sema {
                 found.push((tr, mdef));
                 continue;
             }
-            if self.p.types.has_infer(ty) {
+            let own = td.generics.names.len();
+            // A type still being inferred (`Range::<{integer}>`) may have
+            // the methods of a trait without parameters whose impl fits it.
+            if self.p.types.has_infer(ty) && (own > 0 || self.is_unbound_var(ty)) {
                 continue;
             }
-            let own = td.generics.names.len();
             if own == 0 {
                 let tr = TraitRef { trait_id: tid, args: List::empty() };
-                if self.p.implements(ty, tr, self.fcx.env[..]) {
+                if self.implements_now(ty, tr) {
                     found.push((tr, mdef));
                 }
                 continue;

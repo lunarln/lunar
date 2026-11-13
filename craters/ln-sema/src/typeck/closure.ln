@@ -64,7 +64,7 @@ fn sig_parts(types: &Types, sig: Ty): Option::<ExpectedSig> {
 }
 
 /// Whether trait `id` is `Fn`, `FnMut` or `FnOnce`.
-fn is_fn_trait(p: &Program, id: DefId): bool {
+pub fn is_fn_trait(p: &Program, id: DefId): bool {
     return fn_trait_kind(p, id).is_some();
 }
 

@@ -2038,11 +2038,10 @@ impl Sema {
             return None;
         }
         let tr = TraitRef { trait_id: iter_trait, args: List::empty() };
-        if self.p.types.has_infer(t) {
-            self.oblige(t, tr, span);
-        } else if !self.p.implements(t, tr, self.fcx.env[..]) {
+        if !self.implements_now(t, tr) {
             return None;
         }
+        self.oblige(t, tr, span);
         let al = self.p.types.mk_list([t][..]);
         let proj = self.p.types.mk(TyKind::Proj(item, al));
         return Some(self.shallow(proj));

@@ -80,6 +80,14 @@ impl Program {
                     let tr = self.types.subst_trait_ref(st, args);
                     stack.push(Pred { ty: p.ty, trait_ref: tr, span: p.span });
                 }
+                // The supertraits' constraints: `T: Int` gives
+                // `<T as Add>::Output == T`.
+                for i in 0..t.super_eqs.len() {
+                    let e = self.preds.list(t.super_eqs)[i];
+                    let ety = self.types.subst(e.ty, args);
+                    let etr = self.types.subst_trait_ref(e.trait_ref, args);
+                    stack.push(Pred { ty: ety, trait_ref: etr, span: p.span });
+                }
                 // The bounds of its associated types hold for their
                 // projections: `type Item: Light;` gives `T::Item: Light`.
                 // (Not deeper than a few projections: `type A: Tr;` in `Tr`
@@ -899,6 +907,18 @@ impl Program {
             if !ok {
                 continue;
             }
+            // Parameters the self type does not determine, but a bound
+            // does: `B` in `impl::<I, F: Fn(I::Item): B, B> It for Map::<I,
+            // F>`, from what `F` is.
+            let mut open = false;
+            for s in subst[..] {
+                if s.is_none() {
+                    open = true;
+                }
+            }
+            if open {
+                self.fill_from_bounds(data, &mut subst, env);
+            }
             let err = self.types.error();
             let mut tys: [Ty; ..+] = [];
             for s in subst {
@@ -922,6 +942,86 @@ impl Program {
             }
         }
         return None;
+    }
+
+    /// Bind the parameters of impl `data` that `subst` leaves open from its
+    /// bounds: for a bound `F: Fn(A): B` whose `F` is known, what `F` is
+    /// (a closure's or function pointer's signature, or a bound in `env`)
+    /// gives `B`.
+    fn fill_from_bounds(&mut +self, data: ImplData, subst: &mut +[Option::<Ty>; ..+], env: [Pred; &]) {
+        let mut el: [Pred; ..+] = [];
+        self.elaborate(env, &mut el);
+        for _ in 0..2 {
+            for i in 0..data.generics.preds.len() {
+                let p = self.preds.list(data.generics.preds)[i];
+                if self.is_eq_pred(p) {
+                    continue;
+                }
+                // The bound's arguments with what is known, the open
+                // parameters left as patterns.
+                let mut partial: [Ty; ..+] = [];
+                let mut known_ty = true;
+                for j in 0..subst.len() {
+                    match subst[j] {
+                        Some(t) => partial.push(t),
+                        None => partial.push(self.types.mk(TyKind::Param(j as u32, self.defs[0].name))),
+                    }
+                }
+                let pl = self.types.mk_list(partial[..]);
+                let pty = self.types.subst(p.ty, pl);
+                if let TyKind::Param(j, _) = self.types.kind(p.ty) {
+                    if (j as usize) < subst.len() && subst[j as usize].is_none() {
+                        known_ty = false;
+                    }
+                }
+                if !known_ty {
+                    continue;
+                }
+                let pat0 = self.types.subst_trait_ref(p.trait_ref, pl);
+                let pat = self.normalize_trait_ref(pat0, env);
+                // What `pty` is known to implement.
+                let mut have: [TyList; ..+] = [];
+                for q in el[..] {
+                    if q.ty == pty && q.trait_ref.trait_id == pat.trait_id && !self.is_eq_pred(q) {
+                        have.push(q.trait_ref.args);
+                    }
+                }
+                let fn_like = match self.lang_name(pat.trait_id) {
+                    Some(n) => ClosureKind::from_lang(n).is_some(),
+                    None => false,
+                };
+                if fn_like {
+                    match self.types.kind(pty) {
+                        TyKind::Closure(def, cargs) => {
+                            let sig = self.closure_sig(def, cargs);
+                            have.push(self.types.mk_list([sig][..]));
+                        }
+                        TyKind::FnPtr(..) => have.push(self.types.mk_list([pty][..])),
+                        _ => {}
+                    }
+                }
+                if let TyKind::Opaque(def, oi, oargs) = self.types.kind(pty) {
+                    let mut ob: [Pred; ..+] = [];
+                    self.opaque_bounds(def, oi, oargs, &mut ob);
+                    for q in ob[..] {
+                        if q.trait_ref.trait_id == pat.trait_id && !self.is_eq_pred(q) {
+                            have.push(q.trait_ref.args);
+                        }
+                    }
+                }
+                for h in have[..] {
+                    let mut trial = subst.clone();
+                    if self.match_list(pat.args, h, &mut trial) {
+                        for j in 0..subst.len() {
+                            if subst[j].is_none() && j < trial.len() {
+                                subst[j] = trial[j];
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Whether `ty: tr` holds in environment `env`.

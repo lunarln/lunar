@@ -448,7 +448,7 @@ impl Sema {
                 self.finish_def(id, item, attrs);
                 let k = self.key(t.name, export);
                 self.bind(module, Ns::Type, k, id, item.is_pub, t.name.span);
-                self.p.defs[id.index()].data = DefData::Trait(TraitData { generics: Generics::none(), supertraits: List::empty(), methods: List::empty(), auto: false, assoc: List::empty() });
+                self.p.defs[id.index()].data = DefData::Trait(TraitData { generics: Generics::none(), supertraits: List::empty(), methods: List::empty(), auto: false, assoc: List::empty(), super_eqs: List::empty() });
                 self.collect_trait_items(id, module, t.items, src);
             }
             ItemKind::Impl(im) => {

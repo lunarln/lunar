@@ -38,6 +38,7 @@ use crater::resolve::ModRes;
 use crater::program::{Program, Ref, RefTarget};
 use crater::sema::{AstRef, Sema};
 use crater::thir::{Arg, Block, Body, Callee, Coercion, Expr, ExprKind, FmtPiece, Local, LocalId, LocalKind, LoopId, Pat, PatKind, ReadMode, Stmt};
+use crater::typeck::closure::is_fn_trait;
 use crater::ty::*;
 use crater::typeck::closure::PendingClosure;
 use crater::typeck::pat::{AltOf, OrBind, OrFrame, PatName};
@@ -796,7 +797,9 @@ impl Sema {
         };
         let mut out = if args == args0 { t } else { self.p.types.mk(TyKind::Proj(item, args)) };
         if !unknown {
-            if !self.p.types.has_infer(s) {
+            // A closure's signature is still being inferred: select the
+            // impl here, with the variables.
+            if !self.p.types.has_infer(s) && !has_closure(&self.p.types, s) {
                 let env = self.fcx.env.clone();
                 if let Some(r) = self.p.project(item, args, env[..]) {
                     out = r;
@@ -847,6 +850,7 @@ impl Sema {
         let st = self.p.types.subst(d.self_ty, fresh);
         self.unify(st, self_ty);
         self.unify_subst_lists(itr.args, fresh, targs);
+        self.unify_closure_bounds(d, fresh);
         let Some(at) = self.p.impl_types.get((imp, name)) else {
             // The trait's default.
             if let DefData::AssocTy(ad) = self.p.defs[item.index()].data {
@@ -859,6 +863,66 @@ impl Sema {
         let DefData::AssocTy(ad) = self.p.defs[at.index()].data else { return None; };
         let Some(t) = ad.ty else { return None; };
         return Some(self.p.types.subst(t, fresh));
+    }
+
+    /// The bounds `F: Fn(A): B` of impl `d` (its generics instantiated with
+    /// `args`) whose `F` is a closure checked here: unify the closure's
+    /// signature with the bound's, to learn `B` (`impl::<B, I: Iterator, F:
+    /// FnMut(I::Item): B> Iterator for Map::<I, F>`).
+    fn unify_closure_bounds(&mut self, d: ImplData, args: TyList) {
+        for i in 0..d.generics.preds.len() {
+            let p = self.p.preds.list(d.generics.preds)[i];
+            if self.p.is_eq_pred(p) || p.trait_ref.args.len() == 0 {
+                continue;
+            }
+            if !is_fn_trait(&self.p, p.trait_ref.trait_id) {
+                continue;
+            }
+            let pty0 = self.p.types.subst(p.ty, args);
+            let pty = self.shallow(pty0);
+            let TyKind::Closure(def, cargs) = self.p.types.kind(pty) else { continue; };
+            if !self.p.closures.contains(def) {
+                continue;
+            }
+            let sig = self.p.closure_sig(def, cargs);
+            let want0 = self.p.types.at(p.trait_ref.args, 0);
+            let want = self.p.types.subst(want0, args);
+            let snap = self.snapshot();
+            if !self.unify(want, sig) {
+                self.rollback(snap);
+            }
+        }
+    }
+
+    /// Whether `ty: tr` can hold, for a type still being inferred or one
+    /// holding a closure being checked (whose signature the program does
+    /// not know yet): an impl of the trait fits it. The obligation is
+    /// checked for good once the function is.
+    pub fn implements_now(&mut self, ty: Ty, tr: TraitRef): bool {
+        let env = self.fcx.env.clone();
+        if self.p.implements(ty, tr, env[..]) {
+            return true;
+        }
+        if !self.p.types.has_infer(ty) && !has_closure(&self.p.types, ty) {
+            return false;
+        }
+        let snap = self.snapshot();
+        for k in 0..self.p.impls.len() {
+            let imp = self.p.impls[k];
+            let DefData::Impl(d) = self.p.def(imp).data else { continue; };
+            let Some(itr) = d.trait_ref else { continue; };
+            if itr.trait_id != tr.trait_id || d.negative || itr.args.len() != tr.args.len() {
+                continue;
+            }
+            let fresh = self.fresh_vars(d.generics.count());
+            let st = self.p.types.subst(d.self_ty, fresh);
+            let ok = self.unify(st, ty) && self.unify_subst_lists(itr.args, fresh, tr.args);
+            self.rollback(snap);
+            if ok {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Record that projection `proj` must be `ty` (`PendingProj`); it is
@@ -2123,6 +2187,14 @@ fn len_root(lens: [LenVar; &], v: u32): u32 {
             _ => return v,
         }
     }
+}
+
+/// Whether `t` holds a closure type.
+pub fn has_closure(types: &Types, t: Ty): bool {
+    return types.any(t, &|k| match k {
+        TyKind::Closure(..) => true,
+        _ => false,
+    });
 }
 
 /// Replace any leftover inference variables with defaults (after errors).

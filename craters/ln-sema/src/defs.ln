@@ -274,6 +274,10 @@ pub struct TraitData {
     /// Associated types and constants, in declaration order (in
     /// `Program::trait_assocs`).
     pub assoc: List::<TraitAssoc>,
+    /// The associated type constraints of the supertraits (`trait Int:
+    /// Add::<Output = Self>`), as equality predicates on `Self` (parameter
+    /// 0), in `Program::preds`.
+    pub super_eqs: List::<Pred>,
 }
 
 /// An associated type: in a trait, its bounds (on `Self::Item`, with the
