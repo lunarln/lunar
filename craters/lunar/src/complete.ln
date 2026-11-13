@@ -228,11 +228,72 @@ pub fn context(s: &mut Sema, file: u32, text: str, cursor: u32, snippets: bool):
         body: None,
         snippets,
     };
-    cx.old_cursor = cx.old_near(cursor);
+    cx.old_cursor = match cx.old(cursor) {
+        Some(o) => o,
+        None => start + anchor(old, text, cursor),
+    };
     cx.body = body_at(&s.p, file, cx.old_cursor);
     cx.module = module_at(s, file, cx.old_cursor);
     s.begin_query(cx.body);
     return cx;
+}
+
+/// Where the cursor at `cursor` of the current text (in a part that is not
+/// in the analyzed text `old`) is in `old`: the same distance into the
+/// body of the function of the same name, or the end of the text (no
+/// function) if the analysis does not have the function.
+fn anchor(old: str, text: str, cursor: u32): u32 {
+    let (toks, _) = ln_lexer::lex(text);
+    let mut k: usize = 0;
+    while k < toks.len() && (toks[k].range.start as u32) < cursor {
+        k += 1;
+    }
+    // The innermost brace whose header is a function's.
+    let mut found: Option::<(usize, usize)> = None;
+    while let Some(open) = enclosing(toks[..], k, Token::LBrace) {
+        let mut h = open;
+        while h > 0 {
+            let t = toks[h - 1].token;
+            if t == Token::Semi || t == Token::LBrace || t == Token::RBrace {
+                break;
+            }
+            h -= 1;
+        }
+        for j in h..open {
+            if toks[j].token == Token::Fn && j + 1 < open && toks[j + 1].token == Token::Ident {
+                found = Some((j + 1, open));
+            }
+        }
+        if found.is_some() {
+            break;
+        }
+        k = open;
+    }
+    let end = old.len() as u32;
+    let (name_tok, open) = match found {
+        Some(x) => x,
+        None => return end,
+    };
+    let name = text[toks[name_tok].range.start..toks[name_tok].range.end];
+    let mut needle = String::from("fn ");
+    needle.push_str(name);
+    let ob = old.as_bytes();
+    let mut from: usize = 0;
+    while let Some(i) = old[from..].find(needle.as_str()) {
+        let at = from + i + needle.len();
+        from = at;
+        if at < ob.len() && ln_sema::program::is_ident_byte(ob[at]) {
+            continue;
+        }
+        let brace = match old[at..].find("{") {
+            Some(b) => at + b,
+            None => return end,
+        };
+        let into = cursor - toks[open].range.start as u32;
+        let o = brace as u32 + into;
+        return if o < end { o } else { end };
+    }
+    return end;
 }
 
 /// The innermost body (function or closure) around `at` in `file`.
@@ -1949,7 +2010,7 @@ fn add_keywords(toks: [Spanned; &], before: usize, type_pos: bool, out: &mut +It
         return;
     }
     if stmt_start {
-        for k in ["let", "if", "match", "for", "while", "loop", "return", "break", "continue", "unsafe", "fn", "struct", "enum", "use", "const"] {
+        for k in ["let", "if", "match", "for", "while", "loop", "return", "break", "continue", "unsafe"] {
             out.add(k, CK_KEYWORD, "", k, false, "", S_KEYWORD, 0);
         }
     }

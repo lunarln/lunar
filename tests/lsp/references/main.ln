@@ -1,0 +1,45 @@
+mod util;
+
+use crater::util::{Stack, helper};
+
+trait Shape {
+    fn area(&self): i32;
+}
+
+struct Square {
+    side: i32,
+}
+
+impl Shape for Square {
+    fn area(&self): i32 {
+        return self.side * self.side;
+    }
+}
+
+struct Circle {
+    r: i32,
+}
+
+impl Shape for Circle {
+    fn area(&self): i32 {
+        return 3 * self.r * self.r;
+    }
+}
+
+fn total::<T: Shape>(s: &T): i32 {
+    return s.area();
+}
+
+fn main() {
+    let sq = Square { side: 2 };
+    let side = 3;
+    let other = Square { side };
+    let mut st = Stack::new();
+    st.push(helper(sq.area()));
+    assert_eq!(total(&sq), other.area() - side * side + 4);
+    let c = Circle { r: 1 };
+    match st.top() {
+        Some(v) => println("{v} {c.area()}"),
+        None => {}
+    }
+}

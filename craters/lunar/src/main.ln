@@ -34,6 +34,8 @@ mod complete;
 mod explain;
 mod git;
 mod ide;
+#[cfg(test)]
+mod ide_tests;
 mod link;
 mod lsp;
 mod paths;

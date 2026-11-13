@@ -1,0 +1,35 @@
+use std::fs;
+
+/// A point.
+struct Point {
+    pub x: i32,
+}
+
+enum Kind {
+    One,
+}
+
+trait Show {
+    fn show(&self): str;
+}
+
+const LIMIT: i32 = 3;
+static mut COUNT: i32 = 0;
+
+macro twice($e:expr) {
+    $e + $e
+}
+
+fn area::<T: Show>(p: &Point, t: &T, mut n: i32): i32 {
+    n += LIMIT;
+    let k = Kind::One;
+    let s = t.show();
+    // a comment
+    let total = twice!(p.x) + n;
+    println("{total} {s}");
+    let _ = fs::exists("x");
+    let _ = k;
+    return total;
+}
+
+fn main() {}

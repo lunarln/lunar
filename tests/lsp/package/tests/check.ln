@@ -1,0 +1,4 @@
+#[test]
+fn greets() {
+    assert_eq!(pkg::greet(2), 4);
+}

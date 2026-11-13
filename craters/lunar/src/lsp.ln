@@ -2879,7 +2879,7 @@ fn hex_digit(c: u8): Option::<u8> {
 }
 
 /// A `file:` URI for `path`, encoded as the `url` crate encodes paths.
-fn uri_from_path(path: str): String {
+pub fn uri_from_path(path: str): String {
     let mut out = String::from("file://");
     let norm = normalize(path);
     if !norm.as_str().starts_with("/") {

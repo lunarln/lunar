@@ -1,0 +1,563 @@
+// Language server tests: the session scripts in `tests/lsp/*/session.json`
+// at the root of the repository, replayed through the server in process.
+//
+// A case is a directory of Lunar sources (a single file, several modules,
+// or a package with `lunar.toml`) and `session.json`:
+//
+//     { "about": "...",
+//       "steps": [
+//         { "open": "main.ln" },
+//         { "change": "main.ln", "replace": ["old text", "new text"] },
+//         { "request": "textDocument/completion",
+//           "params": { "textDocument": { "uri": "$uri:main.ln" },
+//                       "position": ["$pos", "main.ln", "needle", 0, 3] },
+//           "expect": ["\"label\":\"norm\""], "absent": ["\"label\":\"zz\""],
+//           "tokens": [["main.ln", "needle", 0, 0, "struct", ["declaration"]]],
+//           "error": false } ] }
+//
+// `$uri:FILE` is the file's URI; `["$pos", FILE, NEEDLE, N, AT]` the
+// position `AT` bytes into the `N`th occurrence of `NEEDLE` in the file's
+// current text. A request's result (or error), written as compact JSON,
+// must contain each `expect` text and none of the `absent` ones; `tokens`
+// decodes semantic tokens and checks the one starting at a position.
+// `change` sends the whole new text, as the editor does. A binary-driven
+// harness can replay the same scripts over `lunar lsp`.
+
+use ln_json::{Json, Kind, Value};
+use std::env;
+use std::fs;
+use crater::lsp;
+use crater::paths::{join, normalize, parent};
+use crater::symbols;
+use crater::sysroot;
+
+/// The directory of the cases: `tests/lsp` above the test executable.
+fn cases_dir(): Option::<String> {
+    let exe = env::current_exe().ok()?;
+    let mut cur = parent(normalize(exe.as_str()).as_str());
+    while let Some(d) = cur {
+        let c = join(d.as_str(), "tests/lsp");
+        if fs::is_dir(c.as_str()) {
+            return Some(c);
+        }
+        cur = parent(d.as_str());
+    }
+    return None;
+}
+
+/// The texts of the case's files as the session has changed them.
+struct Texts {
+    names: String,
+    texts: String,
+    /// (name lo, name hi, text lo, text hi), the latest last.
+    list: [(u32, u32, u32, u32); ..+],
+}
+
+impl Texts {
+    fn get(&self, name: str): Option::<str> {
+        return self.get_at(name, self.list.len());
+    }
+
+    /// The text of `name` when the first `version` texts were set.
+    fn get_at(&self, name: str, version: usize): Option::<str> {
+        let mut i = version;
+        while i > 0 {
+            i -= 1;
+            let (a, b, c, d) = self.list[i];
+            if self.names.as_str()[a as usize..b as usize] == name {
+                return Some(self.texts.as_str()[c as usize..d as usize]);
+            }
+        }
+        return None;
+    }
+
+    fn set(&mut +self, name: str, text: str) {
+        let a = self.names.len() as u32;
+        self.names.push_str(name);
+        let b = self.names.len() as u32;
+        let c = self.texts.len() as u32;
+        self.texts.push_str(text);
+        self.list.push((a, b, c, self.texts.len() as u32));
+    }
+}
+
+/// A frame for `body`.
+fn frame(out: &mut +String, body: str) {
+    out.write("Content-Length: {body.len()}\r\n\r\n{body}");
+}
+
+/// The 0-based line and UTF-16 column of byte `at` of `text`.
+fn line_col(text: str, at: usize): (u32, u32) {
+    return crater::ide::position_of(text, at as u32);
+}
+
+/// Byte offset of the `n`th occurrence of `needle` in `text`, plus `at`.
+fn find_nth(text: str, needle: str, n: usize, at: usize): Option::<usize> {
+    let mut from: usize = 0;
+    let mut k: usize = 0;
+    while let Some(i) = text[from..].find(needle) {
+        if k == n {
+            return Some(from + i + at);
+        }
+        k += 1;
+        from = from + i + 1;
+    }
+    return None;
+}
+
+/// `v` of `src` into `out`, with `$uri:` and `$pos` replaced.
+fn subst(src: &Json, v: Value, out: &mut +Json, dir: str, texts: &Texts): Result::<Value, String> {
+    return match src.kind(v) {
+        Kind::String => {
+            let s = src.as_str(v).unwrap();
+            if s.starts_with("$uri:") {
+                let path = join(dir, s[5..]);
+                Ok(out.string(lsp::uri_from_path(path.as_str()).as_str()))
+            } else {
+                Ok(out.copy_from(src, v))
+            }
+        }
+        Kind::Array => {
+            let first = src.first(v);
+            let is_pos = match first {
+                Some(f) => src.as_str(f) == Some("$pos"),
+                None => false,
+            };
+            if is_pos {
+                let file = String::from(src.as_str(src.at(v, 1).unwrap()).unwrap_or(""));
+                let needle = String::from(src.as_str(src.at(v, 2).unwrap()).unwrap_or(""));
+                let n = src.as_u64(src.at(v, 3).unwrap()).unwrap_or(0) as usize;
+                let at = src.as_u64(src.at(v, 4).unwrap()).unwrap_or(0) as usize;
+                let text = match texts.get(file.as_str()) {
+                    Some(t) => t,
+                    None => return Err(core::fmt::format("`$pos` in `{file}`, which is not open")),
+                };
+                let off = match find_nth(text, needle.as_str(), n, at) {
+                    Some(o) => o,
+                    None => return Err(core::fmt::format("occurrence {n} of {needle:?} not in `{file}`")),
+                };
+                let (l, c) = line_col(text, off);
+                let o = out.object();
+                let lv = out.uint(l as u64);
+                out.set(o, "line", lv);
+                let cv = out.uint(c as u64);
+                out.set(o, "character", cv);
+                return Ok(o);
+            }
+            let a = out.array();
+            let mut m = src.first(v);
+            while let Some(x) = m {
+                let y = subst(src, x, out, dir, texts)?;
+                out.push(a, y);
+                m = src.next(x);
+            }
+            Ok(a)
+        }
+        Kind::Object => {
+            let o = out.object();
+            let mut m = src.first(v);
+            while let Some(x) = m {
+                let y = subst(src, x, out, dir, texts)?;
+                out.set(o, src.key(x), y);
+                m = src.next(x);
+            }
+            Ok(o)
+        }
+        _ => Ok(out.copy_from(src, v)),
+    };
+}
+
+/// A JSON string literal.
+fn quoted(s: str): String {
+    let mut out = String::new();
+    ln_json::write_string(&mut out, s);
+    return out;
+}
+
+/// Replay case `dir`: the problems found, one per line.
+fn run_case(dir: str, std_dir: str, problems: &mut +String) {
+    let script_path = join(dir, "session.json");
+    let script_text = match fs::read_to_string(script_path.as_str()) {
+        Ok(t) => t,
+        Err(e) => {
+            problems.write("{dir}: cannot read session.json: {e}\n");
+            return;
+        }
+    };
+    let script = match ln_json::parse(script_text.as_str()) {
+        Ok(j) => j,
+        Err(e) => {
+            problems.write("{dir}: session.json: {e}\n");
+            return;
+        }
+    };
+    let steps = match script.get(script.root(), "steps") {
+        Some(s) => s,
+        None => {
+            problems.write("{dir}: no `steps`\n");
+            return;
+        }
+    };
+    let mut input = String::new();
+    frame(&mut input, "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"textDocument\":{\"completion\":{\"completionItem\":{\"snippetSupport\":true}}}}}}");
+    frame(&mut input, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
+    let mut texts = Texts { names: String::new(), texts: String::new(), list: [] };
+    // For each request: its step, and the text of its files when sent.
+    let mut asked: [Value; ..+] = [];
+    let mut versions: [u32; ..+] = [];
+    let mut version: u32 = 1;
+    let mut m = script.first(steps);
+    while let Some(step) = m {
+        m = script.next(step);
+        if let Some(f) = script.get(step, "open") {
+            let name = String::from(script.as_str(f).unwrap_or(""));
+            let path = join(dir, name.as_str());
+            let text = match fs::read_to_string(path.as_str()) {
+                Ok(t) => t,
+                Err(e) => {
+                    problems.write("{dir}: cannot open {name}: {e}\n");
+                    return;
+                }
+            };
+            texts.set(name.as_str(), text.as_str());
+            let mut body = String::new();
+            body.write("{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{{\"textDocument\":{{\"uri\":{quoted(lsp::uri_from_path(path.as_str()).as_str())},\"languageId\":\"lunar\",\"version\":1,\"text\":{quoted(text.as_str())}}}}}}}");
+            frame(&mut input, body.as_str());
+            continue;
+        }
+        if let Some(f) = script.get(step, "change") {
+            let name = String::from(script.as_str(f).unwrap_or(""));
+            let old = match texts.get(name.as_str()) {
+                Some(t) => String::from(t),
+                None => {
+                    problems.write("{dir}: change of {name}, which is not open\n");
+                    return;
+                }
+            };
+            let mut new_text = String::new();
+            if let Some(r) = script.get(step, "replace") {
+                let from = script.as_str(script.at(r, 0).unwrap()).unwrap_or("");
+                let to = script.as_str(script.at(r, 1).unwrap()).unwrap_or("");
+                match old.as_str().find(from) {
+                    Some(i) => {
+                        new_text.push_str(old.as_str()[..i]);
+                        new_text.push_str(to);
+                        new_text.push_str(old.as_str()[i + from.len()..]);
+                    }
+                    None => {
+                        problems.write("{dir}: {from:?} is not in {name}\n");
+                        return;
+                    }
+                }
+            } else if let Some(t) = script.get(step, "text") {
+                new_text.push_str(script.as_str(t).unwrap_or(""));
+            }
+            texts.set(name.as_str(), new_text.as_str());
+            version += 1;
+            let path = join(dir, name.as_str());
+            let mut body = String::new();
+            body.write("{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{\"textDocument\":{{\"uri\":{quoted(lsp::uri_from_path(path.as_str()).as_str())},\"version\":{version}}},\"contentChanges\":[{{\"text\":{quoted(new_text.as_str())}}}]}}}}");
+            frame(&mut input, body.as_str());
+            continue;
+        }
+        if let Some(f) = script.get(step, "request") {
+            let method = String::from(script.as_str(f).unwrap_or(""));
+            let mut j = Json::new();
+            let msg = j.object();
+            let jr = j.string("2.0");
+            j.set(msg, "jsonrpc", jr);
+            let id = j.uint((asked.len() + 1) as u64);
+            j.set(msg, "id", id);
+            let mv = j.string(method.as_str());
+            j.set(msg, "method", mv);
+            let params = match script.get(step, "params") {
+                Some(p) => match subst(&script, p, &mut j, dir, &texts) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        problems.write("{dir}: {method}: {e}\n");
+                        return;
+                    }
+                },
+                None => j.object(),
+            };
+            j.set(msg, "params", params);
+            frame(&mut input, j.to_string(msg).as_str());
+            asked.push(step);
+            versions.push(texts.list.len() as u32);
+            continue;
+        }
+        problems.write("{dir}: a step that is not `open`, `change` or `request`\n");
+        return;
+    }
+    frame(&mut input, "{\"jsonrpc\":\"2.0\",\"id\":999999,\"method\":\"shutdown\"}");
+    frame(&mut input, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}");
+    let output = match lsp::serve_script(input.as_str(), std_dir) {
+        Ok(o) => o,
+        Err(e) => {
+            problems.write("{dir}: the server failed: {e}\n");
+            return;
+        }
+    };
+    // The responses, by id.
+    let mut bodies: [(u64, u32, u32); ..+] = [];
+    let b = output.as_bytes();
+    let mut i: usize = 0;
+    while let Some(h) = output.as_str()[i..].find("\r\n\r\n") {
+        let header = output.as_str()[i..i + h];
+        let len = match header.find(": ") {
+            Some(c) => header[c + 2..].parse_i64().unwrap_or(0) as usize,
+            None => 0,
+        };
+        let lo = i + h + 4;
+        let hi = lo + len;
+        if hi > b.len() {
+            break;
+        }
+        if let Ok(msg) = ln_json::parse(output.as_str()[lo..hi]) {
+            if let Some(idv) = msg.get(msg.root(), "id") {
+                if let Some(n) = msg.as_u64(idv) {
+                    bodies.push((n, lo as u32, hi as u32));
+                }
+            }
+        }
+        i = hi;
+    }
+    for k in 0..asked.len() {
+        let step = asked[k];
+        let method = script.as_str(script.get(step, "request").unwrap()).unwrap_or("");
+        let mut found: Option::<(u32, u32)> = None;
+        for x in bodies[..] {
+            let (n, lo, hi) = x;
+            if n == (k + 1) as u64 {
+                found = Some((lo, hi));
+            }
+        }
+        let (lo, hi) = match found {
+            Some(x) => x,
+            None => {
+                problems.write("{dir}: no answer to request {k + 1} ({method})\n");
+                continue;
+            }
+        };
+        let msg = ln_json::parse(output.as_str()[lo as usize..hi as usize]).unwrap();
+        let is_error = msg.get(msg.root(), "error").is_some();
+        let answer = match msg.get(msg.root(), "result") {
+            Some(r) => msg.to_string(r),
+            None => match msg.get(msg.root(), "error") {
+                Some(e) => msg.to_string(e),
+                None => String::new(),
+            },
+        };
+        let want_error = match script.get(step, "error") {
+            Some(e) => script.as_bool(e).unwrap_or(false),
+            None => false,
+        };
+        if is_error != want_error {
+            problems.write("{dir}: request {k + 1} ({method}): {if is_error { "an error" } else { "no error" }}: {answer}\n");
+        }
+        if let Some(es) = script.get(step, "expect") {
+            let mut e = script.first(es);
+            while let Some(x) = e {
+                let s = script.as_str(x).unwrap_or("");
+                if !answer.as_str().contains(s) {
+                    problems.write("{dir}: request {k + 1} ({method}): no {s} in {answer}\n");
+                }
+                e = script.next(x);
+            }
+        }
+        if let Some(es) = script.get(step, "absent") {
+            let mut e = script.first(es);
+            while let Some(x) = e {
+                let s = script.as_str(x).unwrap_or("");
+                if answer.as_str().contains(s) {
+                    problems.write("{dir}: request {k + 1} ({method}): {s} in {answer}\n");
+                }
+                e = script.next(x);
+            }
+        }
+        // `[FILE, NEEDLE, N, AT, LEN]`: a range of the answer; `[FILE,
+        // NEEDLE, N, AT]`: a position of it.
+        for which in ["ranges", "positions"] {
+            let rs = match script.get(step, which) {
+                Some(r) => r,
+                None => continue,
+            };
+            let mut e = script.first(rs);
+            while let Some(x) = e {
+                e = script.next(x);
+                let file = script.as_str(script.at(x, 0).unwrap()).unwrap_or("");
+                let needle = script.as_str(script.at(x, 1).unwrap()).unwrap_or("");
+                let nth = script.as_u64(script.at(x, 2).unwrap()).unwrap_or(0) as usize;
+                let at = script.as_u64(script.at(x, 3).unwrap()).unwrap_or(0) as usize;
+                let text = match texts.get_at(file, versions[k] as usize) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                let off = match find_nth(text, needle, nth, at) {
+                    Some(o) => o,
+                    None => {
+                        problems.write("{dir}: {which}: {needle:?} not found\n");
+                        continue;
+                    }
+                };
+                let (l0, c0) = line_col(text, off);
+                let mut want = String::new();
+                if which == "ranges" {
+                    let len = script.as_u64(script.at(x, 4).unwrap()).unwrap_or(0) as usize;
+                    let (l1, c1) = line_col(text, off + len);
+                    want.write("{{\"end\":{{\"character\":{c1},\"line\":{l1}}},\"start\":{{\"character\":{c0},\"line\":{l0}}}}}");
+                } else {
+                    want.write("\"position\":{{\"character\":{c0},\"line\":{l0}}}");
+                }
+                if !answer.as_str().contains(want.as_str()) {
+                    problems.write("{dir}: request {k + 1} ({method}): no {want} ({needle:?}) in {answer}\n");
+                }
+            }
+        }
+        // `[TEXT, N]`: the answer has `TEXT` exactly `N` times.
+        if let Some(cs) = script.get(step, "count") {
+            let what = script.as_str(script.at(cs, 0).unwrap()).unwrap_or("");
+            let want = script.as_u64(script.at(cs, 1).unwrap()).unwrap_or(0) as usize;
+            let mut n: usize = 0;
+            let mut from: usize = 0;
+            while let Some(i) = answer.as_str()[from..].find(what) {
+                n += 1;
+                from += i + what.len();
+            }
+            if n != want {
+                problems.write("{dir}: request {k + 1} ({method}): {what} {n} times, expected {want}, in {answer}\n");
+            }
+        }
+        if let Some(ts) = script.get(step, "tokens") {
+            let data = match msg.path(msg.root(), ["result", "data"][..]) {
+                Some(d) => d,
+                None => {
+                    problems.write("{dir}: request {k + 1}: no token data\n");
+                    continue;
+                }
+            };
+            // Absolute (line, start, length, type, modifiers).
+            let mut toks: [(u32, u32, u32, u32, u32); ..+] = [];
+            let mut line: u32 = 0;
+            let mut col: u32 = 0;
+            let n = msg.len(data);
+            let mut q: usize = 0;
+            while q + 4 < n {
+                let dl = msg.as_u64(msg.at(data, q).unwrap()).unwrap_or(0) as u32;
+                let dc = msg.as_u64(msg.at(data, q + 1).unwrap()).unwrap_or(0) as u32;
+                let len = msg.as_u64(msg.at(data, q + 2).unwrap()).unwrap_or(0) as u32;
+                let ty = msg.as_u64(msg.at(data, q + 3).unwrap()).unwrap_or(0) as u32;
+                let md = msg.as_u64(msg.at(data, q + 4).unwrap()).unwrap_or(0) as u32;
+                if dl > 0 {
+                    line += dl;
+                    col = dc;
+                } else {
+                    col += dc;
+                }
+                toks.push((line, col, len, ty, md));
+                q += 5;
+            }
+            let types = symbols::token_types();
+            let mods = symbols::token_modifiers();
+            let mut e = script.first(ts);
+            while let Some(x) = e {
+                e = script.next(x);
+                let file = script.as_str(script.at(x, 0).unwrap()).unwrap_or("");
+                let needle = script.as_str(script.at(x, 1).unwrap()).unwrap_or("");
+                let nth = script.as_u64(script.at(x, 2).unwrap()).unwrap_or(0) as usize;
+                let at = script.as_u64(script.at(x, 3).unwrap()).unwrap_or(0) as usize;
+                let want = script.as_str(script.at(x, 4).unwrap()).unwrap_or("");
+                let text = match texts.get_at(file, versions[k] as usize) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                let off = match find_nth(text, needle, nth, at) {
+                    Some(o) => o,
+                    None => {
+                        problems.write("{dir}: token check: {needle:?} not found\n");
+                        continue;
+                    }
+                };
+                let (l, c) = line_col(text, off);
+                let mut got: Option::<(u32, u32)> = None;
+                for t in toks[..] {
+                    let (tl, tc, _, ty, md) = t;
+                    if tl == l && tc == c {
+                        got = Some((ty, md));
+                    }
+                }
+                let (ty, md) = match got {
+                    Some(g) => g,
+                    None => {
+                        if want != "none" {
+                            problems.write("{dir}: no token at {needle:?} ({l}:{c}), expected {want}\n");
+                        }
+                        continue;
+                    }
+                };
+                let got_name = if (ty as usize) < types.len() { types[ty as usize] } else { "?" };
+                if got_name != want {
+                    problems.write("{dir}: token at {needle:?} is {got_name}, expected {want}\n");
+                }
+                if let Some(ms) = script.at(x, 5) {
+                    let mut mm = script.first(ms);
+                    while let Some(y) = mm {
+                        mm = script.next(y);
+                        let name = script.as_str(y).unwrap_or("");
+                        let negate = name.starts_with("!");
+                        let name = if negate { name[1..] } else { name };
+                        let mut bit: u32 = 0;
+                        for bi in 0..mods.len() {
+                            if mods[bi] == name {
+                                bit = 1 << bi as u32;
+                            }
+                        }
+                        let has = md & bit != 0;
+                        if has == negate {
+                            problems.write("{dir}: token at {needle:?}: modifier {name} {if negate { "set" } else { "missing" }} ({md})\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn lsp_sessions() {
+    let dir = match cases_dir() {
+        Some(d) => d,
+        None => panic("no tests/lsp directory above the test executable"),
+    };
+    let std_dir = match sysroot::std_dir() {
+        Some(d) => crater::paths::absolute(d.as_str()),
+        None => panic("no standard library"),
+    };
+    let entries = match fs::read_dir(dir.as_str()) {
+        Ok(e) => e,
+        Err(e) => panic("cannot read {dir}: {e}"),
+    };
+    let mut problems = String::new();
+    let mut ran: usize = 0;
+    // `LSP_CASE=name` runs only the cases whose names contain it.
+    let filter = match env::var("LSP_CASE") {
+        Some(f) => f,
+        None => String::new(),
+    };
+    for i in 0..entries.len() {
+        let name = entries.name(i);
+        if filter.len() > 0 && !name.contains(filter.as_str()) {
+            continue;
+        }
+        let case = join(dir.as_str(), name);
+        if !fs::is_file(join(case.as_str(), "session.json").as_str()) {
+            continue;
+        }
+        run_case(case.as_str(), std_dir.as_str(), &mut problems);
+        ran += 1;
+    }
+    if problems.len() > 0 {
+        panic("{problems}");
+    }
+    assert!(ran > 0);
+}

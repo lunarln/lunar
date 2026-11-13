@@ -1,0 +1,7 @@
+use pkg::Config;
+
+fn main() {
+    let c = Config { level: 3 };
+    let n = pkg::greet(c.level);
+    println("{n}");
+}
