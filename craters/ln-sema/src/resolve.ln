@@ -322,6 +322,8 @@ impl Sema {
         }
         if let Some(s) = self.suggest(from, id.name, ns) {
             self.help("a similar name exists: `{s}`");
+            let title = core::fmt::format("Change it to `{s}`");
+            self.suggest_fix(id.span, s.as_str(), title.as_str());
         }
     }
 
@@ -440,6 +442,7 @@ impl Sema {
                 None => return false,
             };
             self.add_glob(u.module, target, u.is_pub);
+            self.record_use(u.module, path[..], target_ty, None, None);
             return true;
         }
         let v = self.silent_resolve(u.module, path[..], Ns::Value);
@@ -448,7 +451,34 @@ impl Sema {
             return false;
         }
         self.add_import(u.module, path[..], u.tree, u.is_pub, target_ty, v, mac);
+        self.record_use(u.module, path[..], target_ty, v, mac);
         return true;
+    }
+
+    /// Remember what each segment of an imported path names (editor
+    /// tooling): its prefix's modules, and whatever the last one imports
+    /// in each namespace.
+    fn record_use(&mut self, from: DefId, segs: [Ident; &], a: Option::<DefId>, b: Option::<DefId>, c: Option::<DefId>) {
+        let n = segs.len();
+        for k in 1..n {
+            if let Some(d) = self.silent_resolve(from, segs[..k], Ns::Type) {
+                self.record(segs[k - 1].span, d);
+            }
+        }
+        let last = segs[n - 1].span;
+        if let Some(d) = a {
+            self.record(last, d);
+        }
+        if let Some(d) = b {
+            if a != Some(d) {
+                self.record(last, d);
+            }
+        }
+        if let Some(d) = c {
+            if a != Some(d) && b != Some(d) {
+                self.record(last, d);
+            }
+        }
     }
 
     /// `use target::*` in module `m` (once per target), after its other

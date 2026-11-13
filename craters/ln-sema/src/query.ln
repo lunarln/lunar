@@ -1,0 +1,230 @@
+// Queries over a finished analysis, for editor tooling: which methods a
+// receiver type has, which functions a type offers. They answer the way
+// method resolution (`typeck::call`) picks, without reporting anything.
+//
+// They run the type checker's unification in a scratch function context
+// (`begin_query`), which the analysis no longer needs; types they intern
+// only grow the program.
+
+use core::arena::List;
+use crater::defs::*;
+use crater::lower::LowerCx;
+use crater::sema::Sema;
+use crater::ty::*;
+use crater::typeck::FnCtx;
+
+/// A function callable on a type: a method of an inherent impl, or of a
+/// trait the type implements.
+pub struct MethodCand {
+    pub def: DefId,
+    /// The arguments of the impl's generics (inherent), or `Self` then the
+    /// trait's arguments (trait methods): enough to substitute the
+    /// function's signature but for its own generics.
+    pub args: TyList,
+    /// The trait it comes from.
+    pub from_trait: Option::<DefId>,
+    /// Which autoslice step (`[T; -..+]`, then `[T; ..+]`, ...) found it.
+    pub step: u32,
+}
+
+impl Sema {
+    /// Set up the type checker's tables for questions about code inside
+    /// function `def` (its generic bounds hold), or outside any function.
+    pub fn begin_query(&mut self, def: Option::<DefId>) {
+        let unit = self.p.types.unit();
+        let owner = match def {
+            Some(d) => match self.p.closures.get(d) {
+                Some(c) => Some(c.parent),
+                None => Some(d),
+            },
+            None => None,
+        };
+        match owner {
+            Some(d) if (d.index() < self.p.defs.len()) && self.p.defs[d.index()].kind == DefKind::Fn => {
+                let cx = self.lower_cx(d);
+                let mut env: [Pred; ..+] = [];
+                let base = self.p.preds.list(cx.env).to_grow();
+                self.p.elaborate(base[..], &mut env);
+                let ret = self.p.fn_data(d).sig.ret;
+                self.fcx = FnCtx::new(d, cx, ret, false);
+                self.fcx.env = env;
+            }
+            _ => {
+                self.fcx = FnCtx::new(DefId::new(0), LowerCx::new(DefId::new(0)), unit, false);
+            }
+        }
+    }
+
+    /// The functions callable on a value of type `t` with method syntax
+    /// (`with_self`; through autoslicing, as `a.f()` finds them), or every
+    /// associated function of `t` (`T::f`), into `out`: the first of each
+    /// name, as method resolution would pick it (inherent before trait).
+    pub fn methods_of(&mut self, t: Ty, with_self: bool, out: &mut +[MethodCand; ..+]) {
+        let t0 = self.p.types.strip_grow(t);
+        let steps = if with_self {
+            self.method_steps(t0)
+        } else {
+            let mut s: [Ty; ..+] = [];
+            s.push(t0);
+            s
+        };
+        let first = out.len();
+        for si in 0..steps.len() {
+            let st = steps[si];
+            // Inherent impls.
+            for k in 0..self.p.impls.len() {
+                let imp = self.p.impls[k];
+                let d = match self.p.def(imp).data {
+                    DefData::Impl(d) => d,
+                    _ => continue,
+                };
+                if d.trait_ref.is_some() || d.negative {
+                    continue;
+                }
+                if !self.could_match(d.self_ty, st) {
+                    continue;
+                }
+                let args = match self.match_impl(imp, st) {
+                    Some(a) => self.resolve_list(a),
+                    None => continue,
+                };
+                let mut items: [DefId; ..+] = [];
+                self.impl_items_of(imp, &mut items);
+                for m in items {
+                    if self.p.defs[m.index()].kind != DefKind::Fn {
+                        continue;
+                    }
+                    if with_self && !self.p.fn_data(m).has_self {
+                        continue;
+                    }
+                    push_cand(self, out, first, MethodCand { def: m, args, from_trait: None, step: si as u32 });
+                }
+            }
+            // Traits it implements (or that bounds in scope promise).
+            let known = self.known_preds(st);
+            let has_infer = self.p.types.has_infer(st);
+            for i in 0..self.p.defs.len() {
+                if self.p.defs[i].kind != DefKind::Trait {
+                    continue;
+                }
+                let tid = DefId::new(i);
+                let td = self.p.trait_data(tid);
+                if td.auto || td.methods.len() == 0 {
+                    continue;
+                }
+                let mut any = false;
+                for m in self.p.trait_methods.list(td.methods) {
+                    if !with_self || self.p.fn_data(m.def).has_self {
+                        any = true;
+                    }
+                }
+                if !any {
+                    continue;
+                }
+                let mut tr: Option::<TraitRef> = None;
+                for p in known[..] {
+                    if p.ty == st && p.trait_ref.trait_id == tid {
+                        tr = Some(p.trait_ref);
+                        break;
+                    }
+                }
+                if tr.is_none() && !has_infer {
+                    if td.generics.names.len() == 0 {
+                        let r = TraitRef { trait_id: tid, args: List::empty() };
+                        if self.p.implements(st, r, self.fcx.env[..]) {
+                            tr = Some(r);
+                        }
+                    } else {
+                        // A generic trait: the arguments of a matching impl.
+                        for k in 0..self.p.impls.len() {
+                            let imp = self.p.impls[k];
+                            let d = match self.p.def(imp).data {
+                                DefData::Impl(d) => d,
+                                _ => continue,
+                            };
+                            let itr = match d.trait_ref {
+                                Some(x) => x,
+                                None => continue,
+                            };
+                            if itr.trait_id != tid || d.negative || !self.could_match(d.self_ty, st) {
+                                continue;
+                            }
+                            if let Some(a) = self.match_impl(imp, st) {
+                                let a2 = self.resolve_list(a);
+                                tr = Some(self.p.types.subst_trait_ref(itr, a2));
+                                break;
+                            }
+                        }
+                    }
+                }
+                let tr = match tr {
+                    Some(x) => x,
+                    None => continue,
+                };
+                let mut all: [Ty; ..+] = [st];
+                all.extend(self.p.types.list(tr.args));
+                let args = self.p.types.mk_list(all[..]);
+                for m in self.p.trait_methods.list(td.methods) {
+                    if with_self && !self.p.fn_data(m.def).has_self {
+                        continue;
+                    }
+                    push_cand(self, out, first, MethodCand { def: m.def, args, from_trait: Some(tid), step: si as u32 });
+                }
+            }
+        }
+    }
+
+    /// Whether an impl for `self_ty` could apply to `t`: a quick test on
+    /// the outermost type before unifying.
+    fn could_match(&self, self_ty: Ty, t: Ty): bool {
+        return match (self.p.types.kind(self_ty), self.p.types.kind(t)) {
+            (TyKind::Param(..), _) => true,
+            (TyKind::Adt(a, _), TyKind::Adt(b, _)) => a == b,
+            (TyKind::Adt(..), _) => false,
+            (TyKind::Int(a), TyKind::Int(b)) => a == b,
+            (TyKind::Int(_), _) => false,
+            (TyKind::Float(a), TyKind::Float(b)) => a == b,
+            (TyKind::Float(_), _) => false,
+            (TyKind::Str, TyKind::Str) => true,
+            (TyKind::Str, _) => false,
+            (TyKind::String, TyKind::String) => true,
+            (TyKind::String, _) => false,
+            (TyKind::Bool, TyKind::Bool) => true,
+            (TyKind::Bool, _) => false,
+            (TyKind::Char, TyKind::Char) => true,
+            (TyKind::Char, _) => false,
+            (TyKind::Array(..), TyKind::Array(..)) => true,
+            (TyKind::Array(..), _) => false,
+            (TyKind::Tuple(..), TyKind::Tuple(..)) => true,
+            (TyKind::Tuple(..), _) => false,
+            _ => true,
+        };
+    }
+
+    /// The type of a method's result when called through `c` (its own
+    /// generics left unknown: shown as `_`).
+    pub fn cand_ret(&mut self, c: MethodCand): Ty {
+        let fd = self.p.fn_data(c.def);
+        let n = fd.generics.count();
+        let mut all: [Ty; ..+] = [];
+        all.extend(self.p.types.list(c.args));
+        while all.len() < n {
+            all.push(self.new_var(fd.sig.ret_span));
+        }
+        let l = self.p.types.mk_list(all[..]);
+        let r = self.p.types.subst(fd.sig.ret, l);
+        return self.resolve(r);
+    }
+}
+
+/// Add `c` to `out` unless a function of the same name is there (after
+/// `first`).
+fn push_cand(s: &Sema, out: &mut +[MethodCand; ..+], first: usize, c: MethodCand) {
+    let name = s.p.defs[c.def.index()].name;
+    for i in first..out.len() {
+        if s.p.defs[out[i].def.index()].name == name {
+            return;
+        }
+    }
+    out.push(c);
+}

@@ -24,8 +24,19 @@ pub struct Label {
     pub message: Symbol,
 }
 
+/// A fix that a help line of a diagnostic describes exactly, as an edit
+/// (for editors: a quick fix). It is not printed: the help says it.
+pub struct Suggestion {
+    /// What to replace (empty to insert).
+    pub span: Span,
+    /// The replacement.
+    pub text: Symbol,
+    /// What the edit does, for the editor's menu.
+    pub title: Symbol,
+}
+
 /// One diagnostic. Texts are interned in the program's names; labels,
-/// notes and helps are lists in `Diags`.
+/// notes, helps and suggestions are lists in `Diags`.
 pub struct Diag {
     pub severity: Severity,
     pub code: Code,
@@ -36,6 +47,7 @@ pub struct Diag {
     pub labels: List::<Label>,
     pub notes: List::<Symbol>,
     pub helps: List::<Symbol>,
+    pub suggestions: List::<Suggestion>,
 }
 
 impl Diag {
@@ -64,14 +76,17 @@ pub struct Diags {
     pub list: [Diag; -..+],
     pub labels: Arena::<Label>,
     pub texts: Arena::<Symbol>,
+    pub suggestions: Arena::<Suggestion>,
     /// The diagnostic being built.
     cur: Diag,
     cur_labels: [Label; ..+],
     cur_notes: [Symbol; ..+],
     cur_helps: [Symbol; ..+],
+    cur_suggestions: [Suggestion; ..+],
     cur_labels_start: usize,
     cur_notes_start: usize,
     cur_helps_start: usize,
+    cur_suggestions_start: usize,
     errors: usize,
 }
 
@@ -86,18 +101,22 @@ impl Diags {
             labels: List::empty(),
             notes: List::empty(),
             helps: List::empty(),
+            suggestions: List::empty(),
         };
         return Diags {
             list: [],
             labels: Arena::new(),
             texts: Arena::new(),
+            suggestions: Arena::new(),
             cur: empty,
             cur_labels: [],
             cur_notes: [],
             cur_helps: [],
+            cur_suggestions: [],
             cur_labels_start: 0,
             cur_notes_start: 0,
             cur_helps_start: 0,
+            cur_suggestions_start: 0,
             errors: 0,
         };
     }
@@ -113,10 +132,11 @@ impl Diags {
     }
 
     fn begin(&mut +self, severity: Severity, kept code: Code, span: Span, message: Symbol) {
-        self.cur = Diag { severity, code, message, span, label: None, labels: List::empty(), notes: List::empty(), helps: List::empty() };
+        self.cur = Diag { severity, code, message, span, label: None, labels: List::empty(), notes: List::empty(), helps: List::empty(), suggestions: List::empty() };
         self.cur_labels_start = self.cur_labels.len();
         self.cur_notes_start = self.cur_notes.len();
         self.cur_helps_start = self.cur_helps.len();
+        self.cur_suggestions_start = self.cur_suggestions.len();
     }
 
     pub fn label(&mut +self, text: Symbol) {
@@ -135,12 +155,22 @@ impl Diags {
         self.cur_helps.push(text);
     }
 
+    /// Attach an exact fix: replace `span` with `text`. `title` says what
+    /// it does; the diagnostic's help says it on the terminal.
+    pub fn suggest(&mut +self, span: Span, text: Symbol, title: Symbol) {
+        if is_dummy(span) {
+            return;
+        }
+        self.cur_suggestions.push(Suggestion { span, text, title });
+    }
+
     /// Record the diagnostic being built.
     pub fn finish(&mut +self) {
         let mut d = self.cur;
         d.labels = self.labels.add_list(self.cur_labels[self.cur_labels_start..]);
         d.notes = self.texts.add_list(self.cur_notes[self.cur_notes_start..]);
         d.helps = self.texts.add_list(self.cur_helps[self.cur_helps_start..]);
+        d.suggestions = self.suggestions.add_list(self.cur_suggestions[self.cur_suggestions_start..]);
         if d.is_error() {
             self.errors += 1;
         }
@@ -162,6 +192,7 @@ impl Diags {
         d.labels = self.labels.add_list(from.labels.list(d.labels));
         d.notes = self.texts.add_list(from.texts.list(d.notes));
         d.helps = self.texts.add_list(from.texts.list(d.helps));
+        d.suggestions = self.suggestions.add_list(from.suggestions.list(d.suggestions));
         self.push(d);
     }
 

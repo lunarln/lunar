@@ -333,6 +333,9 @@ pub fn lint(p: &mut +Program, body: Body, out: &mut +Diags) {
             out.warning(codes::lint::UNUSED_MUT(), l.span, m);
             out.label(say(p, "never mutated"));
             out.help(say(p, "remove the `mut`"));
+            if let Some(ms) = p.mut_before(l.span, name) {
+                out.suggest(ms, say(p, ""), say(p, "Remove the `mut`"));
+            }
             out.finish();
         }
     }
@@ -353,12 +356,17 @@ pub fn lint(p: &mut +Program, body: Body, out: &mut +Diags) {
                 out.label(say(p, "never used"));
             }
             out.help(say(p, "if this is intentional, prefix it with an underscore: `_{name}`"));
+            let ns = p.name_span(l.span, name);
+            out.suggest(Span::new(ns.lo, ns.lo), say(p, "_"), say(p, "Prefix `{name}` with an underscore"));
             out.finish();
         } else if l.mutable && !mutated[i] {
             let m = say(p, "variable `{name}` does not need to be mutable");
             out.warning(codes::lint::UNUSED_MUT(), l.span, m);
             out.label(say(p, "never mutated"));
             out.help(say(p, "remove the `mut`"));
+            if let Some(ms) = p.mut_before(l.span, name) {
+                out.suggest(ms, say(p, ""), say(p, "Remove the `mut`"));
+            }
             out.finish();
         }
     }
@@ -1655,6 +1663,7 @@ impl Cx {
                     p.diags.error(codes::borrow::ESCAPES_VIA_PARAM(), span, m);
                     p.diags.secondary(lx.span, say(p, "`{n}` is not declared `kept`, so callers do not expect `{dn}` to point into it"));
                     p.diags.help(say(p, "declare it `kept {n}: ...`"));
+                    p.diags.suggest(Span::new(lx.span.lo, lx.span.lo), say(p, "kept "), say(p, "Declare `{n}` `kept`"));
                 }
                 _ => {
                     let m = say(p, "cannot store a view of a local value into parameter `{dn}`");
@@ -1990,6 +1999,11 @@ impl Cx {
                         w.push_str(wanted[j]);
                     }
                     p.diags.help(say(p, "say every parameter the result may point into: `from {w}`"));
+                    if !is_dummy(fc.declared.span) {
+                        p.diags.suggest(fc.declared.span, say(p, "{w}"), say(p, "Declare `from {w}`"));
+                    } else if !is_dummy(sig.ret_span) {
+                        p.diags.suggest(Span::new(sig.ret_span.hi, sig.ret_span.hi), say(p, " from {w}"), say(p, "Declare `from {w}`"));
+                    }
                     p.diags.finish();
                     return;
                 }

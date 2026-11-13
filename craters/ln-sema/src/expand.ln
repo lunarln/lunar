@@ -1377,6 +1377,13 @@ impl Sema {
             let (o, x) = c;
             self.ctxs.insert(base + o, x);
         }
+        // Where each copied token was written, for editors.
+        for i in 0..toks.len() {
+            let t = toks[i];
+            if !is_dummy(t.span) && t.span.hi >= t.span.lo && t.span.hi - t.span.lo == self.p.text(t.text).len() as u32 {
+                self.p.origins.insert(base + rendered.offsets[i], t.span);
+            }
+        }
         let parsed = ln_parser::parse_expansion(&mut self.p.ast, rendered.text.as_str(), base, ctx_map(rendered.ctxs[..], base), kind);
         if derive && parsed.diags.len() > 0 {
             // The parse errors would only restate this from inside the
