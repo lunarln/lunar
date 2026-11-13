@@ -1,8 +1,0 @@
-[package]
-name = "ln-parse-kit"
-description = "A minimal, portable recursive-descent parsing framework generic over token kinds"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
