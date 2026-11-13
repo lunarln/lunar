@@ -125,6 +125,10 @@ pub struct Capture {
 pub struct OpaqueInfo {
     /// What callers know about it (in terms of the function's generics).
     pub bounds: List::<TraitRef>,
+    /// Its associated type constraints (`impl Iterator::<Item = u8>`), as
+    /// projection equalities on it (see `Program::is_eq_pred`), in terms of
+    /// the function's generics.
+    pub eqs: List::<Pred>,
     /// The type the function's body returns there, once checked.
     pub concrete: Option::<Ty>,
     pub span: Span,
@@ -163,6 +167,10 @@ pub struct Program {
     pub globs: [Glob; ..+],
     /// An impl's methods: (impl, name) to the method.
     pub impl_methods: HashMap::<(DefId, Symbol), DefId>,
+    /// An impl's associated types (`type Item = u8;`) and constants, by
+    /// (impl, name).
+    pub impl_types: HashMap::<(DefId, Symbol), DefId>,
+    pub impl_consts: HashMap::<(DefId, Symbol), DefId>,
     pub thir: Thir,
     pub bodies: HashMap::<DefId, Body>,
     /// Lang items (`#[lang = "..."]`) by name.
@@ -198,6 +206,7 @@ pub struct Program {
     pub variants: Arena::<VariantDef>,
     pub trait_refs: Arena::<TraitRef>,
     pub trait_methods: Arena::<TraitMethod>,
+    pub trait_assocs: Arena::<TraitAssoc>,
     pub consts: Arena::<ConstVal>,
     pub idents: Arena::<Ident>,
     pub captures: Arena::<Capture>,
@@ -213,6 +222,8 @@ impl Program {
             bindings: HashMap::new(),
             globs: [],
             impl_methods: HashMap::new(),
+            impl_types: HashMap::new(),
+            impl_consts: HashMap::new(),
             thir: Thir::new(),
             bodies: HashMap::new(),
             lang: HashMap::new(),
@@ -235,6 +246,7 @@ impl Program {
             variants: Arena::new(),
             trait_refs: Arena::new(),
             trait_methods: Arena::new(),
+            trait_assocs: Arena::new(),
             consts: Arena::new(),
             idents: Arena::new(),
             captures: Arena::new(),
@@ -444,21 +456,37 @@ impl Program {
             let tr = self.types.subst_trait_ref(b, args);
             out.push(Pred { ty, trait_ref: tr, span: o.span });
         }
+        for i in 0..o.eqs.len() {
+            let e = self.preds.list(o.eqs)[i];
+            let pt = self.types.subst(e.ty, args);
+            let tr = self.types.subst_trait_ref(e.trait_ref, args);
+            out.push(Pred { ty: pt, trait_ref: tr, span: e.span });
+        }
     }
 
-    /// `t` with every `impl Trait` replaced by the type it stands for (for
-    /// code generation, after the functions returning them are checked).
+    /// `t` with every `impl Trait` replaced by the type it stands for, and
+    /// every projection normalized (for code generation, after the
+    /// functions returning them are checked, where every type is known).
     pub fn reveal(&mut +self, t: Ty): Ty {
         let mut t = t;
+        let none: [Pred; 0] = [];
         for _ in 0..32 {
             let has = self.types.any(t, &|k| match k {
                 TyKind::Opaque(..) => true,
                 _ => false,
             });
-            if !has {
+            if has {
+                t = self.reveal_once(t);
+                continue;
+            }
+            if !self.types.has_proj(t) {
                 break;
             }
-            t = self.reveal_once(t);
+            let n = self.normalize(t, none[..]);
+            if n == t {
+                break;
+            }
+            t = n;
         }
         return t;
     }
@@ -554,16 +582,33 @@ impl Program {
                 let mut preds: [Pred; ..+] = [];
                 self.opaque_preds(def, i, args, &mut preds);
                 out.push_str("impl ");
+                let mut first = true;
                 for j in 0..preds.len() {
-                    if j > 0 {
+                    if self.is_eq_pred(preds[j]) {
+                        continue;
+                    }
+                    if !first {
                         out.push_str(" + ");
                     }
-                    self.write_trait_ref(out, preds[j].trait_ref);
+                    first = false;
+                    // Its constraints: `Iterator::<Item = u8>`.
+                    let mut eqs: [(DefId, Ty); ..+] = [];
+                    for q in preds[..] {
+                        if !self.is_eq_pred(q) {
+                            continue;
+                        }
+                        if let TyKind::Proj(a, pargs) = self.types.kind(q.ty) {
+                            if self.defs[a.index()].parent == Some(preds[j].trait_ref.trait_id) && pargs.len() > 0 && self.types.at(pargs, 0) == t {
+                                eqs.push((a, self.types.at(q.trait_ref.args, 0)));
+                            }
+                        }
+                    }
+                    self.write_trait_ref_with(out, preds[j].trait_ref, eqs[..]);
                 }
             }
             TyKind::Dyn(d, args, flags) => {
                 out.push_str(if flags & DYN_MUT != 0 { "dyn mut " } else { "dyn " });
-                self.write_trait_ref(out, TraitRef { trait_id: d, args });
+                self.write_dyn_trait(out, d, args);
                 if flags & DYN_SEND != 0 {
                     out.push_str(" + Send");
                 }
@@ -572,10 +617,51 @@ impl Program {
                 }
             }
             TyKind::Param(_, n) => out.push_str(self.text(n)),
+            // `T::Item` for a parameter, else `<X as Trait>::Item`.
+            TyKind::Proj(a, args) => {
+                let tr_id = match self.defs[a.index()].parent {
+                    Some(p) => p,
+                    None => a,
+                };
+                let self_ty = self.types.at(args, 0);
+                let short = match self.types.kind(self_ty) {
+                    TyKind::Param(..) => args.len() == 1,
+                    _ => false,
+                };
+                if short {
+                    self.write_ty(out, self_ty);
+                } else {
+                    out.push('<');
+                    self.write_ty(out, self_ty);
+                    out.push_str(" as ");
+                    let rest = self.types.list(args)[1..].to_grow();
+                    let rl = self.types.mk_list(rest[..]);
+                    self.write_trait_ref(out, TraitRef { trait_id: tr_id, args: rl });
+                    out.push('>');
+                }
+                out.push_str("::");
+                out.push_str(self.name(a));
+            }
             TyKind::Infer(_) => out.push('_'),
             TyKind::Never => out.push('!'),
             TyKind::Error => out.push_str("{error}"),
         }
+    }
+
+    /// The trait of `dyn` type `Dyn(d, args, _)` with its arguments and
+    /// associated types: `Iterator::<Item = u8>`.
+    pub fn write_dyn_trait(&mut +self, out: &mut +String, d: DefId, args: TyList) {
+        let tr = self.dyn_trait_ref(d, args);
+        let mut eqs: [(DefId, Ty); ..+] = [];
+        let mut assocs: [DefId; ..+] = [];
+        self.dyn_assoc_tys(tr, &mut assocs);
+        let n = tr.args.len();
+        for k in 0..assocs.len() {
+            if n + k < args.len() {
+                eqs.push((assocs[k], self.types.at(args, n + k)));
+            }
+        }
+        self.write_trait_ref_with(out, tr, eqs[..]);
     }
 
     fn write_list(&mut +self, out: &mut +String, l: TyList) {
@@ -590,6 +676,29 @@ impl Program {
     /// A trait with its arguments, as written in a bound: `Iterator::<i32>`,
     /// or with the `Fn` sugar, `Fn(i32): bool`.
     pub fn write_trait_ref(&mut +self, out: &mut +String, tr: TraitRef) {
+        let none: [(DefId, Ty); 0] = [];
+        self.write_trait_ref_with(out, tr, none[..]);
+    }
+
+    /// A trait with its arguments and associated type constraints:
+    /// `Iterator::<Item = u8>`, `Trait::<A, Out = B>`.
+    pub fn write_trait_ref_with(&mut +self, out: &mut +String, tr: TraitRef, eqs: [(DefId, Ty); &]) {
+        if eqs.len() > 0 {
+            out.push_str(self.name(tr.trait_id));
+            out.push_str("::<");
+            self.write_list(out, tr.args);
+            for i in 0..eqs.len() {
+                if i > 0 || tr.args.len() > 0 {
+                    out.push_str(", ");
+                }
+                let (a, t) = eqs[i];
+                out.push_str(self.name(a));
+                out.push_str(" = ");
+                self.write_ty(out, t);
+            }
+            out.push('>');
+            return;
+        }
         out.push_str(self.name(tr.trait_id));
         if tr.args.len() == 0 {
             return;

@@ -11,22 +11,83 @@ impl Parser {
     pub fn path_ty_style(&mut self): PResult::<Path> {
         let start = self.start();
         let mut segs: [PathSegment; ..+] = [];
+        self.path_segments_into(&mut segs)?;
+        let segments = self.ast.segments.add_list(segs[..]);
+        return Ok(Path { segments, span: self.span_from(start), qself: None });
+    }
+
+    /// Segments `a::b::<T, Item = U>::c` onto `segs`.
+    fn path_segments_into(&mut self, segs: &mut +[PathSegment; ..+]): PResult::<()> {
         loop {
             let ident = self.path_segment_ident()?;
             let mut args: Option::<List::<Id::<Ty>>> = None;
+            let mut bindings: List::<AssocBinding> = List::empty();
             if self.at(T::PathSep) && self.nth_at(1, T::LAngle) {
                 self.bump();
-                args = Some(self.generic_args()?);
+                let (a, b) = self.generic_args_and_bindings()?;
+                args = Some(a);
+                bindings = b;
             }
-            segs.push(PathSegment { ident, args });
+            segs.push(PathSegment { ident, args, bindings });
             if self.at(T::PathSep) && self.path_keyword_or_ident_at(1) {
                 self.bump();
                 continue;
             }
             break;
         }
+        return Ok(());
+    }
+
+    /// `<T as Trait>::Item`, `<T as Trait>::f::<U>` (at `<`): the trait's
+    /// segments then the item's, with `T` as the path's `qself`.
+    pub fn qualified_path(&mut self): PResult::<Path> {
+        let start = self.start();
+        self.expect(T::LAngle)?;
+        let qself = self.ty()?;
+        self.expect(T::As)?;
+        let mut segs: [PathSegment; ..+] = [];
+        self.path_segments_into(&mut segs)?;
+        self.expect(T::RAngle)?;
+        self.expect(T::PathSep)?;
+        let ident = self.path_segment_ident()?;
+        let mut args: Option::<List::<Id::<Ty>>> = None;
+        if self.at(T::PathSep) && self.nth_at(1, T::LAngle) {
+            self.bump();
+            args = Some(self.generic_args()?);
+        }
+        segs.push(PathSegment { ident, args, bindings: List::empty() });
         let segments = self.ast.segments.add_list(segs[..]);
-        return Ok(Path { segments, span: self.span_from(start) });
+        return Ok(Path { segments, span: self.span_from(start), qself: Some(qself) });
+    }
+
+    /// `<A, B, Item = C>` (the leading `::` already consumed): the types,
+    /// then the associated type constraints, which come after them.
+    pub fn generic_args_and_bindings(&mut self): PResult::<(List::<Id::<Ty>>, List::<AssocBinding>)> {
+        self.expect(T::LAngle)?;
+        let mut out: [Id::<Ty>; ..+] = [];
+        let mut bindings: [AssocBinding; ..+] = [];
+        loop {
+            if self.eat(T::RAngle) {
+                break;
+            }
+            if self.at(T::Ident) && self.nth_at(1, T::Eq) {
+                let name = self.ident()?;
+                self.expect(T::Eq)?;
+                let ty = self.ty()?;
+                bindings.push(AssocBinding { name, ty });
+            } else if bindings.len() > 0 {
+                // A type after a constraint.
+                self.expect_note(Expected::Named(Named::AssocBinding));
+                return Err(self.error_expected());
+            } else {
+                out.push(self.ty()?);
+            }
+            if !self.eat(T::Comma) {
+                self.expect(T::RAngle)?;
+                break;
+            }
+        }
+        return Ok((self.ast.ty_ids.add_list(out[..]), self.ast.assoc_bindings.add_list(bindings[..])));
     }
 
     fn path_keyword_or_ident_at(&mut self, n: usize): bool {
@@ -69,6 +130,8 @@ impl Parser {
                 self.bump();
                 TyKind::Infer
             }
+            // `<T as Trait>::Item`
+            Some(T::LAngle) => TyKind::Path(self.qualified_path()?),
             Some(T::Bang) => {
                 self.bump();
                 TyKind::Never

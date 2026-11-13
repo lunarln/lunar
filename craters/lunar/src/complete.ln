@@ -1943,6 +1943,7 @@ fn add_named(s: &mut Sema, cx: Cx, name: str, d: DefId, in_use: bool, next_is_pa
         DefKind::Const => CK_CONSTANT,
         DefKind::Static => CK_CONSTANT,
         DefKind::TypeAlias => CK_STRUCT,
+        DefKind::AssocTy => CK_TYPE_PARAMETER,
         DefKind::Macro => CK_FUNCTION,
     };
     let (detail, doc) = describe(s, &out.idx, d);

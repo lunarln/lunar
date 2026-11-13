@@ -92,6 +92,7 @@ enum Named {
     Delimiter,
     ArraySize,
     EndOfExpansion,
+    AssocBinding,
 }
 
 impl Named {
@@ -107,6 +108,7 @@ impl Named {
             Named::Delimiter => "`(`, `[` or `{`",
             Named::ArraySize => "array size (`N`, `_`, `&`, `&mut`, `..+` or `-..+`)",
             Named::EndOfExpansion => "the end of the macro expansion",
+            Named::AssocBinding => "associated type constraint (`Name = Type`): constraints come after the type arguments",
         };
     }
 }

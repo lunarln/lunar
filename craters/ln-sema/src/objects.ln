@@ -16,9 +16,13 @@
 //   .. the methods of `dispatchable` methods, trait by trait in the order of
 //      `dyn_traits` (the trait itself first, then its supertraits), each
 //      trait's methods in declaration order.
+//   .. the associated constants, trait by trait in the same order, each
+//      trait's in declaration order: each word a pointer to the constant's
+//      value for `X` (read through a `dyn` as `d.N`).
 //
-// Associated constants will follow the methods, trait by trait in the same
-// order, each slot a pointer to the constant's value.
+// A trait's associated types are not in the vtable: a `dyn` type names
+// every one of them (`dyn Iterator::<Item = u8>`), so they are known where
+// it is used.
 
 use core::intern::Symbol;
 use crater::defs::*;
@@ -36,6 +40,9 @@ pub enum VtEntry {
     Super(TraitRef),
     /// A method of a trait (the trait itself or a supertrait).
     Method(TraitRef, Symbol),
+    /// A pointer to the value of an associated constant (declared in the
+    /// trait, the `DefId`) of a trait.
+    Const(TraitRef, DefId),
 }
 
 impl Program {
@@ -189,6 +196,30 @@ impl Program {
                 }
             }
         }
+        for t in ts {
+            let td = self.trait_data(t.trait_id);
+            for i in 0..td.assoc.len() {
+                let a = self.trait_assocs.list(td.assoc)[i];
+                if a.is_const {
+                    out.push(VtEntry::Const(t, a.def));
+                }
+            }
+        }
+    }
+
+    /// The word of `dyn principal`'s vtable pointing at the value of
+    /// associated constant `item` (of one of its traits), and that trait.
+    pub fn vtable_const_index(&mut +self, principal: TraitRef, item: DefId): Option::<(u32, TraitRef)> {
+        let mut es: [VtEntry; ..+] = [];
+        self.vtable_entries(principal, &mut es);
+        for i in 0..es.len() {
+            if let VtEntry::Const(t, d) = es[i] {
+                if d == item {
+                    return Some((i as u32, t));
+                }
+            }
+        }
+        return None;
     }
 
     /// The word of `dyn principal`'s vtable holding method `name` of trait
@@ -276,14 +307,61 @@ impl Program {
                 let m = core::fmt::format("`{tn}::{mn}` cannot be called through a `dyn`: {why}");
                 out.push((self.defs[tm.def.index()].span, self.sym(m.as_str())));
             }
+            // An associated constant is read through the vtable, as a value
+            // of its type: that type cannot depend on the type viewed.
+            for i in 0..d.assoc.len() {
+                let a = self.trait_assocs.list(d.assoc)[i];
+                if !a.is_const {
+                    continue;
+                }
+                let DefData::Const(c) = self.defs[a.def.index()].data else { continue; };
+                if mentions_self(&self.types, c.ty) {
+                    let an = self.text(a.name).to_string();
+                    let m = core::fmt::format("the type of `{tn}::{an}` mentions `Self`, whose type a `dyn` does not know");
+                    out.push((self.defs[a.def.index()].span, self.sym(m.as_str())));
+                }
+            }
         }
     }
 }
 
-/// Whether `t` mentions `Self` (generic parameter 0 of a trait).
+/// Whether `t` mentions `Self` (generic parameter 0 of a trait), other
+/// than as the self type of a projection (`Self::Item`), which a `dyn`
+/// type names.
 fn mentions_self(types: &Types, t: Ty): bool {
-    return types.any(t, &|k| match k {
+    return match types.kind(t) {
         TyKind::Param(0, _) => true,
+        TyKind::Proj(_, l) => {
+            let xs = types.list(l);
+            for i in 0..xs.len() {
+                if i == 0 {
+                    if let TyKind::Param(0, _) = types.kind(xs[0]) {
+                        continue;
+                    }
+                }
+                if mentions_self(types, xs[i]) {
+                    return true;
+                }
+            }
+            false
+        }
+        TyKind::Tuple(l) | TyKind::Adt(_, l) | TyKind::Closure(_, l) | TyKind::Opaque(_, _, l) | TyKind::Dyn(_, l, _) => {
+            for x in types.list(l) {
+                if mentions_self(types, x) {
+                    return true;
+                }
+            }
+            false
+        }
+        TyKind::Array(e, _) | TyKind::Grow(e) | TyKind::Ptr(e, _) => mentions_self(types, e),
+        TyKind::FnPtr(ps, _, r) => {
+            for x in types.list(ps) {
+                if mentions_self(types, x) {
+                    return true;
+                }
+            }
+            mentions_self(types, r)
+        }
         _ => false,
-    });
+    };
 }

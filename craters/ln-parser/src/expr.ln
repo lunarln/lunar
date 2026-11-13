@@ -394,6 +394,8 @@ impl Parser {
                 }
             }
             T::Pipe | T::PipePipe | T::Move => ExprKind::Closure(self.closure()?),
+            // `<T as Trait>::N`, `<T as Trait>::f`
+            T::LAngle => ExprKind::Path(self.qualified_path()?),
             T::LParen => {
                 self.bump();
                 if self.eat(T::RParen) {

@@ -131,6 +131,10 @@ impl Sema {
             }
             ast::ExprKind::Field(base, field) => {
                 let b = self.check_place_or_temp(base);
+                // `d.N`: an associated constant of the value a `dyn` views.
+                if let Some(c) = self.dyn_const(b, field) {
+                    return Some(self.expr_as_place(c));
+                }
                 Some(self.field_place(b, field))
             }
             ast::ExprKind::TupleField(base, idx, sp) => {
@@ -308,6 +312,32 @@ impl Sema {
             DefData::Static(s) => Some(self.mk(ExprKind::Static(def), s.ty, span)),
             _ => None,
         };
+    }
+
+    /// `d.N` on a `dyn` value `b`: associated constant `N` of one of its
+    /// traits, read through its vtable (`None` if `b` is not a `dyn` or its
+    /// traits have no constant `N`).
+    fn dyn_const(&mut self, b: Expr, field: Ident): Option::<Expr> {
+        let bt0 = self.shallow(b.ty);
+        let bt = self.p.types.strip_grow(bt0);
+        let TyKind::Dyn(d, dargs, _) = self.p.types.kind(bt) else { return None; };
+        let principal = self.p.dyn_trait_ref(d, dargs);
+        let mut found: [(TraitRef, DefId); ..+] = [];
+        self.p.bound_assocs(principal, field.name, true, &mut found);
+        if found.len() == 0 {
+            return None;
+        }
+        let (owner, item) = found[0];
+        self.record_def(field.span, item);
+        let mut a: [Ty; ..+] = [bt];
+        a.extend(self.p.types.list(owner.args));
+        let al = self.p.types.mk_list(a[..]);
+        let t0 = self.p.assoc_const_ty(item, al);
+        let ty = self.resolve(t0);
+        let span = b.span.to(field.span);
+        let v = self.read(b, ReadMode::Copy);
+        let vn = self.node(v);
+        return Some(self.mk(ExprKind::DynConst { base: vn, item }, ty, span));
     }
 
     pub fn field_place(&mut self, b: Expr, field: Ident): Expr {
@@ -904,7 +934,21 @@ impl Sema {
             return self.error_expr(span);
         }
         self.oblige(self_ty, tr, span);
-        let ret = if lang == "eq" || lang == "ord" { self.p.types.bool() } else { self_ty };
+        // The result: `<T as Add>::Output` (`T` itself for a standard
+        // library whose operator traits have no `Output`).
+        let output = self.p.sym("Output");
+        let ret = if lang == "eq" || lang == "ord" {
+            self.p.types.bool()
+        } else {
+            match self.p.trait_assoc(tr.trait_id, output, false) {
+                Some(a) => {
+                    let al = self.p.types.mk_list([self_ty][..]);
+                    let proj = self.p.types.mk(TyKind::Proj(a.def, al));
+                    self.shallow(proj)
+                }
+                None => self_ty,
+            }
+        };
         let mut args: [Arg; ..+] = [];
         let ln = self.node(lhs);
         args.push(Arg::Value(ln));
@@ -979,6 +1023,9 @@ impl Sema {
         let r = self.check_expr_borrow(rhs, Some(pty));
         let r = self.coerce_arg(r, pty, rs);
         let v = self.op_trait_call(lang, method, cur, Some(r), span);
+        // `a += b` stores `a + b` back into `a`: the operator's `Output`
+        // must be `a`'s type.
+        let v = self.coerce(v, pty, span);
         let pn = self.node(place);
         let vn = self.node(v);
         return self.mk(ExprKind::Assign { place: pn, value: vn }, u, span);
@@ -1049,12 +1096,29 @@ impl Sema {
             return self.error_expr(span);
         }
         let mutable = flags & DYN_MUT != 0;
-        let dst = TraitRef { trait_id: d, args: dargs };
+        let dst = self.p.dyn_trait_ref(d, dargs);
         let ts = self.ty_str(to);
+        // The associated types the `dyn` type names must be the value's.
+        let mut items: [DefId; ..+] = [];
+        let mut owners: [TraitRef; ..+] = [];
+        self.p.dyn_assoc_tys_of(dst, &mut items, &mut owners);
+        for k in 0..items.len() {
+            let n = dst.args.len() + k;
+            if n >= dargs.len() {
+                break;
+            }
+            let mut a: [Ty; ..+] = [from];
+            a.extend(self.p.types.list(owners[k].args));
+            let al = self.p.types.mk_list(a[..]);
+            let proj = self.p.types.mk(TyKind::Proj(items[k], al));
+            let want = self.p.types.at(dargs, n);
+            self.oblige_proj(proj, want, span);
+        }
+        self.process_projs();
         // From another `dyn`: the same value, through the same vtable or a
         // supertrait's.
         if let TyKind::Dyn(d0, a0, g) = self.p.types.kind(from) {
-            let src = TraitRef { trait_id: d0, args: a0 };
+            let src = self.p.dyn_trait_ref(d0, a0);
             if src == dst || self.p.dyn_has_trait(src, dst) {
                 let fs = self.ty_str(from);
                 if mutable && g & DYN_MUT == 0 {
@@ -1883,8 +1947,16 @@ impl Sema {
                 return self.error_expr(span);
             }
         };
-        // Find the item type from an impl or bound.
-        let item = match self.iterator_item(it_ty, iter_trait) {
+        // Find the item type from an impl or bound: `<I as Iterator>::Item`
+        // (or, for a standard library whose `Iterator` takes the item type
+        // as a parameter, `Iterator::<T>`'s `T`).
+        let item_sym = self.p.sym("Item");
+        let item_assoc = self.p.trait_assoc(iter_trait, item_sym, false);
+        let found = match item_assoc {
+            Some(a) => self.iterator_item_assoc(it_ty, iter_trait, a.def, iter_span),
+            None => self.iterator_item(it_ty, iter_trait),
+        };
+        let item = match found {
             Some(i) => i,
             None => {
                 let t = self.ty_str(it_ty);
@@ -1918,7 +1990,7 @@ impl Sema {
         let b = self.check_block(body, Some(u));
         self.pop_scope();
         self.fcx.loops.pop();
-        let tr = TraitRef { trait_id: iter_trait, args: item_list };
+        let tr = if item_assoc.is_some() { TraitRef { trait_id: iter_trait, args: List::empty() } } else { TraitRef { trait_id: iter_trait, args: item_list } };
         let tmp_place = self.mk(ExprKind::Local(tmp), it_ty, iter_span);
         let tp = self.node(tmp_place);
         let next_sym = self.p.sym("next");
@@ -1956,6 +2028,24 @@ impl Sema {
         let outer_locals = self.p.thir.local_ids.add_list([tmp][..]);
         let outer = self.p.thir.blocks.add(Block { stmts: outer_stmts, tail: None, locals: outer_locals, span });
         return self.mk(ExprKind::Block(outer), u, span);
+    }
+
+    /// The item type of iterator type `t`: `<t as Iterator>::Item` (`item`),
+    /// normalized as far as is known; `None` if `t` is not an iterator.
+    fn iterator_item_assoc(&mut self, t: Ty, iter_trait: DefId, item: DefId, span: Span): Option::<Ty> {
+        let t = self.resolve(t);
+        if self.is_unbound_var(t) {
+            return None;
+        }
+        let tr = TraitRef { trait_id: iter_trait, args: List::empty() };
+        if self.p.types.has_infer(t) {
+            self.oblige(t, tr, span);
+        } else if !self.p.implements(t, tr, self.fcx.env[..]) {
+            return None;
+        }
+        let al = self.p.types.mk_list([t][..]);
+        let proj = self.p.types.mk(TyKind::Proj(item, al));
+        return Some(self.shallow(proj));
     }
 
     fn iterator_item(&mut self, t: Ty, iter_trait: DefId): Option::<Ty> {

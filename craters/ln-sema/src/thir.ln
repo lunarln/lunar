@@ -215,6 +215,13 @@ pub enum ExprKind {
     // ----- values -----
     Read { place: Id::<Expr>, mode: ReadMode },
     Lit(ConstVal),
+    /// Associated constant `item` (declared in a trait) of the self type
+    /// `args[0]` (the trait's arguments after it), which is generic here:
+    /// its value is found for each instance.
+    AssocConst { item: DefId, args: TyList },
+    /// `d.N`: associated constant `item` (declared in a trait of the
+    /// `dyn`) of the value a `dyn` views, read through its vtable.
+    DynConst { base: Id::<Expr>, item: DefId },
     FnRef { def: DefId, args: TyList },
     Call { callee: Callee, args: List::<Arg> },
     Unary(UnOp, Id::<Expr>),

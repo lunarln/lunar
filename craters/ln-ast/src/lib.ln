@@ -301,7 +301,9 @@ pub struct ModDecl {
 pub struct ConstDecl {
     pub name: Ident,
     pub ty: Id::<Ty>,
-    pub value: Id::<Expr>,
+    /// `None` only for an associated constant declared in a trait without
+    /// a default: `const N: usize;`.
+    pub value: Option::<Id::<Expr>>,
 }
 
 pub struct StaticDecl {
@@ -316,10 +318,14 @@ pub struct ExternBlock {
     pub items: List::<Id::<Item>>,
 }
 
+/// `type Name = T;`, or in a trait an associated type `type Item;` /
+/// `type Item: Bound;` (no `ty`, maybe bounds).
 pub struct TypeAlias {
     pub name: Ident,
     pub generics: Generics,
-    pub ty: Id::<Ty>,
+    /// The bounds of an associated type declared in a trait.
+    pub bounds: List::<Path>,
+    pub ty: Option::<Id::<Ty>>,
 }
 
 // ===================================================================== paths & types
@@ -327,12 +333,24 @@ pub struct TypeAlias {
 pub struct Path {
     pub segments: List::<PathSegment>,
     pub span: Span,
+    /// `<T as Trait>::Item`: the self type `T`. The segments are then the
+    /// trait's path followed by the associated item.
+    pub qself: Option::<Id::<Ty>>,
 }
 
 pub struct PathSegment {
     pub ident: Ident,
     /// `::<T, U>` attached to this segment.
     pub args: Option::<List::<Id::<Ty>>>,
+    /// Associated type constraints among the arguments, after the types:
+    /// `Iterator::<Item = u8>`, `Trait::<A, Out = B>`.
+    pub bindings: List::<AssocBinding>,
+}
+
+/// `Item = u8` in `Iterator::<Item = u8>`.
+pub struct AssocBinding {
+    pub name: Ident,
+    pub ty: Id::<Ty>,
 }
 
 pub struct Ty {
@@ -608,6 +626,7 @@ pub struct Ast {
     pub stmts: Arena::<Stmt>,
     pub paths: Arena::<Path>,
     pub segments: Arena::<PathSegment>,
+    pub assoc_bindings: Arena::<AssocBinding>,
     pub idents: Arena::<Ident>,
     pub attrs: Arena::<Attr>,
     pub metas: Arena::<Meta>,
@@ -645,6 +664,7 @@ impl Ast {
             stmts: Arena::new(),
             paths: Arena::new(),
             segments: Arena::new(),
+            assoc_bindings: Arena::new(),
             idents: Arena::new(),
             attrs: Arena::new(),
             metas: Arena::new(),
@@ -673,7 +693,7 @@ impl Ast {
 
     /// Whether the path is one segment without generic arguments.
     pub fn is_single(&self, p: Path): bool {
-        if p.segments.len() != 1 {
+        if p.segments.len() != 1 || p.qself.is_some() {
             return false;
         }
         return self.segments.list(p.segments)[0].args.is_none();
@@ -944,7 +964,9 @@ fn item_kind(a: &Ast, o: &mut String, d: usize, k: ItemKind) {
             ind(o, d);
             o.write("const {ident(a, c.name)}\n");
             ty(a, o, d + 1, c.ty);
-            expr(a, o, d + 1, c.value);
+            if let Some(v) = c.value {
+                expr(a, o, d + 1, v);
+            }
         }
         ItemKind::Static(s) => {
             ind(o, d);
@@ -964,7 +986,16 @@ fn item_kind(a: &Ast, o: &mut String, d: usize, k: ItemKind) {
             ind(o, d);
             o.write("type {ident(a, t.name)}\n");
             generics(a, o, d + 1, t.generics);
-            ty(a, o, d + 1, t.ty);
+            if t.bounds.len() > 0 {
+                ind(o, d + 1);
+                o.push_str("bounds\n");
+                for p in a.paths.list(t.bounds) {
+                    path(a, o, d + 2, p);
+                }
+            }
+            if let Some(x) = t.ty {
+                ty(a, o, d + 1, x);
+            }
         }
         ItemKind::Macro(m) => {
             ind(o, d);
@@ -1094,6 +1125,11 @@ fn tokens(a: &Ast, o: &mut String, d: usize, l: List::<TokenTree>) {
 fn path(a: &Ast, o: &mut String, d: usize, p: Path) {
     ind(o, d);
     o.write("path {at(p.span)}\n");
+    if let Some(q) = p.qself {
+        ind(o, d + 1);
+        o.push_str("qself\n");
+        ty(a, o, d + 2, q);
+    }
     for s in a.segments.list(p.segments) {
         ind(o, d + 1);
         match s.args {
@@ -1102,6 +1138,11 @@ fn path(a: &Ast, o: &mut String, d: usize, p: Path) {
                 o.write("seg {ident(a, s.ident)} args\n");
                 for t in a.ty_ids.list(args) {
                     ty(a, o, d + 2, t);
+                }
+                for b in a.assoc_bindings.list(s.bindings) {
+                    ind(o, d + 2);
+                    o.write("binding {ident(a, b.name)}\n");
+                    ty(a, o, d + 3, b.ty);
                 }
             }
         }

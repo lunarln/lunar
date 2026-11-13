@@ -448,7 +448,7 @@ impl Sema {
                 self.finish_def(id, item, attrs);
                 let k = self.key(t.name, export);
                 self.bind(module, Ns::Type, k, id, item.is_pub, t.name.span);
-                self.p.defs[id.index()].data = DefData::Trait(TraitData { generics: Generics::none(), supertraits: List::empty(), methods: List::empty(), auto: false });
+                self.p.defs[id.index()].data = DefData::Trait(TraitData { generics: Generics::none(), supertraits: List::empty(), methods: List::empty(), auto: false, assoc: List::empty() });
                 self.collect_trait_items(id, module, t.items, src);
             }
             ItemKind::Impl(im) => {
@@ -591,8 +591,23 @@ impl Sema {
                     self.pending_macros.push(Pending::Call { module, call, owner: Owner::Trait(id) });
                     continue;
                 }
+                ItemKind::TypeAlias(ta) => {
+                    if ta.generics.params.len() > 0 {
+                        self.error(codes::ty::GENERIC_COUNT(), ta.generics.span, "associated types cannot have generic parameters");
+                        self.emit();
+                    }
+                    let d = self.new_def(ta.name.name, DefKind::AssocTy, Some(module), ta.name.span, AstRef::Alias(ta));
+                    self.p.defs[d.index()].data = DefData::AssocTy(AssocTyData { bounds: List::empty(), ty: None });
+                    self.add_trait_assoc(id, d, ta.name, false, ta.ty.is_some());
+                    continue;
+                }
+                ItemKind::Const(c) => {
+                    let d = self.new_def(c.name.name, DefKind::Const, Some(module), c.name.span, AstRef::Const(c));
+                    self.add_trait_assoc(id, d, c.name, true, c.value.is_some());
+                    continue;
+                }
                 _ => {
-                    self.error(codes::syntax::UNEXPECTED_TOKEN(), ti.span, "only functions are allowed inside traits");
+                    self.error(codes::syntax::UNEXPECTED_TOKEN(), ti.span, "only functions, associated types and constants are allowed inside traits");
                     self.emit();
                     continue;
                 }
@@ -625,6 +640,89 @@ impl Sema {
         }
     }
 
+    /// Record associated type or constant `d` (named `name`) of trait
+    /// `trait_id`.
+    fn add_trait_assoc(&mut self, trait_id: DefId, d: DefId, name: Ident, is_const: bool, has_default: bool) {
+        self.p.defs[d.index()].parent = Some(trait_id);
+        self.p.defs[d.index()].is_pub = true;
+        let mut t = self.p.trait_data(trait_id);
+        let mut all: [TraitAssoc; ..+] = [];
+        let mut dup = false;
+        for a in self.p.trait_assocs.list(t.assoc) {
+            if a.name == name.name && a.is_const == is_const {
+                dup = true;
+            }
+            all.push(a);
+        }
+        if is_const {
+            for m in self.p.trait_methods.list(t.methods) {
+                if m.name == name.name {
+                    dup = true;
+                }
+            }
+        }
+        all.push(TraitAssoc { name: name.name, def: d, is_const, has_default });
+        t.assoc = self.p.trait_assocs.add_list(all[..]);
+        self.p.defs[trait_id.index()].data = DefData::Trait(t);
+        if dup {
+            let n = self.str_of(name.name);
+            let what = if is_const { "constant" } else { "associated type" };
+            self.error(codes::name::DUPLICATE(), name.span, "{what} `{n}` is defined multiple times");
+            self.emit();
+        }
+    }
+
+    /// An associated type or constant of impl `id`.
+    fn add_impl_assoc(&mut self, id: DefId, module: DefId, ii: Item, is_trait_impl: bool) {
+        match ii.kind {
+            ItemKind::TypeAlias(ta) => {
+                let tn = self.str_of(ta.name.name);
+                if !is_trait_impl {
+                    self.error(codes::syntax::UNEXPECTED_TOKEN(), ii.span, "associated types are only allowed in impls of traits");
+                    self.help("make it a type alias outside the impl: `type {tn} = ...;`");
+                    self.emit();
+                    return;
+                }
+                if ta.generics.params.len() > 0 {
+                    self.error(codes::ty::GENERIC_COUNT(), ta.generics.span, "associated types cannot have generic parameters");
+                    self.emit();
+                }
+                if ta.bounds.len() > 0 {
+                    let first = self.p.ast.paths.list(ta.bounds)[0].span;
+                    self.error(codes::syntax::UNEXPECTED_TOKEN(), first, "bounds on an associated type belong in the trait");
+                    self.help("the trait's `type {tn}: Bound;` says what every impl's type must implement");
+                    self.emit();
+                }
+                let d = self.new_def(ta.name.name, DefKind::AssocTy, Some(module), ta.name.span, AstRef::Alias(ta));
+                self.p.defs[d.index()].parent = Some(id);
+                self.p.defs[d.index()].is_pub = true;
+                self.p.defs[d.index()].data = DefData::AssocTy(AssocTyData { bounds: List::empty(), ty: None });
+                if ta.ty.is_none() {
+                    let n = self.str_of(ta.name.name);
+                    self.error(codes::syntax::MISSING_VALUE(), ii.span, "associated type `{n}` has no type");
+                    self.help("give it one: `type {n} = u8;`");
+                    self.emit();
+                }
+                if self.p.impl_types.insert((id, ta.name.name), d).is_some() {
+                    let n = self.str_of(ta.name.name);
+                    self.error(codes::name::DUPLICATE(), ta.name.span, "associated type `{n}` is defined twice in this impl");
+                    self.emit();
+                }
+            }
+            ItemKind::Const(c) => {
+                let d = self.new_def(c.name.name, DefKind::Const, Some(module), c.name.span, AstRef::Const(c));
+                self.p.defs[d.index()].parent = Some(id);
+                self.p.defs[d.index()].is_pub = ii.is_pub || is_trait_impl;
+                if self.p.impl_consts.insert((id, c.name.name), d).is_some() {
+                    let n = self.str_of(c.name.name);
+                    self.error(codes::name::DUPLICATE(), c.name.span, "constant `{n}` is defined twice in this impl");
+                    self.emit();
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// The functions of impl `id` (also those a macro in its body expands to).
     pub fn collect_impl_items(&mut self, id: DefId, module: DefId, items: List::<Id::<Item>>, src: Id::<ModSource>) {
         let is_trait_impl = match self.ast(id) {
@@ -643,8 +741,12 @@ impl Sema {
                     self.pending_macros.push(Pending::Call { module, call, owner: Owner::Impl(id) });
                     continue;
                 }
+                ItemKind::TypeAlias(_) | ItemKind::Const(_) => {
+                    self.add_impl_assoc(id, module, ii, is_trait_impl);
+                    continue;
+                }
                 _ => {
-                    self.error(codes::syntax::UNEXPECTED_TOKEN(), ii.span, "only functions are allowed inside impls");
+                    self.error(codes::syntax::UNEXPECTED_TOKEN(), ii.span, "only functions, associated types and constants are allowed inside impls");
                     self.emit();
                     continue;
                 }

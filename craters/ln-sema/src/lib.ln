@@ -23,6 +23,7 @@ pub mod resolve;
 pub mod expand;
 pub mod lower;
 pub mod traits;
+pub mod assoc;
 pub mod objects;
 pub mod layout;
 pub mod borrowck;
