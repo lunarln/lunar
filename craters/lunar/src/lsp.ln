@@ -1435,6 +1435,15 @@ fn answer(a: &mut Analysis, st: &mut State, req: &Json, method: str, path: str, 
                 out.set(o, "diagnostics", diags);
                 let pref = out.bool(sugs.len() == 1);
                 out.set(o, "isPreferred", pref);
+                // The fix may be in another file than the diagnostic.
+                let loc = match st.location(out, &a.s.p, sp) {
+                    Some(l) => l,
+                    None => continue,
+                };
+                let fix_uri = match out.get(loc, "uri") {
+                    Some(u) => String::from(out.as_str(u).unwrap_or(uri.as_str())),
+                    None => String::from(uri.as_str()),
+                };
                 let edit = out.object();
                 let changes = out.object();
                 let list = out.array();
@@ -1444,7 +1453,7 @@ fn answer(a: &mut Analysis, st: &mut State, req: &Json, method: str, path: str, 
                 let nt = out.string(a.s.p.text(sg.text));
                 out.set(te, "newText", nt);
                 out.push(list, te);
-                out.set(changes, uri.as_str(), list);
+                out.set(changes, fix_uri.as_str(), list);
                 out.set(edit, "changes", changes);
                 out.set(o, "edit", edit);
                 out.push(arr, o);
