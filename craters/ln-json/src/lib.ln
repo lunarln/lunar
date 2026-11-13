@@ -364,6 +364,44 @@ impl Json {
         };
     }
 
+    /// A copy of `v` (and what it holds), free to go into another array or
+    /// object.
+    pub fn copy(&mut +self, v: Value): Value {
+        let n = self.nodes[v.index as usize];
+        return match n.kind {
+            Kind::Array | Kind::Object => {
+                let o = self.add(n.kind, false, 0, 0);
+                let mut c = n.first;
+                while c != NONE {
+                    let cn = self.nodes[c as usize];
+                    let x = self.copy(Value { index: c });
+                    self.link(o, x);
+                    self.nodes[x.index as usize].key_lo = cn.key_lo;
+                    self.nodes[x.index as usize].key_hi = cn.key_hi;
+                    c = cn.next;
+                }
+                o
+            }
+            // The text only grows, so the copy can share it.
+            _ => self.add(n.kind, n.flag, n.lo, n.hi),
+        };
+    }
+
+    /// Empty `array`; its items are free to go elsewhere (or back).
+    pub fn clear(&mut +self, array: Value) {
+        let a = array.index as usize;
+        let mut c = self.nodes[a].first;
+        while c != NONE {
+            let next = self.nodes[c as usize].next;
+            self.nodes[c as usize].linked = false;
+            self.nodes[c as usize].next = NONE;
+            c = next;
+        }
+        self.nodes[a].first = NONE;
+        self.nodes[a].last = NONE;
+        self.nodes[a].len = 0;
+    }
+
     // ----------------------------------------------------------- reading
 
     pub fn kind(&self, v: Value): Kind {
