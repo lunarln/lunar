@@ -504,6 +504,8 @@ fn capabilities(out: &mut +Json): Value {
     out.set(caps, "workspaceSymbolProvider", t);
     let t = out.bool(true);
     out.set(caps, "inlayHintProvider", t);
+    let t = out.bool(true);
+    out.set(caps, "documentFormattingProvider", t);
     let ca = out.object();
     let kinds = out.array();
     let qf = out.string("quickfix");
@@ -2469,6 +2471,8 @@ impl Server {
             self.workspace_symbol(req, &mut out)
         } else if m == "completionItem/resolve" {
             self.resolve_completion(req, &mut out)
+        } else if m == "textDocument/formatting" {
+            self.format(req, &mut out)
         } else if is_document_request(m) {
             self.document_request(req, m, &mut out)
         } else {
@@ -2671,6 +2675,46 @@ impl Server {
             Some(loc) => Ok(self.slots.definition(loc.slot, &self.st, loc.file, loc.offset, out)),
             None => Ok(out.null()),
         };
+    }
+
+    /// `textDocument/formatting`: the document as `lunar fmt` formats it,
+    /// as one edit of the whole text (none if it is formatted already).
+    /// A document with syntax errors is left alone: `null`, as is one the
+    /// formatter cannot format without changing its meaning.
+    fn format(&mut self, req: &Json, out: &mut Json): Result::<Value, String> {
+        let uri = match req.path(req.root(), ["params", "textDocument", "uri"][..]) {
+            Some(u) => match req.as_str(u) {
+                Some(s) => String::from(s),
+                None => return Err(String::from("invalid type: expected a string for `textDocument.uri`")),
+            },
+            None => return Err(String::from("missing field `textDocument`")),
+        };
+        let path = match to_path(uri.as_str()) {
+            Some(p) => p,
+            None => return Ok(out.null()),
+        };
+        let key = self.st.key_of(path.as_str());
+        let text = match self.st.docs.get(key) {
+            Some(t) => String::from(t),
+            None => match std::fs::read_to_string(path.as_str()) {
+                Ok(t) => t,
+                Err(_) => return Ok(out.null()),
+            },
+        };
+        let formatted = match ln_fmt::format_source(text.as_str()) {
+            Ok(f) => f,
+            Err(_) => return Ok(out.null()),
+        };
+        let edits = out.array();
+        if formatted.as_str() != text.as_str() {
+            let e = out.object();
+            let r = text_range(out, text.as_str(), 0, text.len() as u32);
+            out.set(e, "range", r);
+            let nt = out.string(formatted.as_str());
+            out.set(e, "newText", nt);
+            out.push(edits, e);
+        }
+        return Ok(edits);
     }
 
     /// The analysis, file and offset of a document position, analyzing the

@@ -1,0 +1,7 @@
+// Formatting: the whole document as one edit, comments kept.
+fn add(a:i32,b:i32):i32{ return a+b; }
+
+fn main() {
+    let x=add(1,2);   // three
+    println("{x}");
+}

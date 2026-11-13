@@ -1,0 +1,27 @@
+{
+  "about": "Formatting: the whole document as `lunar fmt` formats it, in one edit with comments kept; no edits when it is formatted already; nothing (null) while it has syntax errors.",
+  "steps": [
+    { "open": "main.ln" },
+    { "request": "textDocument/formatting",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "options": { "tabSize": 4, "insertSpaces": true } },
+      "expect": [
+        "\"range\":{\"end\":{\"character\":0,\"line\":7},\"start\":{\"character\":0,\"line\":0}},",
+        "fn add(a: i32, b: i32): i32 {",
+        "    return a + b;",
+        "    let x = add(1, 2); // three",
+        "// Formatting: the whole document as one edit, comments kept."
+      ],
+      "count": ["\"newText\":", 1] },
+    { "change": "main.ln", "replace": ["fn add(a:i32,b:i32):i32{ return a+b; }", "fn add(a: i32, b: i32): i32 {\n    return a + b;\n}"] },
+    { "change": "main.ln", "replace": ["let x=add(1,2);   // three", "let x = add(1, 2); // three"] },
+    { "request": "textDocument/formatting",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "options": { "tabSize": 4, "insertSpaces": true } },
+      "expect": ["[]"],
+      "absent": ["\"newText\":"] },
+    { "change": "main.ln", "replace": ["return a + b;", "return a + ;"] },
+    { "request": "textDocument/formatting",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "options": { "tabSize": 4, "insertSpaces": true } },
+      "expect": ["null"],
+      "absent": ["\"newText\":"] }
+  ]
+}
