@@ -8,11 +8,22 @@ description: >
 runs:
   using: composite
   steps:
+    - name: Name the system
+      id: system
+      shell: bash
+      run: |
+        case "$RUNNER_OS" in
+          Linux) system=$(. /etc/os-release && echo "$ID-$VERSION_ID") ;;
+          macOS) system=macos-$(sw_vers -productVersion | cut -d. -f1) ;;
+          *) system=windows ;;
+        esac
+        echo "name=$system" >> "$GITHUB_OUTPUT"
+
     - name: Cache LLVM downloads
       uses: actions/cache@v4
       with:
         path: ~/.cache/lunar-llvm
-        key: llvm-20.1.8-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS }}
+        key: llvm-20.1.8-${{ steps.system.outputs.name }}-${{ runner.arch }}
 
     - name: Install LLVM 20 (Linux)
       if: runner.os == 'Linux'
@@ -20,12 +31,14 @@ runs:
       run: |
         set -euo pipefail
         debs="$HOME/.cache/lunar-llvm/debs"
+        # apt.llvm.org, for later `apt-get install`s too.
+        codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+        wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+        echo "deb http://apt.llvm.org/$codename/ llvm-toolchain-$codename-20 main" | sudo tee /etc/apt/sources.list.d/llvm-20.list
         # The cached packages install offline; if the runner image changed
-        # under them, fall back to apt.llvm.org.
+        # under them, they are downloaded again.
         if ! { ls "$debs"/*.deb >/dev/null 2>&1 && sudo dpkg -i "$debs"/*.deb; }; then
-          codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
-          echo "deb http://apt.llvm.org/$codename/ llvm-toolchain-$codename-20 main" | sudo tee /etc/apt/sources.list.d/llvm-20.list
+          rm -rf "$debs"
           sudo apt-get update -q
           mkdir -p "$debs/partial"
           sudo apt-get install -y -q -o Dir::Cache::Archives="$debs" llvm-20-dev
