@@ -1,0 +1,18 @@
+// error: borrow::shrink_while_borrowed
+// once: borrow::shrink_while_borrowed
+// A struct literal's fields are evaluated as written.
+struct Pair {
+    word: str,
+    n: usize,
+}
+
+fn clear_len(s: &mut String): usize {
+    s.clear();
+    return s.len();
+}
+
+fn main() {
+    let mut s = String::from("hello");
+    let p = Pair { word: s.as_str(), n: clear_len(&mut s) };
+    println("{p.word} {p.n}");
+}

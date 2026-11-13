@@ -310,6 +310,17 @@ to 64 MiB in total.
   disjoint fields separately is planned. A view taken from a `str` or slice
   *field* points where that field points, not into the struct, so it
   survives changes to the struct.
+* The operands of an expression are evaluated left to right: a call's
+  receiver and arguments, the items of a tuple or array literal, the fields
+  of a struct literal, the two sides of an operator, the holes of a format
+  string, an indexed place before its index, and the value of an
+  assignment before its place. Each value waits in a temporary until the
+  whole expression is done, so a later operand may not shrink, replace or
+  move what an earlier one points into:
+  `show(c.first(), c.clear_get())` is `err(borrow::shrink_while_borrowed)`.
+  Likewise a `for` loop keeps the address of its array (and a temporary
+  slice such as `c.all()`) for the whole loop, so its body may not shrink
+  what that points into; an array in a variable is read again on each pass.
 * Owners are freed when they go out of scope (also on `return`, `break`,
   `continue`). Moving out of a variable makes it unusable
   (`err(borrow::use_after_move)`).
@@ -427,6 +438,47 @@ println("{v}");
   concrete type the implementation's (or the default body's). An
   implementation may point into no more than the trait declares
   (`err(trait::signature)`).
+
+A `via` clause names parameters whose *views* the result points where,
+without pointing into the parameters' own data. A tokenizer that holds a
+view of a text (and data of its own) hands out pieces of the text: they
+stay valid while the tokenizer changes, even when it shrinks its own data,
+and end only when the text does:
+
+```lunar
+struct Words {
+    text: str,
+    pos: usize,
+    lens: [usize; -..+],
+}
+
+impl Words {
+    fn next_item(&mut self): Option::<str> via self { ... }
+}
+
+let a = w.next_item();
+let b = w.next_item();   // `a` stays valid: it points into `src`, not into `w`
+w.lens.clear();          // so does this
+src.clear();             // err(borrow::shrink_while_borrowed) if `a` is used later
+```
+
+* `from` and `via` combine, `from` first, each with a list of names:
+  `fn pick(a: &String, t: &Tokens, u: &Tokens): str from a via t, u` points
+  into `a`'s data, or where `t`'s and `u`'s views point. A parameter is in
+  one list or the other (`err(name::duplicate)`): `from p` already covers
+  where `p`'s views point. `from static via self` is allowed and means the
+  same as `via self`, since static data is always allowed. `via` alone
+  points into no parameter's own data.
+* A parameter named in `via` must hold views (a `str`, a slice, a struct
+  holding one, a generic `T` not bounded by `Dull`), or
+  `err(type::from_without_views)`: a borrowed owner (`s: &String`) holds
+  none, and belongs in `from` if the result points into it.
+* The body is checked as for `from`: a returned view into a `via`
+  parameter's own data (`self.buf.as_str()` from a `via self` method) is
+  `err(borrow::escapes_via_return)`.
+* `via p` is narrower than `from p`: a trait method declared `from self`
+  may be implemented `via self`, but one declared `via self` may not be
+  implemented `from self` (`err(trait::signature)`).
 * Calls through function pointers may point into every argument; their
   types have no `from` clause.
 * Closures are not part of any signature, so a closure's result is
@@ -439,9 +491,9 @@ println("{v}");
   everything it borrows.
 
 When a borrow error comes from a call's result, it points at the argument:
-"the value returned by `first` points into `x`". `from` is a word only
-after a return type: functions, methods and parameters may still be named
-`from`.
+"the value returned by `first` points into `x`". `from` and `via` are words
+only after a return type: functions, methods and parameters may still be
+named `from` or `via`.
 
 Function pointer types record each parameter's mode, written as in
 signatures: `fn(&String): usize`, `fn(&mut i32)`, `fn(String): usize`. A
@@ -532,6 +584,22 @@ three. A closure given where `Fn(&mut +String)` is expected takes that
 parameter as `&mut +`, so it may only grow it, and calling `f(s)` through
 such a bound keeps the views into `s`, as for a `&mut +` parameter of a
 function.
+
+A closure's parameter can also be declared `&mut +T` itself, with the
+same rules as a function's (`err(type::grow_without_mut)`,
+`err(type::grow_no_owner)`, `err(borrow::grow_only)`). Calling it keeps the
+caller's views, and its type meets `Fn(&mut +T)` bounds:
+
+```lunar
+let first = s.as_str();
+let add = |x: &mut +String| x.push_str(".");
+add(&mut s);              // `first` stays valid
+println("{first} {s}");
+```
+
+Without the `+` (or an expected `Fn(&mut +T)`), a closure's `&mut`
+parameter may shrink its argument, and calling it ends every view into
+that argument.
 
 A function can return a closure (or any value) without naming its type:
 `fn make_adder(n: i32): impl Fn(i32): i32 { return move |x| x + n; }`.

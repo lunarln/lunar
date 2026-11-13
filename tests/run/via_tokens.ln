@@ -1,0 +1,107 @@
+// `via p` after a return type: the result points where `p`'s views point,
+// never into `p`'s own data. A tokenizer holding views of a text (and data
+// of its own) hands out words of the text: later `&mut self` calls do not
+// end them, since they point into the text, not into the tokenizer.
+
+struct Words {
+    text: str,
+    pos: usize,
+    /// The length of every word handed out: data of its own, which
+    /// `&mut self` methods may shrink.
+    lens: [usize; -..+],
+}
+
+impl Words {
+    fn new(text: str): Words {
+        return Words { text, pos: 0, lens: [] };
+    }
+
+    fn next_item(&mut self): Option::<str> via self {
+        let bytes = self.text.as_bytes();
+        while self.pos < bytes.len() && bytes[self.pos] == b' ' {
+            self.pos += 1;
+        }
+        if self.pos >= bytes.len() {
+            return None;
+        }
+        let start = self.pos;
+        while self.pos < bytes.len() && bytes[self.pos] != b' ' {
+            self.pos += 1;
+        }
+        self.lens.push(self.pos - start);
+        return Some(self.text[start..self.pos]);
+    }
+
+    fn forget(&mut self) {
+        self.lens.clear();
+    }
+
+    /// The text not read yet, or the last word's length as text: `from
+    /// static` combined with `via`.
+    fn rest_or(&self, empty: bool): str from static via self {
+        if empty {
+            return "(none)";
+        }
+        return self.text[self.pos..];
+    }
+}
+
+/// Into `a`'s own data, or where `t`'s views point.
+fn pick(a: &String, t: &Words, first: bool): str from a via t {
+    if first {
+        return a.as_str();
+    }
+    return t.text;
+}
+
+/// `from` in a trait allows `via` in an implementation.
+trait Source {
+    fn line(&mut self): str from self;
+}
+
+impl Source for Words {
+    fn line(&mut self): str via self {
+        self.lens.push(0);
+        return self.text;
+    }
+}
+
+/// Generic callers use the trait's clause.
+fn line_of::<S: Source>(s: &mut S): str from s {
+    return s.line();
+}
+
+/// `via` is a name everywhere else.
+fn via(via: &String): str from via {
+    return via.as_str();
+}
+
+fn main() {
+    let src = String::from("let x = 42 ;");
+    let mut w = Words::new(src.as_str());
+    // Every word stays alive across the next `next_item()`, and across
+    // `forget`, which shrinks `w`'s own data.
+    let a = w.next_item().unwrap();
+    let b = w.next_item().unwrap();
+    let c = w.next_item().unwrap();
+    w.forget();
+    let d = w.next_item().unwrap();
+    println("{a} {b} {c} {d} {w.lens.len()}");
+
+    let rest = w.rest_or(false);
+    w.forget();
+    println("[{rest}] [{w.rest_or(true)}]");
+
+    let name = String::from("name");
+    let p = pick(&name, &w, false);
+    let q = pick(&name, &w, true);
+    w.forget();
+    println("{p} {q}");
+
+    let l = w.line();
+    w.forget();
+    println("{l} {line_of(&mut w)}");
+
+    let word = String::from("via");
+    println("{via(&word)}");
+}

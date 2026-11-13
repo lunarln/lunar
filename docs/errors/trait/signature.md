@@ -8,7 +8,11 @@ the trait's generic arguments:
 * the number of parameters (including `self`);
 * each parameter's type and mode: taking ownership (`x: T`), borrowing
   (`x: &T`) or in-out (`x: &mut T`), including `+`;
-* the return type.
+* the return type;
+* what the result may point into: the impl's `from` may name only
+  parameters the trait's `from` names, and its `via` only parameters the
+  trait's `from` or `via` names (`via self` is narrower than `from self`);
+* which parameters are `kept`: only those the trait's are.
 
 Callers that go through the trait rely on the trait's signature: what they
 pass, whether it is moved into the call or changed in place, and what they

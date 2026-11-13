@@ -1,0 +1,9 @@
+// error: borrow::grow_only
+// once: borrow::grow_only
+// A closure parameter declared `&mut +` may only be grown.
+fn main() {
+    let mut s = String::from("hi");
+    let reset = |x: &mut +String| x.clear();
+    reset(&mut s);
+    println("{s}");
+}

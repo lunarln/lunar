@@ -12,6 +12,10 @@ with a `from` clause after the return type, or by leaving one out:
   `a` only, so the caller may change `b` while it uses the result.
 * `from self, key`, `from static` (into no parameter at all, only static
   data such as string literals).
+* `via self` (or `from a via t`): only where `self`'s (or `t`'s) views
+  point, never into its own data. Returning a view into `self`'s own
+  buffer from a `via self` method is this error, since callers keep the
+  result across calls that shrink `self`.
 * Without a clause, a method that borrows its receiver (`&self`, `&mut
   self`) returns views into `self` only; any other function returns views
   into every parameter it could: each borrowed parameter, and each one
@@ -20,7 +24,7 @@ with a `from` clause after the return type, or by leaving one out:
 The body is checked against what the signature says: every value it
 returns (its tail, its `return`s, through `if`, `match` and blocks) may
 point only into the parameters listed. The help lists every parameter the
-body's results point into.
+body's results point into, in `via` those it only points through.
 
 ## Erroneous example
 

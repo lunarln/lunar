@@ -1,0 +1,23 @@
+// error: borrow::shrink_while_borrowed
+// once: borrow::shrink_while_borrowed
+// A tuple's items are evaluated in order: the view made first is still
+// waiting when the second item clears `c`.
+struct Store {
+    nums: [i32; -..+],
+}
+
+impl Store {
+    fn first(&self): [i32; &] {
+        return self.nums[0..1];
+    }
+    fn clear_get(&mut self): i32 {
+        self.nums.clear();
+        return 0;
+    }
+}
+
+fn main() {
+    let mut c = Store { nums: [1, 2, 3] };
+    let (a, b) = (c.first(), c.clear_get());
+    println("{a[0]} {b}");
+}

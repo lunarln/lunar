@@ -323,7 +323,7 @@ impl Cursor {
     }
 
     /// The bytes not yet read.
-    pub fn remaining(&self): [u8; &] {
+    pub fn remaining(&self): [u8; &] via self {
         if self.pos >= self.data.len() {
             return self.data[self.data.len()..];
         }

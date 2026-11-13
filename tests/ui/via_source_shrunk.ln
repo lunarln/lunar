@@ -1,0 +1,24 @@
+// error: borrow::shrink_while_borrowed
+// once: borrow::shrink_while_borrowed
+// A result `via w` points where `w`'s views point: into `src`. Changing `w`
+// keeps it, but shrinking `src` ends it.
+struct Words {
+    text: str,
+    lens: [usize; -..+],
+}
+
+impl Words {
+    fn first(&mut self): str via self {
+        self.lens.push(1);
+        return self.text[0..1];
+    }
+}
+
+fn main() {
+    let mut src = String::from("ab");
+    let mut w = Words { text: src.as_str(), lens: [] };
+    let f = w.first();
+    w.lens.clear();
+    src.clear();
+    println("{f}");
+}

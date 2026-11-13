@@ -1,0 +1,24 @@
+// error: trait::signature
+// once: trait::signature
+// The trait promises `via self`, so callers through it keep results across
+// calls that shrink the receiver; an implementation may not widen that to
+// `from self`.
+trait Source {
+    fn line(&mut self): str via self;
+}
+
+struct Lines {
+    text: str,
+    buf: String,
+}
+
+impl Source for Lines {
+    fn line(&mut self): str from self {
+        return self.buf.as_str();
+    }
+}
+
+fn main() {
+    let mut l = Lines { text: "a", buf: String::new() };
+    println("{l.line()} {l.text}");
+}

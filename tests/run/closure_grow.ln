@@ -1,0 +1,46 @@
+// A closure's parameter may be declared `&mut +T`, like a function's: the
+// closure may only grow it, and calling the closure keeps the caller's views
+// into the argument alive.
+
+fn apply::<F: Fn(&mut +String)>(f: F, s: &mut +String) {
+    f(s);
+}
+
+fn apply_mut::<F: FnMut(&mut +String)>(mut f: F, s: &mut +String) {
+    f(s);
+    f(s);
+}
+
+fn main() {
+    let mut s = String::from("ab");
+    let first = s.as_str();
+    let add = |x: &mut +String| x.push_str(".");
+    add(&mut s);
+    add(&mut s);
+    println("{first} {s}");
+
+    // Its type takes the parameter as `&mut +`, so it meets
+    // `Fn(&mut +String)` bounds, and calls through them keep views too.
+    let head = s.as_str()[0..1];
+    apply(add, &mut s);
+    println("{head} {first} {s}");
+
+    // One that changes a capture is `FnMut`.
+    let mut calls = 0;
+    let count = |x: &mut +String| {
+        calls += 1;
+        x.push('!');
+    };
+    apply_mut(count, &mut s);
+    println("{head} {first} {s} {calls}");
+
+    // Arrays grow too.
+    let mut v: [i32; ..+] = [1, 2];
+    let some = v[0..1];
+    let push_twice = |a: &mut +[i32; ..+], n: i32| {
+        a.push(n);
+        a.push(n);
+    };
+    push_twice(&mut v, 7);
+    println("{some[0]} {v.len()}");
+}

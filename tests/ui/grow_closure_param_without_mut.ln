@@ -1,0 +1,9 @@
+// error: type::grow_without_mut
+// `+` on a closure parameter needs `&mut`, as on a function's.
+fn main() {
+    let s = String::from("hi");
+    let count = |x: &+String| x.len();
+    let take = |x: +String| x.len();
+    println("{count(&s)}");
+    println("{take(s)}");
+}

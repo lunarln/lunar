@@ -1,0 +1,56 @@
+// std's iterators and cursors over views declare `via self`: what they
+// return points where their views point, not into them. That matters when
+// one is a field of a value that owns data: a later `&mut` call on the value
+// may shrink that data, which ends views into the value, but not these.
+
+use std::io::Cursor;
+use std::path::{Component, Components, Path};
+
+struct Walk {
+    parts: Components,
+    /// Data of its own: the length of each name seen.
+    lens: [usize; -..+],
+}
+
+impl Walk {
+    fn name(&mut self): Option::<str> via self {
+        loop {
+            match self.parts.next()? {
+                Component::Normal(n) => {
+                    self.lens.push(n.len());
+                    return Some(n);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.lens.clear();
+    }
+}
+
+struct Input {
+    cursor: Cursor,
+    log: String,
+}
+
+fn main() {
+    let path = String::from("/usr/local/lib");
+    let mut w = Walk { parts: Path::new(path.as_str()).components(), lens: [] };
+    let a = w.name().unwrap();
+    w.reset();
+    let b = w.name().unwrap();
+    w.reset();
+    // Straight from the field: the result points into `path`, not `w`.
+    let rest = w.parts.rest();
+    w.reset();
+    println("{a} {b} {rest} {w.lens.len()}");
+
+    let data = String::from("abc");
+    let mut i = Input { cursor: Cursor::new(data.as_bytes()), log: String::new() };
+    i.cursor.set_position(1);
+    let left = i.cursor.remaining();
+    i.log.clear();
+    println("{left.len()}");
+}

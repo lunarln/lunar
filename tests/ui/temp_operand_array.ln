@@ -1,0 +1,11 @@
+// error: borrow::shrink_while_borrowed
+// once: borrow::shrink_while_borrowed
+// An array literal's items are evaluated in order.
+fn main() {
+    let mut s = String::from("hello");
+    let words = [s.as_str(), {
+        s.clear();
+        "x"
+    }];
+    println("{words[0]} {words[1]}");
+}

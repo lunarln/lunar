@@ -1,0 +1,26 @@
+// error: borrow::shrink_while_borrowed
+// A `for` loop over a temporary slice keeps the slice for the whole loop:
+// the body may not shrink what it points into. (A slice in a variable is
+// read again on each pass, and its uses are checked like any other.)
+struct Store {
+    nums: [i32; -..+],
+}
+
+impl Store {
+    fn all(&self): [i32; &] {
+        return self.nums[..];
+    }
+}
+
+fn main() {
+    let mut c = Store { nums: [1, 2, 3] };
+    for x in c.all() {
+        c.nums.clear();
+        println("{x}");
+    }
+    let mut rows: [[i32; 2]; -..+] = [[1, 2], [3, 4]];
+    for y in rows[0] {
+        rows.clear();
+        println("{y}");
+    }
+}

@@ -1,0 +1,14 @@
+// error: borrow::shrink_while_borrowed
+// once: borrow::shrink_while_borrowed
+// `rows[0][..]` takes the address of `rows[0]`, inside the items of `rows`,
+// before the index is computed, and the index clears `rows`.
+fn clear_get(rows: &mut [[i32; 2]; -..+]): usize {
+    rows.clear();
+    return 0;
+}
+
+fn main() {
+    let mut rows: [[i32; 2]; -..+] = [[1, 2], [3, 4]];
+    let v = rows[0][clear_get(&mut rows)];
+    println("{v}");
+}

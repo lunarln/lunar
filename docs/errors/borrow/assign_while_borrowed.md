@@ -12,7 +12,9 @@ assignments to a field.
 
 The check is based on liveness: a view that is not used after the
 assignment does not block it. Assigning to Dull fields, or writing through
-a mutable slice, does not free anything and is not affected.
+a mutable slice, does not free anything and is not affected. A view made by
+an earlier operand of the same expression (an earlier argument of a call,
+or the value being assigned) is in use until the expression is done.
 
 ## Erroneous example
 

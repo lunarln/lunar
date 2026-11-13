@@ -1,0 +1,15 @@
+// error: borrow::move_while_borrowed
+// once: borrow::move_while_borrowed
+// `consume` gets a view into `s` and `s` itself, and may free `s` before
+// it reads the view.
+fn consume(word: str, s: String) {
+    drop(s);
+    println("{word}");
+}
+
+fn drop(_s: String) {}
+
+fn main() {
+    let s = String::from("hello");
+    consume(s.as_str(), s);
+}

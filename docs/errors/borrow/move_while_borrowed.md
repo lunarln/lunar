@@ -12,6 +12,8 @@ invalidating event and rejected while a view into the value is live.
 The check is based on liveness: a view that is not used after the move
 does not block it. Moving any part of the value that owns data (for
 example an owning field of a struct) counts as moving from that variable.
+A view made by an earlier operand of the same expression is in use until
+the expression is done: `consume(s.as_str(), s)` is rejected.
 
 ## Erroneous example
 

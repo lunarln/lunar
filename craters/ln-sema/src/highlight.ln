@@ -256,7 +256,39 @@ fn ident_class(text: str, toks: [Spanned; &], i: usize): TokenClass {
     if is_primitive(name) {
         return TokenClass::Type;
     }
+    if (name == "from" || name == "via") && ret_clause_word(text, toks, i, name == "from") {
+        return TokenClass::Keyword;
+    }
     return TokenClass::Plain;
+}
+
+/// Whether the word at `i` (`from`, or `via` if not `from`) starts a clause
+/// after a return type saying what the result points into: a name follows
+/// it, and the end of a type (or the last name of a `from` clause) comes
+/// before it. Elsewhere both are plain names, as is a parameter named
+/// `from` or `via` right after the word (`from from`).
+fn ret_clause_word(text: str, toks: [Spanned; &], i: usize, from: bool): bool {
+    if i == 0 || i + 1 >= toks.len() {
+        return false;
+    }
+    // The first name of a clause, named like the words.
+    let p = toks[i - 1];
+    if p.token == Token::Ident {
+        let pn = text[p.range.start..p.range.end];
+        if (pn == "from" || pn == "via") && ret_clause_word(text, toks, i - 1, pn == "from") {
+            return false;
+        }
+    }
+    let next = match toks[i + 1].token {
+        Token::Ident | Token::SelfValue => true,
+        Token::Static => from,
+        _ => false,
+    };
+    let prev = match toks[i - 1].token {
+        Token::Ident | Token::SelfType | Token::SelfValue | Token::Static | Token::RAngle | Token::RParen | Token::RBracket => true,
+        _ => false,
+    };
+    return next && prev;
 }
 
 /// Whether `name` is a primitive type's.

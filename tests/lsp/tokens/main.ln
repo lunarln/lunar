@@ -33,3 +33,15 @@ fn area::<T: Show>(p: &Point, t: &T, mut n: i32): i32 {
 }
 
 fn main() {}
+
+struct Words {
+    text: str,
+}
+
+fn pick(w: &Words, from: &String): str from from via w {
+    let via = from.as_str();
+    if via.len() > 0 {
+        return via;
+    }
+    return w.text;
+}

@@ -1,0 +1,15 @@
+// error: borrow::shrink_while_borrowed
+// once: borrow::shrink_while_borrowed
+// The left operand of `==` is a view into `s`, compared after the right
+// operand cleared `s`.
+fn reset(s: &mut String): str from static {
+    s.clear();
+    return "hello";
+}
+
+fn main() {
+    let mut s = String::from("hello");
+    if s.as_str() == reset(&mut s) {
+        println("same");
+    }
+}

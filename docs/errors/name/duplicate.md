@@ -11,7 +11,10 @@ would be ambiguous. This is reported for:
 * two variants of an enum, or two fields of a struct or enum variant, with
   the same name;
 * two methods with the same name in one `trait` or in one `impl` block;
-* a generic parameter list that repeats a name or declares `Self`.
+* a generic parameter list that repeats a name or declares `Self`;
+* a `from` or `via` clause after a return type that names a parameter
+  twice, or a parameter named in both (`from p` already covers where `p`'s
+  views point).
 
 Local variables are not affected: a `let` may shadow an earlier binding.
 

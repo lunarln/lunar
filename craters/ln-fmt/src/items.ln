@@ -288,22 +288,13 @@ impl Printer {
             self.tok(self.s.find(close + 1, Token::Colon), ":");
             self.text(" ");
             self.ty(r);
-            let n = f.ret_from.len();
-            if n > 0 {
+            if f.ret_from.len() > 0 {
                 let from = self.s.find(self.ast.tys.get(r).span.hi, Token::Ident);
-                self.text(" ");
-                self.tok(from, "from");
-                self.text(" ");
-                let mut i: usize = 0;
-                while i < n {
-                    let id = self.ast.idents.list(f.ret_from)[i];
-                    if i > 0 {
-                        self.tok(self.s.find(self.last_end, Token::Comma), ",");
-                        self.text(" ");
-                    }
-                    self.ident(id);
-                    i += 1;
-                }
+                self.ret_names(from, "from", f.ret_from);
+            }
+            if f.ret_via.len() > 0 {
+                let via = self.s.find(self.last_end, Token::Ident);
+                self.ret_names(via, "via", f.ret_via);
             }
         }
         match f.body {
@@ -312,6 +303,22 @@ impl Printer {
                 self.block(b, false);
             }
             None => self.tok(self.s.find(f.sig_span.hi, Token::Semi), ";"),
+        }
+    }
+
+    /// A `from` or `via` clause after a return type: the word (`kw`, at
+    /// `at`) and its names.
+    fn ret_names(&mut self, at: u32, kw: str, names: List::<Ident>) {
+        self.text(" ");
+        self.tok(at, kw);
+        self.text(" ");
+        for i in 0..names.len() {
+            let id = self.ast.idents.list(names)[i];
+            if i > 0 {
+                self.tok(self.s.find(self.last_end, Token::Comma), ",");
+                self.text(" ");
+            }
+            self.ident(id);
         }
     }
 
