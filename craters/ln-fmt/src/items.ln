@@ -335,11 +335,12 @@ impl Printer {
             trailing = self.d.empty();
         }
         self.open();
-        self.tok(close, ")");
+        self.tok_bare(close, ")");
         let rp = self.close();
         let soft = self.d.softline();
         let g = self.list_doc(lp, parts[..], rp, trailing, soft, 0);
         self.emit(g);
+        self.after(close);
     }
 
     fn param(&mut self, p: Param) {
@@ -441,12 +442,13 @@ impl Printer {
             i += 1;
         }
         self.open();
-        self.tok(close, ">");
+        self.tok_bare(close, ">");
         let rp = self.close();
         let trailing = self.trailing_comma(false);
         let soft = self.d.softline();
         let g = self.list_doc(lp, parts[..], rp, trailing, soft, 0);
         self.emit(g);
+        self.after(close);
     }
 
     /// `A + B::<C> + Fn(D): E`
@@ -498,6 +500,25 @@ impl Printer {
         self.path(p);
     }
 
+    /// A list of types (a tuple's, a function type's parameters): on one
+    /// line, for what is around it to break instead, unless it has
+    /// comments. `one` needs a comma (`(A,)`).
+    fn type_list(&mut self, lp: Id::<Doc>, parts: [Id::<Doc>; &], rp: Id::<Doc>, had: bool, one: bool, open: u32, close: u32) {
+        if close != NONE && !self.s.has_cmts(open, close) {
+            let flat = self.flat_items(parts, had);
+            let comma = if one && !(had && self.in_macro > 0) { self.d.text(",") } else { self.d.empty() };
+            let all = [lp, flat, comma, rp];
+            let c = self.d.concat(all[..]);
+            self.emit(c);
+        } else {
+            let trailing = if one { self.d.text(",") } else { self.trailing_comma(had) };
+            let soft = self.d.softline();
+            let g = self.list_doc(lp, parts, rp, trailing, soft, 0);
+            self.emit(g);
+        }
+        self.after(close);
+    }
+
     /// `(A, &B): R` of a function type or `Fn` bound, `(` at `open`.
     fn fn_sig(&mut self, open: u32, params: List::<FnTyParam>, ret: Option::<Id::<Ty>>) {
         let close = self.s.close_of(open);
@@ -506,6 +527,7 @@ impl Printer {
         self.tok(open, "(");
         let lp = self.close();
         let mut parts: [Id::<Doc>; -..+] = [];
+        let mut had = false;
         let mut i: usize = 0;
         while i < n {
             let p = self.ast.fn_ty_params.list(params)[i];
@@ -514,7 +536,8 @@ impl Printer {
             self.mode(p.mode);
             self.ty(p.ty);
             let d = self.close();
-            let (s, _) = self.sep(self.ast.tys.get(p.ty).span.hi, close, i + 1 == n);
+            let (s, h) = self.sep(self.ast.tys.get(p.ty).span.hi, close, i + 1 == n);
+            had = h;
             parts.push(d);
             parts.push(s);
             i += 1;
@@ -525,12 +548,9 @@ impl Printer {
             self.tok(close, ")");
         } else {
             self.open();
-            self.tok(close, ")");
+            self.tok_bare(close, ")");
             let rp = self.close();
-            let trailing = self.trailing_comma(false);
-            let soft = self.d.softline();
-            let g = self.list_doc(lp, parts[..], rp, trailing, soft, 0);
-            self.emit(g);
+            self.type_list(lp, parts[..], rp, had, false, open, close);
         }
         if let Some(r) = ret {
             self.tok(self.s.find(close + 1, Token::Colon), ":");
@@ -571,12 +591,13 @@ impl Printer {
             return;
         }
         self.open();
-        self.tok(close, ")");
+        self.tok_bare(close, ")");
         let rp = self.close();
         let trailing = self.trailing_comma(false);
         let soft = self.d.softline();
         let g = self.list_doc(lp, parts[..], rp, trailing, soft, 0);
         self.emit(g);
+        self.after(close);
     }
 
     /// `{ pub a: A, b: B }` of a struct, one field a line.
@@ -702,12 +723,13 @@ impl Printer {
             i += 1;
         }
         self.open();
-        self.tok(close, "}");
+        self.tok_bare(close, "}");
         let rp = self.close();
         let trailing = self.trailing_comma(false);
         let line = self.d.line();
         let g = self.list_doc(lp, parts[..], rp, trailing, line, STRUCT_VARIANT_WIDTH);
         self.emit(g);
+        self.after(close);
     }
 
     // ===================================================================== use
@@ -899,6 +921,7 @@ impl Printer {
         let mut parts: [Id::<Doc>; -..+] = [];
         let mut i: usize = 0;
         let mut close: u32 = NONE;
+        let mut had = false;
         while i < n {
             let t = self.ast.ty_ids.list(args)[i];
             self.assume_break();
@@ -916,18 +939,28 @@ impl Printer {
                     close = self.s.toks[k].lo;
                 }
             }
-            let (s, _) = self.sep(hi, if i + 1 == n { close } else { NONE }, i + 1 == n);
+            let (s, h) = self.sep(hi, if i + 1 == n { close } else { NONE }, i + 1 == n);
+            had = h;
             parts.push(d);
             parts.push(s);
             i += 1;
         }
         self.open();
-        self.tok(close, ">");
+        self.tok_bare(close, ">");
         let rp = self.close();
-        let trailing = self.trailing_comma(false);
-        let soft = self.d.softline();
-        let g = self.list_doc(lp, parts[..], rp, trailing, soft, 0);
-        self.emit(g);
+        if lt != NONE && close != NONE && !self.s.has_cmts(lt, close) {
+            // Generic arguments do not break: what is around them does.
+            let flat = self.flat_items(parts[..], had);
+            let all = [lp, flat, rp];
+            let c = self.d.concat(all[..]);
+            self.emit(c);
+        } else {
+            let trailing = self.trailing_comma(had);
+            let soft = self.d.softline();
+            let g = self.list_doc(lp, parts[..], rp, trailing, soft, 0);
+            self.emit(g);
+        }
+        self.after(close);
     }
 
     pub fn ty(&mut self, id: Id::<Ty>) {
@@ -1021,12 +1054,9 @@ impl Printer {
             i += 1;
         }
         self.open();
-        self.tok(close, ")");
+        self.tok_bare(close, ")");
         let rp = self.close();
-        let trailing = if n == 1 { self.d.text(",") } else { self.trailing_comma(had) };
-        let soft = self.d.softline();
-        let g = self.list_doc(lp, parts[..], rp, trailing, soft, 0);
-        self.emit(g);
+        self.type_list(lp, parts[..], rp, had, n == 1, open, close);
     }
 
     // ===================================================================== patterns
@@ -1130,7 +1160,7 @@ impl Printer {
             i += 1;
         }
         self.open();
-        self.tok(close, ")");
+        self.tok_bare(close, ")");
         let rp = self.close();
         let mut trailing = self.trailing_comma(had);
         if tuple && n == 1 {
@@ -1146,6 +1176,7 @@ impl Printer {
         let soft = self.d.softline();
         let g = self.list_doc(lp, parts[..], rp, trailing, soft, limit);
         self.emit(g);
+        self.after(close);
     }
 
     /// `{ a, b: c, .. }` of a struct pattern.
@@ -1200,11 +1231,12 @@ impl Printer {
             trailing = self.d.empty();
         }
         self.open();
-        self.tok(close, "}");
+        self.tok_bare(close, "}");
         let rp = self.close();
         let line = self.d.line();
         let g = self.list_doc(lp, parts[..], rp, trailing, line, STRUCT_LIT_WIDTH);
         self.emit(g);
+        self.after(close);
     }
 }
 

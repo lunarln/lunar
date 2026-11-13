@@ -44,6 +44,10 @@ pub enum Doc {
     Fill(List::<Id::<Doc>>),
     /// A space and the document, or the document on the next line.
     Rhs(Id::<Doc>),
+    /// A method chain: `rest` (the links, each after a line) is indented
+    /// unless `head` took several lines (rustfmt: `foo(` ... `)` then
+    /// `.bar()` at the same indentation).
+    Chain { head: Id::<Doc>, rest: Id::<Doc> },
 }
 
 /// A line comment after code: printed at the end of its line.
@@ -112,6 +116,7 @@ impl Docs {
             Doc::Fill(l) => self.any_hard(l),
             Doc::Indent(x) => self.hard[x.index()],
             Doc::Rhs(x) => self.hard[x.index()],
+            Doc::Chain { head, rest } => self.hard[head.index()] || self.hard[rest.index()],
             Doc::Group { doc, broken, .. } => broken || self.hard[doc.index()],
             _ => false,
         };
@@ -191,6 +196,10 @@ impl Docs {
 
     pub fn rhs(&mut +self, doc: Id::<Doc>): Id::<Doc> {
         return self.add(Doc::Rhs(doc));
+    }
+
+    pub fn chain(&mut +self, head: Id::<Doc>, rest: Id::<Doc>): Id::<Doc> {
+        return self.add(Doc::Chain { head, rest });
     }
 
     /// `d` with its outermost group (the last part's, for a sequence)
@@ -307,7 +316,23 @@ fn fits(d: &Docs, src: str, start: [Cmd; &], rest: [Cmd; &], rem0: i64, limit: u
                     return true;
                 }
                 ri -= 1;
-                FCmd { mode: rest[ri].mode, doc: rest[ri].doc, end: false, lim: 0, base: 0 }
+                let r = rest[ri];
+                if r.k > 0 {
+                    // A chain whose head is printed, or a fill partly printed:
+                    // only what is left of it.
+                    match d.nodes.get(r.doc) {
+                        Doc::Chain { rest: links, .. } => {
+                            fs.push(FCmd { mode: r.mode, doc: links, end: false, lim: 0, base: 0 });
+                        }
+                        Doc::Fill(l) => {
+                            let parts = d.ids.list(l);
+                            push_rev(fs, parts[r.k as usize..], r.mode);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                FCmd { mode: r.mode, doc: r.doc, end: false, lim: 0, base: 0 }
             }
         };
         if f.end {
@@ -396,6 +421,11 @@ fn fits(d: &Docs, src: str, start: [Cmd; &], rest: [Cmd; &], rem0: i64, limit: u
                 w = 1;
                 fs.push(FCmd { mode: f.mode, doc: x, end: false, lim: 0, base: 0 });
             }
+            Doc::Chain { head, rest } => {
+                fs.push(FCmd { mode: f.mode, doc: rest, end: false, lim: 0, base: 0 });
+                fs.push(FCmd { mode: f.mode, doc: head, end: false, lim: 0, base: 0 });
+                continue;
+            }
         }
         used += w;
         rem -= w;
@@ -433,6 +463,9 @@ struct Out {
     pending: bool,
     /// Trailing comments, printed when the line ends.
     suffix: [Span; -..+],
+    /// The last thing printed was a space between tokens (another is not
+    /// needed).
+    spaced: bool,
 }
 
 impl Out {
@@ -458,6 +491,7 @@ impl Out {
         self.pos = ind as i64;
         self.line_ind = ind;
         self.pending = false;
+        self.spaced = false;
     }
 
     /// Remove spaces at the end of the line.
@@ -484,6 +518,11 @@ impl Out {
                 t = t[1..];
             }
         }
+        let space = t == " ";
+        if space && self.spaced {
+            return;
+        }
+        self.spaced = space;
         self.text.push_str(t);
         let (w, nl) = measure(t);
         if nl {
@@ -505,6 +544,7 @@ impl Out {
     /// starts on has moved, from the source's `indent` to this one's.
     fn verbatim(&mut self, src: str, prot: [Span; &], lo: u32, hi: u32, indent: u32) {
         let b = src.as_bytes();
+        self.spaced = false;
         let delta = self.line_ind as i64 - indent as i64;
         let mut start = lo as usize;
         let end = hi as usize;
@@ -582,7 +622,7 @@ fn protected(prot: [Span; &], pos: u32): bool {
 /// and `Comment` documents are in; `prot` the ranges of its multi-line
 /// strings and comments, sorted.
 pub fn render(d: &Docs, src: str, prot: [Span; &], root: Id::<Doc>): String {
-    let mut o = Out { text: String::new(), pos: 0, line_ind: 0, pending: false, suffix: [] };
+    let mut o = Out { text: String::new(), pos: 0, line_ind: 0, pending: false, suffix: [], spaced: false };
     let mut stack: [Cmd; -..+] = [Cmd { ind: 0, mode: BREAK, doc: root, k: 0 }];
     let mut fs: [FCmd; -..+] = [];
     let none: [Cmd; -..+] = [];
@@ -700,6 +740,18 @@ pub fn render(d: &Docs, src: str, prot: [Span; &], root: Id::<Doc>): String {
                 stack.push(Cmd { ind: c.ind, mode: BREAK, doc: c.doc, k: c.k + 2 });
                 stack.push(Cmd { ind: c.ind, mode: if both { FLAT } else { BREAK }, doc: parts[k + 1], k: 0 });
                 stack.push(Cmd { ind: c.ind, mode: content_mode, doc: parts[k], k: 0 });
+            }
+            Doc::Chain { head, rest } => {
+                if c.k == 0 {
+                    // The head first; then this again, knowing where it began.
+                    stack.push(Cmd { ind: c.ind, mode: c.mode, doc: c.doc, k: o.text.len() as u32 + 1 });
+                    stack.push(Cmd { ind: c.ind, mode: c.mode, doc: head, k: 0 });
+                } else {
+                    let start = (c.k - 1) as usize;
+                    let multi = o.text.as_str()[start..].contains("\n");
+                    let ind = if multi { c.ind } else { c.ind + INDENT };
+                    stack.push(Cmd { ind, mode: c.mode, doc: rest, k: 0 });
+                }
             }
             Doc::Rhs(x) => {
                 if c.mode == FLAT {

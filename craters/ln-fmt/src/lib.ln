@@ -283,12 +283,40 @@ impl Printer {
         }
     }
 
-    /// The `{` at `open`; whether comments follow it on its line.
+    /// The closing bracket `s` at `lo` of a list, without the comments
+    /// after it: `after` prints those once the list's group is closed, so
+    /// that they do not break it.
+    fn tok_bare(&mut self, lo: u32, s: str) {
+        if lo != NONE {
+            self.flush(lo, 0);
+        }
+        self.text(s);
+        if lo != NONE && lo + 1 > self.last_end {
+            self.last_end = lo + 1;
+        }
+    }
+
+    /// The comments after the closing bracket at `close`.
+    fn after(&mut self, close: u32) {
+        if close != NONE {
+            self.done(close + 1);
+        }
+    }
+
+    /// The `{` at `open`; whether a line comment follows it on its line.
     fn brace(&mut self, open: u32): bool {
         self.flush(open, 0);
-        let before = self.ci;
         self.tok(open, "{");
-        return self.ci != before;
+        return self.line_comment_after(open);
+    }
+
+    /// Whether the last comment printed is a line comment after `pos`.
+    fn line_comment_after(&self, pos: u32): bool {
+        if self.ci == 0 {
+            return false;
+        }
+        let c = self.s.cmts[self.ci - 1];
+        return !c.block && c.lo > pos;
     }
 
     /// The source text `lo..hi` (an identifier or a literal).

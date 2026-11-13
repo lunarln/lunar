@@ -218,6 +218,25 @@ fn functions() {
 }
 ",
     );
+    // Signatures break their parameters, not their types.
+    check(
+        "fn array_parts_of(&mut self, p: &mut +Program, ptr: ValueRef, t: Ty): (ValueRef, ValueRef, Type44) {}",
+        "fn array_parts_of(
+    &mut self,
+    p: &mut +Program,
+    ptr: ValueRef,
+    t: Ty,
+): (ValueRef, ValueRef, Type44) {}
+",
+    );
+    check(
+        "fn select_one(proj: &Project, package: Option::<str>): Result::<[usize; ..+], ProjectError> from static;",
+        "fn select_one(
+    proj: &Project,
+    package: Option::<str>,
+): Result::<[usize; ..+], ProjectError> from static;
+",
+    );
     // A line of exactly 100 columns fits.
     keep("fn long_function_name(first_argument: SomeLongType, second_argument: AnotherLongType): ReturnType {}\n");
     // Without a body, in traits and extern blocks.
@@ -378,6 +397,43 @@ fn calls_and_chains() {
 ",
     );
     keep("fn f() {\n    call_something(first_argument_value, second_argument_value, third_value_xyz);\n}\n");
+    // A single argument may be as wide as the line.
+    keep("fn f() {\n    println(\"a long format string with {holes} that is wider than sixty columns, see\");\n}\n");
+    // A chain whose head breaks keeps its links at the head's indentation.
+    check(
+        "fn f() { let e = ProjectError::new(manifest::WORKSPACE(), \"this workspace has several programs; pick one\").note(\"programs: {names}\").help(\"`lunar run -p {first}`\"); }",
+        "fn f() {
+    let e = ProjectError::new(
+        manifest::WORKSPACE(),
+        \"this workspace has several programs; pick one\",
+    )
+    .note(\"programs: {names}\")
+    .help(\"`lunar run -p {first}`\");
+}
+",
+    );
+    // `f(x).y()` is a chain too, broken past `chain_width`.
+    check(
+        "fn f() { status(\"Compiling\", core::fmt::format(\"{name} v{version} ({dir})\").as_str()); }",
+        "fn f() {
+    status(
+        \"Compiling\",
+        core::fmt::format(\"{name} v{version} ({dir})\").as_str(),
+    );
+}
+",
+    );
+    check(
+        "fn f() { status(\"Compiling\", core::fmt::format(\"{name} v{version} ({dir}) and more\").as_str()); }",
+        "fn f() {
+    status(
+        \"Compiling\",
+        core::fmt::format(\"{name} v{version} ({dir}) and more\")
+            .as_str(),
+    );
+}
+",
+    );
     // A closure as last argument hugs the parentheses.
     check(
         "fn f() { items.map(|x| { let y = x + 1; y * 2 }); }",

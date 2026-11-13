@@ -54,6 +54,7 @@ impl Printer {
             let c = self.close();
             let g = self.d.group(c, 0);
             self.emit(g);
+            self.after(close);
             return;
         }
         let trailed = self.brace(open);
@@ -97,7 +98,7 @@ impl Printer {
         let ind = self.d.indent(inner);
         self.emit(ind);
         self.line();
-        self.tok(b.span.hi - 1, "}");
+        self.tok_bare(b.span.hi - 1, "}");
     }
 
     /// Whether a block is just an expression, without comments.
@@ -412,16 +413,26 @@ impl Printer {
             return;
         }
         let comments = self.cmts_between(open, close, args);
+        // A single argument may be as wide as the line (rustfmt).
+        let limit = if n == 1 { 0 } else { limit };
         self.open();
         self.tok(open, "(");
         let lp = self.close();
         let (parts, had) = self.expr_items(args, close);
         self.open();
-        self.tok(close, ")");
+        self.tok_bare(close, ")");
         let rp = self.close();
         let trailing = self.trailing_comma(had);
         let soft = self.d.softline();
         let broken = self.list_doc(lp, parts[..], rp, trailing, soft, limit);
+        self.args_layout(lp, parts[..], rp, broken, args, had, comments, limit);
+        self.after(close);
+    }
+
+    /// The layouts of a call's arguments: flat, hugging the last one, or
+    /// one a line (`broken`).
+    fn args_layout(&mut self, lp: Id::<Doc>, parts: [Id::<Doc>; &], rp: Id::<Doc>, broken: Id::<Doc>, args: List::<Id::<Expr>>, had: bool, comments: bool, limit: u32) {
+        let n = args.len();
         let last = self.ast.expr_ids.list(args)[n - 1];
         let hug = if comments { HUG_NONE } else { self.hug(last, n) };
         let mut i: usize = 0;
@@ -436,7 +447,7 @@ impl Printer {
             self.emit(broken);
             return;
         }
-        let flat = self.flat_items(parts[..], had);
+        let flat = self.flat_items(parts, had);
         let a0 = [lp, flat, rp];
         let alt0 = self.d.concat(a0[..]);
         let mut alts: [Id::<Doc>; -..+] = [alt0];
@@ -515,7 +526,17 @@ impl Printer {
             ExprKind::Match { .. } | ExprKind::If { .. } | ExprKind::IfLet { .. } => one,
             ExprKind::While { .. } | ExprKind::WhileLet { .. } | ExprKind::Loop(_) | ExprKind::For { .. } => one,
             ExprKind::Array(_) | ExprKind::StructLit { .. } | ExprKind::Tuple(_) => one,
-            ExprKind::Call(_, _) | ExprKind::MethodCall { .. } | ExprKind::MacCall(_) => one,
+            ExprKind::Call(_, _) | ExprKind::MacCall(_) => one,
+            // A chain hugs only if its last call does: `f(xs.iter().map(|x| {`.
+            ExprKind::MethodCall { args, .. } => {
+                if !self.is_chain(e) {
+                    one
+                } else if args.len() > 0 && self.hug(self.ast.expr_ids.list(args)[args.len() - 1], args.len()) != HUG_NONE {
+                    one
+                } else {
+                    HUG_NONE
+                }
+            }
             ExprKind::Borrow { expr, .. } => self.hug(expr, n),
             ExprKind::Unary(_, x) => self.hug(x, n),
             ExprKind::Try(x) => self.hug(x, n),
@@ -524,45 +545,52 @@ impl Printer {
         };
     }
 
-    /// Method calls, fields, indexing and `?`: a chain, broken before each
-    /// `.` if it is too long (rustfmt's `chain_width`).
-    fn postfix(&mut self, id: Id::<Expr>) {
-        // The links from the outermost in, and the root.
-        let mut links: [Id::<Expr>; -..+] = [];
+    /// Whether `postfix` prints `id` as a chain that may break before its
+    /// `.`s: `a.b().c()` or `f(x).y()`, not `a.b()`.
+    fn is_chain(&self, id: Id::<Expr>): bool {
         let mut cur = id;
         let mut dots: usize = 0;
         let mut calls: usize = 0;
         loop {
             match self.ast.exprs.get(cur).kind {
                 ExprKind::MethodCall { recv, .. } => {
-                    links.push(cur);
                     dots += 1;
                     calls += 1;
                     cur = recv;
                 }
-                ExprKind::Field(x, _) => {
-                    links.push(cur);
+                ExprKind::Field(x, _) | ExprKind::TupleField(x, _, _) => {
                     dots += 1;
                     cur = x;
                 }
-                ExprKind::TupleField(x, _, _) => {
-                    links.push(cur);
-                    dots += 1;
-                    cur = x;
-                }
-                ExprKind::Index(x, _) => {
-                    links.push(cur);
-                    cur = x;
-                }
-                ExprKind::Try(x) => {
-                    links.push(cur);
-                    cur = x;
-                }
+                ExprKind::Index(x, _) | ExprKind::Try(x) => cur = x,
                 _ => break,
             }
         }
+        let call_root = match self.ast.exprs.get(cur).kind {
+            ExprKind::Call(_, _) | ExprKind::MacCall(_) => true,
+            _ => false,
+        };
+        return calls > 0 && dots > 0 && (dots >= 2 || call_root);
+    }
+
+    /// Method calls, fields, indexing and `?`: a chain, broken before each
+    /// `.` if it is too long (rustfmt's `chain_width`).
+    fn postfix(&mut self, id: Id::<Expr>) {
+        // The links from the outermost in, and the root.
+        let mut links: [Id::<Expr>; -..+] = [];
+        let mut cur = id;
+        loop {
+            let next = match self.ast.exprs.get(cur).kind {
+                ExprKind::MethodCall { recv, .. } => recv,
+                ExprKind::Field(x, _) | ExprKind::TupleField(x, _, _) => x,
+                ExprKind::Index(x, _) | ExprKind::Try(x) => x,
+                _ => break,
+            };
+            links.push(cur);
+            cur = next;
+        }
         let n = links.len();
-        if dots < 2 || calls == 0 {
+        if !self.is_chain(id) {
             self.expr(cur);
             let mut k = n;
             while k > 0 {
@@ -616,9 +644,7 @@ impl Printer {
             inner.push(p);
         }
         let body = self.d.concat(inner[..]);
-        let ind = self.d.indent(body);
-        let all = [head, ind];
-        let c = self.d.concat(all[..]);
+        let c = self.d.chain(head, body);
         let broken = self.d.group(c, CHAIN_WIDTH);
         // The last call may hug its arguments with the chain on one line:
         // `xs.iter().map(|x| {` ... `})`.
@@ -726,13 +752,14 @@ impl Printer {
         let lp = self.close();
         let (parts, had) = self.expr_items(es, close);
         self.open();
-        self.tok(close, "]");
+        self.tok_bare(close, "]");
         let rp = self.close();
         let trailing = self.trailing_comma(had);
         let soft = self.d.softline();
         if !short {
             let g = self.list_doc(lp, parts[..], rp, trailing, soft, ARRAY_WIDTH);
             self.emit(g);
+            self.after(close);
             return;
         }
         let comma_line = [self.d.text(","), self.d.line()];
@@ -754,6 +781,7 @@ impl Printer {
         let c = self.d.concat(all[..]);
         let g = self.d.group(c, ARRAY_WIDTH);
         self.emit(g);
+        self.after(close);
     }
 
     /// `(a, b)` or `(a,)`.
@@ -770,12 +798,13 @@ impl Printer {
         let lp = self.close();
         let (parts, had) = self.expr_items(es, close);
         self.open();
-        self.tok(close, ")");
+        self.tok_bare(close, ")");
         let rp = self.close();
         let trailing = if n == 1 { self.d.text(",") } else { self.trailing_comma(had) };
         let soft = self.d.softline();
         let g = self.list_doc(lp, parts[..], rp, trailing, soft, CALL_WIDTH);
         self.emit(g);
+        self.after(close);
     }
 
     /// `Path { a: x, b }` (rustfmt's `struct_lit_width`).
@@ -813,12 +842,13 @@ impl Printer {
             i += 1;
         }
         self.open();
-        self.tok(close, "}");
+        self.tok_bare(close, "}");
         let rp = self.close();
         let trailing = self.trailing_comma(had);
         let line = self.d.line();
         let g = self.list_doc(lp, parts[..], rp, trailing, line, STRUCT_LIT_WIDTH);
         self.emit(g);
+        self.after(close);
     }
 
     // ===================================================================== control flow
@@ -844,6 +874,7 @@ impl Printer {
             let c = self.close();
             let g = self.d.group(c, IF_ELSE_WIDTH);
             self.emit(g);
+            self.after(e.span.hi - 1);
         } else {
             self.if_chain(id, false);
         }
@@ -881,7 +912,7 @@ impl Printer {
         }
         if let Some(x) = else_ {
             let then_hi = self.ast.blocks.get(then).span.hi;
-            if self.last_end > then_hi {
+            if self.line_comment_after(then_hi - 1) {
                 // A comment after the `}`: `else` on the next line.
                 self.hard();
             } else {
