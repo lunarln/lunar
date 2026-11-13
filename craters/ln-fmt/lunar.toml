@@ -1,0 +1,8 @@
+[package]
+name = "ln-fmt"
+version = "0.1.0"
+
+[dependencies]
+ln-lexer = { path = "../ln-lexer" }
+ln-ast = { path = "../ln-ast" }
+ln-parser = { path = "../ln-parser" }

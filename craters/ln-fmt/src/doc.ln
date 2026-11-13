@@ -1,0 +1,742 @@
+// The layout documents the printer builds and the algorithm that lays them
+// out in a line width: Wadler's "prettier printer" as Prettier implements
+// it, with a few additions for rustfmt's rules.
+//
+// A `Group` is printed flat (its `Line`s as spaces, `SoftLine`s as
+// nothing) if it fits in the rest of the line, else broken (every `Line`
+// of its own a line break). A group that contains a `Hard` line break is
+// always broken. A group's `limit` is the widest it may be flat (rustfmt's
+// `fn_call_width` and the like). A `Cond` tries its alternatives in order
+// and takes the first whose first line fits. `Rhs` is what follows `=`: on
+// the same line, else on the next line if it fits there whole, else on the
+// same line broken.
+
+use core::arena::{Arena, Id, List};
+use ln_ast::Span;
+
+pub enum Doc {
+    /// Text in the pool.
+    Text { lo: u32, hi: u32 },
+    /// Text of the source (a token: a multi-line string keeps its lines).
+    Src { lo: u32, hi: u32 },
+    /// Source text printed as written, its lines moved with the line it
+    /// starts on (`indent` is that line's indentation in the source), except
+    /// lines inside a multi-line string or comment.
+    Verbatim { lo: u32, hi: u32, indent: u32 },
+    /// A comment of the source, of a `kind` below.
+    Comment { lo: u32, hi: u32, kind: u8 },
+    /// A space, or a line break.
+    Line,
+    /// Nothing, or a line break.
+    SoftLine,
+    /// A line break.
+    Hard,
+    Empty,
+    Concat(List::<Id::<Doc>>),
+    /// The lines inside are indented one level more.
+    Indent(Id::<Doc>),
+    Group { doc: Id::<Doc>, broken: bool, limit: u32 },
+    Cond { alts: List::<Id::<Doc>>, limit: u32 },
+    /// One or the other, as the enclosing group is broken or flat.
+    IfBreak { broken: Id::<Doc>, flat: Id::<Doc> },
+    /// Contents and separators alternating: as many contents on a line as
+    /// fit.
+    Fill(List::<Id::<Doc>>),
+    /// A space and the document, or the document on the next line.
+    Rhs(Id::<Doc>),
+}
+
+/// A line comment after code: printed at the end of its line.
+pub const TRAILING: u8 = 0;
+/// A comment on a line of its own: the next text starts a new line.
+pub const OWN: u8 = 1;
+/// A block comment between code.
+pub const INLINE: u8 = 2;
+
+pub const WIDTH: u32 = 100;
+pub const INDENT: u32 = 4;
+
+/// The documents of one file.
+pub struct Docs {
+    nodes: Arena::<Doc>,
+    ids: Arena::<Id::<Doc>>,
+    /// Whether each document contains a hard line break (outside a `Cond`).
+    hard: [bool; ..+],
+    pool: String,
+    empty: Id::<Doc>,
+    line: Id::<Doc>,
+    soft: Id::<Doc>,
+    hard_line: Id::<Doc>,
+}
+
+impl Docs {
+    pub fn new(): Docs {
+        let mut d = Docs {
+            nodes: Arena::new(),
+            ids: Arena::new(),
+            hard: [],
+            pool: String::new(),
+            empty: Id::from_index(0),
+            line: Id::from_index(0),
+            soft: Id::from_index(0),
+            hard_line: Id::from_index(0),
+        };
+        d.empty = d.add(Doc::Empty);
+        d.line = d.add(Doc::Line);
+        d.soft = d.add(Doc::SoftLine);
+        d.hard_line = d.add(Doc::Hard);
+        return d;
+    }
+
+    pub fn get(&self, id: Id::<Doc>): Doc {
+        return self.nodes.get(id);
+    }
+
+    pub fn is_hard(&self, id: Id::<Doc>): bool {
+        return self.hard[id.index()];
+    }
+
+    pub fn list(&self, l: List::<Id::<Doc>>): [Id::<Doc>; &] {
+        return self.ids.list(l);
+    }
+
+    pub fn pool_text(&self, lo: u32, hi: u32): str {
+        return self.pool.as_str()[lo as usize..hi as usize];
+    }
+
+    pub fn add(&mut +self, d: Doc): Id::<Doc> {
+        let h = match d {
+            Doc::Hard => true,
+            Doc::Comment { kind, .. } => kind != INLINE,
+            Doc::Concat(l) => self.any_hard(l),
+            Doc::Fill(l) => self.any_hard(l),
+            Doc::Indent(x) => self.hard[x.index()],
+            Doc::Rhs(x) => self.hard[x.index()],
+            Doc::Group { doc, broken, .. } => broken || self.hard[doc.index()],
+            _ => false,
+        };
+        // A group with a hard line break is broken.
+        let d2 = match d {
+            Doc::Group { doc, limit, .. } => Doc::Group { doc, broken: h, limit },
+            _ => d,
+        };
+        self.hard.push(h);
+        return self.nodes.add(d2);
+    }
+
+    fn any_hard(&self, l: List::<Id::<Doc>>): bool {
+        for x in self.ids.list(l) {
+            if self.hard[x.index()] {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn text(&mut +self, s: str): Id::<Doc> {
+        let lo = self.pool.len() as u32;
+        self.pool.push_str(s);
+        return self.add(Doc::Text { lo, hi: self.pool.len() as u32 });
+    }
+
+    pub fn empty(&self): Id::<Doc> {
+        return self.empty;
+    }
+
+    pub fn line(&self): Id::<Doc> {
+        return self.line;
+    }
+
+    pub fn softline(&self): Id::<Doc> {
+        return self.soft;
+    }
+
+    pub fn hardline(&self): Id::<Doc> {
+        return self.hard_line;
+    }
+
+    pub fn concat(&mut +self, items: [Id::<Doc>; &]): Id::<Doc> {
+        if items.len() == 1 {
+            return items[0];
+        }
+        let l = self.ids.add_list(items);
+        return self.add(Doc::Concat(l));
+    }
+
+    pub fn group(&mut +self, doc: Id::<Doc>, limit: u32): Id::<Doc> {
+        return self.add(Doc::Group { doc, broken: false, limit });
+    }
+
+    pub fn broken(&mut +self, doc: Id::<Doc>): Id::<Doc> {
+        return self.add(Doc::Group { doc, broken: true, limit: 0 });
+    }
+
+    pub fn indent(&mut +self, doc: Id::<Doc>): Id::<Doc> {
+        return self.add(Doc::Indent(doc));
+    }
+
+    pub fn if_break(&mut +self, broken: Id::<Doc>, flat: Id::<Doc>): Id::<Doc> {
+        return self.add(Doc::IfBreak { broken, flat });
+    }
+
+    pub fn cond(&mut +self, alts: [Id::<Doc>; &], limit: u32): Id::<Doc> {
+        let l = self.ids.add_list(alts);
+        return self.add(Doc::Cond { alts: l, limit });
+    }
+
+    pub fn fill(&mut +self, parts: [Id::<Doc>; &]): Id::<Doc> {
+        let l = self.ids.add_list(parts);
+        return self.add(Doc::Fill(l));
+    }
+
+    pub fn rhs(&mut +self, doc: Id::<Doc>): Id::<Doc> {
+        return self.add(Doc::Rhs(doc));
+    }
+
+    /// `d` with its outermost group (the last part's, for a sequence)
+    /// broken: how a last argument looks hugged by its call's parentheses.
+    pub fn force_break(&mut +self, d: Id::<Doc>): Id::<Doc> {
+        return match self.nodes.get(d) {
+            Doc::Group { doc, limit, .. } => self.add(Doc::Group { doc, broken: true, limit }),
+            // A call or chain whose last argument hugs: hugged (and broken).
+            Doc::Cond { alts, .. } => {
+                let l = self.ids.list(alts);
+                if l.len() >= 3 { l[1] } else { l[0] }
+            }
+            Doc::Concat(l) => {
+                let n = l.len();
+                if n == 0 {
+                    return d;
+                }
+                let mut items: [Id::<Doc>; -..+] = [];
+                items.extend(self.ids.list(l));
+                let last = self.force_break(items[n - 1]);
+                items[n - 1] = last;
+                self.concat(items[..])
+            }
+            _ => d,
+        };
+    }
+}
+
+// ===================================================================== layout
+
+const FLAT: u8 = 0;
+const BREAK: u8 = 1;
+
+/// A document to print: its indentation and mode, and for a `Fill` the
+/// part to go on with.
+struct Cmd {
+    ind: u32,
+    mode: u8,
+    doc: Id::<Doc>,
+    k: u32,
+}
+
+/// What `fits` still has to measure: a document, or the end of a group
+/// whose width is limited (`lim`), which started `base` columns in.
+struct FCmd {
+    mode: u8,
+    doc: Id::<Doc>,
+    end: bool,
+    lim: u32,
+    base: i64,
+}
+
+/// The width of `s` up to its first line break, and whether it has one.
+fn measure(s: str): (i64, bool) {
+    let b = s.as_bytes();
+    let mut w: i64 = 0;
+    for c in b {
+        if c == b'\n' {
+            return (w, true);
+        }
+        if c < 0x80 || c >= 0xC0 {
+            w += 1;
+        }
+    }
+    return (w, false);
+}
+
+/// The width of `s` after its last line break.
+fn last_line_width(s: str): i64 {
+    let b = s.as_bytes();
+    let mut w: i64 = 0;
+    for c in b {
+        if c == b'\n' {
+            w = 0;
+        } else if c < 0x80 || c >= 0xC0 {
+            w += 1;
+        }
+    }
+    return w;
+}
+
+fn all_spaces(s: str): bool {
+    for c in s.bytes() {
+        if c != b' ' {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether the docs `start` (the first one printed first) fit in `rem`
+/// columns flat, with what follows them (`rest`, the printer's stack) up to
+/// the next line break. The width of the start documents together may be
+/// at most `limit` (none if 0), and so for every group inside with a limit.
+fn fits(d: &Docs, src: str, start: [Cmd; &], rest: [Cmd; &], rem0: i64, limit: u32, fs: &mut [FCmd; -..+]): bool {
+    if rem0 < 0 {
+        return false;
+    }
+    fs.clear();
+    let mut rem = rem0;
+    let mut used: i64 = 0;
+    fs.push(FCmd { mode: FLAT, doc: d.empty, end: true, lim: limit, base: 0 });
+    let mut i = start.len();
+    while i > 0 {
+        i -= 1;
+        fs.push(FCmd { mode: start[i].mode, doc: start[i].doc, end: false, lim: 0, base: 0 });
+    }
+    let mut ri = rest.len();
+    loop {
+        let f = match fs.pop() {
+            Some(f) => f,
+            None => {
+                if ri == 0 {
+                    return true;
+                }
+                ri -= 1;
+                FCmd { mode: rest[ri].mode, doc: rest[ri].doc, end: false, lim: 0, base: 0 }
+            }
+        };
+        if f.end {
+            if f.lim > 0 && used - f.base > f.lim as i64 {
+                return false;
+            }
+            continue;
+        }
+        let mut w: i64 = 0;
+        let mut nl = false;
+        match d.nodes.get(f.doc) {
+            Doc::Text { lo, hi } => {
+                let (a, b) = measure(d.pool_text(lo, hi));
+                w = a;
+                nl = b;
+            }
+            Doc::Src { lo, hi } => {
+                let (a, b) = measure(src[lo as usize..hi as usize]);
+                w = a;
+                nl = b;
+            }
+            Doc::Verbatim { lo, hi, .. } => {
+                let (a, b) = measure(src[lo as usize..hi as usize]);
+                w = a;
+                nl = b;
+            }
+            Doc::Comment { lo, hi, kind } => {
+                if kind == TRAILING {
+                    continue;
+                }
+                let (a, b) = measure(src[lo as usize..hi as usize]);
+                w = a;
+                nl = b || kind == OWN;
+            }
+            Doc::Line => {
+                if f.mode == BREAK {
+                    nl = true;
+                } else {
+                    w = 1;
+                }
+            }
+            Doc::SoftLine => {
+                if f.mode == BREAK {
+                    nl = true;
+                }
+            }
+            Doc::Hard => nl = true,
+            Doc::Empty => {}
+            Doc::Concat(l) => {
+                push_rev(fs, d.ids.list(l), f.mode);
+                continue;
+            }
+            Doc::Fill(l) => {
+                push_rev(fs, d.ids.list(l), f.mode);
+                continue;
+            }
+            Doc::Indent(x) => {
+                fs.push(FCmd { mode: f.mode, doc: x, end: false, lim: 0, base: 0 });
+                continue;
+            }
+            Doc::Group { doc, broken, limit: lim } => {
+                let mode = if broken { BREAK } else { f.mode };
+                if lim > 0 && mode == FLAT {
+                    fs.push(FCmd { mode, doc: d.empty, end: true, lim, base: used });
+                }
+                fs.push(FCmd { mode, doc, end: false, lim: 0, base: 0 });
+                continue;
+            }
+            Doc::Cond { alts, limit: lim } => {
+                let l = d.ids.list(alts);
+                if f.mode == FLAT {
+                    if lim > 0 {
+                        fs.push(FCmd { mode: FLAT, doc: d.empty, end: true, lim, base: used });
+                    }
+                    fs.push(FCmd { mode: FLAT, doc: l[0], end: false, lim: 0, base: 0 });
+                } else {
+                    fs.push(FCmd { mode: BREAK, doc: l[l.len() - 1], end: false, lim: 0, base: 0 });
+                }
+                continue;
+            }
+            Doc::IfBreak { broken, flat } => {
+                fs.push(FCmd { mode: f.mode, doc: if f.mode == BREAK { broken } else { flat }, end: false, lim: 0, base: 0 });
+                continue;
+            }
+            Doc::Rhs(x) => {
+                w = 1;
+                fs.push(FCmd { mode: f.mode, doc: x, end: false, lim: 0, base: 0 });
+            }
+        }
+        used += w;
+        rem -= w;
+        if rem < 0 {
+            return false;
+        }
+        if nl {
+            // Every group still open must keep to its limit up to here.
+            for g in fs {
+                if g.end && g.lim > 0 && used - g.base > g.lim as i64 {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+}
+
+fn push_rev(fs: &mut +[FCmd; -..+], l: [Id::<Doc>; &], mode: u8) {
+    let mut i = l.len();
+    while i > 0 {
+        i -= 1;
+        fs.push(FCmd { mode, doc: l[i], end: false, lim: 0, base: 0 });
+    }
+}
+
+/// The text being laid out.
+struct Out {
+    text: String,
+    /// The column.
+    pos: i64,
+    /// The indentation of the current line.
+    line_ind: u32,
+    /// A comment ended the line: the next text starts a new one.
+    pending: bool,
+    /// Trailing comments, printed when the line ends.
+    suffix: [Span; -..+],
+}
+
+impl Out {
+    /// The column the next text starts at, which is `ind` if a comment
+    /// has ended the line.
+    fn col(&self, ind: u32): i64 {
+        return if self.pending { ind as i64 } else { self.pos };
+    }
+
+    fn newline(&mut self, src: str, ind: u32) {
+        self.trim();
+        for s in self.suffix {
+            self.text.push(' ');
+            self.text.push_str(src[s.lo as usize..s.hi as usize]);
+        }
+        self.suffix.clear();
+        self.text.push('\n');
+        let mut i: u32 = 0;
+        while i < ind {
+            self.text.push(' ');
+            i += 1;
+        }
+        self.pos = ind as i64;
+        self.line_ind = ind;
+        self.pending = false;
+    }
+
+    /// Remove spaces at the end of the line.
+    fn trim(&mut self) {
+        let b = self.text.as_bytes();
+        let mut n = b.len();
+        while n > 0 && (b[n - 1] == b' ' || b[n - 1] == b'\t') {
+            n -= 1;
+        }
+        self.text.truncate(n);
+    }
+
+    fn print(&mut self, src: str, ind: u32, s: str) {
+        if s.len() == 0 {
+            return;
+        }
+        let mut t = s;
+        if self.pending {
+            if all_spaces(t) {
+                return;
+            }
+            self.newline(src, ind);
+            while t.starts_with(" ") {
+                t = t[1..];
+            }
+        }
+        self.text.push_str(t);
+        let (w, nl) = measure(t);
+        if nl {
+            self.pos = last_line_width(t);
+        } else {
+            self.pos += w;
+        }
+    }
+
+    /// Before a comment or verbatim text: end a line a comment is waiting
+    /// on, so that comments stay in order.
+    fn settle(&mut self, src: str, ind: u32) {
+        if self.pending || self.suffix.len() > 0 {
+            self.newline(src, ind);
+        }
+    }
+
+    /// `src[lo..hi]` with its lines after the first moved as the line it
+    /// starts on has moved, from the source's `indent` to this one's.
+    fn verbatim(&mut self, src: str, prot: [Span; &], lo: u32, hi: u32, indent: u32) {
+        let b = src.as_bytes();
+        let delta = self.line_ind as i64 - indent as i64;
+        let mut start = lo as usize;
+        let end = hi as usize;
+        let mut first = true;
+        while start < end {
+            let mut stop = start;
+            while stop < end && b[stop] != b'\n' {
+                stop += 1;
+            }
+            let mut line = src[start..stop];
+            // Trailing whitespace, unless inside a string or comment.
+            if stop < end && !protected(prot, stop as u32) {
+                let lb = line.as_bytes();
+                let mut n = lb.len();
+                while n > 0 && (lb[n - 1] == b' ' || lb[n - 1] == b'\t') {
+                    n -= 1;
+                }
+                line = line[..n];
+            }
+            if first || protected(prot, start as u32) {
+                self.text.push_str(line);
+                self.pos = if first { self.pos + measure(line).0 } else { measure(line).0 };
+            } else {
+                let lb = line.as_bytes();
+                let mut ws: usize = 0;
+                while ws < lb.len() && (lb[ws] == b' ' || lb[ws] == b'\t') {
+                    ws += 1;
+                }
+                if ws < lb.len() {
+                    let mut n = ws as i64 + delta;
+                    if n < 0 {
+                        n = 0;
+                    }
+                    let mut i: i64 = 0;
+                    while i < n {
+                        self.text.push(' ');
+                        i += 1;
+                    }
+                    self.text.push_str(line[ws..]);
+                    self.pos = n + measure(line[ws..]).0;
+                    self.line_ind = n as u32;
+                } else {
+                    self.pos = 0;
+                }
+            }
+            if stop < end {
+                self.text.push('\n');
+                start = stop + 1;
+                first = false;
+            } else {
+                start = stop;
+            }
+        }
+    }
+}
+
+/// Whether `pos` is strictly inside one of the sorted ranges `prot`.
+fn protected(prot: [Span; &], pos: u32): bool {
+    let mut lo: usize = 0;
+    let mut hi = prot.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if prot[mid].lo < pos {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    // `lo` is the first range starting at or after `pos`: only the one
+    // before it can contain it.
+    return lo > 0 && prot[lo - 1].hi > pos;
+}
+
+/// Lay out `root` in `WIDTH` columns. `src` is the text `Src`, `Verbatim`
+/// and `Comment` documents are in; `prot` the ranges of its multi-line
+/// strings and comments, sorted.
+pub fn render(d: &Docs, src: str, prot: [Span; &], root: Id::<Doc>): String {
+    let mut o = Out { text: String::new(), pos: 0, line_ind: 0, pending: false, suffix: [] };
+    let mut stack: [Cmd; -..+] = [Cmd { ind: 0, mode: BREAK, doc: root, k: 0 }];
+    let mut fs: [FCmd; -..+] = [];
+    let none: [Cmd; -..+] = [];
+    let width = WIDTH as i64;
+    while let Some(c) = stack.pop() {
+        match d.nodes.get(c.doc) {
+            Doc::Text { lo, hi } => o.print(src, c.ind, d.pool_text(lo, hi)),
+            Doc::Src { lo, hi } => o.print(src, c.ind, src[lo as usize..hi as usize]),
+            Doc::Verbatim { lo, hi, indent } => {
+                o.settle(src, c.ind);
+                o.verbatim(src, prot, lo, hi, indent);
+            }
+            Doc::Comment { lo, hi, kind } => {
+                if kind == TRAILING {
+                    if o.suffix.len() > 0 || o.pending {
+                        o.newline(src, c.ind);
+                    }
+                    o.suffix.push(Span { lo, hi });
+                } else {
+                    o.settle(src, c.ind);
+                    o.print(src, c.ind, src[lo as usize..hi as usize]);
+                    if kind == OWN {
+                        o.pending = true;
+                    }
+                }
+            }
+            Doc::Line => {
+                if c.mode == BREAK {
+                    o.newline(src, c.ind);
+                } else {
+                    o.print(src, c.ind, " ");
+                }
+            }
+            Doc::SoftLine => {
+                if c.mode == BREAK {
+                    o.newline(src, c.ind);
+                }
+            }
+            Doc::Hard => o.newline(src, c.ind),
+            Doc::Empty => {}
+            Doc::Concat(l) => {
+                let items = d.ids.list(l);
+                let mut i = items.len();
+                while i > 0 {
+                    i -= 1;
+                    stack.push(Cmd { ind: c.ind, mode: c.mode, doc: items[i], k: 0 });
+                }
+            }
+            Doc::Indent(x) => stack.push(Cmd { ind: c.ind + INDENT, mode: c.mode, doc: x, k: 0 }),
+            Doc::Group { doc, broken, limit } => {
+                let mut mode = BREAK;
+                if !broken {
+                    if c.mode == FLAT {
+                        mode = FLAT;
+                    } else {
+                        let start = [Cmd { ind: c.ind, mode: FLAT, doc, k: 0 }];
+                        if fits(d, src, start[..], stack[..], width - o.col(c.ind), limit, &mut fs) {
+                            mode = FLAT;
+                        }
+                    }
+                }
+                stack.push(Cmd { ind: c.ind, mode, doc, k: 0 });
+            }
+            Doc::Cond { alts, limit } => {
+                let l = d.ids.list(alts);
+                let n = l.len();
+                if c.mode == FLAT {
+                    stack.push(Cmd { ind: c.ind, mode: FLAT, doc: l[0], k: 0 });
+                } else {
+                    let mut chosen = n - 1;
+                    let mut mode = BREAK;
+                    let mut i: usize = 0;
+                    while i + 1 < n {
+                        let start = [Cmd { ind: c.ind, mode: FLAT, doc: l[i], k: 0 }];
+                        if fits(d, src, start[..], stack[..], width - o.col(c.ind), limit, &mut fs) {
+                            chosen = i;
+                            mode = FLAT;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    stack.push(Cmd { ind: c.ind, mode, doc: l[chosen], k: 0 });
+                }
+            }
+            Doc::IfBreak { broken, flat } => stack.push(Cmd { ind: c.ind, mode: c.mode, doc: if c.mode == BREAK { broken } else { flat }, k: 0 }),
+            Doc::Fill(l) => {
+                let parts = d.ids.list(l);
+                let n = parts.len();
+                let k = c.k as usize;
+                if k >= n {
+                    continue;
+                }
+                if c.mode == FLAT {
+                    stack.push(Cmd { ind: c.ind, mode: FLAT, doc: c.doc, k: c.k + 1 });
+                    stack.push(Cmd { ind: c.ind, mode: FLAT, doc: parts[k], k: 0 });
+                    continue;
+                }
+                let rem = width - o.col(c.ind);
+                let content = [Cmd { ind: c.ind, mode: FLAT, doc: parts[k], k: 0 }];
+                // The last content is followed by the list's `,`.
+                let last = k + 1 >= n;
+                let content_fits = fits(d, src, content[..], none[..], if last { rem - 1 } else { rem }, 0, &mut fs);
+                let content_mode = if content_fits { FLAT } else { BREAK };
+                if last {
+                    stack.push(Cmd { ind: c.ind, mode: content_mode, doc: parts[k], k: 0 });
+                    continue;
+                }
+                let three = [
+                    Cmd { ind: c.ind, mode: FLAT, doc: parts[k], k: 0 },
+                    Cmd { ind: c.ind, mode: FLAT, doc: parts[k + 1], k: 0 },
+                    Cmd { ind: c.ind, mode: FLAT, doc: parts[k + 2], k: 0 },
+                ];
+                let next_last = k + 3 >= n;
+                let both = fits(d, src, three[..], none[..], if next_last { rem - 1 } else { rem }, 0, &mut fs);
+                stack.push(Cmd { ind: c.ind, mode: BREAK, doc: c.doc, k: c.k + 2 });
+                stack.push(Cmd { ind: c.ind, mode: if both { FLAT } else { BREAK }, doc: parts[k + 1], k: 0 });
+                stack.push(Cmd { ind: c.ind, mode: content_mode, doc: parts[k], k: 0 });
+            }
+            Doc::Rhs(x) => {
+                if c.mode == FLAT {
+                    o.print(src, c.ind, " ");
+                    stack.push(Cmd { ind: c.ind, mode: FLAT, doc: x, k: 0 });
+                    continue;
+                }
+                if o.pending || o.suffix.len() > 0 {
+                    // After a comment: on the next line.
+                    o.newline(src, c.ind + INDENT);
+                    stack.push(Cmd { ind: c.ind + INDENT, mode: BREAK, doc: x, k: 0 });
+                    continue;
+                }
+                let same = [Cmd { ind: c.ind, mode: FLAT, doc: x, k: 0 }];
+                if fits(d, src, same[..], stack[..], width - o.col(c.ind) - 1, 0, &mut fs) {
+                    o.print(src, c.ind, " ");
+                    stack.push(Cmd { ind: c.ind, mode: FLAT, doc: x, k: 0 });
+                    continue;
+                }
+                let ind = c.ind + INDENT;
+                let next = [Cmd { ind, mode: FLAT, doc: x, k: 0 }];
+                if !d.is_hard(x) && fits(d, src, next[..], stack[..], width - ind as i64, 0, &mut fs) {
+                    o.newline(src, ind);
+                    stack.push(Cmd { ind, mode: FLAT, doc: x, k: 0 });
+                    continue;
+                }
+                o.print(src, c.ind, " ");
+                stack.push(Cmd { ind: c.ind, mode: BREAK, doc: x, k: 0 });
+            }
+        }
+    }
+    o.trim();
+    for s in o.suffix {
+        o.text.push(' ');
+        o.text.push_str(src[s.lo as usize..s.hi as usize]);
+    }
+    // One line break at the end.
+    o.text.push('\n');
+    return o.text;
+}

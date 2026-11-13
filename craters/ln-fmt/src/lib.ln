@@ -1,0 +1,507 @@
+// `lunar fmt`: the formatter for Lunar source files. One style, no options,
+// like gofmt; the style is rustfmt's defaults (docs/style.md):
+//
+//     match ln_fmt::format_source(text) {
+//         Ok(formatted) => ...,
+//         Err(e) => ...,       // a syntax error, or a bug in the formatter
+//     }
+//
+// The file is parsed (`ln_parser`), and its syntax tree printed into layout
+// documents (`doc`) that are laid out in 100 columns. Comments are not in
+// the tree: the lexer skips them, and `source` finds them again between
+// the tokens. The printer emits each token with its position in the
+// source, after the comments that come before that position, so comments
+// keep their places among the tokens.
+//
+// Every result is checked before it is returned (`verify`): it must parse
+// to the same syntax tree (spans aside, and `use` lists in any order) and
+// have the same comments in the same order. If not, that is a bug in the
+// formatter, reported as an internal error instead of a changed program.
+
+mod doc;
+mod exprs;
+mod items;
+mod source;
+mod verify;
+
+#[cfg(test)]
+mod tests;
+
+use core::arena::{Id, List};
+use ln_ast::*;
+use ln_lexer::Token;
+use crater::doc::{Doc, Docs, INLINE, OWN, TRAILING, render};
+use crater::source::{NONE, Source, newlines, scan};
+
+/// Why a text could not be formatted.
+#[derive(Eq, Debug)]
+pub enum FmtErrorKind {
+    /// The text does not parse. It is left as it is.
+    Syntax,
+    /// The formatter would have changed the program: a bug in it.
+    Internal,
+}
+
+/// Why a text could not be formatted: what, and where (byte offsets; the
+/// first syntax error's).
+pub struct FmtError {
+    pub kind: FmtErrorKind,
+    pub message: String,
+    pub span: Span,
+}
+
+impl Display for FmtError {
+    fn fmt(&self, out: &mut +String) {
+        out.push_str(self.message.as_str());
+    }
+}
+
+/// `src` formatted, or why it cannot be.
+pub fn format_source(src: str): Result::<String, FmtError> {
+    let parsed = ln_parser::parse_file(src);
+    if parsed.diags.len() > 0 {
+        let d = parsed.diags[0];
+        let mut m = String::new();
+        m.push_str(parsed.ast.text(d.message));
+        return Err(FmtError { kind: FmtErrorKind::Syntax, message: m, span: d.span });
+    }
+    let mut before = String::new();
+    ln_ast::dump(&parsed.ast, &mut before);
+    let file = parsed.ast.file;
+    let mut p = Printer::new(src, parsed.ast);
+    let root = p.file(file);
+    let prot = p.protected();
+    let mut out = render(&p.d, src, prot[..], root);
+    if crlf(src) {
+        out = to_crlf(out.as_str());
+    }
+    if let Err(m) = verify::check(src, before.as_str(), out.as_str()) {
+        return Err(FmtError { kind: FmtErrorKind::Internal, message: m, span: Span::new(0, 0) });
+    }
+    return Ok(out);
+}
+
+/// Whether the text's first line ends with `\r\n`.
+fn crlf(src: str): bool {
+    return match src.find("\n") {
+        Some(i) => i > 0 && src.as_bytes()[i - 1] == b'\r',
+        None => false,
+    };
+}
+
+/// `s` with every `\n` that does not follow `\r` made `\r\n`.
+fn to_crlf(s: str): String {
+    let b = s.as_bytes();
+    let mut out = String::new();
+    let mut start: usize = 0;
+    let mut i: usize = 0;
+    while i < b.len() {
+        if b[i] == b'\n' && (i == 0 || b[i - 1] != b'\r') {
+            out.push_str(s[start..i]);
+            out.push_str("\r\n");
+            start = i + 1;
+        }
+        i += 1;
+    }
+    out.push_str(s[start..]);
+    return out;
+}
+
+// ===================================================================== the printer
+
+/// What was emitted last: nothing yet, text, or a line break.
+const START: u8 = 0;
+const TEXT: u8 = 1;
+const BREAK: u8 = 2;
+
+/// Flags of `flush`: keep empty lines after comments (between items and
+/// statements); the comments are the last before a closing bracket.
+const KEEP: u8 = 1;
+const END: u8 = 2;
+
+/// rustfmt's width heuristics (its defaults for 100 columns) as the widest
+/// a group may be flat: a call's arguments with their parentheses, a
+/// struct literal's fields with `{ ` and ` }`, ...
+const CALL_WIDTH: u32 = 62;
+const ARRAY_WIDTH: u32 = 62;
+const STRUCT_LIT_WIDTH: u32 = 22;
+const STRUCT_VARIANT_WIDTH: u32 = 39;
+const CHAIN_WIDTH: u32 = 60;
+const IF_ELSE_WIDTH: u32 = 50;
+const LET_ELSE_WIDTH: u32 = 50;
+/// Array items no wider than this are filled several to a line.
+const SHORT_ITEM: u32 = 10;
+
+/// Builds the layout documents of a file from its syntax tree. Documents
+/// are emitted into the sequence being built (`open` starts one, `close`
+/// ends it and gives its document).
+struct Printer {
+    src: str,
+    ast: Ast,
+    s: Source,
+    d: Docs,
+    /// The next comment to print.
+    ci: usize,
+    parts: [Id::<Doc>; -..+],
+    marks: [usize; -..+],
+    last_leaf: u8,
+    /// The end of the last token or comment printed.
+    last_end: u32,
+    /// Inside a macro call's arguments: their tokens must stay as they are
+    /// (no trailing commas added or removed, nothing reordered).
+    in_macro: u32,
+}
+
+impl Printer {
+    fn new(src: str, ast: Ast): Printer {
+        return Printer {
+            src,
+            ast,
+            s: scan(src),
+            d: Docs::new(),
+            ci: 0,
+            parts: [],
+            marks: [],
+            last_leaf: START,
+            last_end: 0,
+            in_macro: 0,
+        };
+    }
+
+    /// The ranges of multi-line strings and comments, which verbatim text
+    /// keeps as they are.
+    fn protected(&self): [Span; -..+] {
+        let b = self.src.as_bytes();
+        let mut out: [Span; -..+] = [];
+        let mut ti: usize = 0;
+        let mut ci: usize = 0;
+        let nt = self.s.toks.len();
+        let nc = self.s.cmts.len();
+        while ti < nt || ci < nc {
+            let take_tok = ci >= nc || (ti < nt && self.s.toks[ti].lo < self.s.cmts[ci].lo);
+            let mut lo: u32 = 0;
+            let mut hi: u32 = 0;
+            if take_tok {
+                lo = self.s.toks[ti].lo;
+                hi = self.s.toks[ti].hi;
+                ti += 1;
+            } else {
+                lo = self.s.cmts[ci].lo;
+                hi = self.s.cmts[ci].end;
+                ci += 1;
+            }
+            if newlines(b, lo as usize, hi as usize) > 0 {
+                out.push(Span::new(lo, hi));
+            }
+        }
+        return out;
+    }
+
+    /// The whole file.
+    fn file(&mut self, items: List::<Id::<Item>>): Id::<Doc> {
+        self.open();
+        self.items(items, self.src.len() as u32);
+        self.flush(NONE, KEEP | END);
+        return self.close();
+    }
+
+    // ----- building documents -----
+
+    fn open(&mut self) {
+        self.marks.push(self.parts.len());
+    }
+
+    fn close(&mut self): Id::<Doc> {
+        let m = self.marks.pop().unwrap();
+        let mut items: [Id::<Doc>; -..+] = [];
+        items.extend(self.parts[m..]);
+        self.parts.truncate(m);
+        return self.d.concat(items[..]);
+    }
+
+    fn emit(&mut self, d: Id::<Doc>) {
+        self.parts.push(d);
+    }
+
+    fn emit_doc(&mut self, d: Doc) {
+        let id = self.d.add(d);
+        self.parts.push(id);
+    }
+
+    fn text(&mut self, s: str) {
+        let t = self.d.text(s);
+        self.parts.push(t);
+        self.last_leaf = TEXT;
+    }
+
+    fn line(&mut self) {
+        let l = self.d.line();
+        self.parts.push(l);
+        self.last_leaf = BREAK;
+    }
+
+    fn softline(&mut self) {
+        let l = self.d.softline();
+        self.parts.push(l);
+        self.last_leaf = BREAK;
+    }
+
+    fn hard(&mut self) {
+        let l = self.d.hardline();
+        self.parts.push(l);
+        self.last_leaf = BREAK;
+    }
+
+    /// The inside of braces, one level in, and a line break before the
+    /// closing brace: a broken group, so that its contents are laid out
+    /// in their own right however the line before it was.
+    fn body(&mut self, inner: Id::<Doc>) {
+        let ind = self.d.indent(inner);
+        let h = self.d.hardline();
+        let parts = [ind, h];
+        let c = self.d.concat(parts[..]);
+        let g = self.d.broken(c);
+        self.emit(g);
+        self.last_leaf = BREAK;
+    }
+
+    /// A line break will come before what is built next (a list item, whose
+    /// separator is added afterwards).
+    fn assume_break(&mut self) {
+        self.last_leaf = BREAK;
+    }
+
+    /// The token `s` of the source at `lo` (`NONE`: not in the source),
+    /// after the comments before it and with the comments right after it.
+    fn tok(&mut self, lo: u32, s: str) {
+        if lo != NONE {
+            self.flush(lo, 0);
+        }
+        self.text(s);
+        if lo != NONE {
+            self.done(lo + s.len() as u32);
+        }
+    }
+
+    /// The `{` at `open`; whether comments follow it on its line.
+    fn brace(&mut self, open: u32): bool {
+        self.flush(open, 0);
+        let before = self.ci;
+        self.tok(open, "{");
+        return self.ci != before;
+    }
+
+    /// The source text `lo..hi` (an identifier or a literal).
+    fn tok_src(&mut self, lo: u32, hi: u32) {
+        self.flush(lo, 0);
+        self.emit_doc(Doc::Src { lo, hi });
+        self.last_leaf = TEXT;
+        self.done(hi);
+    }
+
+    fn ident(&mut self, i: Ident) {
+        self.tok_src(i.span.lo, i.span.hi);
+    }
+
+    /// A token ending at `hi` was printed: the comments trailing it.
+    fn done(&mut self, hi: u32) {
+        if hi > self.last_end {
+            self.last_end = hi;
+        }
+        while self.ci < self.s.cmts.len() && self.s.cmts[self.ci].prev_end == hi && !self.s.cmts[self.ci].own_line {
+            let i = self.ci;
+            self.ci += 1;
+            self.comment(i, 0, NONE);
+        }
+    }
+
+    /// `lo..hi` of the source as it is, its lines moved with it.
+    fn verbatim(&mut self, lo: u32, hi: u32) {
+        self.flush(lo, 0);
+        let b = self.src.as_bytes();
+        let mut start = lo as usize;
+        while start > 0 && b[start - 1] != b'\n' {
+            start -= 1;
+        }
+        let mut ws = start;
+        while ws < lo as usize && (b[ws] == b' ' || b[ws] == b'\t') {
+            ws += 1;
+        }
+        self.emit_doc(Doc::Verbatim { lo, hi, indent: (ws - start) as u32 });
+        self.last_leaf = TEXT;
+        // Its comments are in it.
+        while self.cmt_before(hi) {
+            self.ci += 1;
+        }
+        self.done(hi);
+    }
+
+    // ----- comments -----
+
+    /// Whether a comment not printed yet starts before `pos`.
+    fn cmt_before(&self, pos: u32): bool {
+        return self.ci < self.s.cmts.len() && self.s.cmts[self.ci].lo < pos;
+    }
+
+    /// Print the comments before `pos`.
+    fn flush(&mut self, pos: u32, flags: u8) {
+        while self.cmt_before(pos) {
+            let i = self.ci;
+            self.ci += 1;
+            self.comment(i, flags, pos);
+        }
+    }
+
+    fn comment(&mut self, i: usize, flags: u8, pos: u32) {
+        let c = self.s.cmts[i];
+        if c.own_line {
+            if self.last_leaf == TEXT {
+                self.hard();
+            }
+            if c.block && !c.newline_after {
+                self.emit_doc(Doc::Comment { lo: c.lo, hi: c.hi, kind: INLINE });
+                self.text(" ");
+            } else {
+                self.emit_doc(Doc::Comment { lo: c.lo, hi: c.hi, kind: OWN });
+                self.last_leaf = TEXT;
+            }
+            if flags & KEEP != 0 && c.blank_after {
+                let more = i + 1 < self.s.cmts.len() && self.s.cmts[i + 1].lo < pos;
+                if more || flags & END == 0 {
+                    self.hard();
+                    self.hard();
+                }
+            }
+        } else if c.block {
+            if self.last_leaf == TEXT {
+                self.text(" ");
+            }
+            self.emit_doc(Doc::Comment { lo: c.lo, hi: c.hi, kind: INLINE });
+            self.last_leaf = TEXT;
+            if (c.end as usize) < self.src.len() && self.src.as_bytes()[c.end as usize] == b' ' {
+                self.text(" ");
+            }
+        } else {
+            self.emit_doc(Doc::Comment { lo: c.lo, hi: c.hi, kind: TRAILING });
+            self.last_leaf = TEXT;
+        }
+        if c.end > self.last_end {
+            self.last_end = c.end;
+        }
+    }
+
+    // ----- vertical lists: items, statements, fields, variants, arms -----
+
+    /// Before the element starting at `lo`: a line break (unless `first`),
+    /// an empty line where the source has one, and the comments before it.
+    fn next_elem(&mut self, lo: u32, first: bool) {
+        if !first {
+            self.hard();
+            self.blank_before(lo);
+        }
+        self.flush(lo, KEEP);
+    }
+
+    /// An empty line if the source has one between what was printed last
+    /// and what comes next (a comment, or `lo`).
+    fn blank_before(&mut self, lo: u32) {
+        let next = if self.cmt_before(lo) { self.s.cmts[self.ci].lo } else { lo };
+        if self.last_end < next && newlines(self.src.as_bytes(), self.last_end as usize, next as usize) > 1 {
+            self.hard();
+        }
+    }
+
+    /// The comments after a list's last element, before its closing
+    /// bracket at `close`.
+    fn end_list(&mut self, close: u32, empty: bool) {
+        if self.cmt_before(close) {
+            if !empty {
+                self.hard();
+                self.blank_before(close);
+            }
+            self.flush(close, KEEP | END);
+        }
+    }
+
+    // ----- comma-separated lists -----
+
+    /// After a list item ending at `hi`: the comma after it, with the
+    /// comments before it and trailing it (and after the last item, all
+    /// those before `close`). Gives them as a document, and whether the
+    /// source has the comma.
+    fn sep(&mut self, hi: u32, close: u32, last: bool): (Id::<Doc>, bool) {
+        self.open();
+        let comma = self.s.find(hi, Token::Comma);
+        let has = comma != NONE && comma < close;
+        if has {
+            self.flush(comma, 0);
+            self.done(comma + 1);
+        }
+        if last {
+            self.flush(close, END);
+        }
+        let d = self.close();
+        return (d, has);
+    }
+
+    /// A list laid out: `open` and `close` (their documents), and between
+    /// them `parts`, each item followed by its separator's comments. Flat:
+    /// `(a, b)`; broken: an item a line, with `trailing` after the last
+    /// (see `trailing_comma`). `edge` is the line inside the brackets:
+    /// `SoftLine`, or `Line` for `{ a }`.
+    fn list_doc(&mut self, open: Id::<Doc>, parts: [Id::<Doc>; &], close: Id::<Doc>, trailing: Id::<Doc>, edge: Id::<Doc>, limit: u32): Id::<Doc> {
+        let comma = self.d.text(",");
+        let line = self.d.line();
+        let mut inner: [Id::<Doc>; -..+] = [edge];
+        let n = parts.len() / 2;
+        let mut i: usize = 0;
+        while i < n {
+            inner.push(parts[2 * i]);
+            if i + 1 < n {
+                inner.push(comma);
+                inner.push(parts[2 * i + 1]);
+                inner.push(line);
+            } else {
+                inner.push(trailing);
+                inner.push(parts[2 * i + 1]);
+            }
+            i += 1;
+        }
+        let body = self.d.concat(inner[..]);
+        let ind = self.d.indent(body);
+        let all = [open, ind, edge, close];
+        let c = self.d.concat(all[..]);
+        return self.d.group(c, limit);
+    }
+
+    /// A list's trailing comma: a comma if the list is broken, or in a
+    /// macro's arguments, whatever the source has.
+    fn trailing_comma(&mut self, had: bool): Id::<Doc> {
+        if self.in_macro > 0 {
+            return if had { self.d.text(",") } else { self.d.empty() };
+        }
+        let c = self.d.text(",");
+        let e = self.d.empty();
+        return self.d.if_break(c, e);
+    }
+
+    /// The items of a list printed flat, `a, b, c`, for a `Cond`.
+    fn flat_items(&mut self, parts: [Id::<Doc>; &], had_trailing: bool): Id::<Doc> {
+        let sep = self.d.text(", ");
+        let mut out: [Id::<Doc>; -..+] = [];
+        let n = parts.len() / 2;
+        let mut i: usize = 0;
+        while i < n {
+            if i > 0 {
+                out.push(sep);
+            }
+            out.push(parts[2 * i]);
+            i += 1;
+        }
+        if had_trailing && self.in_macro > 0 {
+            let c = self.d.text(",");
+            out.push(c);
+        }
+        return self.d.concat(out[..]);
+    }
+}
