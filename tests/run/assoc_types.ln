@@ -1,0 +1,228 @@
+// Associated types: declared in traits (`type Item;`, with bounds or a
+// default), given by impls (`type Item = u8;`), and named as projections
+// (`T::Item`, `Self::Item`, `<T as Trait>::Item`) in signatures and bodies,
+// constrained in bounds (`S: Source::<Item = u32>`).
+
+trait Source {
+    type Item;
+    fn get(&mut self): Option::<Self::Item>;
+}
+
+struct Counter {
+    n: u32,
+    end: u32,
+}
+
+impl Source for Counter {
+    type Item = u32;
+    fn get(&mut self): Option::<u32> {
+        if self.n < self.end {
+            self.n += 1;
+            return Some(self.n);
+        }
+        return None;
+    }
+}
+
+struct Letters {
+    i: u8,
+}
+
+impl Source for Letters {
+    type Item = char;
+    // `Self::Item` in the impl is the impl's own type.
+    fn get(&mut self): Option::<Self::Item> {
+        if self.i < 3 {
+            self.i += 1;
+            return Some((b'a' + self.i - 1) as char);
+        }
+        return None;
+    }
+}
+
+/// `S::Item` in a signature: whatever the source gives.
+fn first::<T: Detached, S: Source::<Item = T>>(mut s: S): Option::<S::Item> {
+    return s.get();
+}
+
+/// A constraint: only sources of `u32`.
+fn sum::<S: Source::<Item = u32>>(mut s: S): u32 {
+    let mut t: u32 = 0;
+    while let Some(x) = s.get() {
+        t += x;
+    }
+    return t;
+}
+
+/// The constraint names a parameter, which callers' types give.
+fn count_and_last::<T: Light + Detached, S: Source::<Item = T>>(mut s: S): (usize, Option::<T>) {
+    let mut n: usize = 0;
+    let mut last: Option::<T> = None;
+    while let Some(x) = s.get() {
+        n += 1;
+        last = Some(x);
+    }
+    return (n, last);
+}
+
+#[test]
+fn projections_in_signatures() {
+    assert_eq!(first(Counter { n: 0, end: 3 }), Some(1));
+    assert_eq!(first(Letters { i: 0 }), Some('a'));
+    assert_eq!(sum(Counter { n: 0, end: 4 }), 10);
+    let (n, last) = count_and_last(Letters { i: 0 });
+    assert_eq!(n, 3);
+    assert_eq!(last, Some('c'));
+}
+
+// A generic impl whose item depends on its parameter.
+struct Repeat::<T> {
+    value: T,
+    left: usize,
+}
+
+impl::<T: Light> Source for Repeat::<T> {
+    type Item = T;
+    fn get(&mut self): Option::<T> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        return Some(self.value);
+    }
+}
+
+// An adapter: its item is a pair of the inner source's items.
+struct Pairs::<S> {
+    inner: S,
+}
+
+impl::<S: Source> Source for Pairs::<S> {
+    type Item = (S::Item, S::Item);
+    fn get(&mut self): Option::<Self::Item> {
+        let a = self.inner.get()?;
+        let b = self.inner.get()?;
+        return Some((a, b));
+    }
+}
+
+#[test]
+fn generic_impls() {
+    let mut r = Repeat { value: 7u64, left: 2 };
+    assert_eq!(r.get(), Some(7));
+    let mut p = Pairs { inner: Counter { n: 0, end: 5 } };
+    assert_eq!(p.get(), Some((1, 2)));
+    assert_eq!(p.get(), Some((3, 4)));
+    assert!(p.get().is_none());
+    let mut pp = Pairs { inner: Pairs { inner: Letters { i: 0 } } };
+    // Nested: `<Pairs::<Letters> as Source>::Item` is `(char, char)`.
+    let q = Pairs { inner: Repeat { value: 'x', left: 4 } };
+    let ((a, b), (c, d)) = Pairs { inner: q }.get().unwrap();
+    assert_eq!((a, b), ('x', 'x'));
+    assert_eq!((c, d), ('x', 'x'));
+    assert!(pp.get().is_none());
+}
+
+// Bounds on associated types, a default, and projections in bodies.
+trait Shelf {
+    type Book: Light + Eq;
+    type Label = str;
+    fn books(&self): [Self::Book; &];
+    fn label(&self): Self::Label;
+}
+
+struct Numbers {
+    items: [u32; ..+],
+}
+
+impl Shelf for Numbers {
+    type Book = u32;
+    fn books(&self): [u32; &] {
+        return self.items[..];
+    }
+    fn label(&self): str {
+        return "numbers";
+    }
+}
+
+/// `S::Book: Eq` comes from the trait's bound on `Book`.
+fn contains::<S: Shelf>(s: &S, b: S::Book): bool {
+    for x in s.books() {
+        if x == b {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// A qualified path names the trait.
+fn label_of::<S: Shelf::<Label = str>>(s: &S): <S as Shelf>::Label {
+    return s.label();
+}
+
+#[test]
+fn bounds_and_defaults() {
+    let n = Numbers { items: [3, 5, 8] };
+    assert!(contains(&n, 5));
+    assert!(!contains(&n, 4));
+    assert_eq!(label_of(&n), "numbers");
+    let local: <Numbers as Shelf>::Book = 9;
+    assert_eq!(local + 1, 10);
+}
+
+// A trait with a parameter and an associated type.
+trait Convert::<From> {
+    type Out;
+    fn convert(&self, x: From): Self::Out;
+}
+
+struct Doubler;
+
+impl Convert::<u8> for Doubler {
+    type Out = u16;
+    fn convert(&self, x: u8): u16 {
+        return (x as u16) * 2;
+    }
+}
+
+impl Convert::<str> for Doubler {
+    type Out = usize;
+    fn convert(&self, x: str): usize {
+        return x.len() * 2;
+    }
+}
+
+fn run::<A, C: Convert::<A, Out = u16>>(c: &C, x: A): u16 {
+    return c.convert(x);
+}
+
+#[test]
+fn traits_with_parameters() {
+    let d = Doubler;
+    assert_eq!(run(&d, 200u8), 400);
+    let n: <Doubler as Convert::<str>>::Out = <Doubler as Convert::<str>>::convert(&d, "abc");
+    assert_eq!(n, 6);
+}
+
+// `impl Trait` and `dyn` with constraints.
+fn counter(end: u32): impl Source::<Item = u32> {
+    return Counter { n: 0, end };
+}
+
+fn drain(s: dyn mut Source::<Item = u32>): u32 {
+    let mut t: u32 = 0;
+    while let Some(x) = s.get() {
+        t += x;
+    }
+    return t;
+}
+
+#[test]
+fn opaque_and_dyn() {
+    assert_eq!(sum(counter(3)), 6);
+    let mut c = Counter { n: 0, end: 4 };
+    assert_eq!(drain(c as dyn mut Source::<Item = u32>), 10);
+    let mut l = Letters { i: 0 };
+    let d = l as dyn mut Source::<Item = char>;
+    assert_eq!(d.get(), Some('a'));
+}

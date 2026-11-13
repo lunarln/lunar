@@ -1,0 +1,128 @@
+// The operator traits' `Output`: `a + b` is `<A as Add>::Output`, which an
+// impl may choose to be another type; generic code names it as
+// `T::Output`, or requires it with `T: Add::<Output = T>`. `FromStr` has
+// its error type `Err`.
+
+use core::ops::{Add, Mul, Neg, Sub};
+use core::str::FromStr;
+
+#[derive(Eq, Debug)]
+struct Meters {
+    v: i64,
+}
+
+#[derive(Eq, Debug)]
+struct SquareMeters {
+    v: i64,
+}
+
+impl Add for Meters {
+    type Output = Meters;
+    fn add(&self, rhs: &Meters): Meters {
+        return Meters { v: self.v + rhs.v };
+    }
+}
+
+impl Mul for Meters {
+    // Lengths multiply to an area.
+    type Output = SquareMeters;
+    fn mul(&self, rhs: &Meters): SquareMeters {
+        return SquareMeters { v: self.v * rhs.v };
+    }
+}
+
+impl Neg for Meters {
+    type Output = Meters;
+    fn neg(&self): Meters {
+        return Meters { v: -self.v };
+    }
+}
+
+impl Sub for Meters {
+    type Output = i64;
+    fn sub(&self, rhs: &Meters): i64 {
+        return self.v - rhs.v;
+    }
+}
+
+#[test]
+fn outputs_of_user_types() {
+    let a = Meters { v: 3 };
+    let b = Meters { v: 4 };
+    assert_eq!(a + b, Meters { v: 7 });
+    assert_eq!(a * b, SquareMeters { v: 12 });
+    assert_eq!(-a, Meters { v: -3 });
+    let d: i64 = b - a;
+    assert_eq!(d, 1);
+    let mut c = Meters { v: 1 };
+    c += b;
+    assert_eq!(c, Meters { v: 5 });
+}
+
+/// `T::Output` in a signature.
+fn square::<T: Mul>(x: T): T::Output {
+    return x * x;
+}
+
+/// A sum needs `Output = T` to keep adding.
+fn sum::<T: Add::<Output = T> + Light>(xs: [T; &], zero: T): T {
+    let mut t = zero;
+    for x in xs {
+        t = t + x;
+    }
+    return t;
+}
+
+/// `Int` requires its arithmetic to give the same type.
+fn double::<T: core::num::Int>(x: T): T {
+    return x + x;
+}
+
+#[test]
+fn generic_operators() {
+    assert_eq!(square(Meters { v: 5 }), SquareMeters { v: 25 });
+    assert_eq!(square(1.5f64), 2.25);
+    assert_eq!(square(7u8), 49u8);
+    let ms = [Meters { v: 1 }, Meters { v: 2 }, Meters { v: 3 }];
+    assert_eq!(sum(ms[..], Meters { v: 0 }), Meters { v: 6 });
+    assert_eq!(sum([1.5, 2.5][..], 0.0), 4.0);
+    assert_eq!(double(21i32), 42);
+    assert_eq!(double(100u8), 200u8);
+}
+
+// `FromStr` with an error type of its own.
+#[derive(Eq, Debug)]
+enum ColorError {
+    Unknown,
+}
+
+#[derive(Eq, Debug)]
+enum Color {
+    Red,
+    Green,
+}
+
+impl FromStr for Color {
+    type Err = ColorError;
+    fn from_str(s: str): Result::<Color, ColorError> {
+        return match s {
+            "red" => Ok(Color::Red),
+            "green" => Ok(Color::Green),
+            _ => Err(ColorError::Unknown),
+        };
+    }
+}
+
+fn parse_all::<T: FromStr>(s: str): Result::<T, T::Err> {
+    return s.parse::<T>();
+}
+
+#[test]
+fn from_str_errors() {
+    assert_eq!("red".parse::<Color>(), Ok(Color::Red));
+    assert_eq!("blue".parse::<Color>(), Err(ColorError::Unknown));
+    assert_eq!(parse_all::<Color>("green"), Ok(Color::Green));
+    let n: Result::<u8, core::num::ParseError> = "300".parse::<u8>();
+    assert!(n.is_err());
+    assert_eq!(parse_all::<i32>("-5").unwrap(), -5);
+}

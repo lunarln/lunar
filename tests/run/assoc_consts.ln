@@ -1,0 +1,184 @@
+// Associated constants: declared in traits (`const N: usize;`, maybe with
+// a default), given by impls, read as `T::N`, `Self::N`, `Type::N` and
+// `<T as Trait>::N` (in generic code, once per instance), in the
+// initializers of constants and statics, and through a `dyn` as `d.N`
+// (from its vtable).
+
+trait Shape {
+    const SIDES: u32;
+    const NAME: str = "shape";
+    fn area(&self): f64;
+
+    /// `Self::SIDES` in a default method: the implementing type's.
+    fn corners(&self): u32 {
+        return Self::SIDES;
+    }
+}
+
+struct Square {
+    s: f64,
+}
+
+impl Shape for Square {
+    const SIDES: u32 = 4;
+    const NAME: str = "square";
+    fn area(&self): f64 {
+        return self.s * self.s;
+    }
+}
+
+struct Triangle {
+    b: f64,
+    h: f64,
+}
+
+impl Shape for Triangle {
+    const SIDES: u32 = 3;
+    fn area(&self): f64 {
+        return self.b * self.h / 2.0;
+    }
+}
+
+fn sides::<S: Shape>(): u32 {
+    return S::SIDES;
+}
+
+fn name_of::<S: Shape>(_s: &S): str {
+    return <S as Shape>::NAME;
+}
+
+/// Constants in the initializers of constants and statics.
+const ALL_SIDES: u32 = Square::SIDES + <Triangle as Shape>::SIDES;
+static SQUARE_NAME: str = <Square as Shape>::NAME;
+
+#[test]
+fn through_types_and_generics() {
+    assert_eq!(Square::SIDES, 4);
+    assert_eq!(<Triangle as Shape>::SIDES, 3);
+    assert_eq!(sides::<Square>(), 4);
+    assert_eq!(sides::<Triangle>(), 3);
+    assert_eq!(name_of(&Square { s: 1.0 }), "square");
+    // The trait's default.
+    assert_eq!(name_of(&Triangle { b: 1.0, h: 1.0 }), "shape");
+    assert_eq!(Triangle { b: 1.0, h: 1.0 }.corners(), 3);
+    assert_eq!(ALL_SIDES, 7);
+    assert_eq!(SQUARE_NAME, "square");
+}
+
+#[test]
+fn through_dyn() {
+    let sq = Square { s: 2.0 };
+    let tr = Triangle { b: 2.0, h: 3.0 };
+    let shapes = [sq as dyn Shape, tr as dyn Shape];
+    let mut sides: u32 = 0;
+    let mut names = String::new();
+    for s in shapes {
+        sides += s.SIDES;
+        names.push_str(s.NAME);
+        names.push(' ');
+    }
+    assert_eq!(sides, 7);
+    assert_eq!(names, String::from("square shape "));
+    assert_eq!(shapes[1].area(), 3.0);
+}
+
+// A supertrait's constants are in the vtable too, after the trait's own.
+trait Named {
+    const LABEL: str;
+}
+
+trait Unit: Named {
+    const FACTOR: u64;
+}
+
+struct Km;
+
+impl Named for Km {
+    const LABEL: str = "km";
+}
+
+impl Unit for Km {
+    const FACTOR: u64 = 1000;
+}
+
+struct Mm;
+
+impl Named for Mm {
+    const LABEL: str = "mm";
+}
+
+impl Unit for Mm {
+    const FACTOR: u64 = 1;
+}
+
+fn describe(u: dyn Unit): String {
+    return core::fmt::format("{u.LABEL}={u.FACTOR}");
+}
+
+#[test]
+fn supertraits_through_dyn() {
+    let k = Km;
+    let m = Mm;
+    assert_eq!(describe(k as dyn Unit), String::from("km=1000"));
+    assert_eq!(describe(m as dyn Unit), String::from("mm=1"));
+    // Upcasting keeps the constants of the supertrait.
+    let u = k as dyn Unit;
+    let n = u as dyn Named;
+    assert_eq!(n.LABEL, "km");
+}
+
+// Constants of a generic trait, and of generic impls.
+trait Width::<T> {
+    const BITS: u32;
+}
+
+struct Packed;
+
+impl Width::<u8> for Packed {
+    const BITS: u32 = 8;
+}
+
+impl Width::<u64> for Packed {
+    const BITS: u32 = 64;
+}
+
+struct Wrapper::<T> {
+    inner: T,
+}
+
+impl::<T: Shape> Shape for Wrapper::<T> {
+    const SIDES: u32 = 0;
+    const NAME: str = "wrapper";
+    fn area(&self): f64 {
+        return self.inner.area();
+    }
+}
+
+fn bits::<T, W: Width::<T>>(): u32 {
+    return W::BITS;
+}
+
+#[test]
+fn generic_traits_and_impls() {
+    assert_eq!(<Packed as Width::<u8>>::BITS, 8);
+    assert_eq!(<Packed as Width::<u64>>::BITS, 64);
+    assert_eq!(bits::<u64, Packed>(), 64);
+    assert_eq!(sides::<Wrapper::<Square>>(), 0);
+    let w = Wrapper { inner: Square { s: 3.0 } };
+    assert_eq!(name_of(&w), "wrapper");
+    assert_eq!((w as dyn Shape).NAME, "wrapper");
+}
+
+// An inherent impl's constant.
+struct Limits;
+
+impl Limits {
+    const MAX: usize = 16;
+}
+
+#[test]
+fn inherent_constants() {
+    assert_eq!(Limits::MAX, 16);
+    let a = [0u8; Limits::MAX];
+    assert_eq!(a.len(), 16);
+}

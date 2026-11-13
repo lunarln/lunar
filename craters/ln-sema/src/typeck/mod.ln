@@ -795,6 +795,8 @@ impl Sema {
             TyKind::Infer(_) => true,
             _ => false,
         };
+        // The trait's arguments still being inferred: select by unification.
+        let open_args = self.any_infer(args);
         let mut out = if args == args0 { t } else { self.p.types.mk(TyKind::Proj(item, args)) };
         if !unknown {
             // A closure's signature is still being inferred: select the
@@ -805,7 +807,7 @@ impl Sema {
                 TyKind::Opaque(..) | TyKind::Dyn(..) => true,
                 _ => false,
             };
-            if own_info || (!self.p.types.has_infer(s) && !has_closure(&self.p.types, s)) {
+            if own_info || (!open_args && !has_closure(&self.p.types, s)) {
                 let env = self.fcx.env.clone();
                 if let Some(r) = self.p.project(item, args, env[..]) {
                     out = r;
@@ -942,9 +944,8 @@ impl Sema {
     /// variables in it.
     fn proj_pending(&mut self, t: Ty): bool {
         let TyKind::Proj(_, args) = self.p.types.kind(t) else { return false; };
-        let s0 = self.p.types.at(args, 0);
-        let s = self.resolve(s0);
-        return self.p.types.has_infer(s);
+        let rargs = self.resolve_list(args);
+        return self.any_infer(rargs);
     }
 
     /// Settle the pending projections whose self types are known by now:
@@ -960,12 +961,8 @@ impl Sema {
             }
             let p = self.shallow(pp.proj);
             if let TyKind::Proj(_, args) = self.p.types.kind(p) {
-                let s0 = self.p.types.at(args, 0);
-                let s = self.shallow(s0);
-                if let TyKind::Infer(_) = self.p.types.kind(s) {
-                    continue;
-                }
-                if self.p.types.has_infer(s) {
+                let rargs = self.resolve_list(args);
+                if self.any_infer(rargs) {
                     // Not one impl yet: wait for more.
                     continue;
                 }
