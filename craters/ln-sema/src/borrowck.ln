@@ -47,7 +47,7 @@ use crater::diag::{Diags, is_dummy};
 use crater::program::Program;
 use crater::thir::*;
 use crater::traits::MethodImpl;
-use crater::ty::{ArrKind, Ty, TyKind, TyList};
+use crater::ty::{ArrKind, DYN_MUT, Ty, TyKind, TyList};
 use ln_ast::{ParamMode, Span};
 
 #[derive(Eq, Debug)]
@@ -275,6 +275,7 @@ fn lint_walk(p: &Program, e: Id::<Expr>, used: &mut [bool; ..+], mutated: &mut [
         }
         ExprKind::Slice { base, mutable: true, .. } => note_mutated(p, base, mutated),
         ExprKind::Coerce { kind: Coercion::ToSlice { mutable: true }, expr: base } => note_mutated(p, base, mutated),
+        ExprKind::Coerce { kind: Coercion::ToDyn { mutable: true }, expr: base } => note_mutated(p, base, mutated),
         _ => {}
     }
     let mut kids: [Id::<Expr>; ..+] = [];
@@ -647,7 +648,7 @@ pub fn ty_has_view(p: &mut +Program, env: [Pred; &], t: Ty, depth: u32): bool {
         return false;
     }
     return match p.types.kind(t) {
-        TyKind::Str | TyKind::FmtArgs => true,
+        TyKind::Str | TyKind::FmtArgs | TyKind::Dyn(..) => true,
         TyKind::Array(e, k) => k.is_slice() || ty_has_view(p, env, e, depth + 1),
         TyKind::Tuple(ts) => any_view(p, env, ts, depth + 1),
         TyKind::Adt(d, args) => {
@@ -882,7 +883,7 @@ impl Cx {
             return true;
         }
         return match p.types.kind(t) {
-            TyKind::Str | TyKind::FmtArgs => true,
+            TyKind::Str | TyKind::FmtArgs | TyKind::Dyn(..) => true,
             TyKind::Array(e, k) => k.is_slice() || self.has_own_view(p, e, depth + 1),
             TyKind::Tuple(ts) => self.any_own_view(p, ts, depth + 1),
             TyKind::Adt(d, args) => {
@@ -971,6 +972,142 @@ impl Cx {
         return r;
     }
 
+    /// Roots of a `dyn` made from `place` (`x as dyn T`). It points at the
+    /// place itself: at a local variable like a closure borrowing it
+    /// (`Slot`, so only moving the variable ends it), into the caller's
+    /// value behind a borrowed parameter, or into an owner's items, or
+    /// where a slice or `str` points; and at whatever the value there
+    /// points into.
+    fn dyn_roots(&self, p: &mut +Program, place: Id::<Expr>): Roots {
+        let pe = p.thir.expr(place);
+        let mut r: Roots = [];
+        match pe.kind {
+            ExprKind::Local(l) => {
+                let local = self.local(p, l);
+                roots_insert(&mut r, Root::Slot(l));
+                if self.has_view(p, local.ty) {
+                    let lr = self.local_roots(l);
+                    roots_extend(&mut r, lr[..]);
+                }
+            }
+            ExprKind::Field { .. } | ExprKind::Index { .. } => {
+                let Some(base) = proj_base(pe.kind) else { return r; };
+                let bt = p.types.strip_grow(p.thir.expr(base).ty);
+                if self.is_view_container(p, bt) {
+                    return self.value_roots_of_place(p, base);
+                }
+                let owner_items = match p.types.kind(bt) {
+                    TyKind::Array(_, k) => k.is_owner(),
+                    _ => false,
+                };
+                if owner_items {
+                    return self.borrow_roots(p, base);
+                }
+                return self.dyn_roots(p, base);
+            }
+            ExprKind::Temp(inner) => {
+                r = self.value_roots(p, inner);
+                roots_insert(&mut r, Root::Temp);
+            }
+            _ => {}
+        }
+        return r;
+    }
+
+    /// Whether a value of `t` may hold a `dyn mut`, through which a call
+    /// may shrink or replace what it views.
+    fn may_hold_dyn_mut(&self, p: &mut +Program, t: Ty, depth: u32): bool {
+        if depth > 32 {
+            return true;
+        }
+        return match p.types.kind(t) {
+            TyKind::Dyn(_, _, flags) => flags & DYN_MUT != 0,
+            TyKind::Array(e, _) => self.may_hold_dyn_mut(p, e, depth + 1),
+            TyKind::Grow(e) => self.may_hold_dyn_mut(p, e, depth + 1),
+            TyKind::Tuple(ts) => self.any_dyn_mut(p, ts, depth + 1),
+            TyKind::Adt(d, args) => {
+                let fs = p.adt_field_tys(d, args);
+                self.any_dyn_mut(p, fs, depth + 1)
+            }
+            TyKind::Closure(d, args) => {
+                let Some(c) = p.closures.get(d) else { return false; };
+                for i in 0..c.captures.len() {
+                    let cap = p.captures.list(c.captures)[i];
+                    let ct = p.types.subst(cap.ty, args);
+                    if self.may_hold_dyn_mut(p, ct, depth + 1) {
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        };
+    }
+
+    fn any_dyn_mut(&self, p: &mut +Program, l: TyList, depth: u32): bool {
+        for i in 0..l.len() {
+            if self.may_hold_dyn_mut(p, p.types.at(l, i), depth) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The owners a `dyn mut` with roots `roots` may shrink or replace
+    /// when a method is called through it: the variables it points at
+    /// (`Slot`, for a borrowed parameter the caller's value), and the
+    /// caller's values behind parameters whose views it came from (`Arg`).
+    /// An owner's items (`Local`) are Light, so changing one shrinks
+    /// nothing.
+    fn dyn_mut_owners(&self, p: &mut +Program, roots: [Root; &]): [LocalId; ..+] {
+        let mut out: [LocalId; ..+] = [];
+        for r in roots {
+            let l = match r {
+                Root::Slot(x) => x,
+                Root::Arg(x) => x,
+                Root::Local(_) => continue,
+                Root::Temp => continue,
+            };
+            let lt = p.types.strip_grow(self.local(p, l).ty);
+            if !out[..].contains(l) && p.could_own(lt, self.env) {
+                out.push(l);
+            }
+        }
+        return out;
+    }
+
+    /// A `dyn mut` with roots `roots` stored inside local `l`: an error if
+    /// it views `l` itself, since a call through it could then shrink `l`
+    /// where nothing tracks it (code holding `l` keeps its views).
+    fn check_views_itself(&mut self, p: &mut +Program, roots: [Root; &], l: LocalId, span: Span) {
+        if !roots_contains(roots, Root::Slot(l)) && !roots_contains(roots, Root::Local(l)) {
+            return;
+        }
+        if !self.report(span, 11) {
+            return;
+        }
+        let n = p.text(self.local(p, l).name);
+        let m = say(p, "cannot store a `dyn mut` that views `{n}` inside `{n}` itself");
+        p.diags.error(codes::borrow::VIEWS_ITSELF(), span, m);
+        p.diags.note(say(p, "a method called through it could shrink or replace `{n}` while views into `{n}` are in use"));
+        p.diags.help(say(p, "keep the `dyn mut` in a variable of its own, next to `{n}`"));
+        p.diags.finish();
+    }
+
+    /// Where a call may store views through a `dyn mut` with roots
+    /// `roots` (into the value it views): the variable it points at, or
+    /// what it points into.
+    fn dyn_mut_store_targets(&self, roots: [Root; &], out: &mut [Root; -..+]) {
+        for r in roots {
+            match r {
+                Root::Slot(x) => out.push(Root::Local(x)),
+                Root::Local(x) => out.push(Root::Local(x)),
+                Root::Arg(x) => out.push(Root::Arg(x)),
+                Root::Temp => {}
+            }
+        }
+    }
+
     /// `borrow_roots` of a field or element of `base`.
     fn borrow_roots_of_base(&self, p: &mut +Program, base: Id::<Expr>): Roots {
         if self.is_view_container(p, p.thir.expr(base).ty) {
@@ -1006,6 +1143,7 @@ impl Cx {
             ExprKind::Slice { base, .. } => return self.borrow_roots(p, base),
             ExprKind::Coerce { kind: Coercion::ToSlice { .. }, expr } => return self.borrow_roots(p, expr),
             ExprKind::Coerce { kind: Coercion::StringToStr, expr } => return self.borrow_roots(p, expr),
+            ExprKind::Coerce { kind: Coercion::ToDyn { .. }, expr } => return self.dyn_roots(p, expr),
             ExprKind::Coerce { expr, .. } => return self.value_roots(p, expr),
             ExprKind::Call { args, callee } => {
                 // What the body of the callee says its result points into;
@@ -1028,6 +1166,12 @@ impl Cx {
                 }
                 let offset = self.captures_before_args(p, callee);
                 let copies_only = self.copies_only(p, callee);
+                // A `dyn` in the result may view a lent argument itself.
+                let views_args = p.types.any(ex.ty, &|k| match k {
+                    TyKind::Dyn(..) => true,
+                    _ => false,
+                });
+                let mut dyn_r: Roots = [];
                 for i in 0..args.len() {
                     let a = p.thir.args.list(args)[i];
                     let mut level: u8 = 2;
@@ -1039,11 +1183,39 @@ impl Cx {
                     }
                     let ar = self.result_roots_from_arg(p, a, level);
                     roots_extend(&mut r, ar[..]);
+                    if views_args && level > 1 {
+                        let lent = match a {
+                            Arg::InOut(x) => Some(x),
+                            Arg::Value(v) => match p.thir.expr(v).kind {
+                                ExprKind::Read { place, mode: ReadMode::Borrow } => Some(place),
+                                _ => None,
+                            },
+                        };
+                        if let Some(x) = lent {
+                            let dr = self.dyn_roots(p, x);
+                            roots_extend(&mut dyn_r, dr[..]);
+                        }
+                    }
                 }
                 // A result that cannot be a closure, but comes from one that
                 // borrows a variable (called here or by the callee), may be
                 // a view into that variable.
-                if !self.may_hold_closure(p, ex.ty, 0) {
+                // (Only closures make such views, maybe behind a `dyn`; a
+                // `dyn` itself points at a variable, not into it.)
+                let mut closures = match callee {
+                    Callee::Value { .. } => true,
+                    _ => false,
+                };
+                for i in 0..args.len() {
+                    let at = p.thir.expr(p.thir.args.list(args)[i].expr()).ty;
+                    if self.may_hold_closure(p, at, 0) || p.types.any(at, &|k| match k {
+                        TyKind::Dyn(..) => true,
+                        _ => false,
+                    }) {
+                        closures = true;
+                    }
+                }
+                if closures && !views_args && !self.may_hold_closure(p, ex.ty, 0) {
                     let mut slots: [LocalId; ..+] = [];
                     for x in r[..] {
                         if let Root::Slot(l) = x {
@@ -1056,6 +1228,7 @@ impl Cx {
                         }
                     }
                 }
+                roots_extend(&mut r, dyn_r[..]);
             }
             // A loop's value is what its `break`s give.
             ExprKind::Loop { body, id } => {
@@ -1511,6 +1684,11 @@ impl Cx {
                         let wt = self.write_targets(p, x, true);
                         targets.extend(wt[..]);
                     }
+                    // Through a `dyn mut`, into the value it views.
+                    if self.may_hold_dyn_mut(p, p.thir.expr(x).ty, 0) {
+                        let xr = self.value_roots_of_place(p, x);
+                        self.dyn_mut_store_targets(xr[..], &mut targets);
+                    }
                 }
                 Arg::Value(v) => {
                     let mutable_views = match p.types.kind(p.thir.expr(v).ty) {
@@ -1523,6 +1701,10 @@ impl Cx {
                                 targets.push(r);
                             }
                         }
+                    }
+                    if self.may_hold_dyn_mut(p, p.thir.expr(v).ty, 0) {
+                        let vr = self.arg_roots(p, v);
+                        self.dyn_mut_store_targets(vr[..], &mut targets);
                     }
                 }
             }
@@ -1874,6 +2056,11 @@ impl Cx {
     /// A value leaving the function (return / tail).
     fn check_escape(&mut self, p: &mut +Program, v: Id::<Expr>, span: Span) {
         let roots = self.value_roots(p, v);
+        let vt = p.thir.expr(v).ty;
+        let no_closure = !p.types.any(vt, &|k| match k {
+            TyKind::Closure(..) | TyKind::Param(..) | TyKind::Opaque(..) => true,
+            _ => false,
+        });
         for r in roots {
             let ok = match r {
                 Root::Local(l) => match self.local(p, l).kind {
@@ -1883,10 +2070,23 @@ impl Cx {
                     _ => false,
                 },
                 Root::Arg(_) => true,
-                Root::Slot(_) => false,
+                // A `dyn` of a borrowed parameter points at the caller's
+                // value.
+                Root::Slot(l) => no_closure && self.is_borrowed_param(p, l),
                 Root::Temp => false,
             };
+            if ok {
+                continue;
+            }
             if let Root::Slot(l) = r {
+                if no_closure && self.report(span, 7) {
+                    let n = p.text(self.local(p, l).name);
+                    let m = say(p, "cannot return a view of `{n}`, which is freed when the function returns");
+                    p.diags.error(codes::borrow::ESCAPES_FUNCTION(), span, m);
+                    p.diags.help(say(p, "view a value the caller lent instead (a parameter `{n}: &T`), or return the value itself"));
+                    p.diags.finish();
+                    continue;
+                }
                 if self.report(span, 7) {
                     let n = p.text(self.local(p, l).name);
                     let m = say(p, "cannot return a closure that borrows `{n}`, which is freed when the function returns");
@@ -1941,7 +2141,8 @@ impl Cx {
         let (l, arg) = match r {
             Root::Local(x) => (x, false),
             Root::Arg(x) => (x, true),
-            Root::Slot(_) => return None,
+            // A `dyn` of a borrowed parameter.
+            Root::Slot(x) => (x, false),
             Root::Temp => return None,
         };
         if let LocalKind::Param { index, owned, .. } = self.local(p, l).kind {
@@ -2086,7 +2287,13 @@ impl Cx {
                             p.diags.finish();
                         }
                     } else {
+                        let dyn_mut = self.may_hold_dyn_mut(p, ve.ty, 0);
                         for t in self.write_targets(p, place, false) {
+                            if dyn_mut {
+                                if let Some(l) = local_or_arg(t) {
+                                    self.check_views_itself(p, roots[..], l, ve.span);
+                                }
+                            }
                             let mut r: Roots = [];
                             for x in roots[..] {
                                 let same = match (local_or_arg(x), local_or_arg(t)) {
@@ -2104,6 +2311,52 @@ impl Cx {
             }
             ExprKind::Call { callee, args } => {
                 self.check_children(p, e);
+                // A `dyn mut` handed to a call that may keep it, in a value
+                // it views and the call changes.
+                let kept = self.callee_kept(p, callee);
+                for i in 0..args.len() {
+                    let a = p.thir.args.list(args)[i];
+                    if let Some(ps) = kept {
+                        if i < ps.len() && !p.params.list(ps)[i].kept {
+                            continue;
+                        }
+                    }
+                    let at = p.thir.expr(a.expr()).ty;
+                    if !self.may_hold_dyn_mut(p, at, 0) {
+                        continue;
+                    }
+                    let ar = match a {
+                        Arg::InOut(x) => self.value_roots_of_place(p, x),
+                        Arg::Value(v) => self.arg_roots(p, v),
+                    };
+                    for j in 0..args.len() {
+                        if j == i {
+                            continue;
+                        }
+                        let mut into: [LocalId; ..+] = [];
+                        match p.thir.args.list(args)[j] {
+                            Arg::InOut(x) => {
+                                if let Some(Root::Local(l)) = self.place_root(p, x) {
+                                    into.push(l);
+                                }
+                            }
+                            Arg::Value(v) => {
+                                if self.may_hold_dyn_mut(p, p.thir.expr(v).ty, 0) {
+                                    for r in self.arg_roots(p, v) {
+                                        match r {
+                                            Root::Slot(l) => into.push(l),
+                                            Root::Local(l) => into.push(l),
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for l in into {
+                            self.check_views_itself(p, ar[..], l, ex.span);
+                        }
+                    }
+                }
                 let flows = self.call_flows(p, callee, args);
                 let mut i: usize = 0;
                 while i < flows.len() {
@@ -2338,11 +2591,36 @@ impl Cx {
     fn may_change_captures(&self, p: &mut +Program, t: Ty): bool {
         return match p.types.kind(t) {
             TyKind::Closure(d, _) => match p.closures.get(d) {
-                Some(c) => c.kind != ClosureKind::Fn,
+                Some(c) => c.kind != ClosureKind::Fn || self.may_hold_dyn_mut(p, t, 0),
                 None => true,
             },
             _ => self.may_hold_closure(p, t, 0),
         };
+    }
+
+    /// Whether argument `i` of a call through `callee` is the receiver of
+    /// a method called through a `dyn`'s vtable that only reads (`&self`)
+    /// or grows (`&mut +self`) the value viewed.
+    fn dyn_call_keeps(&self, p: &mut +Program, callee: Callee, i: usize): bool {
+        if i != 0 {
+            return false;
+        }
+        let Callee::Trait { trait_ref, self_ty, method, .. } = callee else { return false; };
+        let TyKind::Dyn(..) = p.types.kind(self_ty) else { return false; };
+        let Some(m) = p.trait_method_def(trait_ref.trait_id, method) else { return false; };
+        if !p.dyn_dispatchable(m) {
+            return false;
+        }
+        return !p.method_takes_inout_self(m) || p.method_takes_grow_self(m);
+    }
+
+    /// A call may shrink or replace, through a `dyn mut` with roots
+    /// `roots`, the owners it views.
+    fn invalidate_dyn_mut(&mut self, p: &mut +Program, roots: [Root; &], after: [u64; &], span: Span) {
+        for l in self.dyn_mut_owners(p, roots) {
+            self.check_grow_only(p, l, span, "a method called through a `dyn mut` that views it may shrink or replace it");
+            self.invalidate(p, l, after, span, "shrink");
+        }
     }
 
     /// Calling (or handing on) a closure whose roots are `roots` may shrink
@@ -2634,11 +2912,32 @@ impl Cx {
                 }
                 self.invalidate_captures(p, roots[..], after[..], ex.span);
             }
+            // So may a method called through a `dyn mut` (unless it only
+            // reads or grows what the `dyn` views).
+            if self.may_hold_dyn_mut(p, ty, 0) && !self.dyn_call_keeps(p, callee, i) {
+                let mut roots: Roots = [];
+                self.held.clear();
+                for ar in arg_roots[..] {
+                    let (j, r) = ar;
+                    if j as usize == i {
+                        roots_insert(&mut roots, r);
+                    } else {
+                        roots_insert(&mut self.held, r);
+                    }
+                }
+                self.invalidate_dyn_mut(p, roots[..], after[..], ex.span);
+                self.held.clear();
+            }
         }
         if let Callee::Value { callee: f, kind } = callee {
-            if kind != ClosureKind::Fn {
+            let ft = p.thir.expr(f).ty;
+            let through_dyn = self.may_hold_dyn_mut(p, ft, 0);
+            if kind != ClosureKind::Fn || through_dyn {
                 let roots = if p.thir.is_place(f) { self.value_roots_of_place(p, f) } else { self.value_roots(p, f) };
                 self.invalidate_captures(p, roots[..], after[..], ex.span);
+                if through_dyn {
+                    self.invalidate_dyn_mut(p, roots[..], after[..], ex.span);
+                }
             }
         }
         let mut live = after;
@@ -3181,6 +3480,10 @@ impl Moves {
                 self.check_use(cx, p, expr, st, ex.span);
             }
             ExprKind::Coerce { kind: Coercion::StringToStr, expr } => {
+                self.place_inner(cx, p, expr, st);
+                self.check_use(cx, p, expr, st, ex.span);
+            }
+            ExprKind::Coerce { kind: Coercion::ToDyn { .. }, expr } => {
                 self.place_inner(cx, p, expr, st);
                 self.check_use(cx, p, expr, st, ex.span);
             }

@@ -272,7 +272,7 @@ pub fn is_primitive(name: str): bool {
 
 fn is_keyword(t: Token): bool {
     return match t {
-        Token::As | Token::Break | Token::Const | Token::Continue | Token::Crater | Token::Else | Token::Enum | Token::Extern => true,
+        Token::As | Token::Break | Token::Const | Token::Continue | Token::Crater | Token::Dyn | Token::Else | Token::Enum | Token::Extern => true,
         Token::Fn | Token::For | Token::If | Token::Impl | Token::In | Token::Let | Token::Loop | Token::Macro | Token::Match => true,
         Token::Mod | Token::Move | Token::Mut | Token::Pub | Token::Return | Token::SelfValue | Token::Static | Token::Struct => true,
         Token::Super | Token::Trait | Token::Type | Token::Unsafe | Token::Use | Token::While => true,

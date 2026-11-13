@@ -107,7 +107,7 @@ impl Program {
             TyKind::Float(FloatTy::F64) => Some(Layout::new(8, 8)),
             TyKind::Bool => Some(Layout::new(1, 1)),
             TyKind::Char => Some(Layout::new(4, 4)),
-            TyKind::Str | TyKind::FmtArgs => Some(Layout::new(16, 8)),
+            TyKind::Str | TyKind::FmtArgs | TyKind::Dyn(..) => Some(Layout::new(16, 8)),
             TyKind::String => Some(Layout::new(24, 8)),
             TyKind::Ptr(..) | TyKind::FnPtr(..) => Some(Layout::new(8, 8)),
             TyKind::Grow(inner) => self.layout_depth(inner, d1),

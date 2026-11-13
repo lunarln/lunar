@@ -1,0 +1,158 @@
+// Trait objects: vtables (laid out as `ln_sema::objects` describes), `dyn`
+// values (`{ data, vtable }`) and calls through them.
+
+use core::arena::List;
+use core::ffi::c_string;
+use core::intern::Symbol;
+use ln_sema::objects::VtEntry;
+use ln_sema::program::Program;
+use ln_sema::traits::MethodImpl;
+use ln_sema::ty::{TraitRef, Ty, TyKind, TyList};
+use crater::Cg;
+use crater::llvm::*;
+
+impl Cg {
+    /// The vtable of type `t` for `dyn tr`: a constant array of words, one
+    /// per (type, trait) in the whole program, shared by every `dyn` made
+    /// from a `t`, whichever crater makes it.
+    pub fn vtable(&mut self, p: &mut +Program, t: Ty, tr: TraitRef): ValueRef {
+        if let Some(g) = self.vtables.get((t, tr)) {
+            return g;
+        }
+        let mut es: [VtEntry; ..+] = [];
+        p.vtable_entries(tr, &mut es);
+        let ptr = self.ptr_ty();
+        let at = unsafe { LLVMArrayType2(ptr, es.len() as u64) };
+        let ts = p.ty_str(t);
+        let trs = p.trait_ref_str(tr);
+        let mut name = String::new();
+        name.write("_LN_vtable.{ts}.{trs}");
+        let cname = c_string(name.as_str());
+        let g = unsafe { LLVMAddGlobal(self.module, at, cname.as_ptr()) };
+        unsafe {
+            LLVMSetGlobalConstant(g, 1);
+            LLVMSetLinkage(g, PRIVATE_LINKAGE);
+            LLVMSetUnnamedAddress(g, GLOBAL_UNNAMED_ADDR);
+        }
+        // Known before its words are made: a supertrait's vtable may be
+        // made on the way.
+        self.vtables.insert((t, tr), g);
+        let mut words: [ValueRef; ..+] = [];
+        for e in es {
+            let w = match e {
+                VtEntry::Drop => self.const_null(ptr),
+                VtEntry::Size => {
+                    let n = self.size_of(p, t);
+                    unsafe { LLVMConstIntToPtr(self.const_int(self.usize_ty(), n), ptr) }
+                }
+                VtEntry::Align => {
+                    let n = self.align_of(p, t) as u64;
+                    unsafe { LLVMConstIntToPtr(self.const_int(self.usize_ty(), n), ptr) }
+                }
+                VtEntry::Super(s) => self.vtable(p, t, s),
+                VtEntry::Method(s, m) => self.vtable_method(p, t, s, m),
+            };
+            words.push(w);
+        }
+        let init = unsafe { LLVMConstArray2(ptr, words[..].as_ptr(), words.len() as u64) };
+        unsafe { LLVMSetInitializer(g, init) };
+        return g;
+    }
+
+    /// The function of method `m` of trait `s` for type `t`, for a vtable.
+    fn vtable_method(&mut self, p: &mut +Program, t: Ty, s: TraitRef, m: Symbol): ValueRef {
+        return match p.resolve_method(s, t, m, List::empty()) {
+            Some(MethodImpl::Fn { def, args }) => self.instance(p, def, args),
+            _ => {
+                let ts = p.ty_str(t);
+                let tn = p.trait_ref_str(s);
+                let mn = p.text(m).to_string();
+                let mut msg = String::new();
+                msg.write("no function for `{tn}::{mn}` of `{ts}` in a vtable");
+                self.ice(p, msg.as_str());
+                self.const_null(self.ptr_ty())
+            }
+        };
+    }
+
+    /// The `dyn` value viewing the place at `ptr`, of type `t`, through
+    /// the vtable of `t` for the trait of `dyn` type `dt`.
+    pub fn make_dyn(&mut self, p: &mut +Program, ptr: ValueRef, t: Ty, dt: Ty): ValueRef {
+        let TyKind::Dyn(d, args, _) = p.types.kind(dt) else {
+            self.ice(p, "a `dyn` of a type that is not `dyn`");
+            return self.undef(self.dyn_ty());
+        };
+        let inner = p.types.strip_grow(t);
+        let vt = self.vtable(p, inner, TraitRef { trait_id: d, args });
+        let a = self.insert(self.undef(self.dyn_ty()), ptr, 0);
+        return self.insert(a, vt, 1);
+    }
+
+    /// `dyn Sub` value `v` (of type `from`) as a `dyn Super` (`to`): the
+    /// same data, with the vtable for the supertrait the sub vtable holds.
+    pub fn upcast(&mut self, p: &mut +Program, v: ValueRef, from: Ty, to: Ty): ValueRef {
+        let TyKind::Dyn(d0, a0, _) = p.types.kind(from) else {
+            self.ice(p, "upcast from a type that is not `dyn`");
+            return v;
+        };
+        let TyKind::Dyn(d1, a1, _) = p.types.kind(to) else {
+            self.ice(p, "upcast to a type that is not `dyn`");
+            return v;
+        };
+        let src = TraitRef { trait_id: d0, args: a0 };
+        let dst = TraitRef { trait_id: d1, args: a1 };
+        let Some(index) = p.vtable_super_index(src, dst) else {
+            if src == dst {
+                return v;
+            }
+            self.ice(p, "upcast to a trait that is not a supertrait");
+            return v;
+        };
+        let vt = self.extract(v, 1, z("vtable\0"));
+        let slot = self.gep(self.ptr_ty(), vt, self.const_int(self.usize_ty(), index as u64), z("super\0"));
+        let sup = self.load_ty(self.ptr_ty(), slot, z("super_vtable\0"));
+        return self.insert(v, sup, 1);
+    }
+
+    /// The LLVM type of method `method` of trait `tr` called through the
+    /// vtable of `dyn` type `self_ty` (with its own generic arguments
+    /// `margs`): the trait's signature, `self` passed by address.
+    pub fn virtual_fn_ty(&mut self, p: &mut +Program, tr: TraitRef, self_ty: Ty, method: Symbol, margs: TyList): Option::<TypeRef> {
+        let Some(m) = p.trait_method_def(tr.trait_id, method) else { return None; };
+        let mut tys: [Ty; ..+] = [self_ty];
+        tys.extend(p.types.list(tr.args));
+        tys.extend(p.types.list(margs));
+        let all = p.types.mk_list(tys[..]);
+        let fd = p.fn_data(m);
+        let mut params: [(Ty, bool); ..+] = [];
+        for i in 0..fd.sig.params.len() {
+            let pty = p.params.list(fd.sig.params)[i].ty;
+            let st = p.types.subst(pty, all);
+            let rt = p.reveal(st);
+            params.push((rt, p.param_by_ref(m, i)));
+        }
+        let sr = p.types.subst(fd.sig.ret, all);
+        let ret = p.reveal(sr);
+        return Some(self.fn_ty(p, params[..], ret, false));
+    }
+
+    /// Call word `index` of the vtable of the `dyn` stored at `recv`, with
+    /// its data pointer as `self` and then `rest`, as type `fty` (the
+    /// result written at `sret` if not null).
+    pub fn call_virtual(&mut self, recv: ValueRef, index: u32, fty: TypeRef, rest: [ValueRef; &], sret: ValueRef): Option::<ValueRef> {
+        let fat = self.load_ty(self.dyn_ty(), recv, z("dyn\0"));
+        let data = self.extract(fat, 0, z("data\0"));
+        let vt = self.extract(fat, 1, z("vtable\0"));
+        let slot = self.gep(self.ptr_ty(), vt, self.const_int(self.usize_ty(), index as u64), z("slot\0"));
+        let f = self.load_ty(self.ptr_ty(), slot, z("method\0"));
+        let mut all: [ValueRef; ..+] = [data];
+        all.extend(rest);
+        if is_null(sret) {
+            return self.call_typed(fty, f, all[..]);
+        }
+        let mut with_ret: [ValueRef; ..+] = [sret];
+        with_ret.extend(all[..]);
+        self.call_typed(fty, f, with_ret[..]);
+        return Some(sret);
+    }
+}

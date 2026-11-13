@@ -1,0 +1,289 @@
+// Trait objects (`dyn Trait`): which traits a `dyn` value implements, which
+// methods go through its vtable, how the vtable is laid out, and whether a
+// trait can be used as `dyn` at all ("dyn compatibility").
+//
+// A `dyn Trait` is a view: a pointer to a value of some type implementing
+// the trait, and a pointer to that type's vtable for the trait. The vtable
+// of a type `X` for `dyn Trait` is an array of pointer-sized words
+// (`vtable_entries`):
+//
+//   0  drop glue (always null: a `dyn` never owns its value; reserved for
+//      owned trait objects)
+//   1  size of `X`
+//   2  align of `X`
+//   3  the vtables of `X` for each supertrait (every trait of
+//      `dyn_traits` after the first), for upcasting `dyn Sub as dyn Super`
+//   .. the methods of `dispatchable` methods, trait by trait in the order of
+//      `dyn_traits` (the trait itself first, then its supertraits), each
+//      trait's methods in declaration order.
+//
+// Associated constants will follow the methods, trait by trait in the same
+// order, each slot a pointer to the constant's value.
+
+use core::intern::Symbol;
+use crater::defs::*;
+use crater::program::Program;
+use crater::traits::is_auto_lang;
+use crater::ty::*;
+use ln_ast::{ParamMode, Span};
+
+/// One word of a vtable (see the top of this file).
+pub enum VtEntry {
+    Drop,
+    Size,
+    Align,
+    /// The vtable for a supertrait.
+    Super(TraitRef),
+    /// A method of a trait (the trait itself or a supertrait).
+    Method(TraitRef, Symbol),
+}
+
+impl Program {
+    /// The traits a `dyn tr` is made of: `tr` first, then its supertraits
+    /// (depth first, in declaration order, each once), without the auto
+    /// traits (`Send`, `Dull`, ...), which have no methods.
+    pub fn dyn_traits(&mut +self, tr: TraitRef, out: &mut +[TraitRef; ..+]) {
+        for x in out[..] {
+            if x == tr {
+                return;
+            }
+        }
+        if let Some(n) = self.lang_name(tr.trait_id) {
+            if is_auto_lang(n) {
+                return;
+            }
+        }
+        let DefData::Trait(t) = self.defs[tr.trait_id.index()].data else { return; };
+        out.push(tr);
+        // Supertraits are written with `Self` as parameter 0; a `dyn` has
+        // no `Self` to put there (a trait whose supertraits mention it is
+        // not dyn compatible).
+        let mut args: [Ty; ..+] = [self.types.error()];
+        args.extend(self.types.list(tr.args));
+        let al = self.types.mk_list(args[..]);
+        for i in 0..t.supertraits.len() {
+            let st = self.trait_refs.list(t.supertraits)[i];
+            let s = self.types.subst_trait_ref(st, al);
+            self.dyn_traits(s, out);
+        }
+    }
+
+    /// Whether `tr` is one of the traits of `dyn principal`.
+    pub fn dyn_has_trait(&mut +self, principal: TraitRef, tr: TraitRef): bool {
+        let mut ts: [TraitRef; ..+] = [];
+        self.dyn_traits(principal, &mut ts);
+        return ts[..].contains(tr);
+    }
+
+    /// Whether trait method `m` is called through the vtable: it takes
+    /// `&self`, `&mut self` or `&mut +self`, has no generic parameters of
+    /// its own, and mentions `Self` nowhere else in its signature. Other
+    /// methods (with a default body) are called with `Self` being the
+    /// `dyn` type itself.
+    pub fn dyn_dispatchable(&mut +self, m: DefId): bool {
+        return self.dyn_obstacle(m).len() == 0;
+    }
+
+    /// Why trait method `m` cannot be called through a vtable (empty: it
+    /// can).
+    pub fn dyn_obstacle(&mut +self, m: DefId): str from static {
+        let fd = self.fn_data(m);
+        if fd.generics.names.len() > 0 {
+            return "it has generic parameters, and a vtable holds one function per method";
+        }
+        let ps = self.params.list(fd.sig.params);
+        if ps.len() == 0 || !ps[0].is_self {
+            return "it has no `self` parameter, so there is no value to find its vtable through";
+        }
+        if ps[0].mode == ParamMode::Take {
+            return "it takes `self` by value, and a `dyn` only views its value";
+        }
+        for i in 1..ps.len() {
+            if mentions_self(&self.types, ps[i].ty) {
+                return "a parameter mentions `Self`, whose type a `dyn` does not know";
+            }
+        }
+        if mentions_self(&self.types, fd.sig.ret) {
+            return "its result mentions `Self`, whose type a `dyn` does not know";
+        }
+        return "";
+    }
+
+    /// Whether method `m`'s receiver is in-out (`&mut self` or `&mut
+    /// +self`).
+    pub fn method_takes_inout_self(&self, m: DefId): bool {
+        let ps = self.params.list(self.fn_data(m).sig.params);
+        return ps.len() > 0 && ps[0].is_self && ps[0].mode == ParamMode::InOut;
+    }
+
+    /// Whether method `m`'s receiver is `&mut +self`.
+    pub fn method_takes_grow_self(&self, m: DefId): bool {
+        let ps = self.params.list(self.fn_data(m).sig.params);
+        if ps.len() == 0 || !ps[0].is_self {
+            return false;
+        }
+        return match self.types.kind(ps[0].ty) {
+            TyKind::Grow(_) => true,
+            _ => false,
+        };
+    }
+
+    /// The method named `name` of trait `trait_id`.
+    pub fn trait_method_def(&self, trait_id: DefId, name: Symbol): Option::<DefId> {
+        let DefData::Trait(t) = self.defs[trait_id.index()].data else { return None; };
+        for m in self.trait_methods.list(t.methods) {
+            if m.name == name {
+                return Some(m.def);
+            }
+        }
+        return None;
+    }
+
+    /// Whether `dyn principal` (`dyn mut` if `mutable`) implements `tr`:
+    /// `tr` is one of its traits, and a shared `dyn` implements only traits
+    /// whose vtable methods (with their supertraits') all take `&self`, so
+    /// generic code cannot change the value through it.
+    pub fn dyn_implements(&mut +self, principal: TraitRef, mutable: bool, tr: TraitRef): bool {
+        if !self.dyn_has_trait(principal, tr) {
+            return false;
+        }
+        if mutable {
+            return true;
+        }
+        return self.dyn_inout_method(tr).is_none();
+    }
+
+    /// A method called through the vtable of `dyn tr` that takes its
+    /// receiver in-out, if there is one.
+    pub fn dyn_inout_method(&mut +self, tr: TraitRef): Option::<DefId> {
+        let mut ts: [TraitRef; ..+] = [];
+        self.dyn_traits(tr, &mut ts);
+        for t in ts {
+            let td = self.trait_data(t.trait_id);
+            for i in 0..td.methods.len() {
+                let m = self.trait_methods.list(td.methods)[i].def;
+                if self.dyn_dispatchable(m) && self.method_takes_inout_self(m) {
+                    return Some(m);
+                }
+            }
+        }
+        return None;
+    }
+
+    /// The vtable of `dyn tr`, word by word (see the top of this file).
+    pub fn vtable_entries(&mut +self, tr: TraitRef, out: &mut +[VtEntry; ..+]) {
+        out.push(VtEntry::Drop);
+        out.push(VtEntry::Size);
+        out.push(VtEntry::Align);
+        let mut ts: [TraitRef; ..+] = [];
+        self.dyn_traits(tr, &mut ts);
+        for i in 1..ts.len() {
+            out.push(VtEntry::Super(ts[i]));
+        }
+        for t in ts {
+            let td = self.trait_data(t.trait_id);
+            for i in 0..td.methods.len() {
+                let m = self.trait_methods.list(td.methods)[i];
+                if self.dyn_dispatchable(m.def) {
+                    out.push(VtEntry::Method(t, m.name));
+                }
+            }
+        }
+    }
+
+    /// The word of `dyn principal`'s vtable holding method `name` of trait
+    /// `tr`, if it is called through the vtable.
+    pub fn vtable_method_index(&mut +self, principal: TraitRef, tr: TraitRef, name: Symbol): Option::<u32> {
+        let mut es: [VtEntry; ..+] = [];
+        self.vtable_entries(principal, &mut es);
+        for i in 0..es.len() {
+            if let VtEntry::Method(t, n) = es[i] {
+                if t == tr && n == name {
+                    return Some(i as u32);
+                }
+            }
+        }
+        return None;
+    }
+
+    /// The word of `dyn principal`'s vtable holding the vtable for
+    /// supertrait `tr`.
+    pub fn vtable_super_index(&mut +self, principal: TraitRef, tr: TraitRef): Option::<u32> {
+        let mut es: [VtEntry; ..+] = [];
+        self.vtable_entries(principal, &mut es);
+        for i in 0..es.len() {
+            if let VtEntry::Super(t) = es[i] {
+                if t == tr {
+                    return Some(i as u32);
+                }
+            }
+        }
+        return None;
+    }
+
+    /// Why trait `trait_id` cannot be the trait of a `dyn`: a message and
+    /// where for each reason (interned texts; empty: it can be).
+    pub fn dyn_violations(&mut +self, trait_id: DefId, out: &mut +[(Span, Symbol); ..+]) {
+        let name = self.name(trait_id).to_string();
+        if let Some(n) = self.lang_name(trait_id) {
+            if n == "fn" || n == "fn_mut" || n == "fn_once" {
+                let m = core::fmt::format("closures cannot be viewed as `dyn {name}` yet; take a function pointer or a generic `F: {name}(..)`");
+                out.push((self.defs[trait_id.index()].span, self.sym(m.as_str())));
+                return;
+            }
+            if is_auto_lang(n) {
+                let m = core::fmt::format("`{name}` is implemented by the compiler and has no methods; write it after the trait: `dyn Trait + {name}`");
+                out.push((self.defs[trait_id.index()].span, self.sym(m.as_str())));
+                return;
+            }
+        }
+        let td = self.trait_data(trait_id);
+        let mut args: [Ty; ..+] = [];
+        for i in 0..td.generics.names.len() {
+            let n = self.symbols.list(td.generics.names)[i];
+            args.push(self.types.mk(TyKind::Param(i as u32 + 1, n)));
+        }
+        let tr = TraitRef { trait_id, args: self.types.mk_list(args[..]) };
+        let mut ts: [TraitRef; ..+] = [];
+        self.dyn_traits(tr, &mut ts);
+        for t in ts {
+            let d = self.trait_data(t.trait_id);
+            let tn = self.name(t.trait_id).to_string();
+            for i in 0..d.supertraits.len() {
+                let st = self.trait_refs.list(d.supertraits)[i];
+                let mut mentions = false;
+                for a in self.types.list(st.args) {
+                    if mentions_self(&self.types, a) {
+                        mentions = true;
+                    }
+                }
+                if mentions {
+                    let sn = self.name(st.trait_id).to_string();
+                    let m = core::fmt::format("supertrait `{sn}` of `{tn}` takes `Self` as an argument, whose type a `dyn` does not know");
+                    out.push((self.defs[t.trait_id.index()].span, self.sym(m.as_str())));
+                }
+            }
+            for i in 0..d.methods.len() {
+                let tm = self.trait_methods.list(d.methods)[i];
+                if tm.has_default {
+                    continue;
+                }
+                let why = self.dyn_obstacle(tm.def);
+                if why.len() == 0 {
+                    continue;
+                }
+                let mn = self.text(tm.name).to_string();
+                let m = core::fmt::format("`{tn}::{mn}` cannot be called through a `dyn`: {why}");
+                out.push((self.defs[tm.def.index()].span, self.sym(m.as_str())));
+            }
+        }
+    }
+}
+
+/// Whether `t` mentions `Self` (generic parameter 0 of a trait).
+fn mentions_self(types: &Types, t: Ty): bool {
+    return types.any(t, &|k| match k {
+        TyKind::Param(0, _) => true,
+        _ => false,
+    });
+}

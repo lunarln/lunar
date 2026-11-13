@@ -94,6 +94,10 @@ pub fn ty(a: &Ast, src: str, id: Id::<Ty>): String {
             out.push_str("impl ");
             bounds_text(a, src, bounds, &mut out);
         }
+        TyKind::Dyn { is_mut, bounds } => {
+            out.push_str(if is_mut { "dyn mut " } else { "dyn " });
+            bounds_text(a, src, bounds, &mut out);
+        }
     }
     return out;
 }

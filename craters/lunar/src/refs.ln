@@ -259,7 +259,7 @@ pub fn rename_refusal(p: &Program, std_key: str, t: RefTarget, name: str): Optio
 
 /// Whether `name` is a keyword (it cannot be a new name either).
 pub fn is_keyword(name: str): bool {
-    let kws = ["as", "break", "const", "continue", "crater", "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "macro", "match", "mod", "move", "mut", "pub", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "while"];
+    let kws = ["as", "break", "const", "continue", "crater", "dyn", "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "macro", "match", "mod", "move", "mut", "pub", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "while"];
     for k in kws {
         if k == name {
             return true;

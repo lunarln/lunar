@@ -45,6 +45,9 @@ impl Sema {
             if let DeferKind::ArrayElem = d.kind {
                 self.fcx.dull_checks.push((d.ty, d.span));
             }
+            if let DeferKind::DynCompat = d.kind {
+                self.check_dyn_compat(d.ty, d.span);
+            }
         }
         self.deferred.truncate(before);
         let span = self.p.ast.tys.get(t).span;
@@ -983,6 +986,9 @@ impl Sema {
 
     fn check_cast(&mut self, x: Id::<ast::Expr>, t: Id::<ast::Ty>, span: Span): Expr {
         let target = self.lower_local_ty(t);
+        if let TyKind::Dyn(..) = self.p.types.kind(target) {
+            return self.check_dyn_cast(x, target, span);
+        }
         let v = self.check_expr(x, None);
         let from = self.default_var(v.ty);
         let to = self.shallow(target);
@@ -1023,6 +1029,102 @@ impl Sema {
         }
         let vn = self.node(v);
         return self.mk(ExprKind::Cast(vn), to, span);
+    }
+
+    /// `x as dyn Trait`: a view of the place `x` (or of a temporary
+    /// holding its value) through its type's vtable for the trait. From a
+    /// `dyn`, it drops `mut` or auto traits, or upcasts to a supertrait.
+    fn check_dyn_cast(&mut self, x: Id::<ast::Expr>, to: Ty, span: Span): Expr {
+        let TyKind::Dyn(d, dargs, flags) = self.p.types.kind(to) else { return self.error_expr(span); };
+        let place = self.check_place_or_temp(x);
+        let f0 = self.default_var(place.ty);
+        let f1 = self.p.types.strip_grow(f0);
+        let from = self.resolve(f1);
+        if self.p.types.has_error(from) || self.p.types.has_error(to) {
+            return self.error_expr(span);
+        }
+        if self.is_unbound_var(from) {
+            let xs = self.ast_span(x);
+            self.annotations_needed(xs);
+            return self.error_expr(span);
+        }
+        let mutable = flags & DYN_MUT != 0;
+        let dst = TraitRef { trait_id: d, args: dargs };
+        let ts = self.ty_str(to);
+        // From another `dyn`: the same value, through the same vtable or a
+        // supertrait's.
+        if let TyKind::Dyn(d0, a0, g) = self.p.types.kind(from) {
+            let src = TraitRef { trait_id: d0, args: a0 };
+            if src == dst || self.p.dyn_has_trait(src, dst) {
+                let fs = self.ty_str(from);
+                if mutable && g & DYN_MUT == 0 {
+                    let mut m = String::new();
+                    m.write("cannot view a `{fs}` as `{ts}`: it only gives shared access");
+                    self.error_at(codes::ty::IMMUTABLE(), span, m.as_str());
+                    self.with_help("make the first view a `dyn mut`, from a mutable place");
+                    self.emit();
+                } else if (flags & !DYN_MUT) & !g != 0 {
+                    let mut m = String::new();
+                    m.write("cannot view a `{fs}` as `{ts}`: what it views is not known to be Send or Sync");
+                    self.error_at(codes::ty::BAD_CAST(), span, m.as_str());
+                    self.with_note("`+ Send` and `+ Sync` are checked when a value is first viewed as `dyn`");
+                    self.emit();
+                }
+                let v = self.read(place, ReadMode::Copy);
+                if src == dst {
+                    if g == flags {
+                        return v;
+                    }
+                    let vn = self.node(v);
+                    return self.mk(ExprKind::Coerce { kind: Coercion::Weaken, expr: vn }, to, span);
+                }
+                let vn = self.node(v);
+                return self.mk(ExprKind::Coerce { kind: Coercion::Upcast, expr: vn }, to, span);
+            }
+        }
+        let fs = self.ty_str(from);
+        let tn = self.p.trait_ref_str(dst);
+        if self.p.types.has_infer(from) {
+            self.oblige(from, dst, span);
+        } else if !self.p.implements(from, dst, self.fcx.env[..]) {
+            let mut m = String::new();
+            m.write("`{fs}` does not implement `{tn}`, so it cannot be viewed as `{ts}`");
+            self.error_at(codes::ty::UNSATISFIED_BOUND(), span, m.as_str());
+            let mut h = String::new();
+            h.write("implement it: `impl {tn} for {fs} {{ ... }}`");
+            self.with_help(h.as_str());
+            self.emit();
+        }
+        let env = self.fcx.env.clone();
+        if flags & DYN_SEND != 0 && !self.p.is_send(from, env[..]) {
+            let mut m = String::new();
+            m.write("`{fs}` cannot be sent to another thread, so it cannot be viewed as `{ts}`");
+            self.error_at(codes::ty::NOT_SEND(), span, m.as_str());
+            self.auto_notes(from, "send");
+            self.emit();
+        }
+        if flags & DYN_SYNC != 0 && !self.p.is_sync(from, env[..]) {
+            let mut m = String::new();
+            m.write("`{fs}` cannot be shared between threads, so it cannot be viewed as `{ts}`");
+            self.error_at(codes::ty::NOT_SYNC(), span, m.as_str());
+            self.auto_notes(from, "sync");
+            self.emit();
+        }
+        if mutable && !self.is_mutable_place(place) && !self.p.types.is_error(place.ty) {
+            self.immutable_err(place, span, "view this value as `dyn mut`");
+        }
+        let pn = self.node(place);
+        return self.mk(ExprKind::Coerce { kind: Coercion::ToDyn { mutable }, expr: pn }, to, span);
+    }
+
+    /// The notes saying why `t` is not Send / Sync / Detached (`lang`).
+    fn auto_notes(&mut self, t: Ty, lang: str) {
+        let env = self.fcx.env.clone();
+        let mut why: [Symbol; ..+] = [];
+        self.p.auto_why(t, env[..], lang, &mut why);
+        for w in why {
+            self.p.diags.note(w);
+        }
     }
 
     // ===================================================================== arrays & ranges

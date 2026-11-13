@@ -40,7 +40,8 @@ use ln_sema::defs::{CtorKind, DefId, DefKind};
 use ln_sema::diag::is_dummy;
 use ln_sema::program::Program;
 use ln_sema::thir::{Body, LocalId, LocalKind, Pat, PatKind, Thir};
-use ln_sema::ty::{ArrKind, IntTy, Ty, TyKind, TyList};
+use ln_sema::objects::VtEntry;
+use ln_sema::ty::{ArrKind, IntTy, TraitRef, Ty, TyKind, TyList};
 use crater::{Cg, DebugInfo};
 use crater::llvm::*;
 
@@ -883,6 +884,21 @@ impl Cg {
                 let r = p.reveal(t);
                 self.di_type(p, r)
             }
+            // `{ pointer, vtable }`: the data (of a type the debugger does
+            // not know) and the vtable's words (`ln_sema::objects`).
+            TyKind::Dyn(d, args, _) => {
+                let mut es: [VtEntry; ..+] = [];
+                p.vtable_entries(TraitRef { trait_id: d, args }, &mut es);
+                let u8t = p.types.int(IntTy::U8);
+                let data = p.types.ptr(u8t, false);
+                let usize_t = p.types.int(IntTy::Usize);
+                let words = p.types.array(usize_t, ArrKind::Fixed(es.len() as u64));
+                let vt = p.types.ptr(words, false);
+                let mut ms: [MetadataRef; ..+] = [];
+                ms.push(self.di_field(p, null(), "pointer", data, self.offset(lt, 0), file, 0));
+                ms.push(self.di_field(p, null(), "vtable", vt, self.offset(lt, 1), file, 0));
+                self.di_struct(null(), name.as_str(), "", file, 0, bits, align, ms[..])
+            }
             TyKind::Never | TyKind::Error | TyKind::Param(..) | TyKind::Infer(_) => {
                 let none: [MetadataRef; 0] = [];
                 self.di_struct(null(), name.as_str(), "", file, 0, 0, 8, none[..])
@@ -1103,6 +1119,16 @@ impl Cg {
             TyKind::Opaque(..) => {
                 let r = p.reveal(t);
                 self.di_ty_name(p, r, out);
+            }
+            // CodeView: `dyn$<Trait>`, like the arrays.
+            TyKind::Dyn(d, args, _) => {
+                if self.di_cv {
+                    out.push_str("dyn$<");
+                    p.write_trait_ref(out, TraitRef { trait_id: d, args });
+                    out.push('>');
+                } else {
+                    p.write_ty(out, t);
+                }
             }
             _ => p.write_ty(out, t),
         }

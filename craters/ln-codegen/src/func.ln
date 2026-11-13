@@ -850,6 +850,16 @@ impl Cg {
                     let (data, len, _) = self.array_parts(p, ptr, at);
                     return Some(self.make_slice(data, len));
                 }
+                Coercion::ToDyn { .. } => {
+                    let ptr = self.place(p, expr)?;
+                    let at = self.place_ty(p, expr);
+                    return Some(self.make_dyn(p, ptr, at, ty));
+                }
+                Coercion::Upcast => {
+                    let v = self.value(p, expr)?;
+                    let from = self.ety(p, expr);
+                    return Some(self.upcast(p, v, from, ty));
+                }
             },
             ExprKind::FmtArgs(pieces) => return self.fmt_args(p, pieces),
             // The captures: the address of each borrowed variable, the

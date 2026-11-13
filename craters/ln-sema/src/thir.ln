@@ -175,6 +175,11 @@ pub enum Coercion {
     StringToStr,
     /// Function item to function pointer.
     FnToPtr,
+    /// A place viewed as `dyn Trait` (`x as dyn Trait`): its address and
+    /// the vtable of its type.
+    ToDyn { mutable: bool },
+    /// `dyn Sub` to `dyn Super`: the same data, the supertrait's vtable.
+    Upcast,
 }
 
 pub struct Arm {
