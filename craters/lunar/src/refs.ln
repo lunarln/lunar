@@ -42,6 +42,15 @@ pub fn same_target(a: RefTarget, b: RefTarget): bool {
     };
 }
 
+/// Local `local` of body `body`, if the analysis kept it.
+pub fn local_of(p: &Program, body: DefId, local: ln_sema::thir::LocalId): Option::<ln_sema::thir::Local> {
+    let b = p.bodies.get(body)?;
+    if local.index() >= b.locals.len() {
+        return None;
+    }
+    return Some(p.thir.local(b, local));
+}
+
 /// The name a target is declared under.
 pub fn target_name(p: &Program, t: RefTarget): String {
     return match t {
@@ -50,8 +59,8 @@ pub fn target_name(p: &Program, t: RefTarget): String {
             let v = p.variants_of(p.adt(adt))[variant as usize];
             String::from(p.text(p.fields_of(v)[field as usize].name))
         }
-        RefTarget::Local { body, local } => match p.bodies.get(body) {
-            Some(b) => String::from(p.text(p.thir.local(b, local).name)),
+        RefTarget::Local { body, local } => match local_of(p, body, local) {
+            Some(l) => String::from(p.text(l.name)),
             None => String::new(),
         },
         RefTarget::TyParam(decl) => if is_dummy(decl) { String::new() } else { String::from(p.sources.snippet(decl)) },
@@ -66,11 +75,8 @@ pub fn decl_span(p: &Program, t: RefTarget): Option::<Span> {
             let v = p.variants_of(p.adt(adt))[variant as usize];
             p.fields_of(v)[field as usize].span
         }
-        RefTarget::Local { body, local } => match p.bodies.get(body) {
-            Some(b) => {
-                let l = p.thir.local(b, local);
-                p.name_span(l.span, p.text(l.name))
-            }
+        RefTarget::Local { body, local } => match local_of(p, body, local) {
+            Some(l) => p.name_span(l.span, p.text(l.name)),
             None => return None,
         },
         RefTarget::TyParam(decl) => decl,
@@ -207,8 +213,7 @@ pub fn is_shorthand(p: &Program, span: Span): bool {
         match r.target {
             RefTarget::Field { .. } => field = field || s == span,
             RefTarget::Local { body, local: l } => {
-                if let Some(b) = p.bodies.get(body) {
-                    let loc = p.thir.local(b, l);
+                if let Some(loc) = local_of(p, body, l) {
                     if p.name_span(s, p.text(loc.name)) == span {
                         local = true;
                     }

@@ -525,9 +525,8 @@ fn classify(p: &Program, t: RefTarget, std_roots: [DefId; &]): (u8, u8) {
             (k, m)
         }
         RefTarget::Field { adt, .. } => (T_PROPERTY, if in_std(p, adt, std_roots) { M_DEFAULT_LIBRARY } else { 0 }),
-        RefTarget::Local { body, local } => match p.bodies.get(body) {
-            Some(b) => {
-                let l = p.thir.local(b, local);
+        RefTarget::Local { body, local } => match refs::local_of(p, body, local) {
+            Some(l) => {
                 if p.text(l.name) == "self" {
                     (T_KEYWORD, 0)
                 } else {
