@@ -2037,7 +2037,24 @@ impl Cx {
                 self.collect_assigns_block(p, body, out);
             }
             ExprKind::ForRange { body, .. } => self.collect_assigns_block(p, body, out),
-            ExprKind::ForArray { body, .. } => self.collect_assigns_block(p, body, out),
+            ExprKind::ForArray { pat, array, body, .. } => {
+                // The bindings are copies of the items, which point
+                // wherever the array's views point.
+                if self.has_view(p, p.thir.expr(array).ty) {
+                    let r = self.value_roots_of_place(p, array);
+                    let mut binds: [LocalId; ..+] = [];
+                    pat_bindings(&p.thir, pat, &mut binds);
+                    for l in binds {
+                        if self.has_view(p, self.local(p, l).ty) {
+                            for x in r[..] {
+                                out.push(pair_key(l, x));
+                            }
+                        }
+                    }
+                }
+                self.collect_assigns(p, array, out);
+                self.collect_assigns_block(p, body, out);
+            }
             _ => {
                 let mut kids: [Id::<Expr>; ..+] = [];
                 visit_children(&p.thir, e, &mut kids);
