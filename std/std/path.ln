@@ -202,7 +202,9 @@ impl Components {
     }
 }
 
-impl Iterator::<Component> for Components {
+impl Iterator for Components {
+    type Item = Component;
+
     fn next(&mut self): Option::<Component> {
         let b = self.s.as_bytes();
         if self.state == 0 {

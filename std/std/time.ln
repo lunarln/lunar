@@ -221,6 +221,8 @@ fn scaled(secs: u64, per: u64, extra: u64): u64 {
 }
 
 impl Add for Duration {
+    type Output = Duration;
+
     fn add(&self, rhs: &Duration): Duration {
         return match self.checked_add(rhs) {
             Some(d) => d,
@@ -230,6 +232,8 @@ impl Add for Duration {
 }
 
 impl Sub for Duration {
+    type Output = Duration;
+
     fn sub(&self, rhs: &Duration): Duration {
         return match self.checked_sub(rhs) {
             Some(d) => d,

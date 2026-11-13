@@ -108,6 +108,8 @@ impl Debug for Ipv4Addr {
 }
 
 impl FromStr for Ipv4Addr {
+    type Err = ParseError;
+
     /// Four decimal octets separated by `.`, without leading zeros.
     fn from_str(s: str): Result::<Ipv4Addr, ParseError> {
         let mut bits: u32 = 0;
@@ -328,6 +330,8 @@ fn hex_groups(s: str, out: [u16; &mut], max: usize, v4_ok: bool): Result::<usize
 }
 
 impl FromStr for Ipv6Addr {
+    type Err = ParseError;
+
     /// Eight hexadecimal groups separated by `:`, with at most one `::`
     /// standing for a run of zero groups, and optionally an IPv4 address
     /// for the last two (`::ffff:1.2.3.4`).
@@ -419,6 +423,8 @@ impl Debug for IpAddr {
 }
 
 impl FromStr for IpAddr {
+    type Err = ParseError;
+
     /// An IPv4 address, else an IPv6 one.
     fn from_str(s: str): Result::<IpAddr, ParseError> {
         if let Ok(a) = Ipv4Addr::from_str(s) {
@@ -541,6 +547,8 @@ impl Debug for SocketAddr {
 }
 
 impl FromStr for SocketAddr {
+    type Err = ParseError;
+
     /// `1.2.3.4:80`, or `[v6]:80` with an optional `%scope` (a number).
     fn from_str(s: str): Result::<SocketAddr, ParseError> {
         if s.starts_with("[") {

@@ -178,17 +178,17 @@ impl::<K: Light + Hash + Eq, V: Light> HashMap::<K, V> {
     }
 
     /// Every key and value, in no particular order.
-    pub fn iter(&self): impl Iterator::<(K, V)> {
+    pub fn iter(&self): impl Iterator::<Item = (K, V)> {
         return Entries { slots: self.slots[..], i: 0 };
     }
 
     /// Every key, in no particular order.
-    pub fn keys(&self): impl Iterator::<K> {
+    pub fn keys(&self): impl Iterator::<Item = K> {
         return Keys { slots: self.slots[..], i: 0 };
     }
 
     /// Every value, in no particular order.
-    pub fn values(&self): impl Iterator::<V> {
+    pub fn values(&self): impl Iterator::<Item = V> {
         return Values { slots: self.slots[..], i: 0 };
     }
 }
@@ -200,7 +200,7 @@ impl::<K: Light + Hash + Eq + Debug, V: Light + Debug> Debug for HashMap::<K, V>
 }
 
 /// `{k: v, ...}`.
-fn debug_entries::<K: Light + Debug, V: Light + Debug, I: Iterator::<(K, V)>>(mut it: I, out: &mut +String) {
+fn debug_entries::<K: Light + Debug, V: Light + Debug, I: Iterator::<Item = (K, V)>>(mut it: I, out: &mut +String) {
     out.push('{');
     let mut first = true;
     for (k, v) in it {
@@ -220,7 +220,9 @@ struct Entries::<K: Light, V: Light> {
     i: usize,
 }
 
-impl::<K: Light, V: Light> Iterator::<(K, V)> for Entries::<K, V> {
+impl::<K: Light, V: Light> Iterator for Entries::<K, V> {
+    type Item = (K, V);
+
     fn next(&mut self): Option::<(K, V)> {
         while self.i < self.slots.len() {
             let s = self.slots[self.i];
@@ -238,7 +240,9 @@ struct Keys::<K: Light, V: Light> {
     i: usize,
 }
 
-impl::<K: Light, V: Light> Iterator::<K> for Keys::<K, V> {
+impl::<K: Light, V: Light> Iterator for Keys::<K, V> {
+    type Item = K;
+
     fn next(&mut self): Option::<K> {
         while self.i < self.slots.len() {
             let s = self.slots[self.i];
@@ -256,7 +260,9 @@ struct Values::<K: Light, V: Light> {
     i: usize,
 }
 
-impl::<K: Light, V: Light> Iterator::<V> for Values::<K, V> {
+impl::<K: Light, V: Light> Iterator for Values::<K, V> {
+    type Item = V;
+
     fn next(&mut self): Option::<V> {
         while self.i < self.slots.len() {
             let s = self.slots[self.i];
@@ -414,17 +420,17 @@ impl::<K: Light + Hash + Eq, V: Light> OrderedHashMap::<K, V> {
     }
 
     /// Every key and value, in insertion order.
-    pub fn iter(&self): impl Iterator::<(K, V)> {
+    pub fn iter(&self): impl Iterator::<Item = (K, V)> {
         return OrderedEntries { entries: self.entries[..], i: 0 };
     }
 
     /// Every key, in insertion order.
-    pub fn keys(&self): impl Iterator::<K> {
+    pub fn keys(&self): impl Iterator::<Item = K> {
         return OrderedKeys { entries: self.entries[..], i: 0 };
     }
 
     /// Every value, in insertion order.
-    pub fn values(&self): impl Iterator::<V> {
+    pub fn values(&self): impl Iterator::<Item = V> {
         return OrderedValues { entries: self.entries[..], i: 0 };
     }
 }
@@ -440,7 +446,9 @@ struct OrderedEntries::<K: Light, V: Light> {
     i: usize,
 }
 
-impl::<K: Light, V: Light> Iterator::<(K, V)> for OrderedEntries::<K, V> {
+impl::<K: Light, V: Light> Iterator for OrderedEntries::<K, V> {
+    type Item = (K, V);
+
     fn next(&mut self): Option::<(K, V)> {
         if self.i == self.entries.len() {
             return None;
@@ -456,7 +464,9 @@ struct OrderedKeys::<K: Light, V: Light> {
     i: usize,
 }
 
-impl::<K: Light, V: Light> Iterator::<K> for OrderedKeys::<K, V> {
+impl::<K: Light, V: Light> Iterator for OrderedKeys::<K, V> {
+    type Item = K;
+
     fn next(&mut self): Option::<K> {
         if self.i == self.entries.len() {
             return None;
@@ -472,7 +482,9 @@ struct OrderedValues::<K: Light, V: Light> {
     i: usize,
 }
 
-impl::<K: Light, V: Light> Iterator::<V> for OrderedValues::<K, V> {
+impl::<K: Light, V: Light> Iterator for OrderedValues::<K, V> {
+    type Item = V;
+
     fn next(&mut self): Option::<V> {
         if self.i == self.entries.len() {
             return None;
@@ -536,7 +548,7 @@ impl::<T: Light + Hash + Eq> HashSet::<T> {
     }
 
     /// Every item, in no particular order.
-    pub fn iter(&self): impl Iterator::<T> {
+    pub fn iter(&self): impl Iterator::<Item = T> {
         return self.map.keys();
     }
 
@@ -603,7 +615,7 @@ impl::<T: Light + Hash + Eq + Debug> Debug for HashSet::<T> {
 }
 
 /// `(a, b, ...)` between `open` and `close`.
-fn debug_items::<T: Light + Debug, I: Iterator::<T>>(it: I, out: &mut +String, open: char, close: char) {
+fn debug_items::<T: Light + Debug, I: Iterator::<Item = T>>(it: I, out: &mut +String, open: char, close: char) {
     out.push(open);
     let mut first = true;
     for v in it {
@@ -746,7 +758,7 @@ impl::<T: Light> Deque::<T> {
     }
 
     /// Every item, front to back.
-    pub fn iter(&self): impl Iterator::<T> {
+    pub fn iter(&self): impl Iterator::<Item = T> {
         return DequeIter { buf: self.buf[..], head: self.head, len: self.len, i: 0 };
     }
 }
@@ -776,7 +788,9 @@ struct DequeIter::<T: Light> {
     i: usize,
 }
 
-impl::<T: Light> Iterator::<T> for DequeIter::<T> {
+impl::<T: Light> Iterator for DequeIter::<T> {
+    type Item = T;
+
     fn next(&mut self): Option::<T> {
         if self.i == self.len {
             return None;
@@ -887,7 +901,7 @@ impl::<T: Light + Ord> BinaryHeap::<T> {
     }
 
     /// Every item, in no particular order.
-    pub fn iter(&self): impl Iterator::<T> {
+    pub fn iter(&self): impl Iterator::<Item = T> {
         return SliceIter { items: self.items[..], i: 0 };
     }
 
@@ -914,7 +928,9 @@ struct SliceIter::<T: Light> {
     i: usize,
 }
 
-impl::<T: Light> Iterator::<T> for SliceIter::<T> {
+impl::<T: Light> Iterator for SliceIter::<T> {
+    type Item = T;
+
     fn next(&mut self): Option::<T> {
         if self.i == self.items.len() {
             return None;
@@ -1078,13 +1094,13 @@ impl::<K: Light + Ord, V: Light> SortedMap::<K, V> {
     }
 
     /// Every key and value, in key order.
-    pub fn iter(&self): impl Iterator::<(K, V)> {
+    pub fn iter(&self): impl Iterator::<Item = (K, V)> {
         return SortedEntries { entries: self.entries[..], i: 0 };
     }
 
     /// The keys and values with keys from `lo` up to (not including)
     /// `hi`, in key order.
-    pub fn range(&self, lo: K, hi: K): impl Iterator::<(K, V)> {
+    pub fn range(&self, lo: K, hi: K): impl Iterator::<Item = (K, V)> {
         let start = self.lower_bound(lo);
         let mut end = self.lower_bound(hi);
         if end < start {
@@ -1094,12 +1110,12 @@ impl::<K: Light + Ord, V: Light> SortedMap::<K, V> {
     }
 
     /// Every key, in order.
-    pub fn keys(&self): impl Iterator::<K> {
+    pub fn keys(&self): impl Iterator::<Item = K> {
         return SortedKeys { entries: self.entries[..], i: 0 };
     }
 
     /// Every value, in key order.
-    pub fn values(&self): impl Iterator::<V> {
+    pub fn values(&self): impl Iterator::<Item = V> {
         return SortedValues { entries: self.entries[..], i: 0 };
     }
 }
@@ -1115,7 +1131,9 @@ struct SortedEntries::<K: Light, V: Light> {
     i: usize,
 }
 
-impl::<K: Light, V: Light> Iterator::<(K, V)> for SortedEntries::<K, V> {
+impl::<K: Light, V: Light> Iterator for SortedEntries::<K, V> {
+    type Item = (K, V);
+
     fn next(&mut self): Option::<(K, V)> {
         if self.i == self.entries.len() {
             return None;
@@ -1131,7 +1149,9 @@ struct SortedKeys::<K: Light, V: Light> {
     i: usize,
 }
 
-impl::<K: Light, V: Light> Iterator::<K> for SortedKeys::<K, V> {
+impl::<K: Light, V: Light> Iterator for SortedKeys::<K, V> {
+    type Item = K;
+
     fn next(&mut self): Option::<K> {
         if self.i == self.entries.len() {
             return None;
@@ -1147,7 +1167,9 @@ struct SortedValues::<K: Light, V: Light> {
     i: usize,
 }
 
-impl::<K: Light, V: Light> Iterator::<V> for SortedValues::<K, V> {
+impl::<K: Light, V: Light> Iterator for SortedValues::<K, V> {
+    type Item = V;
+
     fn next(&mut self): Option::<V> {
         if self.i == self.entries.len() {
             return None;

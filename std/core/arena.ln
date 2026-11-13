@@ -182,7 +182,7 @@ impl::<T: Light> Arena::<T> {
     }
 
     /// The handles of every item, in the order they were added.
-    pub fn ids(&self): impl Iterator::<Id::<T>> {
+    pub fn ids(&self): impl Iterator::<Item = Id::<T>> {
         return Ids { next: 0, end: self.items.len() as u32 };
     }
 }
@@ -193,7 +193,9 @@ struct Ids::<T> {
     end: u32,
 }
 
-impl::<T> Iterator::<Id::<T>> for Ids::<T> {
+impl::<T> Iterator for Ids::<T> {
+    type Item = Id::<T>;
+
     fn next(&mut self): Option::<Id::<T>> {
         if self.next == self.end {
             return None;

@@ -6,12 +6,16 @@ use crater::num::{ParseError, ParseErrorKind};
 
 /// Types that can be parsed from text, with `s.parse::<T>()` or
 /// `T::from_str(s)`: the integer and float types, `bool` and `char`, and
-/// others such as network addresses.
+/// others such as network addresses. `Err` says why text did not parse
+/// (`ParseError` for all of those).
 pub trait FromStr {
-    fn from_str(s: str): Result::<Self, ParseError>;
+    type Err;
+    fn from_str(s: str): Result::<Self, Self::Err>;
 }
 
 impl FromStr for bool {
+    type Err = ParseError;
+
     /// `true` or `false`, exactly.
     fn from_str(s: str): Result::<bool, ParseError> {
         if s == "true" {
@@ -25,6 +29,8 @@ impl FromStr for bool {
 }
 
 impl FromStr for char {
+    type Err = ParseError;
+
     /// Exactly one character.
     fn from_str(s: str): Result::<char, ParseError> {
         let mut it = s.chars();
@@ -106,12 +112,12 @@ impl str {
 
     /// The pieces between occurrences of `sep` (an empty `sep` gives the
     /// whole text once).
-    pub fn split(self, sep: str): impl Iterator::<str> {
+    pub fn split(self, sep: str): impl Iterator::<Item = str> {
         return Split { rest: self, sep, done: false };
     }
 
     /// The lines, without their `\n` (or `\r\n`) endings.
-    pub fn lines(self): impl Iterator::<str> {
+    pub fn lines(self): impl Iterator::<Item = str> {
         let text = if self.ends_with("\n") { self[..self.len() - 1] } else { self };
         return Lines { inner: Split { rest: text, sep: "\n", done: self.len() == 0 } };
     }
@@ -167,7 +173,7 @@ impl str {
     }
 
     /// Parse the text as a `T`: `"42".parse::<i32>()`, `"1.5".parse::<f64>()`.
-    pub fn parse::<T: FromStr>(self): Result::<T, ParseError> {
+    pub fn parse::<T: FromStr>(self): Result::<T, T::Err> {
         return T::from_str(self);
     }
 
@@ -227,18 +233,18 @@ impl str {
 
     /// At most `n` pieces between occurrences of `sep`: the last piece is
     /// the rest of the text. `"a,b,c".splitn(2, ",")` gives `a`, `b,c`.
-    pub fn splitn(self, n: usize, sep: str): impl Iterator::<str> {
+    pub fn splitn(self, n: usize, sep: str): impl Iterator::<Item = str> {
         return SplitN { inner: Split { rest: self, sep, done: n == 0 }, left: n };
     }
 
     /// The pieces between occurrences of `sep`, from the end.
-    pub fn rsplit(self, sep: str): impl Iterator::<str> {
+    pub fn rsplit(self, sep: str): impl Iterator::<Item = str> {
         return RSplit { rest: self, sep, done: false, left: 18446744073709551615 };
     }
 
     /// At most `n` pieces between occurrences of `sep`, from the end: the
     /// last piece is the start of the text.
-    pub fn rsplitn(self, n: usize, sep: str): impl Iterator::<str> {
+    pub fn rsplitn(self, n: usize, sep: str): impl Iterator::<Item = str> {
         return RSplit { rest: self, sep, done: n == 0, left: n };
     }
 
@@ -255,7 +261,7 @@ impl str {
     }
 
     /// The pieces separated by whitespace, without empty ones.
-    pub fn split_whitespace(self): impl Iterator::<str> {
+    pub fn split_whitespace(self): impl Iterator::<Item = str> {
         return SplitWhitespace { rest: self };
     }
 
@@ -434,7 +440,9 @@ pub struct CharIndices {
     pos: usize,
 }
 
-impl Iterator::<(usize, char)> for CharIndices {
+impl Iterator for CharIndices {
+    type Item = (usize, char);
+
     fn next(&mut self): Option::<(usize, char)> {
         if self.pos >= self.s.len() {
             return None;
@@ -453,7 +461,9 @@ struct SplitN {
     left: usize,
 }
 
-impl Iterator::<str> for SplitN {
+impl Iterator for SplitN {
+    type Item = str;
+
     fn next(&mut self): Option::<str> {
         if self.left == 0 || self.inner.done {
             return None;
@@ -476,7 +486,9 @@ struct RSplit {
     left: usize,
 }
 
-impl Iterator::<str> for RSplit {
+impl Iterator for RSplit {
+    type Item = str;
+
     fn next(&mut self): Option::<str> {
         if self.done || self.left == 0 {
             return None;
@@ -505,7 +517,9 @@ struct SplitWhitespace {
     rest: str,
 }
 
-impl Iterator::<str> for SplitWhitespace {
+impl Iterator for SplitWhitespace {
+    type Item = str;
+
     fn next(&mut self): Option::<str> {
         let s = self.rest.trim_start();
         if s.is_empty() {
@@ -573,7 +587,9 @@ pub struct Chars {
     pos: usize,
 }
 
-impl Iterator::<char> for Chars {
+impl Iterator for Chars {
+    type Item = char;
+
     fn next(&mut self): Option::<char> {
         let b = self.s.as_bytes();
         if self.pos >= b.len() {
@@ -606,7 +622,9 @@ pub struct Bytes {
     pos: usize,
 }
 
-impl Iterator::<u8> for Bytes {
+impl Iterator for Bytes {
+    type Item = u8;
+
     fn next(&mut self): Option::<u8> {
         let b = self.s.as_bytes();
         if self.pos >= b.len() {
@@ -625,7 +643,9 @@ struct Split {
     done: bool,
 }
 
-impl Iterator::<str> for Split {
+impl Iterator for Split {
+    type Item = str;
+
     fn next(&mut self): Option::<str> {
         if self.done {
             return None;
@@ -653,7 +673,9 @@ struct Lines {
     inner: Split,
 }
 
-impl Iterator::<str> for Lines {
+impl Iterator for Lines {
+    type Item = str;
+
     fn next(&mut self): Option::<str> {
         return match self.inner.next() {
             Some(line) => Some(if line.ends_with("\r") { line[..line.len() - 1] } else { line }),
