@@ -24,6 +24,25 @@ pub enum MethodImpl {
     Builtin { lang: Symbol, method: Symbol },
 }
 
+/// The auto traits that follow a type's parts (`auto_rec`).
+const AUTO_SEND: u32 = 0;
+const AUTO_SYNC: u32 = 1;
+const AUTO_DETACHED: u32 = 2;
+
+fn auto_lang(k: u32): str {
+    return match k {
+        0 => "send",
+        1 => "sync",
+        _ => "detached",
+    };
+}
+
+/// The traits the compiler implements by itself: `Dull`, `Light`, `Send`,
+/// `Sync` and `Detached` (lang names).
+pub fn is_auto_lang(name: str): bool {
+    return name == "dull" || name == "light" || name == "send" || name == "sync" || name == "detached";
+}
+
 /// Operator traits that primitives implement natively.
 pub fn OP_TRAITS(): [str; 12] {
     return ["add", "sub", "mul", "div", "rem", "neg", "not", "bitand", "bitor", "bitxor", "shl", "shr"];
@@ -116,6 +135,11 @@ impl Program {
             TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Error => true,
             TyKind::Tuple(ts) => self.all_dull(ts, env, depth + 1),
             TyKind::Adt(id, args) => {
+                // A cell's value may change behind a shared view, so it is
+                // never copied implicitly.
+                if self.is_lang(id, "unsafe_cell") {
+                    return false;
+                }
                 let fs = self.adt_field_tys(id, args);
                 self.all_dull(fs, env, depth + 1)
             }
@@ -172,6 +196,9 @@ impl Program {
             TyKind::Grow(t) => self.is_light_rec(t, env, depth + 1),
             TyKind::Tuple(ts) => self.all_light(ts, env, depth + 1),
             TyKind::Adt(id, args) => {
+                if self.is_lang(id, "unsafe_cell") {
+                    return false;
+                }
                 let fs = self.adt_field_tys(id, args);
                 self.all_light(fs, env, depth + 1)
             }
@@ -205,6 +232,350 @@ impl Program {
                 false
             }
             TyKind::Infer(_) => false,
+        };
+    }
+
+    /// Whether `ty` is Send: a value of it may move to another thread.
+    pub fn is_send(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        return self.auto_rec(ty, env, AUTO_SEND, 0);
+    }
+
+    /// Whether `ty` is Sync: threads may share views of a value of it.
+    pub fn is_sync(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        return self.auto_rec(ty, env, AUTO_SYNC, 0);
+    }
+
+    /// Whether `ty` is Detached: it holds no views (no `str`, slice or
+    /// borrowing closure), so nothing in it points into data it does not
+    /// own, and it may outlive every local variable.
+    pub fn is_detached(&mut +self, ty: Ty, env: [Pred; &]): bool {
+        return self.auto_rec(ty, env, AUTO_DETACHED, 0);
+    }
+
+    fn auto_all(&mut +self, l: TyList, env: [Pred; &], k: u32, depth: u32): bool {
+        for i in 0..l.len() {
+            if !self.auto_rec(self.types.at(l, i), env, k, depth) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// `Send`, `Sync` or `Detached` (`k`), from the type's parts. A struct
+    /// or enum with an explicit impl of `Send` or `Sync` (an `unsafe impl`,
+    /// or a negative one) is decided by its impls alone.
+    fn auto_rec(&mut +self, ty: Ty, env: [Pred; &], k: u32, depth: u32): bool {
+        if depth > 64 {
+            return true; // recursive types are reported elsewhere
+        }
+        return match self.types.kind(ty) {
+            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Error => true,
+            TyKind::String | TyKind::FnPtr(..) => true,
+            // A view of text, which is never written through.
+            TyKind::Str => k != AUTO_DETACHED,
+            TyKind::FmtArgs | TyKind::Infer(_) => false,
+            // Raw pointers carry no promise about what they point at; types
+            // holding one opt in with `unsafe impl`. They are not views.
+            TyKind::Ptr(..) => k == AUTO_DETACHED,
+            TyKind::Array(e, kind) => match kind {
+                // A shared slice gives every thread holding a copy views of
+                // its items: those must be Sync.
+                ArrKind::Slice => k != AUTO_DETACHED && self.auto_rec(e, env, AUTO_SYNC, depth + 1),
+                // Mutable slices are copied freely, so two threads could
+                // write through the same one.
+                ArrKind::SliceMut => false,
+                _ => self.auto_rec(e, env, k, depth + 1),
+            },
+            TyKind::Grow(t) => self.auto_rec(t, env, k, depth + 1),
+            TyKind::Tuple(ts) => self.auto_all(ts, env, k, depth + 1),
+            TyKind::Adt(id, args) => {
+                if k != AUTO_DETACHED {
+                    if let Some(r) = self.explicit_auto(ty, id, k, env, depth) {
+                        return r;
+                    }
+                    // Changing a cell through a shared view is what
+                    // `Sync` types must make safe.
+                    if k == AUTO_SYNC && self.is_lang(id, "unsafe_cell") {
+                        return false;
+                    }
+                }
+                let fs = self.adt_field_tys(id, args);
+                self.auto_all(fs, env, k, depth + 1)
+            }
+            TyKind::Param(..) => {
+                let Some(tr) = self.lang_item(auto_lang(k)) else { return false; };
+                if self.env_has(ty, tr, env) {
+                    return true;
+                }
+                // Dull values hold no views.
+                k == AUTO_DETACHED && self.is_dull(ty, env)
+            }
+            // A closure moved to another thread takes its captures along: a
+            // borrowed capture is shared with the closure's creator (so it
+            // must be Sync), one it changes is never sent, and one it owns
+            // goes with it.
+            TyKind::Closure(def, args) => {
+                let Some(c) = self.closures.get(def) else { return false; };
+                for i in 0..c.captures.len() {
+                    let cap = self.captures.list(c.captures)[i];
+                    let t = self.types.subst(cap.ty, args);
+                    if cap.by_ref {
+                        if k == AUTO_DETACHED || cap.mode == ParamMode::InOut {
+                            return false;
+                        }
+                        if !self.auto_rec(t, env, AUTO_SYNC, depth + 1) {
+                            return false;
+                        }
+                    } else if !self.auto_rec(t, env, k, depth + 1) {
+                        return false;
+                    }
+                }
+                true
+            }
+            TyKind::Opaque(def, i, args) => {
+                let Some(tr) = self.lang_item(auto_lang(k)) else { return false; };
+                let dull = self.lang_item("dull");
+                let mut el: [Pred; ..+] = [];
+                self.opaque_bounds(def, i, args, &mut el);
+                for p in el {
+                    if p.trait_ref.trait_id == tr || (k == AUTO_DETACHED && Some(p.trait_ref.trait_id) == dull) {
+                        return true;
+                    }
+                }
+                false
+            }
+        };
+    }
+
+    /// Why `ty` is not `Send`, `Sync` or `Detached` (by lang name): notes,
+    /// from the outside in, down to the part that is not (interned texts,
+    /// onto `out`).
+    pub fn auto_why(&mut +self, ty: Ty, env: [Pred; &], lang: str, out: &mut +[Symbol; ..+]) {
+        let k = if lang == "send" { AUTO_SEND } else if lang == "sync" { AUTO_SYNC } else { AUTO_DETACHED };
+        self.auto_why_rec(ty, env, k, out, 0);
+    }
+
+    fn auto_note(&mut +self, out: &mut +[Symbol; ..+], text: str) {
+        out.push(self.sym(text));
+    }
+
+    fn auto_why_rec(&mut +self, ty: Ty, env: [Pred; &], k: u32, out: &mut +[Symbol; ..+], depth: u32) {
+        if depth > 8 || self.auto_rec(ty, env, k, 0) {
+            return;
+        }
+        let ts = self.ty_str(ty);
+        let tn = match k {
+            0 => "Send",
+            1 => "Sync",
+            _ => "Detached",
+        };
+        let mut m = String::new();
+        match self.types.kind(ty) {
+            TyKind::Str | TyKind::FmtArgs => {
+                m.write("`{ts}` is a view: it points into text it does not own");
+                self.auto_note(out, m.as_str());
+            }
+            TyKind::Ptr(..) => {
+                m.write("`{ts}` is a raw pointer, and raw pointers are neither Send nor Sync; a type that holds one can promise both with `unsafe impl`");
+                self.auto_note(out, m.as_str());
+            }
+            TyKind::Array(e, kind) => match kind {
+                ArrKind::Slice => {
+                    if k == AUTO_DETACHED {
+                        m.write("`{ts}` is a view: it points into items it does not own");
+                        self.auto_note(out, m.as_str());
+                    } else {
+                        m.write("`{ts}` is a shared view, so every thread holding a copy reads its items: they must be Sync");
+                        self.auto_note(out, m.as_str());
+                        self.auto_why_rec(e, env, AUTO_SYNC, out, depth + 1);
+                    }
+                }
+                ArrKind::SliceMut => {
+                    if k == AUTO_DETACHED {
+                        m.write("`{ts}` is a view: it points into items it does not own");
+                    } else {
+                        m.write("`{ts}` is a mutable slice, which is copied freely, so two threads could write through the same one; share data through a `Mutex` or atomics instead");
+                    }
+                    self.auto_note(out, m.as_str());
+                }
+                _ => self.auto_why_rec(e, env, k, out, depth + 1),
+            },
+            TyKind::Grow(t) => self.auto_why_rec(t, env, k, out, depth + 1),
+            TyKind::Tuple(ts2) => {
+                for i in 0..ts2.len() {
+                    let t = self.types.at(ts2, i);
+                    if !self.auto_rec(t, env, k, 0) {
+                        self.auto_why_rec(t, env, k, out, depth + 1);
+                        return;
+                    }
+                }
+            }
+            TyKind::Adt(id, args) => {
+                if k != AUTO_DETACHED {
+                    if let Some(false) = self.explicit_auto(ty, id, k, env, 0) {
+                        m.write("`{ts}` is not {tn}: its impls of `{tn}` do not apply here (a negative impl, or bounds that do not hold)");
+                        self.auto_note(out, m.as_str());
+                        return;
+                    }
+                    if k == AUTO_SYNC && self.is_lang(id, "unsafe_cell") {
+                        m.write("`{ts}` lets its value change through shared views, so it is not Sync; types built on it (`Mutex`, atomics) are");
+                        self.auto_note(out, m.as_str());
+                        return;
+                    }
+                }
+                let adt = self.adt(id);
+                for v in self.variants.list(adt.variants) {
+                    for f in self.fields.list(v.fields) {
+                        let ft = self.types.subst(f.ty, args);
+                        if !self.auto_rec(ft, env, k, 0) {
+                            let fts = self.ty_str(ft);
+                            let fname = self.text(f.name).to_string();
+                            if adt.is_enum {
+                                let vname = self.text(v.name).to_string();
+                                m.write("variant `{vname}` of `{ts}` holds a `{fts}`");
+                            } else {
+                                m.write("field `{fname}` of `{ts}` is a `{fts}`");
+                            }
+                            self.auto_note(out, m.as_str());
+                            self.auto_why_rec(ft, env, k, out, depth + 1);
+                            return;
+                        }
+                    }
+                }
+            }
+            TyKind::Param(_, n) => {
+                let name = self.text(n).to_string();
+                m.write("`{name}` is a generic parameter without a `{tn}` bound");
+                self.auto_note(out, m.as_str());
+            }
+            TyKind::Closure(def, args) => {
+                let Some(c) = self.closures.get(def) else { return; };
+                for i in 0..c.captures.len() {
+                    let cap = self.captures.list(c.captures)[i];
+                    let t = self.types.subst(cap.ty, args);
+                    let cname = self.text(cap.name).to_string();
+                    let cts = self.ty_str(t);
+                    if cap.by_ref {
+                        if k == AUTO_DETACHED {
+                            m.write("the closure borrows `{cname}`: a closure that borrows is a view; use `move` to take its captures");
+                            self.auto_note(out, m.as_str());
+                            return;
+                        }
+                        if cap.mode == ParamMode::InOut {
+                            m.write("the closure changes `{cname}`, which it borrows, and threads must not change a variable they share; use a `Mutex` or an atomic");
+                            self.auto_note(out, m.as_str());
+                            return;
+                        }
+                        if !self.auto_rec(t, env, AUTO_SYNC, 0) {
+                            m.write("the closure borrows `{cname}`, so threads would share it, and `{cts}` is not Sync");
+                            self.auto_note(out, m.as_str());
+                            self.auto_why_rec(t, env, AUTO_SYNC, out, depth + 1);
+                            return;
+                        }
+                    } else if !self.auto_rec(t, env, k, 0) {
+                        m.write("the closure captures `{cname}`, a `{cts}`");
+                        self.auto_note(out, m.as_str());
+                        self.auto_why_rec(t, env, k, out, depth + 1);
+                        return;
+                    }
+                }
+            }
+            TyKind::Opaque(..) => {
+                m.write("`{ts}` is an `impl Trait` whose bounds do not include `{tn}`");
+                self.auto_note(out, m.as_str());
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the impls of auto trait `k` written for the struct or enum
+    /// `id` make `ty` implement it, or `None` if there are none: the type
+    /// then follows its fields.
+    fn explicit_auto(&mut +self, ty: Ty, id: DefId, k: u32, env: [Pred; &], depth: u32): Option::<bool> {
+        let Some(tr) = self.lang_item(auto_lang(k)) else { return None; };
+        let mut any = false;
+        let mut pos = false;
+        for n in 0..self.impls.len() {
+            let imp = self.impls[n];
+            let DefData::Impl(data) = self.defs[imp.index()].data else { continue; };
+            let Some(itr) = data.trait_ref else { continue; };
+            if itr.trait_id != tr {
+                continue;
+            }
+            let TyKind::Adt(head, _) = self.types.kind(data.self_ty) else { continue; };
+            if head != id {
+                continue;
+            }
+            any = true;
+            let mut subst: [Option::<Ty>; ..+] = [None; data.generics.count()];
+            if !self.match_ty(data.self_ty, ty, &mut subst) {
+                continue;
+            }
+            if data.negative {
+                return Some(false);
+            }
+            let err = self.types.error();
+            let mut tys: [Ty; ..+] = [];
+            for s in subst {
+                tys.push(match s {
+                    Some(t) => t,
+                    None => err,
+                });
+            }
+            let args = self.types.mk_list(tys[..]);
+            let mut ok = true;
+            for i in 0..data.generics.preds.len() {
+                let p = self.preds.list(data.generics.preds)[i];
+                let pty = self.types.subst(p.ty, args);
+                let ptr = self.types.subst_trait_ref(p.trait_ref, args);
+                if !self.implements_depth(pty, ptr, env, depth + 1) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                pos = true;
+            }
+        }
+        if !any {
+            return None;
+        }
+        return Some(pos);
+    }
+
+    /// Whether a value of `ty` holds a `core::cell::UnsafeCell`, whose value
+    /// may change behind shared views.
+    pub fn has_cell(&mut +self, ty: Ty): bool {
+        return self.has_cell_rec(ty, 0);
+    }
+
+    fn has_cell_rec(&mut +self, ty: Ty, depth: u32): bool {
+        if depth > 64 {
+            return false;
+        }
+        return match self.types.kind(ty) {
+            TyKind::Array(e, k) => !k.is_owner() && !k.is_slice() && self.has_cell_rec(e, depth + 1),
+            TyKind::Tuple(ts) => {
+                for i in 0..ts.len() {
+                    if self.has_cell_rec(self.types.at(ts, i), depth + 1) {
+                        return true;
+                    }
+                }
+                false
+            }
+            TyKind::Adt(id, args) => {
+                if self.is_lang(id, "unsafe_cell") {
+                    return true;
+                }
+                let fs = self.adt_field_tys(id, args);
+                for i in 0..fs.len() {
+                    if self.has_cell_rec(self.types.at(fs, i), depth + 1) {
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
         };
     }
 
@@ -307,6 +678,9 @@ impl Program {
             TyKind::Param(..) | TyKind::Opaque(..) => self.is_light(ty, env),
             TyKind::Tuple(ts) => self.all_copy(ts, env, depth + 1),
             TyKind::Adt(id, args) => {
+                if self.is_lang(id, "unsafe_cell") {
+                    return false;
+                }
                 let fs = self.adt_field_tys(id, args);
                 self.all_copy(fs, env, depth + 1)
             }
@@ -368,6 +742,9 @@ impl Program {
         return match lang {
             "dull" => self.is_dull(ty, env),
             "light" => self.is_light(ty, env),
+            "send" => self.is_send(ty, env),
+            "sync" => self.is_sync(ty, env),
+            "detached" => self.is_detached(ty, env),
             "add" | "sub" | "mul" | "div" | "rem" => int || float,
             "neg" => signed || float,
             "not" => int || is_bool,
@@ -548,8 +925,10 @@ impl Program {
         if self.builtin_impl(ty, tr.trait_id, env) {
             return true;
         }
-        if self.is_lang(tr.trait_id, "dull") || self.is_lang(tr.trait_id, "light") {
-            return false;
+        if let Some(n) = self.lang_name(tr.trait_id) {
+            if is_auto_lang(n) {
+                return false;
+            }
         }
         return self.find_impl_depth(ty, tr, env, depth).is_some();
     }
@@ -559,7 +938,7 @@ impl Program {
         let trait_data = self.trait_data(tr.trait_id);
         let none: [Pred; 0] = [];
         if let Some(lang) = self.defs[tr.trait_id.index()].attrs.lang {
-            if self.builtin_impl(self_ty, tr.trait_id, none[..]) && self.text(lang) != "dull" && self.text(lang) != "light" {
+            if self.builtin_impl(self_ty, tr.trait_id, none[..]) && !is_auto_lang(self.text(lang)) {
                 return Some(MethodImpl::Builtin { lang, method });
             }
         }

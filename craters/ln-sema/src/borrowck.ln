@@ -671,7 +671,7 @@ pub fn ty_has_view(p: &mut +Program, env: [Pred; &], t: Ty, depth: u32): bool {
         }
         // Generic values may be instantiated with views, and `impl Trait`
         // may stand for one, unless bounded by `Dull`.
-        TyKind::Param(..) | TyKind::Opaque(..) => !p.is_dull(t, env),
+        TyKind::Param(..) | TyKind::Opaque(..) => !p.is_dull(t, env) && !p.is_detached(t, env),
         _ => false,
     };
 }

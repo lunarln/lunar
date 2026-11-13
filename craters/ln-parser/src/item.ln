@@ -51,7 +51,7 @@ impl Parser {
 
     pub fn at_item_start(&mut self): bool {
         return match self.peek() {
-            Some(T::Unsafe) => self.nth_at(1, T::Fn),
+            Some(T::Unsafe) => self.nth_at(1, T::Fn) || self.nth_at(1, T::Impl),
             Some(t) => is_item_start(t),
             None => false,
         };
@@ -122,15 +122,23 @@ impl Parser {
         let attrs = self.attrs()?;
         let is_pub = self.eat(T::Pub);
         let kind = match self.peek() {
-            Some(T::Fn) => ItemKind::Fn(self.fn_decl(false)?),
+            Some(T::Fn) => ItemKind::Fn(self.fn_decl(false, false)?),
             Some(T::Unsafe) if self.nth_at(1, T::Fn) => {
                 self.bump();
-                ItemKind::Fn(self.fn_decl(true)?)
+                ItemKind::Fn(self.fn_decl(true, false)?)
+            }
+            Some(T::Const) if self.nth_at(1, T::Fn) => {
+                self.bump();
+                ItemKind::Fn(self.fn_decl(false, true)?)
+            }
+            Some(T::Unsafe) if self.nth_at(1, T::Impl) => {
+                self.bump();
+                ItemKind::Impl(self.impl_decl(true)?)
             }
             Some(T::Struct) => ItemKind::Struct(self.struct_decl()?),
             Some(T::Enum) => ItemKind::Enum(self.enum_decl()?),
             Some(T::Trait) => ItemKind::Trait(self.trait_decl()?),
-            Some(T::Impl) => ItemKind::Impl(self.impl_decl()?),
+            Some(T::Impl) => ItemKind::Impl(self.impl_decl(false)?),
             Some(T::Use) => {
                 self.bump();
                 let tree = self.use_tree()?;
@@ -269,7 +277,7 @@ impl Parser {
         return Ok(path);
     }
 
-    fn fn_decl(&mut self, is_unsafe: bool): PResult::<FnDecl> {
+    fn fn_decl(&mut self, is_unsafe: bool, is_const: bool): PResult::<FnDecl> {
         let sig_start = self.start();
         self.expect(T::Fn)?;
         let name = self.ident()?;
@@ -327,7 +335,7 @@ impl Parser {
         let sig_span = self.span_from(sig_start);
         let body = if self.eat(T::Semi) { None } else { Some(self.block()?) };
         let params = self.ast.params.add_list(params[..]);
-        return Ok(FnDecl { name, generics, params, ret, ret_from, body, is_unsafe, variadic, sig_span });
+        return Ok(FnDecl { name, generics, params, ret, ret_from, body, is_unsafe, is_const, variadic, sig_span });
     }
 
     fn param(&mut self): PResult::<Param> {
@@ -468,7 +476,7 @@ impl Parser {
         return Ok(TraitDecl { name, generics, supertraits, items });
     }
 
-    fn impl_decl(&mut self): PResult::<ImplDecl> {
+    fn impl_decl(&mut self, is_unsafe: bool): PResult::<ImplDecl> {
         self.expect(T::Impl)?;
         let generics = self.generics_decl()?;
         let negative = self.eat(T::Bang);
@@ -481,13 +489,13 @@ impl Parser {
             };
             let self_ty = self.ty()?;
             let items = self.items_until_brace()?;
-            return Ok(ImplDecl { generics, negative, trait_ref: Some(trait_ref), self_ty, items });
+            return Ok(ImplDecl { generics, is_unsafe, negative, trait_ref: Some(trait_ref), self_ty, items });
         }
         if negative {
             return Err(self.error_at(first_ty.span.lo, first_ty.span.hi, "negative impls must name a trait: `impl !Trait for Type`"));
         }
         let items = self.items_until_brace()?;
-        return Ok(ImplDecl { generics, negative, trait_ref: None, self_ty: first, items });
+        return Ok(ImplDecl { generics, is_unsafe, negative, trait_ref: None, self_ty: first, items });
     }
 
     fn use_tree(&mut self): PResult::<UseTree> {

@@ -188,6 +188,17 @@ extern "C" {
     pub fn LLVMIsAConstantInt(v: ValueRef): ValueRef;
     pub fn LLVMIsNull(v: ValueRef): i32;
     pub fn LLVMConstIntGetZExtValue(v: ValueRef): u64;
+    pub fn LLVMConstStructInContext(c: ContextRef, vals: *ValueRef, n: u32, packed: i32): ValueRef;
+    pub fn LLVMStructGetTypeAtIndex(st: TypeRef, i: u32): TypeRef;
+
+    // ----- atomics and thread-local storage -----
+    pub fn LLVMBuildAtomicRMW(b: BuilderRef, op: u32, p: ValueRef, v: ValueRef, ordering: u32, single_thread: i32): ValueRef;
+    pub fn LLVMBuildAtomicCmpXchg(b: BuilderRef, p: ValueRef, cmp: ValueRef, new: ValueRef, success: u32, failure: u32, single_thread: i32): ValueRef;
+    pub fn LLVMBuildFence(b: BuilderRef, ordering: u32, single_thread: i32, name: *u8): ValueRef;
+    pub fn LLVMSetOrdering(access: ValueRef, ordering: u32);
+    pub fn LLVMSetWeak(cmpxchg: ValueRef, weak: i32);
+    pub fn LLVMSetAlignment(v: ValueRef, bytes: u32);
+    pub fn LLVMSetThreadLocal(g: ValueRef, is_thread_local: i32);
 
     // ----- globals and functions -----
     pub fn LLVMAddGlobal(m: ModuleRef, t: TypeRef, name: *u8): ValueRef;

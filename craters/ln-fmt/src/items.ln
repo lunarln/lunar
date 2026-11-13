@@ -119,6 +119,10 @@ impl Printer {
                 self.item_block(self.s.find(after, Token::LBrace), t.items);
             }
             ItemKind::Impl(i) => {
+                if i.is_unsafe {
+                    self.tok(self.s.find(pos, Token::Unsafe), "unsafe");
+                    self.text(" ");
+                }
                 self.tok(self.s.find(pos, Token::Impl), "impl");
                 self.generics(i.generics);
                 self.text(" ");
@@ -256,6 +260,10 @@ impl Printer {
     fn fn_decl(&mut self, f: FnDecl, pos: u32) {
         if f.is_unsafe {
             self.tok(self.s.find(pos, Token::Unsafe), "unsafe");
+            self.text(" ");
+        }
+        if f.is_const {
+            self.tok(self.s.find(pos, Token::Const), "const");
             self.text(" ");
         }
         self.tok(f.sig_span.lo, "fn");

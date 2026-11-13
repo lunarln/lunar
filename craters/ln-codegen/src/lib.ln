@@ -852,18 +852,72 @@ impl Cg {
                         vals.push(self.const_val(p, cv, ct)?);
                     }
                     let st = self.llty(p, t);
-                    return Ok(unsafe { LLVMConstNamedStruct(st, vals[..].as_ptr(), vals.len() as u32) });
+                    return Ok(self.const_aggregate(st, vals[..]));
                 }
             }
             ConstVal::Array(vs) => {
                 if let TyKind::Array(e, ArrKind::Fixed(_)) = k {
                     let et = self.llty(p, e);
                     let mut vals: [ValueRef; ..+] = [];
+                    let mut same = true;
                     for i in 0..vs.len() {
                         let cv = p.consts.list(vs)[i];
-                        vals.push(self.const_val(p, cv, e)?);
+                        let v = self.const_val(p, cv, e)?;
+                        if (unsafe { LLVMTypeOf(v) } as usize) != (et as usize) {
+                            same = false;
+                        }
+                        vals.push(v);
+                    }
+                    if !same {
+                        // Items spelled out byte for byte (enums with
+                        // payloads): one after another, as laid out.
+                        return Ok(unsafe { LLVMConstStructInContext(self.ctx, vals[..].as_ptr(), vals.len() as u32, 1) });
                     }
                     return Ok(unsafe { LLVMConstArray2(et, vals[..].as_ptr(), vals.len() as u64) });
+                }
+            }
+            ConstVal::Adt(index, vs) => {
+                if let TyKind::Adt(d, args) = k {
+                    let adt = p.adt(d);
+                    let vi = index as usize;
+                    if vi < adt.variants.len() {
+                        let var = p.variants.list(adt.variants)[vi];
+                        let mut vals: [ValueRef; ..+] = [];
+                        let n = if vs.len() < var.fields.len() { vs.len() } else { var.fields.len() };
+                        for i in 0..n {
+                            let cv = p.consts.list(vs)[i];
+                            let fty = p.fields.list(var.fields)[i].ty;
+                            let ft = p.types.subst(fty, args);
+                            vals.push(self.const_val(p, cv, ft)?);
+                        }
+                        let st = self.llty(p, t);
+                        if !adt.is_enum {
+                            return Ok(self.const_aggregate(st, vals[..]));
+                        }
+                        let tag = self.const_int(self.i32_ty(), index as u64);
+                        let payload_ty = unsafe { LLVMStructGetTypeAtIndex(st, 1) };
+                        if vals.len() == 0 {
+                            let parts = [tag, unsafe { LLVMConstNull(payload_ty) }];
+                            return Ok(unsafe { LLVMConstNamedStruct(st, parts[..].as_ptr(), 2) });
+                        }
+                        // `{ i32 tag, [W x i64] }` with the variant's fields
+                        // where the words are: spelled out byte for byte.
+                        let vst = self.variant_struct(p, t, vi);
+                        let payload = self.const_aggregate(vst, vals[..]);
+                        let used = unsafe { LLVMABISizeOfType(self.td, LLVMTypeOf(payload)) };
+                        let total = unsafe { LLVMABISizeOfType(self.td, st) };
+                        let i8t = unsafe { LLVMInt8TypeInContext(self.ctx) };
+                        let mut parts: [ValueRef; ..+] = [tag, unsafe { LLVMConstNull(LLVMArrayType2(i8t, 4)) }, payload];
+                        if total > 8 + used {
+                            parts.push(unsafe { LLVMConstNull(LLVMArrayType2(i8t, total - 8 - used)) });
+                        }
+                        return Ok(unsafe { LLVMConstStructInContext(self.ctx, parts[..].as_ptr(), parts.len() as u32, 1) });
+                    }
+                }
+            }
+            ConstVal::Fn(def) => {
+                if let TyKind::FnPtr(..) = k {
+                    return Ok(self.instance(p, def, List::empty()));
                 }
             }
             _ => {}
@@ -873,6 +927,40 @@ impl Cg {
         let mut e = String::new();
         e.write("internal compiler error: unsupported constant {vs} of type {ts}");
         return Err(e);
+    }
+
+    /// A constant of struct type `st` with the fields `vals`. A field whose
+    /// constant is spelled out byte for byte (an enum with a payload) has
+    /// another LLVM type than the struct's; then the whole struct is spelled
+    /// out too: a packed struct of the fields with the padding between them
+    /// as zero bytes, laid out exactly like `st`.
+    fn const_aggregate(&mut self, st: TypeRef, vals: [ValueRef; &]): ValueRef {
+        let mut same = true;
+        for i in 0..vals.len() {
+            let want = unsafe { LLVMStructGetTypeAtIndex(st, i as u32) };
+            if (unsafe { LLVMTypeOf(vals[i]) } as usize) != (want as usize) {
+                same = false;
+            }
+        }
+        if same {
+            return unsafe { LLVMConstNamedStruct(st, vals.as_ptr(), vals.len() as u32) };
+        }
+        let i8t = unsafe { LLVMInt8TypeInContext(self.ctx) };
+        let mut parts: [ValueRef; ..+] = [];
+        let mut at: u64 = 0;
+        for i in 0..vals.len() {
+            let off = unsafe { LLVMOffsetOfElement(self.td, st, i as u32) };
+            if off > at {
+                parts.push(unsafe { LLVMConstNull(LLVMArrayType2(i8t, off - at)) });
+            }
+            parts.push(vals[i]);
+            at = off + unsafe { LLVMABISizeOfType(self.td, LLVMTypeOf(vals[i])) };
+        }
+        let size = unsafe { LLVMABISizeOfType(self.td, st) };
+        if size > at {
+            parts.push(unsafe { LLVMConstNull(LLVMArrayType2(i8t, size - at)) });
+        }
+        return unsafe { LLVMConstStructInContext(self.ctx, parts[..].as_ptr(), parts.len() as u32, 1) };
     }
 
     /// A private global holding constant `v` of type `t`, for a value that
@@ -900,15 +988,24 @@ impl Cg {
         let llty = self.llty(p, s.ty);
         let name = self.mangle(p, def, List::empty());
         let cname = c_string(name.as_str());
-        let g = unsafe { LLVMAddGlobal(self.module, llty, cname.as_ptr()) };
         let init = match s.value {
             Some(v) => self.const_val(p, v, s.ty)?,
             None => unsafe { LLVMConstNull(llty) },
         };
+        // The initializer may be spelled out byte for byte (enums with
+        // payloads), so the global takes its type; uses go through `llty`.
+        let g = unsafe { LLVMAddGlobal(self.module, LLVMTypeOf(init), cname.as_ptr()) };
+        // A static holding a cell (an atomic, a lock) changes behind shared
+        // views, so it is never constant.
+        let constant = !s.mutable && !p.has_cell(s.ty);
         unsafe {
             LLVMSetInitializer(g, init);
-            LLVMSetGlobalConstant(g, (!s.mutable) as i32);
+            LLVMSetGlobalConstant(g, constant as i32);
             LLVMSetLinkage(g, INTERNAL_LINKAGE);
+            LLVMSetAlignment(g, LLVMABIAlignmentOfType(self.td, llty));
+            if p.def(def).attrs.thread_local {
+                LLVMSetThreadLocal(g, 1);
+            }
         }
         self.statics.insert(def, g);
         return Ok(g);
@@ -1161,6 +1258,7 @@ fn describe_const(p: &mut +Program, v: ConstVal): String {
             write_consts(p, &mut s, vs);
             s.push_str("])");
         }
+        ConstVal::Fn(d) => s.write("Fn({p.path_of(d)})"),
     }
     return s;
 }

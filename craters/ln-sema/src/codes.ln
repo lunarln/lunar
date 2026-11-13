@@ -42,6 +42,9 @@ pub mod ty {
     pub fn OPAQUE_MISMATCH(): Code { return c("opaque_mismatch"); }
     pub fn LET_ELSE_FALLS_THROUGH(): Code { return c("let_else_falls_through"); }
     pub fn FROM_WITHOUT_VIEWS(): Code { return c("from_without_views"); }
+    pub fn NOT_SEND(): Code { return c("not_send"); }
+    pub fn NOT_SYNC(): Code { return c("not_sync"); }
+    pub fn NOT_DETACHED(): Code { return c("not_detached"); }
 }
 
 pub mod syntax {
@@ -87,6 +90,8 @@ pub mod trait_ {
     pub fn CONFLICTING_IMPL(): Code { return c("conflicting_impl"); }
     pub fn AMBIGUOUS_METHOD(): Code { return c("ambiguous_method"); }
     pub fn INHERENT_FOREIGN(): Code { return c("inherent_foreign"); }
+    pub fn UNSAFE_IMPL(): Code { return c("unsafe_impl"); }
+    pub fn AUTO_IMPL(): Code { return c("auto_impl"); }
 }
 
 pub mod borrow {
@@ -170,10 +175,10 @@ pub mod manifest {
 /// explain --list`).
 pub fn all_codes(): [crater::diag::Code; ..+] {
     let scopes = [
-        ("type", "mismatch array_owner_items grow_outside_param grow_no_owner grow_without_mut fmtargs_outside_param annotations_needed not_callable arg_count generic_count no_field no_method not_indexable bad_operand bad_cast unsatisfied_bound infinite_size array_len not_a_place immutable missing_field duplicate_field non_exhaustive bad_pattern return_missing break_outside_loop literal_range not_iterable ffi_type bad_main bad_test const_eval variadic_not_extern impl_trait_position opaque_mismatch let_else_falls_through from_without_views"),
+        ("type", "mismatch array_owner_items grow_outside_param grow_no_owner grow_without_mut fmtargs_outside_param annotations_needed not_callable arg_count generic_count no_field no_method not_indexable bad_operand bad_cast unsatisfied_bound infinite_size array_len not_a_place immutable missing_field duplicate_field non_exhaustive bad_pattern return_missing break_outside_loop literal_range not_iterable ffi_type bad_main bad_test const_eval variadic_not_extern impl_trait_position opaque_mismatch let_else_falls_through from_without_views not_send not_sync not_detached"),
         ("syntax", "unexpected_token unknown_char unterminated bad_escape bad_number bad_format missing_semi missing_body bad_char bad_attribute conflict_marker"),
         ("name", "unresolved duplicate private not_a_type not_a_value not_a_trait module_file bad_self unbound_in_alternative inconsistent_binding bound_twice"),
-        ("trait", "dull_impl negative_impl missing_item extra_item signature conflicting_impl ambiguous_method inherent_foreign"),
+        ("trait", "dull_impl negative_impl missing_item extra_item signature conflicting_impl ambiguous_method inherent_foreign unsafe_impl auto_impl"),
         ("borrow", "use_after_move move_out_of_borrow grow_only shrink_while_borrowed move_while_borrowed assign_while_borrowed outlives_root escapes_function escapes_via_param missing_marker wrong_marker not_an_argument escapes_via_return"),
         ("macro", "undefined no_match bad_matcher repetition recursion_limit derive_output not_supported error"),
         ("unsafe", "outside_unsafe in_unsafe_fn"),
