@@ -1,0 +1,46 @@
+trait Source {
+    /// What the source gives.
+    type Item;
+    /// How many it holds.
+    const SIZE: usize;
+    fn get(&mut self): Option::<Self::Item>;
+}
+
+struct Bytes {
+    left: u8,
+}
+
+impl Source for Bytes {
+    type Item = u8;
+    const SIZE: usize = 4;
+    fn get(&mut self): Option::<Self::Item> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        return Some(self.left);
+    }
+}
+
+fn keep::<S: Source>(x: S::Item): S::Item {
+    return x;
+}
+
+fn size::<S: Source>(s: &S): usize {
+    let n = S::SIZE;
+    // here
+    return n;
+}
+
+fn total::<I: Iterator::<Item = u64>>(it: I): u64 {
+    let mut t: u64 = 0;
+    for x in it {
+        t += x;
+    }
+    return t;
+}
+
+fn main() {
+    let b = Bytes { left: 2 };
+    println("{size(&b)} {total((0..4u64).map(|x| x * 2))}");
+}

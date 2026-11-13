@@ -1,0 +1,36 @@
+{
+  "about": "Associated types and constants: hover on an impl's `type Item = u8` and on a projection `S::Item` (the trait's declaration and docs), go to definition from a projection, a constraint and a constant, semantic tokens of projections and constants, and completion of `S::` with the associated items of its bounds.",
+  "steps": [
+    { "open": "main.ln" },
+    { "request": "textDocument/hover",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "Item = u8", 0, 1] },
+      "expect": ["type Item = u8", "impl Source for Bytes"] },
+    { "request": "textDocument/hover",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "S::Item {", 0, 4] },
+      "expect": ["trait Source", "type Item", "What the source gives."] },
+    { "request": "textDocument/definition",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "S::Item {", 0, 4] },
+      "ranges": [["main.ln", "Item;", 0, 0, 4]] },
+    { "request": "textDocument/definition",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "S::SIZE", 0, 4] },
+      "ranges": [["main.ln", "SIZE: usize;", 0, 0, 4]] },
+    { "request": "textDocument/hover",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "Item = u64", 0, 1] },
+      "expect": ["type Item", "core::iter"] },
+    { "request": "textDocument/semanticTokens/full",
+      "params": { "textDocument": { "uri": "$uri:main.ln" } },
+      "tokens": [
+        ["main.ln", "Item;", 0, 0, "type", ["declaration"]],
+        ["main.ln", "Item {", 0, 0, "type"],
+        ["main.ln", "SIZE;", 0, 0, "variable", ["readonly"]]
+      ] },
+    { "change": "main.ln", "replace": ["    // here", "    let m = S::/*C*/"] },
+    { "request": "textDocument/completion",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "/*C*/", 0, 0] },
+      "expect": ["\"label\":\"SIZE\"", "\"label\":\"Item\"", "\"label\":\"get\""] },
+    { "change": "main.ln", "replace": ["        if self.left == 0 {", "        let z = Self::/*D*/\n        if self.left == 0 {"] },
+    { "request": "textDocument/completion",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "/*D*/", 0, 0] },
+      "expect": ["\"label\":\"SIZE\"", "\"label\":\"Item\""] }
+  ]
+}
