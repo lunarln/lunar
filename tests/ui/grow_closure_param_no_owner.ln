@@ -1,0 +1,8 @@
+// error: type::grow_no_owner
+// `+` on a closure parameter needs a type that owns an array or string.
+fn main() {
+    let mut n = 1;
+    let bump = |x: &mut +i32| x += 1;
+    bump(&mut n);
+    println("{n}");
+}

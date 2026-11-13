@@ -1299,7 +1299,7 @@ impl Sema {
             ln_ast::TyKind::Grow(inner) => {
                 let inner_ty = self.lower_ty(cx, inner, TyPos::Other);
                 if pos != TyPos::Param {
-                    self.error(codes::ty::GROW_OUTSIDE_PARAM(), at.span, "`+` types are only valid as function parameter types");
+                    self.error(codes::ty::GROW_OUTSIDE_PARAM(), at.span, "`+` types are only valid as function and closure parameter types");
                     self.note("`&mut +T` marks a parameter that only grows; it has no meaning elsewhere");
                     self.emit();
                     return inner_ty;

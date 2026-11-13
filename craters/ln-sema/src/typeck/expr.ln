@@ -37,9 +37,19 @@ impl Sema {
 
     /// Lower a type annotation inside a body.
     pub fn lower_local_ty(&mut self, t: Id::<ast::Ty>): Ty {
+        return self.lower_body_ty(t, TyPos::Other);
+    }
+
+    /// Lower the type of a closure's parameter, which may be `+T` like a
+    /// function's.
+    pub fn lower_closure_param_ty(&mut self, t: Id::<ast::Ty>): Ty {
+        return self.lower_body_ty(t, TyPos::Param);
+    }
+
+    fn lower_body_ty(&mut self, t: Id::<ast::Ty>, pos: TyPos): Ty {
         let cx = self.local_cx();
         let before = self.deferred.len();
-        let ty = self.lower_ty(cx, t, TyPos::Other);
+        let mut ty = self.lower_ty(cx, t, pos);
         for i in before..self.deferred.len() {
             let d = self.deferred[i];
             if let DeferKind::ArrayElem = d.kind {
@@ -47,6 +57,18 @@ impl Sema {
             }
             if let DeferKind::DynCompat = d.kind {
                 self.check_dyn_compat(d.ty, d.span);
+            }
+            if let DeferKind::Grow = d.kind {
+                if !self.p.could_own(d.ty, self.fcx.env[..]) {
+                    let s = self.p.ty_str(d.ty);
+                    let mut m = String::new();
+                    m.write("`+{s}` is meaningless: `{s}` owns no array or string");
+                    self.error_at(codes::ty::GROW_NO_OWNER(), d.span, m.as_str());
+                    self.with_note("`+` promises an argument is never shrunk or replaced; only owners (`[T]`, `[T; ..+]`, `[T; -..+]`, `String`, or types containing them) can be");
+                    self.emit();
+                    // Go on as if there were no `+`.
+                    ty = self.p.types.strip_grow(ty);
+                }
             }
         }
         self.deferred.truncate(before);

@@ -541,6 +541,22 @@ parameter as `&mut +`, so it may only grow it, and calling `f(s)` through
 such a bound keeps the views into `s`, as for a `&mut +` parameter of a
 function.
 
+A closure's parameter can also be declared `&mut +T` itself, with the
+same rules as a function's (`err(type::grow_without_mut)`,
+`err(type::grow_no_owner)`, `err(borrow::grow_only)`). Calling it keeps the
+caller's views, and its type meets `Fn(&mut +T)` bounds:
+
+```lunar
+let first = s.as_str();
+let add = |x: &mut +String| x.push_str(".");
+add(&mut s);              // `first` stays valid
+println("{first} {s}");
+```
+
+Without the `+` (or an expected `Fn(&mut +T)`), a closure's `&mut`
+parameter may shrink its argument, and calling it ends every view into
+that argument.
+
 A function can return a closure (or any value) without naming its type:
 `fn make_adder(n: i32): impl Fn(i32): i32 { return move |x| x + n; }`.
 Callers see only the bounds after `impl`; the body returns one concrete

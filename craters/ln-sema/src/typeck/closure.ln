@@ -190,7 +190,33 @@ impl Sema {
             };
             let ty = match p.ty {
                 Some(t) => {
-                    let t = self.lower_local_ty(t);
+                    // `x: &mut +T` only grows its argument, as for a
+                    // function's parameter.
+                    let t = self.lower_closure_param_ty(t);
+                    let grow = match self.p.types.kind(t) {
+                        TyKind::Grow(_) => true,
+                        _ => false,
+                    };
+                    let inout = match p.mode {
+                        Some(ParamMode::InOut) => true,
+                        _ => false,
+                    };
+                    if grow && !inout {
+                        let shown = match p.name {
+                            Some(n) => self.p.text(n.name).to_string(),
+                            None => String::from("_"),
+                        };
+                        let ts = self.p.ty_str(t);
+                        let mut m = String::new();
+                        m.write("`+` parameter `{shown}` is not `&mut`");
+                        self.error_at(codes::ty::GROW_WITHOUT_MUT(), p.span, m.as_str());
+                        self.with_label("a parameter that is not in-out cannot change the caller's value at all");
+                        self.with_note("`+` promises that an in-out argument only grows");
+                        let mut h = String::new();
+                        h.write("declare it `{shown}: &mut {ts}`, or drop the `+`");
+                        self.with_help(h.as_str());
+                        self.emit();
+                    }
                     if let Some(e) = exp {
                         let (_, et) = e;
                         if !self.unify(t, et) {
