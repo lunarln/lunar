@@ -55,16 +55,23 @@ fn language_server_survives_broken_code() {
                 println("cut {file} at {at} ({if k == 0 { "prefix" } else { "deletion" }})");
                 version += 1;
                 s.change(uri.as_str(), version, v.as_str());
-                s.diagnostics(uri.as_str());
+                // The requests follow the change at once: the server
+                // analyzes the new text before it answers them (and
+                // publishes its diagnostics), without waiting for the
+                // typing to pause.
                 let vb = v.as_str().as_bytes();
                 let mut off: usize = 0;
                 let hop = if vb.len() / 6 > 0 { vb.len() / 6 } else { 1 };
-                while off < vb.len() {
+                loop {
                     let (l, c) = position(v.as_str(), boundary(v.as_str(), off));
                     s.at("textDocument/hover", uri.as_str(), l, c);
                     s.at("textDocument/definition", uri.as_str(), l, c);
                     off += hop;
+                    if off >= vb.len() {
+                        break;
+                    }
                 }
+                s.forget_notes();
             }
             cut += step;
         }

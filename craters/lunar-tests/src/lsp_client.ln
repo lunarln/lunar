@@ -177,6 +177,12 @@ impl Server {
         return Some(msg);
     }
 
+    /// Drop the kept notifications and the log, in a long session.
+    pub fn forget_notes(&mut self) {
+        self.notes.clear();
+        self.log.clear();
+    }
+
     /// Open the document `uri` with `text`.
     pub fn open(&mut self, uri: str, text: str) {
         let mut p = String::from("{\"textDocument\":{\"uri\":");
