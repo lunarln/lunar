@@ -1,0 +1,90 @@
+// Editors analyze half-typed code: the language server must survive every
+// prefix (and small mutilation) of a valid or invalid program, and answer
+// hovers and definitions in it.
+
+use std::env;
+use crater::lsp_client::{Server, position, uri_of};
+use crater::{files, join, read, scratch, write_file};
+
+/// Each program in examples, tests/run and tests/ui, cut off at
+/// `$LUNAR_ROBUST_CUTS` places (default 12), and with three characters
+/// deleted there instead, is sent to the server as the edited document,
+/// with hovers and definitions at places in it. The server must answer
+/// everything and exit cleanly. The last `cut` line printed names what was
+/// being analyzed when it did not.
+#[test]
+fn language_server_survives_broken_code() {
+    let cuts = match env::var("LUNAR_ROBUST_CUTS") {
+        Some(n) => match n.as_str().parse_i64() {
+            Some(k) => k as usize,
+            None => 12,
+        },
+        None => 12,
+    };
+    let dir = scratch("robust");
+    let path = join(dir.as_str(), "main.ln");
+    write_file(path.as_str(), "");
+    let uri = uri_of(path.as_str());
+    let mut list = files("examples", ".ln");
+    list.push_str(files("tests/run", ".ln").as_str());
+    list.push_str(files("tests/ui", ".ln").as_str());
+    let mut s = Server::start(dir.as_str(), "");
+    s.open(uri.as_str(), "");
+    s.diagnostics(uri.as_str());
+    let mut version: i64 = 1;
+    for file in list.as_str().lines() {
+        let text = read(file);
+        let t = text.as_str();
+        let b = t.as_bytes();
+        let step = if b.len() / cuts > 0 { b.len() / cuts } else { 1 };
+        let mut cut: usize = 0;
+        while cut <= b.len() {
+            let at = boundary(t, cut);
+            // The program cut off at `at`, then with three characters
+            // deleted there.
+            for k in 0..2 {
+                let mut v = String::from(t[..at]);
+                if k == 1 {
+                    let mut end = at + 3;
+                    if end >= b.len() {
+                        break;
+                    }
+                    end = boundary(t, end);
+                    v.push_str(t[end..]);
+                }
+                println("cut {file} at {at} ({if k == 0 { "prefix" } else { "deletion" }})");
+                version += 1;
+                s.change(uri.as_str(), version, v.as_str());
+                // The requests follow the change at once: the server
+                // analyzes the new text before it answers them (and
+                // publishes its diagnostics), without waiting for the
+                // typing to pause.
+                let vb = v.as_str().as_bytes();
+                let mut off: usize = 0;
+                let hop = if vb.len() / 6 > 0 { vb.len() / 6 } else { 1 };
+                loop {
+                    let (l, c) = position(v.as_str(), boundary(v.as_str(), off));
+                    s.at("textDocument/hover", uri.as_str(), l, c);
+                    s.at("textDocument/definition", uri.as_str(), l, c);
+                    off += hop;
+                    if off >= vb.len() {
+                        break;
+                    }
+                }
+                s.forget_notes();
+            }
+            cut += step;
+        }
+    }
+    s.stop();
+}
+
+/// The nearest character boundary of `s` at or before byte `i`.
+fn boundary(s: str, i: usize): usize {
+    let b = s.as_bytes();
+    let mut k = if i > b.len() { b.len() } else { i };
+    while k > 0 && k < b.len() && (b[k] & 192) == 128 {
+        k -= 1;
+    }
+    return k;
+}

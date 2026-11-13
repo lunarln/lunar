@@ -1,0 +1,31 @@
+{
+  "about": "What an editor shows in a small program with an error: hovers on a function with its docs, a local, a declaration (container, signature, docs and nothing else), a struct with its layout, a keyword (its docs, not the `!` type of `return`) and a field; go to definition; the same after the error is fixed. (Its diagnostics are checked in craters/lunar-tests/src/lsp.ln.)",
+  "steps": [
+    { "open": "main.ln" },
+    { "request": "textDocument/hover",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "add(1, 2)", 0, 1] },
+      "expect": ["fn add(a: i32, b: i32): i32", "Adds two numbers."] },
+    { "request": "textDocument/hover",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "total =", 0, 1] },
+      "expect": ["let total: i32"] },
+    { "request": "textDocument/hover",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "add(a", 0, 0] },
+      "expect": ["\"value\":\"```lunar\\nmain\\n```\\n\\n```lunar\\nfn add(a: i32, b: i32): i32\\n```\\n\\n---\\n\\nAdds two numbers.\""] },
+    { "request": "textDocument/hover",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "Stack {", 0, 1] },
+      "expect": ["// size = 24 (0x18), align = 0x8\\nstruct Stack {"] },
+    { "request": "textDocument/hover",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "return a", 0, 2] },
+      "expect": ["\"value\":\"```lunar\\nreturn\\n```\\n\\n---\\n\\nReturns a value from a function."] },
+    { "request": "textDocument/hover",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "items.len", 0, 1] },
+      "expect": ["items: [i32; -..+]"] },
+    { "request": "textDocument/definition",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "add(1, 2)", 0, 1] },
+      "ranges": [["main.ln", "add(a", 0, 0, 3]] },
+    { "change": "main.ln", "replace": ["undefined_name", "n as i32"] },
+    { "request": "textDocument/hover",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "add(1, 2)", 0, 1] },
+      "expect": ["fn add(a: i32, b: i32): i32"] }
+  ]
+}

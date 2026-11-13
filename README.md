@@ -111,24 +111,45 @@ fails with `err(build::link)` and says what to install.
 
 ## Building
 
-Requirements:
+The compiler is written in Lunar ([craters/](craters/README.md)) and is
+built by a released Lunar compiler, the one named in
+[craters/stage0.txt](craters/stage0.txt). Requirements:
 
-* Rust (stable, edition 2024)
-* LLVM 20 (shared library)
+* that release, installed as above (with `--version`), or unpacked anywhere;
+* LLVM 20, whose shared library the compiler links. Point `LUNAR_LIB_PATH`
+  at its directory:
   * Windows: the official installer from
-    [llvm-project releases](https://github.com/llvm/llvm-project/releases).
-    It is found in `C:\Program Files\LLVM` or via `LLVM_SYS_201_PREFIX`, and
-    `LLVM-C.dll` must be on `PATH`.
-  * Linux: `llvm-20-dev` (e.g. from [apt.llvm.org](https://apt.llvm.org)).
-  * macOS: `brew install llvm@20`.
-  * `LLVM_CONFIG` can point at a specific `llvm-config` on Unix.
-* A system linker for the programs Lunar compiles: `clang` or the MSVC build
-  tools on Windows, `cc` on Linux and macOS (override with `LUNAR_CC`).
+    [llvm-project releases](https://github.com/llvm/llvm-project/releases);
+    `LUNAR_LIB_PATH=C:/Program Files/LLVM/lib`, and `LLVM-C.dll` (in
+    `C:\Program Files\LLVM\bin`) on `PATH` to run what you build;
+  * Linux: `llvm-20-dev` (e.g. from [apt.llvm.org](https://apt.llvm.org));
+    `LUNAR_LIB_PATH=$(llvm-config-20 --libdir)`;
+  * macOS: `brew install llvm@20`;
+    `LUNAR_LIB_PATH=$(brew --prefix llvm@20)/lib`;
+* a linker, as above.
 
 ```sh
-cargo build --release
-./target/release/lunar run examples/arrays.ln
+cd craters
+lunar build --release      # craters/target/release/lunar
+target/release/lunar run ../examples/arrays.ln
 ```
+
+The compiler built in `craters/target/` reads the standard library and the
+error explanations of the checkout it is in. `tools/bootstrap.sh STAGE0 DIR`
+does what CI does: stage 1 is `craters/` built by `STAGE0` (with the std of
+its own release), stage 2 is built by stage 1 and stage 3 by stage 2 (with
+the repository's std), and stages 2 and 3 must be identical.
+
+The tests run against a built compiler:
+
+```sh
+cd craters
+lunar test -p lunar                     # the compiler's own tests
+LUNAR_BIN=$PWD/target/release/lunar lunar test -p lunar-tests   # the executable
+```
+
+[CONTRIBUTING.md](CONTRIBUTING.md) has the bootstrap rule (what the
+compiler's own code may use) and how to move stage 0 to a new release.
 
 ## Usage
 
@@ -206,8 +227,7 @@ pass `--release` to see optimized code) to stdout without building anything.
 
 ### Debugging
 
-The self-hosted compiler ([craters](craters/README.md)) generates debug
-information the way cargo does: full in the debug profile, none with
+The compiler generates debug information the way cargo does: full in the debug profile, none with
 `--release`. `--debug-info none|lines|full` overrides that for `build`,
 `run`, `test` and `emit-llvm` (`lines` is functions and line tables only,
 enough for backtraces and stepping).
@@ -247,13 +267,14 @@ The explanations live in [docs/errors](docs/errors), one file per code.
 
 ## Editor support
 
-`lunar lsp` is a language server with diagnostics as you type, hover
-(signatures, doc comments, types of locals, fields and expressions) and go
-to definition, including into the standard library. The VS Code extension in
-[editors/vscode](editors/vscode) adds syntax highlighting and runs it:
+`lunar lsp` is a language server: diagnostics as you type, quick fixes,
+hover, go to definition (also into the standard library), references,
+rename, completion, signature help, semantic tokens, symbols and inlay
+hints. The VS Code extension in [editors/vscode](editors/vscode) adds
+syntax highlighting and runs the `lunar` on your `PATH` (or the one the
+install scripts put in `~/.lunar/bin`):
 
 ```sh
-cargo install --path crates/ln-driver   # puts `lunar` on PATH
 cd editors/vscode && npm install && npx @vscode/vsce package
 code --install-extension lunar-0.1.0.vsix
 ```
@@ -262,23 +283,21 @@ code --install-extension lunar-0.1.0.vsix
 
 | Path | Contents |
 |---|---|
-| `crates/ln-lexer` | Tokens (logos) |
-| `crates/ln-parse-kit` | Minimal parser framework, generic over token kinds |
-| `crates/ln-parser` | Lunar grammar → AST |
-| `crates/ln-ast` | Syntax tree |
-| `crates/ln-diag` | Spans, scoped error codes, ariadne rendering |
-| `crates/ln-sema` | Name resolution, type checking, traits, borrow checking → typed IR |
-| `crates/ln-codegen` | Monomorphization and LLVM code generation (inkwell) |
-| `crates/ln-driver` | The `lunar` CLI, linking, the language server, end-to-end tests |
-| `craters/` | The compiler again, written in Lunar: self-hosted, it builds itself into the same executable, `lunar`, a drop-in replacement for the Rust one that reads std from its sysroot (see [craters/README.md](craters/README.md)) |
-| `editors/vscode` | VS Code extension: syntax highlighting, LSP client |
-| `std/core`, `std/std` | The standard library, written in Lunar (embedded in the compiler) |
-| `docs/errors` | One explanation per diagnostic code, shown by `lunar explain` (embedded in the compiler) |
+| `craters/` | The compiler, written in Lunar and self-hosted: lexer, parser, semantic analysis, LLVM code generation, the `lunar` command, package manager and language server (see [craters/README.md](craters/README.md)) |
+| `craters/lunar-tests` | The tests of the `lunar` executable, run against a built compiler |
+| `craters/stage0.txt` | The release that builds the compiler |
+| `std/core`, `std/std` | The standard library, written in Lunar (installed next to the compiler) |
+| `std/debugger` | Debugger visualizers (natvis, lldb) |
+| `docs/errors` | One explanation per diagnostic code, shown by `lunar explain` |
 | `examples/` | Example programs (with expected output in `.out` files) |
-| `tests/ui`, `tests/run` | Diagnostics tests and run tests |
+| `tests/ui`, `tests/run`, `tests/fatal` | Diagnostics tests, run tests, tests of clean runtime failures |
+| `tests/lsp` | Language server sessions |
+| `tools/` | Bootstrapping and packaging, for CI and releases |
+| `editors/vscode` | VS Code extension: syntax highlighting, LSP client |
+| `install.sh`, `install.ps1` | The install scripts |
 
-Set `LUNAR_STD_DIR=std` to make the compiler read the standard library from
-disk instead of the copy embedded at build time.
+`LUNAR_STD_DIR` makes the compiler read the standard library from another
+directory than its own (`<prefix>/lib/lunar/std`, or the checkout's `std/`).
 
 ## Releases
 

@@ -1,0 +1,36 @@
+trait Named {
+    fn name(&self): str;
+}
+
+#[inline]
+pub fn largest::<T: Dull + Ord, U>(items: [T; &], extra: &mut U): T {
+    return items[0];
+}
+
+#[test] fn adds() {}
+
+/// Two values.
+//// Not documentation.
+struct Pair::<A: Dull, B: Dull + Named> {
+    /// The first.
+    pub a: A,
+    b: [B; -..+],
+}
+
+/// The largest item.
+#[inline]
+/// Assumes there is one.
+fn largest_doc(x: i32): i32 { return x; }
+
+enum Shape {
+    /// A single point.
+    Dot,
+    Line { /// From here.
+        from: i32, to: i32 },
+}
+
+impl::<A: Dull, B: Dull + Named> Pair::<A, B> {
+    pub fn first(&self): A { return self.a; }
+}
+
+fn main() {}

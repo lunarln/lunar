@@ -1,0 +1,532 @@
+// The language end to end, from files in the repository:
+//
+// * tests/ui/*.ln: every `// error: scope::name` line must appear as
+//   `err(scope::name)` in the diagnostics, and every `// warning:
+//   scope::name` line as `warn(scope::name)`. A file with `// error:`
+//   lines must fail to compile; one with only `// warning:` lines must
+//   compile. `// absent: scope::name` must not be reported at all, and
+//   `// once: scope::name` exactly once. A `// command: build` line runs
+//   `lunar build` instead of `lunar check` (for errors only a build
+//   reports, such as a missing `main`).
+// * tests/run/*.ln and examples/*.ln: must compile and run; if a sibling
+//   `.out` file exists, the output must match it exactly. Files with
+//   `#[test]` functions are also run through `lunar test`.
+// * tests/fatal/*.ln: must compile, then fail cleanly with the `// fatal:`
+//   message.
+// * docs/errors: an explanation for every code, whose examples report
+//   exactly that code (or nothing, once fixed).
+
+use std::fs;
+use crater::{Failures, clean, count, files, header, join, lunar, printed, read, replace, root, scratch, strip, write_file, exe_suffix, command, run};
+
+#[test]
+fn ui_tests_report_expected_errors() {
+    let mut f = Failures::new();
+    let dir = scratch("ui");
+    let list = files("tests/ui", ".ln");
+    for file in list.as_str().lines() {
+        let src = read(file);
+        let errors = header(src.as_str(), "// error:");
+        let warnings = header(src.as_str(), "// warning:");
+        if errors.is_empty() && warnings.is_empty() {
+            f.add("{file} declares no `// error:` or `// warning:` lines");
+            continue;
+        }
+        let o = if header(src.as_str(), "// command:").as_str().contains("build") {
+            let mut exe = join(dir.as_str(), "ui");
+            exe.push_str(exe_suffix());
+            lunar(["build", file, "-o", exe.as_str()][..])
+        } else {
+            lunar(["check", file][..])
+        };
+        let stderr = clean(o.stderr.as_str());
+        if !errors.is_empty() && o.status.success() {
+            f.add("{file}: compiled successfully but should fail");
+        }
+        if errors.is_empty() && !o.status.success() {
+            f.add("{file}: should compile with warnings only, but failed:\n{stderr}");
+        }
+        for code in errors.as_str().lines() {
+            if !stderr.as_str().contains(core::fmt::format("err({code})").as_str()) {
+                f.add("{file}: expected err({code}), got:\n{stderr}");
+            }
+        }
+        for code in warnings.as_str().lines() {
+            if !stderr.as_str().contains(core::fmt::format("warn({code})").as_str()) {
+                f.add("{file}: expected warn({code}), got:\n{stderr}");
+            }
+        }
+        let absent = header(src.as_str(), "// absent:");
+        for code in absent.as_str().lines() {
+            if stderr.as_str().contains(core::fmt::format("({code})").as_str()) {
+                f.add("{file}: {code} should not be reported, got:\n{stderr}");
+            }
+        }
+        let once = header(src.as_str(), "// once:");
+        for code in once.as_str().lines() {
+            let n = count(stderr.as_str(), core::fmt::format("({code})").as_str());
+            if n != 1 {
+                f.add("{file}: {code} should be reported exactly once, got {n}:\n{stderr}");
+            }
+        }
+    }
+    f.check();
+}
+
+/// Of equally close names, the suggestion is the first in alphabetical
+/// order (`print` and `println` are both one edit from `printn`), whatever
+/// order the scope's hash map is in this time.
+#[test]
+fn similar_name_suggestion_is_deterministic() {
+    for _ in 0..8 {
+        let o = lunar(["check", "tests/ui/unresolved.ln"][..]);
+        let stderr = clean(o.stderr.as_str());
+        if !stderr.as_str().contains("a similar name exists: `print`") {
+            panic("no suggestion of `print`:\n{stderr}");
+        }
+    }
+}
+
+/// Build and run every program in `dir`, and `lunar test` those with
+/// tests.
+fn run_dir(dir: str) {
+    let mut f = Failures::new();
+    let list = files(dir, ".ln");
+    for file in list.as_str().lines() {
+        let src = read(file);
+        if src.as_str().contains("fn main()") {
+            let o = lunar(["run", file][..]);
+            let stdout = clean(o.stdout.as_str());
+            if !o.status.success() {
+                f.add("{file}: exited with {o.status}\nstdout:\n{stdout}\nstderr:\n{clean(o.stderr.as_str())}");
+                continue;
+            }
+            let mut expect = String::from(file[..file.len() - 3]);
+            expect.push_str(".out");
+            let r = root();
+            if fs::is_file(join(r.as_str(), expect.as_str()).as_str()) {
+                let expected = read(expect.as_str());
+                if stdout.as_str() != expected.as_str() {
+                    f.add("{file}: output mismatch\n--- expected\n{expected}\n--- got\n{stdout}");
+                }
+            }
+        }
+        if src.as_str().contains("#[test]") {
+            let o = lunar(["test", file][..]);
+            if !o.status.success() {
+                f.add("{file}: `lunar test` failed\n{printed(&o)}");
+            }
+        }
+    }
+    f.check();
+}
+
+#[test]
+fn run_tests_produce_expected_output() {
+    run_dir("tests/run");
+}
+
+#[test]
+fn examples_run() {
+    run_dir("examples");
+}
+
+#[test]
+fn emit_llvm_prints_ir() {
+    for release in [false, true] {
+        let o = if release { lunar(["emit-llvm", "examples/hello.ln", "--release"][..]) } else { lunar(["emit-llvm", "examples/hello.ln"][..]) };
+        if !o.status.success() {
+            panic("emit-llvm failed:\n{o.stderr}");
+        }
+        if !o.stdout.as_str().contains("define") || !o.stdout.as_str().contains("@main") {
+            panic("unexpected IR (release = {release}):\n{o.stdout}");
+        }
+    }
+}
+
+/// tests/fatal/*.ln: must compile, then exit with a failure status (not a
+/// crash) printing the `// fatal:` message, in debug and release builds.
+#[test]
+fn fatal_tests_fail_cleanly() {
+    let mut f = Failures::new();
+    let list = files("tests/fatal", ".ln");
+    for file in list.as_str().lines() {
+        let src = read(file);
+        let expected = header(src.as_str(), "// fatal:");
+        let expected = expected.as_str().trim();
+        if expected.is_empty() {
+            f.add("{file}: missing `// fatal:` line");
+            continue;
+        }
+        for release in [false, true] {
+            let o = if release { lunar(["run", file, "--release"][..]) } else { lunar(["run", file][..]) };
+            let stderr = clean(o.stderr.as_str());
+            if o.status.code() != Some(134) || !stderr.as_str().contains(expected) {
+                f.add("{file} (release = {release}): expected exit 134 and `{expected}`, got {o.status}:\n{stderr}");
+            }
+        }
+    }
+    f.check();
+}
+
+/// The codes the compiler knows, one per line, from `lunar explain --list`.
+fn all_codes(): String {
+    let o = lunar(["explain", "--list"][..]);
+    if !o.status.success() {
+        panic("`lunar explain --list` failed:\n{o.stderr}");
+    }
+    let mut out = String::new();
+    for line in o.stdout.as_str().lines() {
+        let code = match line.find(" ") {
+            Some(i) => line[..i],
+            None => line,
+        };
+        if code.len() > 0 {
+            out.push_str(code);
+            out.push('\n');
+        }
+    }
+    return out;
+}
+
+/// Every code has a `docs/errors/<scope>/<name>.md` starting with `#
+/// scope::name: title`, and every such file names a code.
+#[test]
+fn every_code_has_an_explanation() {
+    let mut f = Failures::new();
+    let codes = all_codes();
+    if count(codes.as_str(), "\n") < 50 {
+        f.add("`lunar explain --list` lists only:\n{codes}");
+    }
+    let r = root();
+    for code in codes.as_str().lines() {
+        let path = explanation_path(code);
+        let full = join(r.as_str(), path.as_str());
+        match fs::read_to_string(full.as_str()) {
+            Ok(md) => {
+                let text = md.as_str();
+                let first = match text.find("\n") {
+                    Some(i) => text[..i],
+                    None => text,
+                };
+                let want = core::fmt::format("# {code}: ");
+                let ok = match strip(first, want.as_str()) {
+                    Some(title) => !title.trim().is_empty(),
+                    None => false,
+                };
+                if !ok {
+                    f.add("{path}: the first line must be `# {code}: <title>`, not `{first}`");
+                }
+                if md.as_str().contains("\r") {
+                    f.add("{path}: must use LF line endings");
+                }
+            }
+            Err(_) => f.add("{code}: missing {path}"),
+        }
+    }
+    let docs = join(r.as_str(), "docs/errors");
+    let scopes = fs::read_dir(docs.as_str()).unwrap();
+    for i in 0..scopes.len() {
+        let scope = scopes.name(i);
+        let names = fs::read_dir(join(docs.as_str(), scope).as_str()).unwrap();
+        for k in 0..names.len() {
+            let n = names.name(k);
+            let stem = if n.ends_with(".md") { n[..n.len() - 3] } else { n };
+            let code = core::fmt::format("{scope}::{stem}");
+            if !has_line(codes.as_str(), code.as_str()) {
+                f.add("docs/errors/{scope}/{n}: `{scope}::{stem}` is not a code the compiler knows");
+            }
+        }
+    }
+    f.check();
+}
+
+fn explanation_path(code: str): String {
+    let i = match code.find("::") {
+        Some(i) => i,
+        None => panic("`{code}` is not `scope::name`"),
+    };
+    return core::fmt::format("docs/errors/{code[..i]}/{code[i + 2..]}.md");
+}
+
+/// The first code block under `heading` in an explanation: its info
+/// string, then its source, separated by a NUL. Empty if there is none.
+fn example(md: str, heading: str): String {
+    let marker = core::fmt::format("\n{heading}\n");
+    let start = match md.find(marker.as_str()) {
+        Some(i) => i + marker.len(),
+        None => return String::new(),
+    };
+    let mut section = md[start..];
+    if let Some(end) = section.find("\n## ") {
+        section = section[..end];
+    }
+    let mut info: Option::<str> = None;
+    let mut src = String::new();
+    for line in section.lines() {
+        match info {
+            None => {
+                if line.starts_with("```") {
+                    info = Some(line.trim());
+                }
+            }
+            Some(_) => {
+                if line.starts_with("```") {
+                    break;
+                }
+                src.push_str(line);
+                src.push('\n');
+            }
+        }
+    }
+    return match info {
+        Some(i) => {
+            let mut out = String::from(i[3..]);
+            out.push('\0');
+            out.push_str(src.as_str());
+            out
+        }
+        None => String::new(),
+    };
+}
+
+/// The `err(...)` and `warn(...)` codes in compiler output, each once, one
+/// per line.
+fn reported_codes(stderr: str): String {
+    let mut codes = String::new();
+    for open in ["err(", "warn("] {
+        let mut rest = stderr;
+        loop {
+            let i = match rest.find(open) {
+                Some(i) => i,
+                None => break,
+            };
+            rest = rest[i + open.len()..];
+            let close = match rest.find(")") {
+                Some(c) => c,
+                None => break,
+            };
+            let code = rest[..close];
+            if is_code(code) && !has_line(codes.as_str(), code) {
+                codes.push_str(code);
+                codes.push('\n');
+            }
+        }
+    }
+    return codes;
+}
+
+fn has_line(text: str, line: str): bool {
+    for l in text.lines() {
+        if l == line {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn is_code(s: str): bool {
+    let i = match s.find("::") {
+        Some(i) => i,
+        None => return false,
+    };
+    return is_part(s[..i]) && is_part(s[i + 2..]);
+}
+
+fn is_part(p: str): bool {
+    if p.is_empty() {
+        return false;
+    }
+    for b in p.as_bytes() {
+        if !((b >= b'a' && b <= b'z') || b == b'_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// For every explanation, the erroneous example reports exactly its code
+/// and the fixed example checks without any diagnostics. Examples marked
+/// ```lunar,ignore are skipped, and so are `toml` and `text` examples (for
+/// manifest diagnostics, which the project tests cover).
+#[test]
+fn explanation_examples_check() {
+    let mut f = Failures::new();
+    let dir = scratch("explain");
+    let codes = all_codes();
+    let r = root();
+    for code in codes.as_str().lines() {
+        let path = explanation_path(code);
+        let md = match fs::read_to_string(join(r.as_str(), path.as_str()).as_str()) {
+            Ok(m) => clean(m.as_str()),
+            // Reported by `every_code_has_an_explanation`.
+            Err(_) => continue,
+        };
+        for bad in [true, false] {
+            let heading = if bad { "## Erroneous example" } else { "## Fixed" };
+            let ex = example(md.as_str(), heading);
+            let sep = match ex.as_str().find("\0") {
+                Some(i) => i,
+                None => continue,
+            };
+            let info = ex.as_str()[..sep];
+            let src = ex.as_str()[sep + 1..];
+            if info == "lunar,ignore" || info == "toml" || info == "text" {
+                continue;
+            }
+            if info != "lunar" {
+                f.add("{code}: `{heading}` block must be ```lunar, ```lunar,ignore, ```toml or ```text, not ```{info}");
+                continue;
+            }
+            let file = core::fmt::format("{dir}/{replace(code, "::", "_")}_{if bad { "bad" } else { "fixed" }}.ln");
+            write_file(file.as_str(), src);
+            let o = lunar(["check", file.as_str()][..]);
+            let stderr = clean(o.stderr.as_str());
+            let reported = reported_codes(stderr.as_str());
+            let mut only = String::from(code);
+            only.push('\n');
+            if bad && reported.as_str() != only.as_str() {
+                f.add("{code}: the erroneous example should report exactly {code}, reported [{reported}]:\n{stderr}");
+            }
+            if !bad && (!o.status.success() || !reported.is_empty()) {
+                f.add("{code}: the fixed example should check cleanly, reported [{reported}]:\n{stderr}");
+            }
+        }
+    }
+    f.check();
+}
+
+#[test]
+fn explain_prints_explanations() {
+    let expected = read("docs/errors/borrow/shrink_while_borrowed.md");
+    for arg in ["borrow::shrink_while_borrowed", "err(borrow::shrink_while_borrowed)"] {
+        let o = lunar(["explain", arg][..]);
+        if !o.status.success() {
+            panic("`lunar explain {arg}` failed:\n{o.stderr}");
+        }
+        let got = clean(o.stdout.as_str());
+        if got.as_str() != expected.as_str() {
+            panic("`lunar explain {arg}` printed:\n{got}");
+        }
+    }
+
+    let o = lunar(["explain", "borrow::shrink_while_borowed"][..]);
+    if o.status.code() != Some(1) {
+        panic("an unknown code should exit 1, not {o.status}");
+    }
+    if !o.stderr.as_str().contains("did you mean `borrow::shrink_while_borrowed`?") {
+        panic("no suggestion:\n{o.stderr}");
+    }
+
+    let codes = all_codes();
+    let n = count(codes.as_str(), "\n");
+    for list in [false, true] {
+        let o = if list { lunar(["explain", "--list"][..]) } else { lunar(["explain"][..]) };
+        if !o.status.success() {
+            panic("`lunar explain` (--list: {list}) failed");
+        }
+        let lines = count(o.stdout.as_str(), "\n");
+        if lines != n {
+            panic("`lunar explain` (--list: {list}) should list every code ({n}), listed {lines}:\n{o.stdout}");
+        }
+        if !o.stdout.as_str().starts_with("lint::unused_mut ") && !o.stdout.as_str().contains("\nlint::unused_mut ") {
+            panic("`lunar explain` (--list: {list}) does not list lint::unused_mut:\n{o.stdout}");
+        }
+    }
+}
+
+#[test]
+fn failed_check_suggests_explain() {
+    let o = lunar(["check", "tests/ui/shrink_while_borrowed.ln"][..]);
+    let stderr = clean(o.stderr.as_str());
+    if !stderr.as_str().trim().ends_with("For more information about this error, try `lunar explain borrow::shrink_while_borrowed`.") {
+        panic("missing hint:\n{stderr}");
+    }
+}
+
+/// Failures after the front end are diagnostics with `build::` codes,
+/// rendered without a source snippet.
+#[test]
+fn build_failures_are_diagnostics() {
+    let dir = scratch("build-failures");
+    let mut exe = join(dir.as_str(), "hello");
+    exe.push_str(exe_suffix());
+    let r = root();
+
+    let mut c = command(r.as_str(), "");
+    c.env("LUNAR_CC", "lunar-test-no-such-linker");
+    c.args(["build", "examples/hello.ln", "-o", exe.as_str()][..]);
+    check_build_failure(&run(&c), "build::link", "lunar-test-no-such-linker");
+
+    // Writing the IR into a directory fails in code generation.
+    let o = lunar(["build", "examples/hello.ln", "-o", exe.as_str(), "--emit-llvm", dir.as_str()][..]);
+    check_build_failure(&o, "build::llvm", "could not write LLVM IR");
+
+    let o = lunar(["emit-llvm", "tests/ui/no_main.ln"][..]);
+    check_build_failure(&o, "build::no_main", "has no `main` function");
+}
+
+fn check_build_failure(o: &std::process::Output, code: str, extra: str) {
+    let stderr = clean(o.stderr.as_str());
+    let s = stderr.as_str();
+    if o.status.success() {
+        panic("{code}: should fail");
+    }
+    if !s.starts_with(core::fmt::format("err({code}): ").as_str()) {
+        panic("{code}: unexpected output:\n{s}");
+    }
+    if !s.contains(extra) {
+        panic("{code}: missing `{extra}`:\n{s}");
+    }
+    if s.contains("│") {
+        panic("{code}: should render without a source snippet:\n{s}");
+    }
+    if !s.contains(core::fmt::format("try `lunar explain {code}`").as_str()) {
+        panic("{code}: missing hint:\n{s}");
+    }
+}
+
+/// A standard library without a lang item the program needs reports
+/// `build::missing_lang_item`.
+#[test]
+fn missing_lang_item_is_reported() {
+    let dir = scratch("std-without-range");
+    let r = root();
+    let std_copy = join(dir.as_str(), "std");
+    crater::copy_dir(join(r.as_str(), "std").as_str(), std_copy.as_str());
+    let ops = join(std_copy.as_str(), "core/ops.ln");
+    let src = fs::read_to_string(ops.as_str()).unwrap();
+    if !src.as_str().contains("#[lang = \"range\"]") {
+        panic("core::ops no longer defines the `range` lang item");
+    }
+    write_file(ops.as_str(), replace(src.as_str(), "#[lang = \"range\"]", "").as_str());
+    let file = join(dir.as_str(), "uses_range.ln");
+    write_file(file.as_str(), "fn main() {\n    let r = 0..3;\n    println(\"{r.start}\");\n}\n");
+    let mut c = command(dir.as_str(), "");
+    c.env("LUNAR_STD_DIR", std_copy.as_str());
+    c.args(["check", file.as_str()][..]);
+    let o = run(&c);
+    let stderr = clean(o.stderr.as_str());
+    let reported = reported_codes(stderr.as_str());
+    if reported.as_str() != "build::missing_lang_item\n" {
+        panic("expected only build::missing_lang_item:\n{stderr}");
+    }
+}
+
+/// `lunar --version` prints the version in craters/lunar/lunar.toml.
+#[test]
+fn version_comes_from_the_manifest() {
+    let manifest = read("craters/lunar/lunar.toml");
+    let mut version = "";
+    for line in manifest.as_str().lines() {
+        if let Some(v) = strip(line.trim(), "version = \"") {
+            version = v[..v.len() - 1];
+            break;
+        }
+    }
+    let o = lunar(["--version"][..]);
+    let want = core::fmt::format("lunar {version}\n");
+    if clean(o.stdout.as_str()).as_str() != want.as_str() {
+        panic("`lunar --version` printed `{o.stdout}`, expected `{want}`");
+    }
+}

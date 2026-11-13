@@ -466,15 +466,38 @@ pub fn process_id(): u32 {
     return unsafe { getpid() } as u32;
 }
 
-/// Run `args[0]` (searched for on `PATH`) with the arguments `args[1..]`
-/// and wait for it. Its standard output and error go to the files
-/// `out_path` and `err_path`, created for it, or, where empty, where this
-/// process's go. The result is the exit code (`0..=255`), `2^32 + the
-/// signal` if a signal ended it, or, if it could not be started,
-/// `-1 - errno`.
-pub fn spawn(args: [str; &], out_path: str, err_path: str): i64 {
-    // Every argument, NUL-terminated, end to end in one buffer (which
-    // never moves), then pointers to each.
+extern "C" {
+    fn chdir(path: *u8): i32;
+    fn setenv(name: *u8, value: *u8, overwrite: i32): i32;
+    fn unsetenv(name: *u8): i32;
+}
+
+/// A child's standard stream: this process's (`STDIO_INHERIT`), a file
+/// (`STDIO_FILE`: read for input, created or truncated for output), a pipe
+/// to this process (`STDIO_PIPE`) or nothing (`STDIO_NULL`).
+pub const STDIO_INHERIT: i32 = 0;
+pub const STDIO_FILE: i32 = 1;
+pub const STDIO_PIPE: i32 = 2;
+pub const STDIO_NULL: i32 = 3;
+
+/// A started process (its id) and this process's ends of the pipes to its
+/// standard input, output and error (-1 where there is none).
+pub struct Started {
+    pub process: isize,
+    pub stdin: isize,
+    pub stdout: isize,
+    pub stderr: isize,
+}
+
+/// Start `args[0]` (searched for on `PATH`) with the arguments
+/// `args[1..]`, in the directory `dir` (unless empty), with the changes
+/// `env` to this process's environment (`NAME=value` sets a variable,
+/// `NAME` removes it). `modes[k]` and `paths[k]` say where its standard
+/// input (k = 0), output (1) and error (2) go. The error is an `errno`,
+/// also for a program that could not be run.
+pub fn start(args: [str; &], dir: str, env: [str; &], modes: [i32; &], paths: [str; &]): Result::<Started, i32> {
+    // Every C string end to end in one buffer (which never moves): the
+    // arguments, the directory and the variables' names and values.
     let mut text = String::new();
     let mut starts: [usize; ..+] = [];
     for a in args {
@@ -482,34 +505,81 @@ pub fn spawn(args: [str; &], out_path: str, err_path: str): i64 {
         text.push_str(a);
         text.push('\0');
     }
+    let dir_at = text.len();
+    text.push_str(dir);
+    text.push('\0');
+    // (name, value) offsets; a value of 0 removes the variable.
+    let mut vars: [(usize, usize); ..+] = [];
+    for e in env {
+        let name_at = text.len();
+        match e.find("=") {
+            Some(i) => {
+                text.push_str(e[..i]);
+                text.push('\0');
+                let value_at = text.len();
+                text.push_str(e[i + 1..]);
+                text.push('\0');
+                vars.push((name_at, value_at));
+            }
+            None => {
+                text.push_str(e);
+                text.push('\0');
+                vars.push((name_at, 0));
+            }
+        }
+    }
     let base = text.as_bytes().as_ptr();
     let mut argv: [*u8; ..+] = [];
     for s in starts {
         argv.push(core::ptr::offset(base, s as isize));
     }
     argv.push(core::ptr::null());
-    let mut fds: [i32; 3] = [-1, -1, -1];
-    for k in 1..3 {
-        let path = if k == 1 { out_path } else { err_path };
-        if path.len() > 0 {
-            let fd = open_file(path, true);
+    // The child's ends of its streams, and ours.
+    let mut child: [i32; 3] = [-1, -1, -1];
+    let mut mine: [i32; 3] = [-1, -1, -1];
+    for k in 0..3 {
+        let m = modes[k];
+        if m == STDIO_FILE || m == STDIO_NULL {
+            let fd = open_file(if m == STDIO_NULL { "/dev/null" } else { paths[k] }, k > 0);
             if fd < 0 {
                 let e = last_error();
-                close_fds(fds[..]);
-                return -1 - (e as i64);
+                close_fds(child[..]);
+                close_fds(mine[..]);
+                return Err(e);
             }
-            fds[k] = fd as i32;
+            child[k] = fd as i32;
+        } else if m == STDIO_PIPE {
+            let mut p: [i32; 2] = [-1, -1];
+            if unsafe { pipe((intrinsics::addr_of_mut(&mut p) as usize) as *mut i32) } != 0 {
+                let e = last_error();
+                close_fds(child[..]);
+                close_fds(mine[..]);
+                return Err(e);
+            }
+            // F_SETFD = 2, FD_CLOEXEC = 1: `dup2` gives the child copies
+            // without it.
+            unsafe {
+                fcntl(p[0], 2, 1);
+                fcntl(p[1], 2, 1);
+            }
+            if k == 0 {
+                child[0] = p[0];
+                mine[0] = p[1];
+            } else {
+                child[k] = p[1];
+                mine[k] = p[0];
+            }
         }
     }
     // A pipe closed by a successful exec: the child writes `errno` to it
-    // when exec fails.
+    // when changing directory or exec fails.
     let mut p: [i32; 2] = [-1, -1];
     if unsafe { pipe((intrinsics::addr_of_mut(&mut p) as usize) as *mut i32) } != 0 {
         let e = last_error();
-        close_fds(fds[..]);
-        return -1 - (e as i64);
+        close_fds(child[..]);
+        close_fds(mine[..]);
+        return Err(e);
     }
-    // F_SETFD = 2, FD_CLOEXEC = 1
     unsafe {
         fcntl(p[0], 2, 1);
         fcntl(p[1], 2, 1);
@@ -517,19 +587,30 @@ pub fn spawn(args: [str; &], out_path: str, err_path: str): i64 {
     let pid = unsafe { fork() };
     if pid < 0 {
         let e = last_error();
-        close_fds(fds[..]);
+        close_fds(child[..]);
+        close_fds(mine[..]);
         close_fds(p[..]);
-        return -1 - (e as i64);
+        return Err(e);
     }
     if pid == 0 {
         unsafe {
-            if fds[1] >= 0 {
-                dup2(fds[1], 1);
+            for k in 0..3 {
+                if child[k] >= 0 {
+                    dup2(child[k], k as i32);
+                }
             }
-            if fds[2] >= 0 {
-                dup2(fds[2], 2);
+            let ok = dir.len() == 0 || chdir(core::ptr::offset(base, dir_at as isize)) == 0;
+            for v in vars {
+                let (name, value) = v;
+                if value == 0 {
+                    unsetenv(core::ptr::offset(base, name as isize));
+                } else {
+                    setenv(core::ptr::offset(base, name as isize), core::ptr::offset(base, value as isize), 1);
+                }
             }
-            execvp(intrinsics::ptr_read(argv[..].as_ptr()), argv[..].as_ptr());
+            if ok {
+                execvp(intrinsics::ptr_read(argv[..].as_ptr()), argv[..].as_ptr());
+            }
             let mut e = last_error();
             c_write(p[1], (intrinsics::addr_of_mut(&mut e) as usize) as *u8, 4);
             _exit(127);
@@ -538,25 +619,55 @@ pub fn spawn(args: [str; &], out_path: str, err_path: str): i64 {
     unsafe {
         close(p[1]);
     }
-    close_fds(fds[..]);
+    close_fds(child[..]);
     let mut e: i32 = 0;
     let n = unsafe { c_read(p[0], (intrinsics::addr_of_mut(&mut e) as usize) as *mut u8, 4) };
     unsafe {
         close(p[0]);
     }
-    let mut status: i32 = 0;
-    let waited = unsafe { waitpid(pid, intrinsics::addr_of_mut(&mut status), 0) };
     if n == 4 {
-        return -1 - (e as i64);
+        let mut status: i32 = 0;
+        unsafe {
+            waitpid(pid, intrinsics::addr_of_mut(&mut status), 0);
+        }
+        close_fds(mine[..]);
+        return Err(e);
     }
-    if waited < 0 {
-        return -1 - (last_error() as i64);
+    return Ok(Started { process: pid as isize, stdin: mine[0] as isize, stdout: mine[1] as isize, stderr: mine[2] as isize });
+}
+
+/// Wait for a started process: its exit code (`0..=255`), `2^32 + the
+/// signal` if a signal ended it, or `-1 - errno`.
+pub fn wait(process: isize): i64 {
+    let mut status: i32 = 0;
+    loop {
+        if unsafe { waitpid(process as i32, intrinsics::addr_of_mut(&mut status), 0) } >= 0 {
+            break;
+        }
+        if last_error() != EINTR {
+            return -1 - (last_error() as i64);
+        }
     }
     // Exited normally: WIFEXITED / WEXITSTATUS; else WTERMSIG.
     if (status & 127) == 0 {
         return ((status >> 8) & 255) as i64;
     }
     return 4294967296 + ((status & 127) as i64);
+}
+
+/// Run `args[0]` (searched for on `PATH`) with the arguments `args[1..]`
+/// and wait for it. Its standard output and error go to the files
+/// `out_path` and `err_path`, created for it, or, where empty, where this
+/// process's go. The result is as `wait`'s, or, if it could not be
+/// started, `-1 - errno`.
+pub fn spawn(args: [str; &], out_path: str, err_path: str): i64 {
+    let modes = [STDIO_INHERIT, if out_path.len() > 0 { STDIO_FILE } else { STDIO_INHERIT }, if err_path.len() > 0 { STDIO_FILE } else { STDIO_INHERIT }];
+    let paths = ["", out_path, err_path];
+    let none: [str; 0] = [];
+    return match start(args, "", none[..], modes[..], paths[..]) {
+        Ok(s) => wait(s.process),
+        Err(e) => -1 - (e as i64),
+    };
 }
 
 /// The address of `b`'s first byte, for C to write to.

@@ -1,9 +1,0 @@
-[package]
-name = "ln-lexer"
-description = "Lexer for the Lunar programming language"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-logos.workspace = true

@@ -22,10 +22,11 @@ Language support for [Lunar](https://github.com/lunarln/lunar):
 * An outline of each file, workspace symbol search, and inlay hints (the
   types of `let`s, parameter names at calls).
 
-The language features come from `lunar lsp`, so the `lunar` executable must
-be on your `PATH` (or set `lunar.server.path`). Use the compiler built from
-`craters/` (see `craters/README.md`): the Rust compiler in `crates/` serves
-only diagnostics, hover and go to definition.
+The language features come from `lunar lsp`. Install Lunar with its
+install script (see [Installing](https://github.com/lunarln/lunar#installing));
+the extension runs the `lunar` on your `PATH`, else the one in `~/.lunar/bin`
+(or `$LUNAR_PREFIX/bin`). To use another one, such as a compiler you built,
+set `lunar.server.path`.
 
 ## Building the extension
 

@@ -53,8 +53,8 @@
       "properties": {
         "lunar.server.path": {
           "type": "string",
-          "default": "lunar",
-          "description": "Path to the `lunar` executable used to run the language server (`lunar lsp`)."
+          "default": "",
+          "description": "Path to the `lunar` executable used to run the language server (`lunar lsp`). Empty: `lunar` on PATH, else the one installed in `~/.lunar/bin` (or `$LUNAR_PREFIX/bin`)."
         },
         "lunar.trace.server": {
           "type": "string",

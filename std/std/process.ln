@@ -142,6 +142,261 @@ pub fn output(program: str, args: [str; &]): Result::<Output, crater::io::Error>
     return Ok(Output { status: ExitStatus { raw: r }, stdout, stderr });
 }
 
+/// A unique path in the temporary directory, ending in `ext`.
+fn temp_path(ext: str): String {
+    let n = unsafe { OUTPUTS };
+    unsafe {
+        OUTPUTS = n + 1;
+    }
+    let mut dir = String::new();
+    sys::temp_dir(&mut dir);
+    let mut p = String::new();
+    p.write("{dir}/lunar-{id()}-{n}.{ext}");
+    return p;
+}
+
+/// A program to run, with its arguments, working directory, environment
+/// and standard input:
+///
+/// ```
+/// let mut c = Command::new("git");
+/// c.args(["status", "--short"][..]);
+/// c.current_dir("/src/project");
+/// c.env("GIT_PAGER", "cat");
+/// let o = c.output()?;
+/// ```
+///
+/// `output` runs it to the end, collecting what it prints; `status` runs
+/// it with this process's output; `spawn` starts it with pipes to its
+/// standard input and output, to talk to it. A command can be run more
+/// than once.
+pub struct Command {
+    /// The program, the arguments, the directory, the environment changes
+    /// and the input, end to end.
+    text: String,
+    /// The program and its arguments: ranges of `text`.
+    argv: [(usize, usize); ..+],
+    /// The working directory (empty: this process's).
+    dir: (usize, usize),
+    /// Environment changes, `NAME=value` or (removing it) `NAME`.
+    vars: [(usize, usize); ..+],
+    /// Standard input for `output` and `status`, if given.
+    input: Option::<(usize, usize)>,
+}
+
+impl Command {
+    /// Run `program`, searched for on `PATH` (unless it is a path).
+    pub fn new(program: str): Command {
+        let mut c = Command { text: String::new(), argv: [], dir: (0, 0), vars: [], input: None };
+        let r = c.add(program);
+        c.argv.push(r);
+        return c;
+    }
+
+    fn add(&mut +self, s: str): (usize, usize) {
+        let start = self.text.len();
+        self.text.push_str(s);
+        return (start, self.text.len());
+    }
+
+    fn get(&self, r: (usize, usize)): str {
+        let (s, e) = r;
+        return self.text.as_str()[s..e];
+    }
+
+    /// Add an argument.
+    pub fn arg(&mut +self, a: str) {
+        let r = self.add(a);
+        self.argv.push(r);
+    }
+
+    /// Add arguments.
+    pub fn args(&mut +self, args: [str; &]) {
+        for a in args {
+            self.arg(a);
+        }
+    }
+
+    /// Run it in the directory `dir`.
+    pub fn current_dir(&mut self, dir: str) {
+        self.dir = self.add(dir);
+    }
+
+    /// Set the environment variable `name` to `value` for it.
+    pub fn env(&mut +self, name: str, value: str) {
+        let start = self.text.len();
+        self.text.push_str(name);
+        self.text.push('=');
+        self.text.push_str(value);
+        self.vars.push((start, self.text.len()));
+    }
+
+    /// Remove the environment variable `name` for it.
+    pub fn env_remove(&mut +self, name: str) {
+        let r = self.add(name);
+        self.vars.push(r);
+    }
+
+    /// Give `output` and `status` this text as its standard input
+    /// (otherwise `output` gives it none and `status` this process's).
+    pub fn stdin(&mut self, text: str) {
+        self.input = Some(self.add(text));
+    }
+
+    /// Start it with the standard streams `modes` (`sys::STDIO_*`), the
+    /// files in `paths` for `STDIO_FILE`.
+    fn start(&self, modes: [i32; &], paths: [str; &]): Result::<sys::Started, crater::io::Error> {
+        let mut argv: [str; ..+] = [];
+        for r in self.argv {
+            argv.push(self.get(r));
+        }
+        let mut vars: [str; ..+] = [];
+        for r in self.vars {
+            vars.push(self.get(r));
+        }
+        return match sys::start(argv[..], self.get(self.dir), vars[..], modes, paths) {
+            Ok(s) => Ok(s),
+            Err(e) => Err(crater::io::Error::from_os(e)),
+        };
+    }
+
+    /// The file with the standard input, if one was given (else empty).
+    fn input_file(&self): Result::<String, crater::io::Error> {
+        let r = match self.input {
+            Some(r) => r,
+            None => return Ok(String::new()),
+        };
+        let path = temp_path("in");
+        crater::fs::write(path.as_str(), self.get(r).as_bytes())?;
+        return Ok(path);
+    }
+
+    /// Run it to the end, collecting its standard output and error as text
+    /// (bytes that are not UTF-8 become U+FFFD). An error if it could not
+    /// be started.
+    pub fn output(&self): Result::<Output, crater::io::Error> {
+        // Through temporary files, which, unlike pipes, cannot fill up
+        // while another one is being read.
+        let input = self.input_file()?;
+        let out_path = temp_path("out");
+        let err_path = temp_path("err");
+        let in_path = input.as_str();
+        let in_mode = if in_path.len() > 0 { sys::STDIO_FILE } else { sys::STDIO_NULL };
+        let modes = [in_mode, sys::STDIO_FILE, sys::STDIO_FILE];
+        let paths = [in_path, out_path.as_str(), err_path.as_str()];
+        let started = self.start(modes[..], paths[..]);
+        let r = match started {
+            Ok(s) => sys::wait(s.process),
+            Err(_) => 0,
+        };
+        let stdout = read_lossy(out_path.as_str());
+        let stderr = read_lossy(err_path.as_str());
+        sys::remove_file(out_path.as_str());
+        sys::remove_file(err_path.as_str());
+        if in_path.len() > 0 {
+            sys::remove_file(in_path);
+        }
+        if let Err(e) = started {
+            return Err(e);
+        }
+        if r < 0 {
+            return Err(crater::io::Error::from_os((-1 - r) as i32));
+        }
+        return Ok(Output { status: ExitStatus { raw: r }, stdout, stderr });
+    }
+
+    /// Run it to the end with this process's standard output and error.
+    pub fn status(&self): Result::<ExitStatus, crater::io::Error> {
+        let input = self.input_file()?;
+        let in_path = input.as_str();
+        let modes = [if in_path.len() > 0 { sys::STDIO_FILE } else { sys::STDIO_INHERIT }, sys::STDIO_INHERIT, sys::STDIO_INHERIT];
+        let paths = [in_path, "", ""];
+        let started = self.start(modes[..], paths[..]);
+        if in_path.len() > 0 {
+            // Its input is open (or it did not start): the file can go.
+            let r = match started {
+                Ok(s) => sys::wait(s.process),
+                Err(e) => return Err(e),
+            };
+            sys::remove_file(in_path);
+            return exit_status(r);
+        }
+        return match started {
+            Ok(s) => exit_status(sys::wait(s.process)),
+            Err(e) => Err(e),
+        };
+    }
+
+    /// Start it with pipes to its standard input and output (its standard
+    /// error is this process's), to write to and read from while it runs.
+    pub fn spawn(&self): Result::<Child, crater::io::Error> {
+        let modes = [sys::STDIO_PIPE, sys::STDIO_PIPE, sys::STDIO_INHERIT];
+        let paths = ["", "", ""];
+        let s = self.start(modes[..], paths[..])?;
+        return Ok(Child { process: s.process, stdin: s.stdin, stdout: s.stdout, waited: false });
+    }
+}
+
+fn exit_status(r: i64): Result::<ExitStatus, crater::io::Error> {
+    if r < 0 {
+        return Err(crater::io::Error::from_os((-1 - r) as i32));
+    }
+    return Ok(ExitStatus { raw: r });
+}
+
+/// A running process started by `Command::spawn`, with pipes to its
+/// standard input and output. `wait` for it when done.
+pub struct Child {
+    process: isize,
+    stdin: isize,
+    stdout: isize,
+    waited: bool,
+}
+
+impl Child {
+    /// Write `bytes` to its standard input; false if it does not take
+    /// them (it closed its input or exited).
+    pub fn write(&mut self, bytes: [u8; &]): bool {
+        if self.stdin == -1 {
+            return false;
+        }
+        return sys::write_file(self.stdin, bytes);
+    }
+
+    /// Read what it wrote to its standard output into `buf`, waiting for
+    /// some if there is none yet: the number of bytes, 0 at the end.
+    pub fn read(&mut self, buf: [u8; &mut]): usize {
+        if self.stdout == -1 {
+            return 0;
+        }
+        let n = sys::read_file(self.stdout, buf);
+        // A pipe whose writer is gone fails on Windows: the end too.
+        return if n < 0 { 0 } else { n as usize };
+    }
+
+    /// Close its standard input: it reads to the end.
+    pub fn close_stdin(&mut self) {
+        if self.stdin != -1 {
+            sys::close_file(self.stdin);
+            self.stdin = -1;
+        }
+    }
+
+    /// Close the pipes and wait for it to exit.
+    pub fn wait(&mut self): Result::<ExitStatus, crater::io::Error> {
+        self.close_stdin();
+        if self.stdout != -1 {
+            sys::close_file(self.stdout);
+            self.stdout = -1;
+        }
+        if self.waited {
+            return Err(crater::io::Error::new(crater::io::ErrorKind::Other));
+        }
+        self.waited = true;
+        return exit_status(sys::wait(self.process));
+    }
+}
+
 /// The file at `path` as text, with U+FFFD for bytes that are not UTF-8
 /// (empty if it cannot be read).
 fn read_lossy(path: str): String {
