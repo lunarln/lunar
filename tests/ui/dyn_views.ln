@@ -2,9 +2,11 @@
 // error: borrow::move_while_borrowed
 // error: borrow::escapes_function
 // error: borrow::escapes_via_return
+// error: borrow::shrink_while_borrowed
 // A `dyn` is a view of the place it was made from, checked like a slice:
 // not of a temporary kept past its statement, not past the variable's
-// scope, not across a move, and returned only if the caller lent it.
+// scope, not across a move, not of an array's item once the array may
+// shrink, and returned only if the caller lent it.
 trait Show {
     fn show(&self): i32;
 }
@@ -45,6 +47,13 @@ fn moved(): i32 {
     let d = s as dyn Show;
     let t = s;
     return d.show() + t.show();
+}
+
+fn item(): i32 {
+    let mut items: [P; -..+] = [P { x: 1 }, P { x: 2 }];
+    let last = items[1] as dyn Show;
+    items.pop();
+    return last.show();
 }
 
 fn local(): dyn Show {

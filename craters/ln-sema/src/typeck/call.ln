@@ -977,6 +977,12 @@ impl Sema {
                 }
             }
             TyKind::String => out.push(self.p.types.str()),
+            // `impl dyn Trait` methods, from a `dyn mut Trait + Sync`.
+            TyKind::Dyn(d, args, flags) => {
+                if flags != 0 {
+                    out.push(self.p.types.mk(TyKind::Dyn(d, args, 0)));
+                }
+            }
             _ => {}
         }
         return out;

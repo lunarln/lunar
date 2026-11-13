@@ -1557,6 +1557,8 @@ impl Sema {
                 // Inherent impl.
                 let ok = match self.p.types.kind(data.self_ty) {
                     TyKind::Adt(d, _) => self.p.mod_data(self.p.defs[d.index()].module).krate == krate,
+                    // `impl dyn Trait`: in the trait's crater.
+                    TyKind::Dyn(d, _, _) => is_std || self.p.mod_data(self.p.defs[d.index()].module).krate == krate,
                     TyKind::Error => true,
                     _ => is_std,
                 };

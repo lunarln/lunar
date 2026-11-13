@@ -167,6 +167,40 @@ fn generic_code_over_dyn() {
     assert_eq!(largest(both[..]), 6.0);
 }
 
+/// The crater of a trait may give its `dyn` methods of its own.
+impl dyn Shape {
+    fn double_area(&self): f64 {
+        return self.area() * 2.0;
+    }
+}
+
+fn pick(xs: [Rect; &], i: usize): Option::<dyn Shape> {
+    if i < xs.len() {
+        return Some(xs[i] as dyn Shape);
+    }
+    return None;
+}
+
+#[test]
+fn inherent_methods_and_enums() {
+    let r = Rect { w: 1.0, h: 3.0 };
+    let d = r as dyn Shape;
+    assert_eq!(d.double_area(), 6.0);
+    let rects = [Rect { w: 1.0, h: 1.0 }, Rect { w: 2.0, h: 2.0 }];
+    let rs = rects[..];
+    let total = match pick(rs, 1) {
+        Some(s) => s.area(),
+        None => 0.0,
+    };
+    assert_eq!(total, 4.0);
+    assert!(pick(rs, 2).is_none());
+    // Items of a growable array stay where they are as it grows.
+    let mut owned: [Rect; ..+] = [Rect { w: 5.0, h: 1.0 }];
+    let first = owned[0] as dyn Shape;
+    owned.push(Rect { w: 1.0, h: 1.0 });
+    assert_eq!(first.area(), 5.0);
+}
+
 // Supertraits: their methods are in the vtable too, and a `dyn Sub`
 // upcasts to a `dyn Super`.
 trait Named {
