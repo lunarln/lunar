@@ -330,6 +330,10 @@ fn types() {
         "fn g(x:&mut +String,y:[str;..+]){}",
         "fn g(x: &mut +String, y: [str; ..+]) {}\n",
     );
+    check(
+        "fn d(a:dyn  Show,b:dyn mut  io::Write+Send,c:[dyn Iterator::<u8>+Send+Sync;&]):dyn Show from a{a as dyn  Show}",
+        "fn d(\n    a: dyn Show,\n    b: dyn mut io::Write + Send,\n    c: [dyn Iterator::<u8> + Send + Sync; &],\n): dyn Show from a {\n    a as dyn Show\n}\n",
+    );
 }
 
 #[test]
