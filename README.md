@@ -98,7 +98,8 @@ build programs it needs a linker, which you install yourself:
   Ubuntu, `build-essential`). The prebuilt compiler needs glibc 2.34 and
   the C++ runtime of GCC 12 or newer (Ubuntu 22.04, Debian 12, Fedora 36
   and later).
-* **macOS**: the Xcode command line tools (`xcode-select --install`).
+* **macOS**: the Xcode command line tools (`xcode-select --install`). The
+  prebuilt compiler needs macOS 15 or newer on Apple silicon.
 * **Windows**: the
   [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
   with the C++ workload (for the C runtime and the Windows SDK), and either
