@@ -1,0 +1,945 @@
+// Before/after pairs for every construct, comment placement, and the
+// formatter's own checks.
+
+use crater::{FmtErrorKind, format_source};
+
+/// `src` formatted (which must work).
+fn fmt(src: str): String {
+    return match format_source(src) {
+        Ok(s) => s,
+        Err(e) => panic("formatting failed: {e.message}\n{src}"),
+    };
+}
+
+/// `before` formats to `after`, and `after` to itself.
+fn check(before: str, after: str) {
+    let out = fmt(before);
+    if out.as_str() != after {
+        panic("formatted:\n{out}\nexpected:\n{after}");
+    }
+    let again = fmt(after);
+    if again.as_str() != after {
+        panic("not idempotent:\n{again}\nexpected:\n{after}");
+    }
+}
+
+/// `src` is formatted already.
+fn keep(src: str) {
+    check(src, src);
+}
+
+// ===================================================================== the repository
+
+/// The repository's root: the nearest directory above the current one with
+/// `std/core/lib.ln`.
+fn repo_root(): Option::<String> {
+    let mut dir = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(_) => return None,
+    };
+    loop {
+        let mut probe = String::from(dir.as_str());
+        probe.push_str("/std/core/lib.ln");
+        if std::fs::exists(probe.as_str()) {
+            return Some(dir);
+        }
+        let b = dir.as_str().as_bytes();
+        let mut i = b.len();
+        while i > 0 && b[i - 1] != b'/' && b[i - 1] != b'\\' {
+            i -= 1;
+        }
+        if i <= 1 {
+            return None;
+        }
+        let up = String::from(dir.as_str()[..i - 1]);
+        dir = up;
+    }
+}
+
+/// Every file under `dir` whose name ends with `ext` (not in `target`).
+fn files(dir: str, ext: str, names: &mut +String, ends: &mut +[usize; ..+]) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for i in 0..entries.len() {
+        let name = entries.name(i);
+        if name == "target" || name.starts_with(".") {
+            continue;
+        }
+        let mut path = String::from(dir);
+        path.push('/');
+        path.push_str(name);
+        if std::fs::is_dir(path.as_str()) {
+            files(path.as_str(), ext, names, ends);
+        } else if name.ends_with(ext) {
+            names.push_str(path.as_str());
+            ends.push(names.len());
+        }
+    }
+}
+
+/// What formatting the repository found.
+struct Tally {
+    files: usize,
+    syntax: usize,
+    changed: usize,
+    failures: usize,
+    report: String,
+}
+
+/// Format `text` (from `what`), check the result is stable, and count.
+fn try_text(what: str, text: str, t: &mut Tally) {
+    t.files += 1;
+    let out = match format_source(text) {
+        Ok(s) => s,
+        Err(e) => {
+            if e.kind == FmtErrorKind::Syntax {
+                t.syntax += 1;
+            } else {
+                t.failures += 1;
+                t.report.write("{what}: {e.message}\n");
+            }
+            return;
+        }
+    };
+    if out.as_str() != text {
+        t.changed += 1;
+    }
+    match format_source(out.as_str()) {
+        Ok(again) => {
+            if again.as_str() != out.as_str() {
+                t.failures += 1;
+                t.report
+                    .write(
+                        "{what}: not idempotent near `{first_diff(out.as_str(), again.as_str())}`\n",
+                    );
+            }
+        }
+        Err(e) => {
+            t.failures += 1;
+            t.report
+                .write("{what}: formatting its output failed: {e.message}\n");
+        }
+    }
+}
+
+/// The line of `a` where `b` first differs from it.
+fn first_diff(a: str, b: str): str {
+    let x = a.as_bytes();
+    let y = b.as_bytes();
+    let mut i: usize = 0;
+    let mut start: usize = 0;
+    while i < x.len() && i < y.len() && x[i] == y[i] {
+        if x[i] == b'\n' {
+            start = i + 1;
+        }
+        i += 1;
+    }
+    let mut end = start;
+    while end < x.len() && x[end] != b'\n' {
+        end += 1;
+    }
+    return a[start..end];
+}
+
+/// Every `.ln` file of the repository, and every Lunar example in the
+/// explanations of error codes, formats to a text with the same syntax
+/// tree and comments (`format_source` checks that), and formatting that
+/// again changes nothing.
+#[test]
+fn every_file_in_the_repository() {
+    let root = match repo_root() {
+        Some(r) => r,
+        None => panic("run the tests inside the repository"),
+    };
+    let mut names = String::new();
+    let mut ends: [usize; ..+] = [];
+    for dir in ["std", "craters", "tests", "examples"] {
+        let mut d = String::from(root.as_str());
+        d.push('/');
+        d.push_str(dir);
+        files(d.as_str(), ".ln", &mut names, &mut ends);
+    }
+    let n_ln = ends.len();
+    let mut docs = String::from(root.as_str());
+    docs.push_str("/docs/errors");
+    files(docs.as_str(), ".md", &mut names, &mut ends);
+    let mut t = Tally {
+        files: 0,
+        syntax: 0,
+        changed: 0,
+        failures: 0,
+        report: String::new(),
+    };
+    let mut start: usize = 0;
+    for k in 0..ends.len() {
+        let path = names.as_str()[start..ends[k]];
+        start = ends[k];
+        let text = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => panic("{path}: {e}"),
+        };
+        if k < n_ln {
+            try_text(path, text.as_str(), &mut t);
+            continue;
+        }
+        // The ```lunar blocks of an explanation.
+        let mut block = String::new();
+        let mut inside = false;
+        for line in text.as_str().lines() {
+            if inside {
+                if line.starts_with("```") {
+                    try_text(path, block.as_str(), &mut t);
+                    block.clear();
+                    inside = false;
+                } else {
+                    block.push_str(line);
+                    block.push('\n');
+                }
+            } else if line.starts_with("```lunar") {
+                inside = true;
+            }
+        }
+    }
+    println(
+        "{t.files} texts: {t.changed} would change, {t.syntax} have syntax errors, {t.failures} failures",
+    );
+    if t.failures > 0 {
+        panic("{t.report}");
+    }
+}
+
+// ===================================================================== constructs
+
+#[test]
+fn functions() {
+    check("fn  main ( ) {  }", "fn main() {}\n");
+    check(
+        "pub fn add(a:i32,b:i32):i32{return a+b;}",
+        "pub fn add(a: i32, b: i32): i32 {\n    return a + b;\n}\n",
+    );
+    check(
+        "unsafe  fn raw ( ) : i32 { 1 }",
+        "unsafe fn raw(): i32 {\n    1\n}\n",
+    );
+    // Generic parameters with `::<>`, bounds with ` + `.
+    check(
+        "fn max::<T:Ord+Clone,U>(a:T,b:U){}",
+        "fn max::<T: Ord + Clone, U>(a: T, b: U) {}\n",
+    );
+    // Parameters that do not fit go one a line, with a trailing comma.
+    check(
+        "fn long_function_name(first_argument: SomeLongType, second_argument: AnotherLongType): ReturnTypeXY { x }",
+        "fn long_function_name(
+    first_argument: SomeLongType,
+    second_argument: AnotherLongType,
+): ReturnTypeXY {
+    x
+}
+",
+    );
+    // Signatures break their parameters, not their types.
+    check(
+        "fn array_parts_of(&mut self, p: &mut +Program, ptr: ValueRef, t: Ty): (ValueRef, ValueRef, Type44) {}",
+        "fn array_parts_of(
+    &mut self,
+    p: &mut +Program,
+    ptr: ValueRef,
+    t: Ty,
+): (ValueRef, ValueRef, Type44) {}
+",
+    );
+    check(
+        "fn select_one(proj: &Project, package: Option::<str>): Result::<[usize; ..+], ProjectError> from static;",
+        "fn select_one(
+    proj: &Project,
+    package: Option::<str>,
+): Result::<[usize; ..+], ProjectError> from static;
+",
+    );
+    // A line of exactly 100 columns fits.
+    keep(
+        "fn long_function_name(first_argument: SomeLongType, second_argument: AnotherLongType): ReturnType {}\n",
+    );
+    // Without a body, in traits and extern blocks.
+    check(
+        "trait T { fn f(&self) ; fn g(&mut self):(); }",
+        "trait T {\n    fn f(&self);\n    fn g(&mut self): ();\n}\n",
+    );
+}
+
+#[test]
+fn parameter_modes() {
+    keep("fn f(a: T, b: &T, c: &mut T, d: &mut +T, mut e: T, _: T) {}\n");
+    keep(
+        "impl S {\n    fn a(self) {}\n    fn b(mut self) {}\n    fn c(&self) {}\n    fn d(&mut self) {}\n    fn e(&mut +self) {}\n}\n",
+    );
+    check(
+        "fn set(&mut self,kept s:str,kept mut t:&T){}",
+        "fn set(&mut self, kept s: str, kept mut t: &T) {}\n",
+    );
+    // A parameter may be named `kept`.
+    keep("fn f(kept: i32) {}\n");
+    // `from` after the return type.
+    check(
+        "fn first(a:&String,b:&String):str from a{a.as_str()}",
+        "fn first(a: &String, b: &String): str from a {\n    a.as_str()\n}\n",
+    );
+    check(
+        "fn both(a:&String,b:&String):str from a,b;",
+        "fn both(a: &String, b: &String): str from a, b;\n",
+    );
+    check(
+        "fn kind(a:&String):str from static;",
+        "fn kind(a: &String): str from static;\n",
+    );
+    check(
+        "fn view(&self):str from self;",
+        "fn view(&self): str from self;\n",
+    );
+}
+
+#[test]
+fn types() {
+    check(
+        "type A=([u8;4],[u8;_],[u8],[u8;..+],[u8;-..+],[u8;&],[u8;&mut]);",
+        "type A = ([u8; 4], [u8; _], [u8], [u8; ..+], [u8; -..+], [u8; &], [u8; &mut]);\n",
+    );
+    check(
+        "type P=(*u8,*mut u8,!,(),(i32,));",
+        "type P = (*u8, *mut u8, !, (), (i32,));\n",
+    );
+    check(
+        "type F=fn(i32,&String,&mut u8):bool;",
+        "type F = fn(i32, &String, &mut u8): bool;\n",
+    );
+    check(
+        "type G=Pair::<Option::<i32>,HashMap::<K,V>>;",
+        "type G = Pair::<Option::<i32>, HashMap::<K, V>>;\n",
+    );
+    check(
+        "fn f::<F:Fn(&String):usize+Clone>(f:F){}",
+        "fn f::<F: Fn(&String): usize + Clone>(f: F) {}\n",
+    );
+    check(
+        "fn adder(n:i32):impl Fn(i32):i32{move|x|x+n}",
+        "fn adder(n: i32): impl Fn(i32): i32 {\n    move |x| x + n\n}\n",
+    );
+    check(
+        "fn g(x:&mut +String,y:[str;..+]){}",
+        "fn g(x: &mut +String, y: [str; ..+]) {}\n",
+    );
+}
+
+#[test]
+fn structs_and_enums() {
+    check(
+        "struct Point{pub x:i32,y:i32}",
+        "struct Point {\n    pub x: i32,\n    y: i32,\n}\n",
+    );
+    check(
+        "struct Pair::<T>(pub T,T);",
+        "struct Pair::<T>(pub T, T);\n",
+    );
+    check("struct Unit ;", "struct Unit;\n");
+    check("struct Empty{}", "struct Empty {}\n");
+    check(
+        "enum Shape{Circle(f64),Rect{w:f64,h:f64},Empty}",
+        "enum Shape {\n    Circle(f64),\n    Rect { w: f64, h: f64 },\n    Empty,\n}\n",
+    );
+    // A struct variant too wide for a line (rustfmt's `struct_variant_width`).
+    check(
+        "enum E { Long { first_field: SomeType, second_field: OtherType } }",
+        "enum E {\n    Long {\n        first_field: SomeType,\n        second_field: OtherType,\n    },\n}\n",
+    );
+    check(
+        "#[derive(Eq,Debug)] enum K { #[default] A, B }",
+        "#[derive(Eq,Debug)]\nenum K {\n    #[default]\n    A,\n    B,\n}\n",
+    );
+}
+
+#[test]
+fn traits_and_impls() {
+    check(
+        "pub trait Show:Display+Debug{fn show(&self):str;}",
+        "pub trait Show: Display + Debug {\n    fn show(&self): str;\n}\n",
+    );
+    check(
+        "impl::<T:Dull> Show for Pair::<T>{}",
+        "impl::<T: Dull> Show for Pair::<T> {}\n",
+    );
+    check("impl !Send for P {}", "impl !Send for P {}\n");
+    check(
+        "impl Point{fn new():Point{Point{x:0,y:0}}}",
+        "impl Point {\n    fn new(): Point {\n        Point { x: 0, y: 0 }\n    }\n}\n",
+    );
+}
+
+#[test]
+fn other_items() {
+    check("mod shapes ;", "mod shapes;\n");
+    check(
+        "pub mod inline{fn f(){}}",
+        "pub mod inline {\n    fn f() {}\n}\n",
+    );
+    check("const N:usize=4;", "const N: usize = 4;\n");
+    check("static mut COUNT:u64=0;", "static mut COUNT: u64 = 0;\n");
+    check("type Bytes=[u8;&];", "type Bytes = [u8; &];\n");
+    check(
+        "extern \"C\"{fn puts(s:*u8):i32;#[link_name=\"write\"] fn c_write(fd:i32,b:*u8,n:usize):isize;fn printf(f:*u8,...):i32;}",
+        "extern \"C\" {\n    fn puts(s: *u8): i32;\n    #[link_name=\"write\"]\n    fn c_write(fd: i32, b: *u8, n: usize): isize;\n    fn printf(f: *u8, ...): i32;\n}\n",
+    );
+}
+
+#[test]
+fn use_lists_are_sorted() {
+    check(
+        "use std::io::{println as say,print};",
+        "use std::io::{print, println as say};\n",
+    );
+    check(
+        "use a::{Z,b,self,C,a10,a9};",
+        "use a::{self, C, Z, a9, a10, b};\n",
+    );
+    check("use crater::shapes::*;", "use crater::shapes::*;\n");
+    check("use a::{b::{d,c},a};", "use a::{a, b::{c, d}};\n");
+    // A glob after the names, a renaming after the name.
+    check(
+        "use crater::a::{b::{c,d},e as f,*,e};",
+        "use crater::a::{b::{c, d}, e, e as f, *};\n",
+    );
+    // Too long for a line: filled.
+    check(
+        "use ln_ast::{Block, ConstDecl, EnumDecl, FnDecl, ImplDecl, MacroDef, Span, StaticDecl, StructDecl, TraitDecl, TypeAlias};",
+        "use ln_ast::{
+    Block, ConstDecl, EnumDecl, FnDecl, ImplDecl, MacroDef, Span, StaticDecl, StructDecl, TraitDecl,
+    TypeAlias,
+};
+",
+    );
+    // With comments inside, the order is kept.
+    check(
+        "use a::{c, // see\n b};",
+        "use a::{\n    c, // see\n    b,\n};\n",
+    );
+}
+
+#[test]
+fn statements() {
+    check(
+        "fn f(){let x=1;let mut y:i32=2;let (a,b)=(1,2);x+=1;y=x;}",
+        "fn f() {\n    let x = 1;\n    let mut y: i32 = 2;\n    let (a, b) = (1, 2);\n    x += 1;\n    y = x;\n}\n",
+    );
+    // At most one empty line in a row; none at the start or end of a block.
+    check(
+        "fn f() {\n\n    a();\n\n\n    b();\n\n}\n",
+        "fn f() {\n    a();\n\n    b();\n}\n",
+    );
+    // `let ... else`: on one line if short.
+    check(
+        "fn f(){let Some(v)=m else{return};}",
+        "fn f() {\n    let Some(v) = m else { return };\n}\n",
+    );
+    check(
+        "fn f(){let Some(v)=m else{return;};}",
+        "fn f() {\n    let Some(v) = m else {\n        return;\n    };\n}\n",
+    );
+    // Block-like statements keep (or not) their `;`.
+    keep(
+        "fn f() {\n    if a {\n        b();\n    }\n    match x {\n        _ => {}\n    };\n    unsafe { g() };\n}\n",
+    );
+}
+
+#[test]
+fn operators() {
+    check(
+        "fn f(){x=a+b*c-d/e%f;y=!a&&-b||*c;z=&mut v;w=& &v;}",
+        "fn f() {\n    x = a + b * c - d / e % f;\n    y = !a && -b || *c;\n    z = &mut v;\n    w = & &v;\n}\n",
+    );
+    check(
+        "fn f(){a>>=1;b=c>>2;d=e>=f;g=h<<3;}",
+        "fn f() {\n    a >>= 1;\n    b = c >> 2;\n    d = e >= f;\n    g = h << 3;\n}\n",
+    );
+    check(
+        "fn f(){for i in 0..n{} for j in 0..=n{} let s=a[1..];let t=a[..2];let u=x as u64;}",
+        "fn f() {\n    for i in 0..n {}\n    for j in 0..=n {}\n    let s = a[1..];\n    let t = a[..2];\n    let u = x as u64;\n}\n",
+    );
+    check(
+        "fn f(){let r=1. ..2.;}",
+        "fn f() {\n    let r = 1. ..2.;\n}\n",
+    );
+    // Long chains of one operator break before it.
+    check(
+        "fn f() { if first_condition_is_long(a) && second_condition_is_longer(b) && third_condition(c) && fourth(d) { x(); } }",
+        "fn f() {
+    if first_condition_is_long(a)
+        && second_condition_is_longer(b)
+        && third_condition(c)
+        && fourth(d)
+    {
+        x();
+    }
+}
+",
+    );
+    // A condition and its `{` break together.
+    check(
+        "fn f() { if v.kind == Kind::Table && (v.table == TableKind::Header || v.table == TableKind::Implicit123) { x(); } }",
+        "fn f() {
+    if v.kind == Kind::Table
+        && (v.table == TableKind::Header || v.table == TableKind::Implicit123)
+    {
+        x();
+    }
+}
+",
+    );
+    // What follows `=` goes on the next line if it fits there...
+    check(
+        "fn f() { let total = first_value_with_long_name + second_value_with_long_name + third_value_name * 200000; }",
+        "fn f() {
+    let total =
+        first_value_with_long_name + second_value_with_long_name + third_value_name * 200000;
+}
+",
+    );
+    // ... else it breaks where it is.
+    check(
+        "fn f() { let total = first_value_with_long_name + second_value_with_long_name + third_value_name * fourth_value_name; }",
+        "fn f() {
+    let total = first_value_with_long_name
+        + second_value_with_long_name
+        + third_value_name * fourth_value_name;
+}
+",
+    );
+}
+
+#[test]
+fn calls_and_chains() {
+    // Arguments wider than rustfmt's `fn_call_width` go one a line.
+    check(
+        "fn f() { call_something(first_argument_value, second_argument_value, third_value_xyz1); }",
+        "fn f() {
+    call_something(
+        first_argument_value,
+        second_argument_value,
+        third_value_xyz1,
+    );
+}
+",
+    );
+    keep(
+        "fn f() {\n    call_something(first_argument_value, second_argument_value, third_value_xyz);\n}\n",
+    );
+    // A single argument may be as wide as the line.
+    keep(
+        "fn f() {\n    println(\"a long format string with {holes} that is wider than sixty columns, see\");\n}\n",
+    );
+    // A chain whose head breaks keeps its links at the head's indentation.
+    check(
+        "fn f() { let e = ProjectError::new(manifest::WORKSPACE(), \"this workspace has several programs; pick one\").note(\"programs: {names}\").help(\"`lunar run -p {first}`\"); }",
+        "fn f() {
+    let e = ProjectError::new(
+        manifest::WORKSPACE(),
+        \"this workspace has several programs; pick one\",
+    )
+    .note(\"programs: {names}\")
+    .help(\"`lunar run -p {first}`\");
+}
+",
+    );
+    // A link before the last that takes several lines breaks the chain; so
+    // does an argument before the last its list.
+    check(
+        "fn f() { let x = items.iter().map(|item| { let v = 1; v }).filter(|v| v > 10).collect(); foo(|x| { let y = 1; y }, b); }",
+        "fn f() {
+    let x = items
+        .iter()
+        .map(|item| {
+            let v = 1;
+            v
+        })
+        .filter(|v| v > 10)
+        .collect();
+    foo(
+        |x| {
+            let y = 1;
+            y
+        },
+        b,
+    );
+}
+",
+    );
+    // `f(x).y()` is a chain too, broken past `chain_width`.
+    check(
+        "fn f() { status(\"Compiling\", core::fmt::format(\"{name} v{version} ({dir})\").as_str()); }",
+        "fn f() {
+    status(
+        \"Compiling\",
+        core::fmt::format(\"{name} v{version} ({dir})\").as_str(),
+    );
+}
+",
+    );
+    check(
+        "fn f() { status(\"Compiling\", core::fmt::format(\"{name} v{version} ({dir}) and more\").as_str()); }",
+        "fn f() {
+    status(
+        \"Compiling\",
+        core::fmt::format(\"{name} v{version} ({dir}) and more\")
+            .as_str(),
+    );
+}
+",
+    );
+    // A closure as last argument hugs the parentheses.
+    check(
+        "fn f() { items.map(|x| { let y = x + 1; y * 2 }); }",
+        "fn f() {\n    items.map(|x| {\n        let y = x + 1;\n        y * 2\n    });\n}\n",
+    );
+    // So does a sole struct literal.
+    check(
+        "fn f() { out.push(Spanned { token: Token::DocComment, range: r }); }",
+        "fn f() {\n    out.push(Spanned {\n        token: Token::DocComment,\n        range: r,\n    });\n}\n",
+    );
+    // Chains wider than `chain_width` break before each `.`; a root as
+    // short as an indentation keeps the first link.
+    check(
+        "fn f() { let v = self.items.iter().filter(is_interesting).map(transform_value).collect(); }",
+        "fn f() {
+    let v = self.items
+        .iter()
+        .filter(is_interesting)
+        .map(transform_value)
+        .collect();
+}
+",
+    );
+    check(
+        "fn f() { let v = parser.items.iter().filter(is_interesting).map(transform_value).collect(); }",
+        "fn f() {
+    let v = parser
+        .items
+        .iter()
+        .filter(is_interesting)
+        .map(transform_value)
+        .collect();
+}
+",
+    );
+    check(
+        "fn f(){x.y.z;a.b().c()?;t.0.1;v[i][j];}",
+        "fn f() {\n    x.y.z;\n    a.b().c()?;\n    t.0.1;\n    v[i][j];\n}\n",
+    );
+    check(
+        "fn f(){let x=size_of::<T>();p.get::<u8>(1);}",
+        "fn f() {\n    let x = size_of::<T>();\n    p.get::<u8>(1);\n}\n",
+    );
+}
+
+#[test]
+fn literals() {
+    // Struct literals wider than `struct_lit_width` go one field a line.
+    check(
+        "fn f(){let p=Point{x:1,y};}",
+        "fn f() {\n    let p = Point { x: 1, y };\n}\n",
+    );
+    check(
+        "fn f(){let r=Range{start:begin,end:finish};}",
+        "fn f() {\n    let r = Range {\n        start: begin,\n        end: finish,\n    };\n}\n",
+    );
+    check(
+        "fn f(){let a=[1,2,3];let b=[0;8];let e=[];let t=(1,);let u=();}",
+        "fn f() {\n    let a = [1, 2, 3];\n    let b = [0; 8];\n    let e = [];\n    let t = (1,);\n    let u = ();\n}\n",
+    );
+    // Short items fill lines.
+    check(
+        "fn f(){let a=[100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000, 1100000];}",
+        "fn f() {
+    let a = [
+        100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000, 1100000,
+    ];
+}
+",
+    );
+    // Literals are kept as written, and format strings with their holes.
+    keep(
+        "fn f() {\n    let x = 0xff_u8 + 1_000 + 1.5e3;\n    println(\"{x}  {m.get(\"k\")}{{\");\n    let c = '\\n';\n    let b = b'a';\n}\n",
+    );
+}
+
+#[test]
+fn control_flow() {
+    check(
+        "fn f(){if a{b()}else if c{d()}else{e()}}",
+        "fn f() {\n    if a {\n        b()\n    } else if c {\n        d()\n    } else {\n        e()\n    }\n}\n",
+    );
+    // A short `if ... else` expression stays on one line.
+    check(
+        "fn f(){let x=if a>b{a}else{b};}",
+        "fn f() {\n    let x = if a > b { a } else { b };\n}\n",
+    );
+    check(
+        "fn f(){if let Some(x)=y{z(x);}while let Some(v)=it.next(){} while i<n{i+=1;} loop{break;}}",
+        "fn f() {\n    if let Some(x) = y {\n        z(x);\n    }\n    while let Some(v) = it.next() {}\n    while i < n {\n        i += 1;\n    }\n    loop {\n        break;\n    }\n}\n",
+    );
+    check(
+        "fn f(){match s{Shape::Circle(r)|Shape::Square(r)=>r,Shape::Rect{w,h:height}=>{w*height}_ if x>1=>{let a=1;a}_=>0.0}}",
+        "fn f() {
+    match s {
+        Shape::Circle(r) | Shape::Square(r) => r,
+        Shape::Rect { w, h: height } => { w * height }
+        _ if x > 1 => {
+            let a = 1;
+            a
+        }
+        _ => 0.0,
+    }
+}
+",
+    );
+    check(
+        "fn f(){let v=loop{if done(){break 42;}};return;}",
+        "fn f() {\n    let v = loop {\n        if done() {\n            break 42;\n        }\n    };\n    return;\n}\n",
+    );
+}
+
+#[test]
+fn patterns() {
+    check(
+        "fn f(){match x{-1=>a,1..=5=>b,'a'..='z'=>c,(a,..)=>d,P{x,mut y,..}=>e,Q(_,z)=>g,(v,)=>h,None=>i,}}",
+        "fn f() {
+    match x {
+        -1 => a,
+        1..=5 => b,
+        'a'..='z' => c,
+        (a, ..) => d,
+        P { x, mut y, .. } => e,
+        Q(_, z) => g,
+        (v,) => h,
+        None => i,
+    }
+}
+",
+    );
+}
+
+#[test]
+fn closures() {
+    check(
+        "fn f(){let a=|x:i32|x+k;let b=||c+=1;let c=move||n;let d=|x:i32|:i32{x};let e=|_,mut y:&mut i32|y;}",
+        "fn f() {\n    let a = |x: i32| x + k;\n    let b = || c += 1;\n    let c = move || n;\n    let d = |x: i32|: i32 { x };\n    let e = |_, mut y: &mut i32| y;\n}\n",
+    );
+}
+
+#[test]
+fn macros() {
+    // A macro call whose arguments are expressions is formatted as a call
+    // (its trailing comma, or none, kept).
+    check(
+        "fn f(){assert_eq!(a,b);assert!(x,);}",
+        "fn f() {\n    assert_eq!(a, b);\n    assert!(x,);\n}\n",
+    );
+    check(
+        "fn f(){assert_eq!(kinds(\"1.5e3 2e-1 7u8\").as_str(), \"Number(Float) Number(Float) Number(Int)\");}",
+        "fn f() {
+    assert_eq!(
+        kinds(\"1.5e3 2e-1 7u8\").as_str(),
+        \"Number(Float) Number(Float) Number(Int)\"
+    );
+}
+",
+    );
+    // Other token trees keep their layout, moved with their line.
+    check(
+        "fn f(){\n  m!(a;  b);\n  n! { x  y }\n}\n",
+        "fn f() {\n    m!(a;  b);\n    n! { x  y }\n}\n",
+    );
+    // So do macro definitions.
+    keep("pub macro square($x:expr) {\n    let t = $x;     // cannot clash\n    t * t\n}\n");
+    keep(
+        "macro max {\n    ($x:expr) => { $x },\n    ($x:expr, $($rest:expr),+) => {\n        let a = $x;\n        a\n    },\n}\n",
+    );
+    check(
+        "mod m {\nmacro twice {\n    ($x:expr) => {\n        $x + $x\n    },\n}\n}\n",
+        "mod m {\n    macro twice {\n        ($x:expr) => {\n            $x + $x\n        },\n    }\n}\n",
+    );
+    // Strings in token trees keep their lines.
+    check(
+        "mod m {\nmacro s {\n    () => { \"a\nb\" },\n}\n}\n",
+        "mod m {\n    macro s {\n        () => { \"a\nb\" },\n    }\n}\n",
+    );
+}
+
+// ===================================================================== comments
+
+#[test]
+fn comments_between_items() {
+    keep(
+        "// A file comment.\n\n/// Docs.\n/// More docs.\n#[test]\nfn a() {}\n\n// Between.\nfn b() {} // Trailing.\n\n/* Block. */\nfn c() {}\n// At the end.\n",
+    );
+    // A doc comment after the attributes.
+    keep("#[inline]\n/// Docs.\nfn a() {}\n");
+    check(
+        "fn a() {}   // trailing   \n//! inner\nfn b() {}",
+        "fn a() {} // trailing\n//! inner\nfn b() {}\n",
+    );
+}
+
+#[test]
+fn comments_in_blocks() {
+    keep(
+        "fn f() {\n    // First.\n    let x = 1; // After x.\n\n    // Before y.\n    let y = 2;\n    // Last.\n}\n",
+    );
+    // In empty blocks.
+    keep("fn f() {\n    // Nothing yet.\n}\n");
+    check(
+        "fn f() { // Nothing yet.\n}",
+        "fn f() { // Nothing yet.\n}\n",
+    );
+    check(
+        "fn f() {\n    if a { // Why.\n        b();\n    }\n}\n",
+        "fn f() {\n    if a { // Why.\n        b();\n    }\n}\n",
+    );
+    keep("fn f() {\n    loop {\n        // Waiting.\n    }\n}\n");
+    // Before `else`.
+    keep(
+        "fn f() {\n    if a {\n        b();\n    }\n    // Otherwise.\n    else {\n        c();\n    }\n}\n",
+    );
+    check(
+        "fn f() {\n    if a {\n        b();\n    } // Otherwise.\n    else {\n        c();\n    }\n}\n",
+        "fn f() {\n    if a {\n        b();\n    } // Otherwise.\n    else {\n        c();\n    }\n}\n",
+    );
+}
+
+#[test]
+fn comments_in_lists() {
+    // Trailing comments on arguments break the call.
+    check(
+        "fn f() { call(a, // first\n b); }",
+        "fn f() {\n    call(\n        a, // first\n        b,\n    );\n}\n",
+    );
+    check(
+        "fn f() { call(\n    // before a\n    a,\n    b, // after b\n); }",
+        "fn f() {\n    call(\n        // before a\n        a,\n        b, // after b\n    );\n}\n",
+    );
+    check(
+        "fn f() { call(a /* inline */, b); }",
+        "fn f() {\n    call(a /* inline */, b);\n}\n",
+    );
+    check(
+        "fn f(\n    a: i32, // the first\n    b: i32,\n) {}",
+        "fn f(\n    a: i32, // the first\n    b: i32,\n) {}\n",
+    );
+    check(
+        "struct S {\n    a: i32, // the first\n    // about b\n    b: i32,\n}",
+        "struct S {\n    a: i32, // the first\n    // about b\n    b: i32,\n}\n",
+    );
+    check(
+        "fn f() { let p = P { a: 1, // one\n b: 2 }; }",
+        "fn f() {\n    let p = P {\n        a: 1, // one\n        b: 2,\n    };\n}\n",
+    );
+    // After the last item.
+    check(
+        "fn f() { call(a, b // last\n); }",
+        "fn f() {\n    call(\n        a,\n        b, // last\n    );\n}\n",
+    );
+}
+
+#[test]
+fn comments_in_match_arms() {
+    keep(
+        "fn f() {\n    match x {\n        // The first.\n        A => 1, // One.\n\n        // The second.\n        B => {\n            // Inside.\n            2\n        }\n        // Nothing after.\n    }\n}\n",
+    );
+    check(
+        "fn f() {\n    match x {\n        A => // why\n            1,\n    }\n}\n",
+        "fn f() {\n    match x {\n        A => // why\n            1,\n    }\n}\n",
+    );
+}
+
+#[test]
+fn comments_in_expressions() {
+    keep("fn f() {\n    let x = a\n        // why b\n        + b;\n}\n");
+    check(
+        "fn f() {\n    let x = // why\n        5;\n}\n",
+        "fn f() {\n    let x = // why\n        5;\n}\n",
+    );
+    check(
+        "fn f() {\n    let x =\n        // why\n        5;\n}\n",
+        "fn f() {\n    let x =\n        // why\n        5;\n}\n",
+    );
+}
+
+// ===================================================================== safety
+
+#[test]
+fn syntax_errors_are_reported() {
+    match format_source("fn main( {") {
+        Ok(_) => panic("formatted a syntax error"),
+        Err(e) => assert!(e.kind == FmtErrorKind::Syntax),
+    }
+    match format_source("fn f() {\n<<<<<<< HEAD\n}\n") {
+        Ok(_) => panic("formatted a conflict"),
+        Err(e) => assert!(e.kind == FmtErrorKind::Syntax),
+    }
+}
+
+#[test]
+fn the_check_compares_trees_and_comments() {
+    use crater::verify::check as verify;
+    let src = "fn f() {\n    a(); // c\n}\n";
+    let mut tree = String::new();
+    ln_ast::dump(&ln_parser::parse_file(src).ast, &mut tree);
+    assert!(verify(src, tree.as_str(), src).is_ok());
+    // Whitespace and spans may change.
+    assert!(
+        verify(src, tree.as_str(), "fn f() { a(); // c\n}\n")
+            .is_ok()
+    );
+    // The tree may not.
+    assert!(
+        verify(src, tree.as_str(), "fn f() {\n    b(); // c\n}\n")
+            .is_err()
+    );
+    // Nor the comments.
+    assert!(
+        verify(src, tree.as_str(), "fn f() {\n    a();\n}\n")
+            .is_err()
+    );
+    assert!(
+        verify(src, tree.as_str(), "fn f() {\n    a(); // d\n}\n")
+            .is_err()
+    );
+    // Nor may it stop parsing.
+    assert!(
+        verify(src, tree.as_str(), "fn f() {\n    a(); // c\n")
+            .is_err()
+    );
+    // `use` lists may be reordered.
+    let u = "use a::{c, b};\n";
+    let mut ut = String::new();
+    ln_ast::dump(&ln_parser::parse_file(u).ast, &mut ut);
+    assert!(verify(u, ut.as_str(), "use a::{b, c};\n").is_ok());
+    assert!(verify(u, ut.as_str(), "use a::{b, d};\n").is_err());
+}
+
+#[test]
+fn line_endings() {
+    check(
+        "fn  f() {\r\n    a(); // c\r\n}\r\n",
+        "fn f() {\r\n    a(); // c\r\n}\r\n",
+    );
+}
+
+#[test]
+fn long_lines_that_cannot_break_stay_long() {
+    keep(
+        "fn f() {\n    let message = \"a very long string literal that cannot be broken anywhere at all, so it stays\";\n}\n",
+    );
+    keep(
+        "use some::very::long::path::to::a::module::that::goes::on::and::on::forever::and::ever::Item;\n",
+    );
+}

@@ -1,0 +1,257 @@
+// The source text around the syntax tree: its tokens, to find the keywords
+// and punctuation the tree does not record, and its comments, which the
+// lexer skips and the printer puts back by position.
+
+use ln_lexer::Token;
+
+/// No position.
+pub const NONE: u32 = 4294967295;
+
+/// A token of the source (doc comments are comments here): its kind and
+/// byte range.
+#[derive(Eq, Debug)]
+pub struct STok {
+    pub kind: Token,
+    pub lo: u32,
+    pub hi: u32,
+}
+
+/// A comment: `//`, `///`, `//!` or `/* */`.
+#[derive(Eq, Debug)]
+pub struct Cmt {
+    /// Its text is `lo..hi`: a line comment without trailing whitespace
+    /// (a doc comment's is part of its `doc` attribute, so `verify`
+    /// ignores it there too).
+    pub lo: u32,
+    pub hi: u32,
+    /// Where it really ends.
+    pub end: u32,
+    pub block: bool,
+    /// Alone on its line: a line break between it and the token or comment
+    /// before it, or nothing before it at all.
+    pub own_line: bool,
+    /// The end of the token before it (0 for none).
+    pub prev_end: u32,
+    /// The start of the token after it (the length of the text for none).
+    pub next_lo: u32,
+    /// A line break between it and the next token or comment.
+    pub newline_after: bool,
+    /// An empty line between it and the next token or comment.
+    pub blank_after: bool,
+}
+
+/// The tokens and comments of a source text.
+pub struct Source {
+    pub toks: [STok; ..+],
+    /// For each bracket token, the index of its partner (`NONE` for others).
+    pub pair: [u32; ..+],
+    pub cmts: [Cmt; ..+],
+}
+
+/// The line breaks in `b[lo..hi]`.
+pub fn newlines(b: [u8; &], lo: usize, hi: usize): usize {
+    let mut n: usize = 0;
+    let mut i = lo;
+    while i < hi {
+        if b[i] == b'\n' {
+            n += 1;
+        }
+        i += 1;
+    }
+    return n;
+}
+
+fn at(b: [u8; &], i: usize): u8 {
+    if i < b.len() { b[i] } else { 0 }
+}
+
+/// The end of the nested block comment starting at `i` (or the end of the
+/// text if it is not closed).
+fn block_end(b: [u8; &], i: usize, limit: usize): usize {
+    let mut depth: usize = 0;
+    let mut j = i;
+    while j < limit {
+        if b[j] == b'/' && at(b, j + 1) == b'*' {
+            depth += 1;
+            j += 2;
+        } else if b[j] == b'*' && at(b, j + 1) == b'/' {
+            depth -= 1;
+            j += 2;
+            if depth == 0 {
+                return j;
+            }
+        } else {
+            j += 1;
+        }
+    }
+    return limit;
+}
+
+/// Lex `src` (which must lex without errors) into tokens and comments.
+pub fn scan(src: str): Source {
+    let (all, _) = ln_lexer::lex(src);
+    let mut toks: [STok; ..+] = [];
+    for t in all {
+        if t.token != Token::DocComment {
+            toks.push(STok {
+                kind: t.token,
+                lo: t.range.start as u32,
+                hi: t.range.end as u32,
+            });
+        }
+    }
+    let b = src.as_bytes();
+    let mut cmts: [Cmt; ..+] = [];
+    let n = toks.len();
+    let mut k: usize = 0;
+    // The end of the last token or comment, and whether there was one.
+    let mut last: usize = 0;
+    let mut any = false;
+    while k <= n {
+        let gap_lo = if k == 0 { 0 } else { toks[k - 1].hi as usize };
+        let gap_hi = if k < n { toks[k].lo as usize } else { b.len() };
+        let prev_end = if k == 0 { 0 } else { toks[k - 1].hi };
+        let mut i = gap_lo;
+        while i < gap_hi {
+            let c = b[i];
+            let mut j = i;
+            let mut block = false;
+            if c == b'/' && at(b, i + 1) == b'/' {
+                while j < gap_hi && b[j] != b'\n' {
+                    j += 1;
+                }
+            } else if c == b'/' && at(b, i + 1) == b'*' {
+                j = block_end(b, i, gap_hi);
+                block = true;
+            } else {
+                i += 1;
+                continue;
+            }
+            let mut hi = j;
+            if !block {
+                while hi > i && (b[hi - 1] == b'\r' || b[hi - 1] == b' ' || b[hi - 1] == b'\t') {
+                    hi -= 1;
+                }
+            }
+            let own_line = !any || newlines(b, last, i) > 0;
+            cmts.push(Cmt {
+                lo: i as u32,
+                hi: hi as u32,
+                end: j as u32,
+                block,
+                own_line,
+                prev_end,
+                next_lo: gap_hi as u32,
+                newline_after: false,
+                blank_after: false,
+            });
+            last = j;
+            any = true;
+            i = j;
+        }
+        if k < n {
+            last = toks[k].hi as usize;
+            any = true;
+        }
+        k += 1;
+    }
+    // What follows each comment: the next comment in its gap, or the token.
+    let m = cmts.len();
+    let mut c: usize = 0;
+    while c < m {
+        let next = if c + 1 < m && cmts[c + 1].next_lo == cmts[c].next_lo {
+            cmts[c + 1].lo
+        } else {
+            cmts[c].next_lo
+        };
+        let nl = newlines(b, cmts[c].end as usize, next as usize);
+        cmts[c].newline_after = nl > 0 || !cmts[c].block;
+        cmts[c].blank_after = nl > 1;
+        c += 1;
+    }
+    // Bracket partners.
+    let mut pair: [u32; ..+] = [];
+    let mut stack: [usize; -..+] = [];
+    let mut t: usize = 0;
+    while t < n {
+        pair.push(NONE);
+        let kind = toks[t].kind;
+        if kind == Token::LParen || kind == Token::LBracket || kind == Token::LBrace {
+            stack.push(t);
+        } else if kind == Token::RParen || kind == Token::RBracket || kind == Token::RBrace {
+            if let Some(o) = stack.pop() {
+                pair[o] = t as u32;
+                pair[t] = o as u32;
+            }
+        }
+        t += 1;
+    }
+    return Source { toks, pair, cmts };
+}
+
+impl Source {
+    /// The index of the first token starting at or after `pos`.
+    pub fn first_at(&self, pos: u32): usize {
+        let mut lo: usize = 0;
+        let mut hi = self.toks.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.toks[mid].lo < pos {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
+    /// The first token starting at or after `pos`.
+    pub fn next(&self, pos: u32): Option::<STok> {
+        let i = self.first_at(pos);
+        if i < self.toks.len() {
+            return Some(self.toks[i]);
+        }
+        return None;
+    }
+
+    /// The start of the first token at or after `pos` if it is a `kind`,
+    /// else `NONE`.
+    pub fn find(&self, pos: u32, kind: Token): u32 {
+        if let Some(t) = self.next(pos) {
+            if t.kind == kind {
+                return t.lo;
+            }
+        }
+        return NONE;
+    }
+
+    /// The start of the bracket closing the one that starts at `open`.
+    pub fn close_of(&self, open: u32): u32 {
+        let i = self.first_at(open);
+        if i < self.toks.len() && self.toks[i].lo == open && self.pair[i] != NONE {
+            return self.toks[self.pair[i] as usize].lo;
+        }
+        return NONE;
+    }
+
+    /// The index of the first comment starting at or after `pos`.
+    pub fn first_cmt(&self, pos: u32): usize {
+        let mut lo: usize = 0;
+        let mut hi = self.cmts.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.cmts[mid].lo < pos {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
+    /// Whether a comment starts in `lo..hi`.
+    pub fn has_cmts(&self, lo: u32, hi: u32): bool {
+        let i = self.first_cmt(lo);
+        return i < self.cmts.len() && self.cmts[i].lo < hi;
+    }
+}

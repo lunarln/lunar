@@ -1,0 +1,1380 @@
+// Items, attributes, generics, types, paths, patterns and `use` trees.
+
+use core::arena::{Id, List};
+use ln_ast::*;
+use ln_lexer::Token;
+use crater::{CALL_WIDTH, END, Printer, STRUCT_LIT_WIDTH, STRUCT_VARIANT_WIDTH};
+use crater::doc::Doc;
+use crater::source::NONE;
+
+impl Printer {
+    /// The items of a file, module, trait, impl or extern block, up to the
+    /// closing bracket at `close`.
+    pub fn items(&mut self, list: List::<Id::<Item>>, close: u32) {
+        let n = list.len();
+        let mut i: usize = 0;
+        while i < n {
+            let id = self.ast.item_ids.list(list)[i];
+            let lo = self.ast.items.get(id).span.lo;
+            self.next_elem(lo, i == 0);
+            self.item(id);
+            i += 1;
+        }
+        self.end_list(close, n == 0);
+    }
+
+    /// `{ items }`, its `{` at `open`.
+    fn item_block(&mut self, open: u32, list: List::<Id::<Item>>) {
+        let close = self.s.close_of(open);
+        let trailed = self.brace(open);
+        if list.len() == 0 && !self.cmt_before(close) {
+            if trailed {
+                self.hard();
+            }
+            self.tok(close, "}");
+            return;
+        }
+        self.open();
+        if list.len() > 0 || self.cmt_before(close) {
+            self.hard();
+        }
+        self.items(list, close);
+        let inner = self.close();
+        self.body(inner);
+        self.tok(close, "}");
+    }
+
+    /// The attributes of an item, field or variant, one a line; doc
+    /// comments are comments here. Gives where what follows them starts.
+    fn attrs(&mut self, list: List::<Attr>, start: u32): u32 {
+        let mut pos = start;
+        let mut i: usize = 0;
+        while i < list.len() {
+            let a = self.ast.attrs.list(list)[i];
+            i += 1;
+            if self.src[a.span.lo as usize..].starts_with("///") {
+                continue;
+            }
+            self.verbatim(a.span.lo, a.span.hi);
+            self.hard();
+            if a.span.hi > pos {
+                pos = a.span.hi;
+            }
+        }
+        return pos;
+    }
+
+    pub fn item(&mut self, id: Id::<Item>) {
+        let it = self.ast.items.get(id);
+        let mut pos = self.attrs(it.attrs, it.span.lo);
+        if it.is_pub {
+            let p = self.s.find(pos, Token::Pub);
+            self.tok(p, "pub");
+            self.text(" ");
+            if p != NONE {
+                pos = p + 3;
+            }
+        }
+        match it.kind {
+            ItemKind::Fn(f) => self.fn_decl(f, pos),
+            ItemKind::Struct(s) => {
+                self.tok(self.s.find(pos, Token::Struct), "struct");
+                self.text(" ");
+                self.ident(s.name);
+                self.generics(s.generics);
+                match s.kind {
+                    VariantData::Unit => self.semi(it.span.hi),
+                    VariantData::Tuple(fs) => {
+                        self.tuple_fields(fs, s.generics.span.hi);
+                        self.semi(it.span.hi);
+                    }
+                    VariantData::Named(fs) => {
+                        self.text(" ");
+                        self.named_fields(fs, self.s.find(s.generics.span.hi, Token::LBrace));
+                    }
+                }
+            }
+            ItemKind::Enum(e) => {
+                self.tok(self.s.find(pos, Token::Enum), "enum");
+                self.text(" ");
+                self.ident(e.name);
+                self.generics(e.generics);
+                self.text(" ");
+                self.variants(e.variants, self.s.find(e.generics.span.hi, Token::LBrace));
+            }
+            ItemKind::Trait(t) => {
+                self.tok(self.s.find(pos, Token::Trait), "trait");
+                self.text(" ");
+                self.ident(t.name);
+                self.generics(t.generics);
+                let mut after = t.generics.span.hi;
+                if t.supertraits.len() > 0 {
+                    self.tok(self.s.find(after, Token::Colon), ":");
+                    self.text(" ");
+                    self.bounds(t.supertraits);
+                    let ps = self.ast.paths.list(t.supertraits);
+                    after = ps[ps.len() - 1].span.hi;
+                }
+                self.text(" ");
+                self.item_block(self.s.find(after, Token::LBrace), t.items);
+            }
+            ItemKind::Impl(i) => {
+                self.tok(self.s.find(pos, Token::Impl), "impl");
+                self.generics(i.generics);
+                self.text(" ");
+                if i.negative {
+                    self.tok(self.s.find(i.generics.span.hi, Token::Bang), "!");
+                }
+                if let Some(t) = i.trait_ref {
+                    self.path(t);
+                    self.text(" ");
+                    self.tok(self.s.find(t.span.hi, Token::For), "for");
+                    self.text(" ");
+                }
+                self.ty(i.self_ty);
+                self.text(" ");
+                let open = self.s
+                    .find(self.ast.tys.get(i.self_ty).span.hi, Token::LBrace);
+                self.item_block(open, i.items);
+            }
+            ItemKind::Use(u) => {
+                self.tok(self.s.find(pos, Token::Use), "use");
+                self.text(" ");
+                self.use_tree(u);
+                self.semi(it.span.hi);
+            }
+            ItemKind::Mod(m) => {
+                self.tok(self.s.find(pos, Token::Mod), "mod");
+                self.text(" ");
+                self.ident(m.name);
+                match m.items {
+                    Some(l) => {
+                        self.text(" ");
+                        self.item_block(self.s.find(m.name.span.hi, Token::LBrace), l);
+                    }
+                    None => self.semi(it.span.hi),
+                }
+            }
+            ItemKind::Const(c) => {
+                self.tok(self.s.find(pos, Token::Const), "const");
+                self.text(" ");
+                self.ident(c.name);
+                self.tok(self.s.find(c.name.span.hi, Token::Colon), ":");
+                self.text(" ");
+                self.ty(c.ty);
+                self.text(" ");
+                self.tok(self.s.find(self.ast.tys.get(c.ty).span.hi, Token::Eq), "=");
+                self.rhs(c.value);
+                self.semi(it.span.hi);
+            }
+            ItemKind::Static(s) => {
+                let kw = self.s.find(pos, Token::Static);
+                self.tok(kw, "static");
+                self.text(" ");
+                if s.is_mut {
+                    self.tok(self.s.find(kw + 6, Token::Mut), "mut");
+                    self.text(" ");
+                }
+                self.ident(s.name);
+                self.tok(self.s.find(s.name.span.hi, Token::Colon), ":");
+                self.text(" ");
+                self.ty(s.ty);
+                self.text(" ");
+                self.tok(self.s.find(self.ast.tys.get(s.ty).span.hi, Token::Eq), "=");
+                self.rhs(s.value);
+                self.semi(it.span.hi);
+            }
+            ItemKind::Extern(e) => {
+                let kw = self.s.find(pos, Token::Extern);
+                self.tok(kw, "extern");
+                self.text(" ");
+                let mut after = kw + 6;
+                if e.abi.is_some() {
+                    if let Some(t) = self.s.next(after) {
+                        if t.kind == Token::Str {
+                            self.tok_src(t.lo, t.hi);
+                            self.text(" ");
+                            after = t.hi;
+                        }
+                    }
+                }
+                self.item_block(self.s.find(after, Token::LBrace), e.items);
+            }
+            ItemKind::TypeAlias(t) => {
+                self.tok(self.s.find(pos, Token::Type), "type");
+                self.text(" ");
+                self.ident(t.name);
+                self.generics(t.generics);
+                self.text(" ");
+                self.tok(self.s.find(t.generics.span.hi, Token::Eq), "=");
+                self.text(" ");
+                self.ty(t.ty);
+                self.semi(it.span.hi);
+            }
+            ItemKind::Macro(_) => {
+                // Macro definitions keep their layout.
+                let kw = self.s.find(pos, Token::Macro);
+                if kw == NONE {
+                    self.verbatim(pos, it.span.hi);
+                } else {
+                    self.tok(kw, "macro");
+                    self.text(" ");
+                    if let Some(t) = self.s.next(kw + 5) {
+                        self.tok_src(t.lo, t.hi);
+                        if let Some(o) = self.s.next(t.hi) {
+                            // `macro name { rules }`, `macro name(matcher) { body }`.
+                            if o.kind == Token::LBrace {
+                                self.text(" ");
+                            }
+                            self.verbatim(o.lo, it.span.hi);
+                        }
+                    }
+                }
+            }
+            ItemKind::MacCall(m) => {
+                self.mac_call(m);
+                match m.delim {
+                    Delim::Brace => {}
+                    _ => self.semi(it.span.hi),
+                }
+            }
+        }
+    }
+
+    /// The `;` ending an item or statement at `hi` (if the source has it
+    /// there).
+    pub fn semi(&mut self, hi: u32) {
+        if hi > 0 && self.src.as_bytes()[(hi - 1) as usize] == b';' {
+            self.tok(hi - 1, ";");
+        } else {
+            self.text(";");
+        }
+    }
+
+    /// `fn name::<T>(params): Ret from a { body }` (after `pub`), its first
+    /// keyword at or after `pos`.
+    fn fn_decl(&mut self, f: FnDecl, pos: u32) {
+        if f.is_unsafe {
+            self.tok(self.s.find(pos, Token::Unsafe), "unsafe");
+            self.text(" ");
+        }
+        self.tok(f.sig_span.lo, "fn");
+        self.text(" ");
+        self.ident(f.name);
+        self.generics(f.generics);
+        let open = self.s.find(f.generics.span.hi, Token::LParen);
+        let close = self.s.close_of(open);
+        self.params(open, close, f.params, f.variadic);
+        if let Some(r) = f.ret {
+            self.tok(self.s.find(close + 1, Token::Colon), ":");
+            self.text(" ");
+            self.ty(r);
+            let n = f.ret_from.len();
+            if n > 0 {
+                let from = self.s.find(self.ast.tys.get(r).span.hi, Token::Ident);
+                self.text(" ");
+                self.tok(from, "from");
+                self.text(" ");
+                let mut i: usize = 0;
+                while i < n {
+                    let id = self.ast.idents.list(f.ret_from)[i];
+                    if i > 0 {
+                        self.tok(self.s.find(self.last_end, Token::Comma), ",");
+                        self.text(" ");
+                    }
+                    self.ident(id);
+                    i += 1;
+                }
+            }
+        }
+        match f.body {
+            Some(b) => {
+                self.text(" ");
+                self.block(b, false);
+            }
+            None => self.tok(self.s.find(f.sig_span.hi, Token::Semi), ";"),
+        }
+    }
+
+    /// The parameter list `(...)` of a function, its brackets at `open` and
+    /// `close`.
+    fn params(&mut self, open: u32, close: u32, params: List::<Param>, variadic: bool) {
+        let n = params.len();
+        if n == 0 && !variadic {
+            self.tok(open, "(");
+            self.flush(close, END);
+            self.tok(close, ")");
+            return;
+        }
+        self.open();
+        self.tok(open, "(");
+        let lp = self.close();
+        let mut parts: [Id::<Doc>; -..+] = [];
+        let mut i: usize = 0;
+        while i < n {
+            let p = self.ast.params.list(params)[i];
+            self.assume_break();
+            self.open();
+            self.param(p);
+            let d = self.close();
+            let (s, _) = self.sep(p.span.hi, close, i + 1 == n && !variadic);
+            parts.push(d);
+            parts.push(s);
+            i += 1;
+        }
+        let mut trailing = self.trailing_comma(false);
+        if variadic {
+            self.assume_break();
+            self.open();
+            self.tok(self.s.find(self.last_end, Token::DotDotDot), "...");
+            let d = self.close();
+            self.open();
+            self.flush(close, END);
+            let s = self.close();
+            parts.push(d);
+            parts.push(s);
+            trailing = self.d.empty();
+        }
+        self.open();
+        self.tok_bare(close, ")");
+        let rp = self.close();
+        let soft = self.d.softline();
+        let g = self.list_doc(lp, parts[..], rp, trailing, soft, 0);
+        self.emit(g);
+        self.after(close);
+    }
+
+    fn param(&mut self, p: Param) {
+        if p.kept {
+            self.tok(p.span.lo, "kept");
+            self.text(" ");
+        }
+        match p.kind {
+            ParamKind::SelfParam => {
+                match p.mode {
+                    ParamMode::Take => {
+                        if p.is_mut {
+                            self.tok(self.s.find(p.span.lo, Token::Mut), "mut");
+                            self.text(" ");
+                        }
+                        self.tok(self.s.find(p.span.lo, Token::SelfValue), "self");
+                        if let Some(t) = p.ty {
+                            self.tok(self.s.find(self.last_end, Token::Colon), ":");
+                            self.text(" ");
+                            self.ty(t);
+                        }
+                    }
+                    ParamMode::Borrow => {
+                        self.tok(p.span.lo, "&");
+                        self.tok(self.s.find(p.span.lo, Token::SelfValue), "self");
+                    }
+                    ParamMode::InOut => {
+                        self.tok(p.span.lo, "&");
+                        self.tok(self.s.find(p.span.lo + 1, Token::Mut), "mut");
+                        self.text(" ");
+                        if p.self_grow {
+                            self.tok(self.s.find(p.span.lo + 1, Token::Plus), "+");
+                        }
+                        self.tok(self.s.find(p.span.lo, Token::SelfValue), "self");
+                    }
+                }
+            }
+            ParamKind::Named(_) | ParamKind::Wild => {
+                if p.is_mut {
+                    self.tok(self.s.find(p.span.lo, Token::Mut), "mut");
+                    self.text(" ");
+                }
+                match p.kind {
+                    ParamKind::Named(name) => self.ident(name),
+                    _ => self.tok(self.s.find(p.span.lo, Token::Placeholder), "_"),
+                }
+                self.tok(self.s.find(self.last_end, Token::Colon), ":");
+                self.text(" ");
+                self.mode(p.mode);
+                if let Some(t) = p.ty {
+                    self.ty(t);
+                }
+            }
+        }
+    }
+
+    /// `&` or `&mut ` before a parameter's type.
+    pub fn mode(&mut self, m: ParamMode) {
+        match m {
+            ParamMode::Take => {}
+            ParamMode::Borrow => self.tok(self.s.find(self.last_end, Token::Amp), "&"),
+            ParamMode::InOut => {
+                self.tok(self.s.find(self.last_end, Token::Amp), "&");
+                self.tok(self.s.find(self.last_end, Token::Mut), "mut");
+                self.text(" ");
+            }
+        }
+    }
+
+    /// `::<T: A + B, U>` after a declaration's name.
+    fn generics(&mut self, g: Generics) {
+        let n = g.params.len();
+        if n == 0 {
+            return;
+        }
+        let close = g.span.hi - 1;
+        self.open();
+        self.tok(g.span.lo, "::<");
+        let lp = self.close();
+        let mut parts: [Id::<Doc>; -..+] = [];
+        let mut i: usize = 0;
+        while i < n {
+            let p = self.ast.generic_params.list(g.params)[i];
+            self.assume_break();
+            self.open();
+            self.ident(p.name);
+            let mut hi = p.name.span.hi;
+            if p.bounds.len() > 0 {
+                self.tok(self.s.find(hi, Token::Colon), ":");
+                self.text(" ");
+                self.bounds(p.bounds);
+                let bs = self.ast.paths.list(p.bounds);
+                hi = bs[bs.len() - 1].span.hi;
+            }
+            let d = self.close();
+            let (s, _) = self.sep(hi, close, i + 1 == n);
+            parts.push(d);
+            parts.push(s);
+            i += 1;
+        }
+        self.open();
+        self.tok_bare(close, ">");
+        let rp = self.close();
+        let trailing = self.trailing_comma(false);
+        let soft = self.d.softline();
+        let g = self.list_doc(lp, parts[..], rp, trailing, soft, 0);
+        self.emit(g);
+        self.after(close);
+    }
+
+    /// `A + B::<C> + Fn(D): E`
+    fn bounds(&mut self, l: List::<Path>) {
+        let n = l.len();
+        let mut i: usize = 0;
+        while i < n {
+            let p = self.ast.paths.list(l)[i];
+            if i > 0 {
+                self.text(" ");
+                self.tok(self.s.find(self.last_end, Token::Plus), "+");
+                self.text(" ");
+            }
+            self.bound(p);
+            i += 1;
+        }
+    }
+
+    /// A trait in a bound, with the `Fn(A): R` sugar where it was written
+    /// so.
+    fn bound(&mut self, p: Path) {
+        let n = p.segments.len();
+        let last = self.ast.segments.list(p.segments)[n - 1];
+        if let Some(args) = last.args {
+            if args.len() == 1 {
+                let t = self.ast.ty_ids.list(args)[0];
+                let ty = self.ast.tys.get(t);
+                if let TyKind::Fn { params, ret } = ty.kind {
+                    if self.src.as_bytes()[ty.span.lo as usize] == b'(' {
+                        let mut i: usize = 0;
+                        while i < n {
+                            let seg = self.ast.segments.list(p.segments)[i];
+                            if i > 0 {
+                                self.tok(self.s.find(self.last_end, Token::PathSep), "::");
+                            }
+                            if i + 1 < n {
+                                self.segment(seg);
+                            } else {
+                                self.ident(seg.ident);
+                            }
+                            i += 1;
+                        }
+                        self.fn_sig(ty.span.lo, params, ret);
+                        return;
+                    }
+                }
+            }
+        }
+        self.path(p);
+    }
+
+    /// A list of types (a tuple's, a function type's parameters): on one
+    /// line, for what is around it to break instead, unless it has
+    /// comments. `one` needs a comma (`(A,)`).
+    fn type_list(
+        &mut self,
+        lp: Id::<Doc>,
+        parts: [Id::<Doc>; &],
+        rp: Id::<Doc>,
+        had: bool,
+        one: bool,
+        open: u32,
+        close: u32,
+    ) {
+        if close != NONE && !self.s.has_cmts(open, close) {
+            let flat = self.flat_items(parts, had);
+            let comma = if one && !(had && self.in_macro > 0) {
+                self.d.text(",")
+            } else {
+                self.d.empty()
+            };
+            let all = [lp, flat, comma, rp];
+            let c = self.d.concat(all[..]);
+            self.emit(c);
+        } else {
+            let trailing = if one {
+                self.d.text(",")
+            } else {
+                self.trailing_comma(had)
+            };
+            let soft = self.d.softline();
+            let g = self.list_doc(lp, parts, rp, trailing, soft, 0);
+            self.emit(g);
+        }
+        self.after(close);
+    }
+
+    /// `(A, &B): R` of a function type or `Fn` bound, `(` at `open`.
+    fn fn_sig(&mut self, open: u32, params: List::<FnTyParam>, ret: Option::<Id::<Ty>>) {
+        let close = self.s.close_of(open);
+        let n = params.len();
+        self.open();
+        self.tok(open, "(");
+        let lp = self.close();
+        let mut parts: [Id::<Doc>; -..+] = [];
+        let mut had = false;
+        let mut i: usize = 0;
+        while i < n {
+            let p = self.ast.fn_ty_params.list(params)[i];
+            self.assume_break();
+            self.open();
+            self.mode(p.mode);
+            self.ty(p.ty);
+            let d = self.close();
+            let (s, h) = self.sep(self.ast.tys.get(p.ty).span.hi, close, i + 1 == n);
+            had = h;
+            parts.push(d);
+            parts.push(s);
+            i += 1;
+        }
+        if n == 0 {
+            self.emit(lp);
+            self.flush(close, END);
+            self.tok(close, ")");
+        } else {
+            self.open();
+            self.tok_bare(close, ")");
+            let rp = self.close();
+            self.type_list(lp, parts[..], rp, had, false, open, close);
+        }
+        if let Some(r) = ret {
+            self.tok(self.s.find(close + 1, Token::Colon), ":");
+            self.text(" ");
+            self.ty(r);
+        }
+    }
+
+    /// `(pub A, B)` of a tuple struct or variant, after `after`.
+    fn tuple_fields(&mut self, fs: List::<TupleField>, after: u32) {
+        let open = self.s.find(after, Token::LParen);
+        let close = self.s.close_of(open);
+        let n = fs.len();
+        self.open();
+        self.tok(open, "(");
+        let lp = self.close();
+        let mut parts: [Id::<Doc>; -..+] = [];
+        let mut i: usize = 0;
+        while i < n {
+            let f = self.ast.tuple_fields.list(fs)[i];
+            self.assume_break();
+            self.open();
+            if f.is_pub {
+                self.tok(self.s.find(self.last_end, Token::Pub), "pub");
+                self.text(" ");
+            }
+            self.ty(f.ty);
+            let d = self.close();
+            let (s, _) = self.sep(self.ast.tys.get(f.ty).span.hi, close, i + 1 == n);
+            parts.push(d);
+            parts.push(s);
+            i += 1;
+        }
+        if n == 0 {
+            self.emit(lp);
+            self.flush(close, END);
+            self.tok(close, ")");
+            return;
+        }
+        self.open();
+        self.tok_bare(close, ")");
+        let rp = self.close();
+        let trailing = self.trailing_comma(false);
+        let soft = self.d.softline();
+        let g = self.list_doc(lp, parts[..], rp, trailing, soft, 0);
+        self.emit(g);
+        self.after(close);
+    }
+
+    /// `{ pub a: A, b: B }` of a struct, one field a line.
+    fn named_fields(&mut self, fs: List::<FieldDecl>, open: u32) {
+        let close = self.s.close_of(open);
+        let n = fs.len();
+        let trailed = self.brace(open);
+        if n == 0 && !self.cmt_before(close) {
+            if trailed {
+                self.hard();
+            }
+            self.tok(close, "}");
+            return;
+        }
+        self.open();
+        self.hard();
+        let mut i: usize = 0;
+        while i < n {
+            let f = self.ast.field_decls.list(fs)[i];
+            self.next_elem(f.span.lo, i == 0);
+            self.field_decl(f);
+            let (s, _) = self.sep(f.span.hi, close, false);
+            self.text(",");
+            self.emit(s);
+            i += 1;
+        }
+        self.end_list(close, n == 0);
+        let inner = self.close();
+        self.body(inner);
+        self.tok(close, "}");
+    }
+
+    fn field_decl(&mut self, f: FieldDecl) {
+        self.attrs(f.attrs, f.span.lo);
+        if f.is_pub {
+            self.tok(f.span.lo, "pub");
+            self.text(" ");
+        }
+        self.ident(f.name);
+        self.tok(self.s.find(f.name.span.hi, Token::Colon), ":");
+        self.text(" ");
+        self.ty(f.ty);
+    }
+
+    /// `{ A, B(T), C { x: T } }` of an enum, one variant a line.
+    fn variants(&mut self, vs: List::<VariantDecl>, open: u32) {
+        let close = self.s.close_of(open);
+        let n = vs.len();
+        let trailed = self.brace(open);
+        if n == 0 && !self.cmt_before(close) {
+            if trailed {
+                self.hard();
+            }
+            self.tok(close, "}");
+            return;
+        }
+        self.open();
+        self.hard();
+        let mut i: usize = 0;
+        while i < n {
+            let v = self.ast.variants.list(vs)[i];
+            let lo = self.variant_lo(v);
+            self.next_elem(lo, i == 0);
+            self.attrs(v.attrs, lo);
+            self.ident(v.name);
+            match v.data {
+                VariantData::Unit => {}
+                VariantData::Tuple(fs) => self.tuple_fields(fs, v.name.span.hi),
+                VariantData::Named(fs) => {
+                    self.text(" ");
+                    self.variant_fields(fs, self.s.find(v.name.span.hi, Token::LBrace));
+                }
+            }
+            let (s, _) = self.sep(v.span.hi, close, false);
+            self.text(",");
+            self.emit(s);
+            i += 1;
+        }
+        self.end_list(close, n == 0);
+        let inner = self.close();
+        self.body(inner);
+        self.tok(close, "}");
+    }
+
+    /// Where a variant starts: its first attribute that is not a doc
+    /// comment, or its name.
+    fn variant_lo(&self, v: VariantDecl): u32 {
+        let mut i: usize = 0;
+        while i < v.attrs.len() {
+            let a = self.ast.attrs.list(v.attrs)[i];
+            if !self.src[a.span.lo as usize..].starts_with("///") {
+                return a.span.lo;
+            }
+            i += 1;
+        }
+        return v.span.lo;
+    }
+
+    /// A struct variant's `{ a: A, b: B }`: on one line if short.
+    fn variant_fields(&mut self, fs: List::<FieldDecl>, open: u32) {
+        let close = self.s.close_of(open);
+        let n = fs.len();
+        self.open();
+        self.tok(open, "{");
+        let lp = self.close();
+        if n == 0 {
+            self.emit(lp);
+            self.flush(close, END);
+            self.tok(close, "}");
+            return;
+        }
+        let mut parts: [Id::<Doc>; -..+] = [];
+        let mut i: usize = 0;
+        while i < n {
+            let f = self.ast.field_decls.list(fs)[i];
+            self.assume_break();
+            self.open();
+            self.field_decl(f);
+            let d = self.close();
+            let (s, _) = self.sep(f.span.hi, close, i + 1 == n);
+            parts.push(d);
+            parts.push(s);
+            i += 1;
+        }
+        self.open();
+        self.tok_bare(close, "}");
+        let rp = self.close();
+        let trailing = self.trailing_comma(false);
+        let line = self.d.line();
+        let g = self.list_doc(lp, parts[..], rp, trailing, line, STRUCT_VARIANT_WIDTH);
+        self.emit(g);
+        self.after(close);
+    }
+
+    // ===================================================================== use
+
+    /// A `use` tree; the items of a `{}` list sorted (rustfmt's order).
+    fn use_tree(&mut self, u: UseTree) {
+        let np = u.prefix.len();
+        let mut i: usize = 0;
+        while i < np {
+            let id = self.ast.idents.list(u.prefix)[i];
+            if i > 0 {
+                self.tok(self.s.find(self.last_end, Token::PathSep), "::");
+            }
+            self.ident(id);
+            i += 1;
+        }
+        match u.kind {
+            UseKind::Simple(None) => {}
+            UseKind::Simple(Some(r)) => {
+                self.text(" ");
+                self.tok(self.s.find(self.last_end, Token::As), "as");
+                self.text(" ");
+                self.ident(r);
+            }
+            UseKind::Glob => {
+                if np > 0 {
+                    self.tok(self.s.find(self.last_end, Token::PathSep), "::");
+                }
+                self.tok(u.span.hi - 1, "*");
+            }
+            UseKind::Nested(l) => {
+                if np > 0 {
+                    self.tok(self.s.find(self.last_end, Token::PathSep), "::");
+                }
+                self.use_list(l, self.s.find(self.last_end, Token::LBrace), u.span.hi - 1);
+            }
+        }
+    }
+
+    /// `{a, b::c, d as e}`: sorted unless it has comments; filled several
+    /// to a line, or one a line if some are lists themselves.
+    fn use_list(&mut self, l: List::<UseTree>, open: u32, close: u32) {
+        let n = l.len();
+        self.open();
+        self.tok(open, "{");
+        let lp = self.close();
+        if n == 0 {
+            self.emit(lp);
+            self.flush(close, END);
+            self.tok(close, "}");
+            return;
+        }
+        // The order to print them in.
+        let mut order: [usize; -..+] = [];
+        let mut i: usize = 0;
+        while i < n {
+            order.push(i);
+            i += 1;
+        }
+        let sorted = self.in_macro == 0 && !self.s.has_cmts(open, close);
+        if sorted {
+            let mut keys = String::new();
+            let mut bounds: [u32; -..+] = [0];
+            i = 0;
+            while i < n {
+                let t = self.ast.use_trees.list(l)[i];
+                use_key(&self.ast, t, &mut keys);
+                bounds.push(keys.len() as u32);
+                i += 1;
+            }
+            // Insertion sort: lists are short.
+            let mut a: usize = 1;
+            while a < n {
+                let mut b = a;
+                while b > 0 {
+                    let x = order[b - 1];
+                    let y = order[b];
+                    let kx = keys.as_str()[bounds[x] as usize..bounds[x + 1] as usize];
+                    let ky = keys.as_str()[bounds[y] as usize..bounds[y + 1] as usize];
+                    if use_cmp(kx, ky) <= 0 {
+                        break;
+                    }
+                    order[b - 1] = y;
+                    order[b] = x;
+                    b -= 1;
+                }
+                a += 1;
+            }
+        }
+        let mut nested = false;
+        let mut parts: [Id::<Doc>; -..+] = [];
+        i = 0;
+        let mut had = false;
+        while i < n {
+            let t = self.ast.use_trees.list(l)[order[i]];
+            if let UseKind::Nested(_) = t.kind {
+                nested = true;
+            }
+            self.assume_break();
+            self.open();
+            self.use_tree(t);
+            let d = self.close();
+            let mut s = self.d.empty();
+            if sorted {
+                // No comments: only the trailing comma matters.
+                if order[i] + 1 == n {
+                    let comma = self.s.find(t.span.hi, Token::Comma);
+                    had = comma != NONE && comma < close;
+                }
+            } else {
+                let (s2, h) = self.sep(t.span.hi, close, i + 1 == n);
+                s = s2;
+                if i + 1 == n {
+                    had = h;
+                }
+            }
+            parts.push(d);
+            parts.push(s);
+            i += 1;
+        }
+        self.open();
+        self.tok(close, "}");
+        let rp = self.close();
+        let trailing = self.trailing_comma(had);
+        let soft = self.d.softline();
+        if nested || !sorted {
+            let g = self.list_doc(lp, parts[..], rp, trailing, soft, 0);
+            self.emit(g);
+            return;
+        }
+        // Filled: `a, b,` as many as fit on each line.
+        let comma_line = [self.d.text(","), self.d.line()];
+        let sep = self.d.concat(comma_line[..]);
+        let mut fill: [Id::<Doc>; -..+] = [];
+        i = 0;
+        while i < n {
+            if i > 0 {
+                fill.push(sep);
+            }
+            fill.push(parts[2 * i]);
+            i += 1;
+        }
+        let f = self.d.fill(fill[..]);
+        let body = [soft, f, trailing];
+        let b = self.d.concat(body[..]);
+        let ind = self.d.indent(b);
+        let all = [lp, ind, soft, rp];
+        let c = self.d.concat(all[..]);
+        let g = self.d.group(c, 0);
+        self.emit(g);
+    }
+
+    // ===================================================================== paths & types
+
+    pub fn path(&mut self, p: Path) {
+        let n = p.segments.len();
+        let mut i: usize = 0;
+        while i < n {
+            let seg = self.ast.segments.list(p.segments)[i];
+            if i > 0 {
+                self.tok(self.s.find(self.last_end, Token::PathSep), "::");
+            }
+            self.segment(seg);
+            i += 1;
+        }
+    }
+
+    fn segment(&mut self, seg: PathSegment) {
+        self.ident(seg.ident);
+        if let Some(args) = seg.args {
+            self.type_args(args);
+        }
+    }
+
+    /// `::<A, B>` after a path segment or method name.
+    pub fn type_args(&mut self, args: List::<Id::<Ty>>) {
+        let open = self.s.find(self.last_end, Token::PathSep);
+        let lt = self.s.find(open + 2, Token::LAngle);
+        self.tok(open, "::");
+        let n = args.len();
+        if n == 0 {
+            self.tok(lt, "<");
+            self.tok(self.s.find(self.last_end, Token::RAngle), ">");
+            return;
+        }
+        self.open();
+        self.tok(lt, "<");
+        let lp = self.close();
+        let mut parts: [Id::<Doc>; -..+] = [];
+        let mut i: usize = 0;
+        let mut close: u32 = NONE;
+        let mut had = false;
+        while i < n {
+            let t = self.ast.ty_ids.list(args)[i];
+            self.assume_break();
+            self.open();
+            self.ty(t);
+            let d = self.close();
+            let hi = self.ast.tys.get(t).span.hi;
+            if i + 1 == n {
+                // The `>` after the last argument (and its comma).
+                let mut k = self.s.first_at(hi);
+                while k < self.s.toks.len() && self.s.toks[k].kind == Token::Comma {
+                    k += 1;
+                }
+                if k < self.s.toks.len() {
+                    close = self.s.toks[k].lo;
+                }
+            }
+            let (s, h) = self.sep(hi, if i + 1 == n { close } else { NONE }, i + 1 == n);
+            had = h;
+            parts.push(d);
+            parts.push(s);
+            i += 1;
+        }
+        self.open();
+        self.tok_bare(close, ">");
+        let rp = self.close();
+        if lt != NONE && close != NONE && !self.s.has_cmts(lt, close) {
+            // Generic arguments do not break: what is around them does.
+            let flat = self.flat_items(parts[..], had);
+            let all = [lp, flat, rp];
+            let c = self.d.concat(all[..]);
+            self.emit(c);
+        } else {
+            let trailing = self.trailing_comma(had);
+            let soft = self.d.softline();
+            let g = self.list_doc(lp, parts[..], rp, trailing, soft, 0);
+            self.emit(g);
+        }
+        self.after(close);
+    }
+
+    pub fn ty(&mut self, id: Id::<Ty>) {
+        let t = self.ast.tys.get(id);
+        let lo = t.span.lo;
+        match t.kind {
+            TyKind::Path(p) => self.path(p),
+            TyKind::Array(e, size) => {
+                self.tok(lo, "[");
+                self.ty(e);
+                self.tok(self.s.find(self.ast.tys.get(e).span.hi, Token::Semi), ";");
+                self.text(" ");
+                match size {
+                    ArraySize::Fixed(x) => self.expr(x),
+                    ArraySize::Inferred =>
+                        self.tok(self.s.find(self.last_end, Token::Placeholder), "_"),
+                    ArraySize::Grow => {
+                        self.tok(self.s.find(self.last_end, Token::DotDot), "..");
+                        self.tok(self.s.find(self.last_end, Token::Plus), "+");
+                    }
+                    ArraySize::GrowShrink => {
+                        self.tok(self.s.find(self.last_end, Token::Minus), "-");
+                        self.tok(self.s.find(self.last_end, Token::DotDot), "..");
+                        self.tok(self.s.find(self.last_end, Token::Plus), "+");
+                    }
+                    ArraySize::Slice => self.tok(self.s.find(self.last_end, Token::Amp), "&"),
+                    ArraySize::SliceMut => {
+                        self.tok(self.s.find(self.last_end, Token::Amp), "&");
+                        self.tok(self.s.find(self.last_end, Token::Mut), "mut");
+                    }
+                }
+                self.tok(t.span.hi - 1, "]");
+            }
+            TyKind::DynArray(e) => {
+                self.tok(lo, "[");
+                self.ty(e);
+                self.tok(t.span.hi - 1, "]");
+            }
+            TyKind::Grow(e) => {
+                self.tok(lo, "+");
+                self.ty(e);
+            }
+            TyKind::Ptr { is_mut, inner } => {
+                self.tok(lo, "*");
+                if is_mut {
+                    self.tok(self.s.find(lo + 1, Token::Mut), "mut");
+                    self.text(" ");
+                }
+                self.ty(inner);
+            }
+            TyKind::Tuple(ts) => self.tuple_ty(lo, t.span.hi - 1, ts),
+            TyKind::Fn { params, ret } => {
+                self.tok(lo, "fn");
+                self.fn_sig(self.s.find(lo + 2, Token::LParen), params, ret);
+            }
+            TyKind::Never => self.tok(lo, "!"),
+            TyKind::Infer => self.tok(lo, "_"),
+            TyKind::MacCall(m) => self.mac_call(m),
+            TyKind::ImplTrait(bs) => {
+                self.tok(lo, "impl");
+                self.text(" ");
+                self.bounds(bs);
+            }
+        }
+    }
+
+    /// `(A, B)`, `(A,)` or `()`.
+    fn tuple_ty(&mut self, open: u32, close: u32, ts: List::<Id::<Ty>>) {
+        let n = ts.len();
+        self.open();
+        self.tok(open, "(");
+        let lp = self.close();
+        if n == 0 {
+            self.emit(lp);
+            self.flush(close, END);
+            self.tok(close, ")");
+            return;
+        }
+        let mut parts: [Id::<Doc>; -..+] = [];
+        let mut had = false;
+        let mut i: usize = 0;
+        while i < n {
+            let t = self.ast.ty_ids.list(ts)[i];
+            self.assume_break();
+            self.open();
+            self.ty(t);
+            let d = self.close();
+            let (s, h) = self.sep(self.ast.tys.get(t).span.hi, close, i + 1 == n);
+            had = h;
+            parts.push(d);
+            parts.push(s);
+            i += 1;
+        }
+        self.open();
+        self.tok_bare(close, ")");
+        let rp = self.close();
+        self.type_list(lp, parts[..], rp, had, n == 1, open, close);
+    }
+
+    // ===================================================================== patterns
+
+    pub fn pat(&mut self, id: Id::<Pat>) {
+        let p = self.ast.pats.get(id);
+        let lo = p.span.lo;
+        match p.kind {
+            PatKind::Wild => self.tok(lo, "_"),
+            PatKind::Rest => self.tok(lo, ".."),
+            PatKind::Binding { is_mut, name } => {
+                if is_mut {
+                    self.tok(lo, "mut");
+                    self.text(" ");
+                }
+                self.ident(name);
+            }
+            PatKind::Lit(_, _) | PatKind::Range { .. } => self.tight(lo, p.span.hi),
+            PatKind::Tuple(ps) => {
+                let close = p.span.hi - 1;
+                self.pat_list(lo, close, ps, true, 0);
+            }
+            PatKind::TupleStruct { path, pats } => {
+                self.path(path);
+                let open = self.s.find(path.span.hi, Token::LParen);
+                self.pat_list(open, p.span.hi - 1, pats, false, CALL_WIDTH);
+            }
+            PatKind::Struct { path, fields, rest } => {
+                self.path(path);
+                self.text(" ");
+                self.struct_pat(
+                    self.s.find(path.span.hi, Token::LBrace),
+                    p.span.hi - 1,
+                    fields,
+                    rest,
+                );
+            }
+            PatKind::Path(path) => self.path(path),
+            PatKind::Or(ps) => {
+                // Alternatives broken before `|`, at the same indentation.
+                let n = ps.len();
+                self.open();
+                let mut i: usize = 0;
+                while i < n {
+                    let x = self.ast.pat_ids.list(ps)[i];
+                    if i > 0 {
+                        self.line();
+                        self.tok(self.s.find(self.last_end, Token::Pipe), "|");
+                        self.text(" ");
+                    }
+                    self.pat(x);
+                    i += 1;
+                }
+                let c = self.close();
+                let g = self.d.group(c, 0);
+                self.emit(g);
+            }
+            PatKind::MacCall(m) => self.mac_call(m),
+        }
+    }
+
+    /// The tokens of `lo..hi` without spaces: literal and range patterns
+    /// (`-1`, `'a'..='z'`).
+    fn tight(&mut self, lo: u32, hi: u32) {
+        let mut k = self.s.first_at(lo);
+        let mut prev_dot = false;
+        while k < self.s.toks.len() && self.s.toks[k].lo < hi {
+            let t = self.s.toks[k];
+            let starts_dot = self.src.as_bytes()[t.lo as usize] == b'.';
+            if prev_dot && starts_dot {
+                // `1. ..2` must not become `1...2`.
+                self.text(" ");
+            }
+            self.tok_src(t.lo, t.hi);
+            prev_dot = self.src.as_bytes()[(t.hi - 1) as usize] == b'.';
+            k += 1;
+        }
+    }
+
+    /// `(a, b)` of a tuple pattern (`tuple`: one element needs a comma) or
+    /// a tuple struct pattern.
+    fn pat_list(&mut self, open: u32, close: u32, ps: List::<Id::<Pat>>, tuple: bool, limit: u32) {
+        let n = ps.len();
+        self.open();
+        self.tok(open, "(");
+        let lp = self.close();
+        if n == 0 {
+            self.emit(lp);
+            self.flush(close, END);
+            self.tok(close, ")");
+            return;
+        }
+        let mut parts: [Id::<Doc>; -..+] = [];
+        let mut had = false;
+        let mut i: usize = 0;
+        while i < n {
+            let x = self.ast.pat_ids.list(ps)[i];
+            self.assume_break();
+            self.open();
+            self.pat(x);
+            let d = self.close();
+            let (s, h) = self.sep(self.ast.pats.get(x).span.hi, close, i + 1 == n);
+            had = h;
+            parts.push(d);
+            parts.push(s);
+            i += 1;
+        }
+        self.open();
+        self.tok_bare(close, ")");
+        let rp = self.close();
+        let mut trailing = self.trailing_comma(had);
+        if tuple && n == 1 {
+            let only = self.ast.pat_ids.list(ps)[0];
+            let is_rest = match self.ast.pats.get(only).kind {
+                PatKind::Rest => true,
+                _ => false,
+            };
+            if !is_rest || had {
+                trailing = self.d.text(",");
+            }
+        }
+        let soft = self.d.softline();
+        let g = self.list_doc(lp, parts[..], rp, trailing, soft, limit);
+        self.emit(g);
+        self.after(close);
+    }
+
+    /// `{ a, b: c, .. }` of a struct pattern.
+    fn struct_pat(&mut self, open: u32, close: u32, fields: List::<FieldPat>, rest: bool) {
+        let n = fields.len();
+        self.open();
+        self.tok(open, "{");
+        let lp = self.close();
+        if n == 0 && !rest {
+            self.emit(lp);
+            self.flush(close, END);
+            self.tok(close, "}");
+            return;
+        }
+        let mut parts: [Id::<Doc>; -..+] = [];
+        let mut had = false;
+        let mut i: usize = 0;
+        while i < n {
+            let f = self.ast.field_pats.list(fields)[i];
+            let fp = self.ast.pats.get(f.pat);
+            self.assume_break();
+            self.open();
+            let shorthand = fp.span.lo <= f.name.span.lo;
+            if shorthand {
+                self.pat(f.pat);
+            } else {
+                self.ident(f.name);
+                self.tok(self.s.find(f.name.span.hi, Token::Colon), ":");
+                self.text(" ");
+                self.pat(f.pat);
+            }
+            let d = self.close();
+            let hi = if fp.span.hi > f.name.span.hi {
+                fp.span.hi
+            } else {
+                f.name.span.hi
+            };
+            let (s, h) = self.sep(hi, close, i + 1 == n && !rest);
+            had = h;
+            parts.push(d);
+            parts.push(s);
+            i += 1;
+        }
+        let mut trailing = self.trailing_comma(had);
+        if rest {
+            self.assume_break();
+            self.open();
+            self.tok(self.s.find(self.last_end, Token::DotDot), "..");
+            let d = self.close();
+            self.open();
+            self.flush(close, END);
+            let s = self.close();
+            parts.push(d);
+            parts.push(s);
+            // Nothing may follow `..`.
+            trailing = self.d.empty();
+        }
+        self.open();
+        self.tok_bare(close, "}");
+        let rp = self.close();
+        let line = self.d.line();
+        let g = self.list_doc(lp, parts[..], rp, trailing, line, STRUCT_LIT_WIDTH);
+        self.emit(g);
+        self.after(close);
+    }
+}
+
+// ===================================================================== use order
+
+/// The text a `use` tree sorts by: its path, then `{` for `*` or `|` for a
+/// list, which sort after any name.
+fn use_key(a: &Ast, t: UseTree, out: &mut +String) {
+    let mut i: usize = 0;
+    for id in a.idents.list(t.prefix) {
+        if i > 0 {
+            out.push_str("::");
+        }
+        out.push_str(a.text(id.name));
+        i += 1;
+    }
+    match t.kind {
+        UseKind::Simple(None) => {}
+        UseKind::Simple(Some(r)) => {
+            out.push_str(" as ");
+            out.push_str(a.text(r.name));
+        }
+        // After every name, as rustfmt orders them: globs, then lists.
+        UseKind::Glob => {
+            if i > 0 {
+                out.push_str("::");
+            }
+            out.push('{');
+        }
+        UseKind::Nested(_) => {
+            if i > 0 {
+                out.push_str("::");
+            }
+            out.push('|');
+        }
+    }
+}
+
+/// rustfmt's order of `use` items: `self`, `super` and `crater` first,
+/// then by "version sorting": byte by byte, but runs of digits by their
+/// value.
+fn use_cmp(a: str, b: str): i32 {
+    let ra = rank(a);
+    let rb = rank(b);
+    if ra != rb {
+        return if ra < rb { -1 } else { 1 };
+    }
+    let x = a.as_bytes();
+    let y = b.as_bytes();
+    let mut i: usize = 0;
+    let mut j: usize = 0;
+    while i < x.len() && j < y.len() {
+        if is_digit(x[i]) && is_digit(y[j]) {
+            let mut ie = i;
+            while ie < x.len() && is_digit(x[ie]) {
+                ie += 1;
+            }
+            let mut je = j;
+            while je < y.len() && is_digit(y[je]) {
+                je += 1;
+            }
+            // Without leading zeros, a longer run is a larger number.
+            let mut i0 = i;
+            while i0 + 1 < ie && x[i0] == b'0' {
+                i0 += 1;
+            }
+            let mut j0 = j;
+            while j0 + 1 < je && y[j0] == b'0' {
+                j0 += 1;
+            }
+            if ie - i0 != je - j0 {
+                return if ie - i0 < je - j0 { -1 } else { 1 };
+            }
+            let mut k: usize = 0;
+            while k < ie - i0 {
+                if x[i0 + k] != y[j0 + k] {
+                    return if x[i0 + k] < y[j0 + k] { -1 } else { 1 };
+                }
+                k += 1;
+            }
+            i = ie;
+            j = je;
+            continue;
+        }
+        if x[i] != y[j] {
+            return if x[i] < y[j] { -1 } else { 1 };
+        }
+        i += 1;
+        j += 1;
+    }
+    if x.len() - i == y.len() - j {
+        return 0;
+    }
+    return if x.len() - i < y.len() - j { -1 } else { 1 };
+}
+
+fn is_digit(c: u8): bool {
+    return c >= b'0' && c <= b'9';
+}
+
+/// `self` sorts first, then `super`, then `crater`, then the rest.
+fn rank(k: str): u8 {
+    if k == "self" || k.starts_with("self::") || k.starts_with("self as") {
+        return 0;
+    }
+    if k == "super" || k.starts_with("super::") {
+        return 1;
+    }
+    if k == "crater" || k.starts_with("crater::") {
+        return 2;
+    }
+    return 3;
+}

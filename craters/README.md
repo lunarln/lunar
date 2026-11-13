@@ -42,8 +42,8 @@ What `craters/` may use (only what stage 0 supports) and how to move
 stage 0 forward is in [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 The executable has the commands `new`, `init`, `check`, `build`, `run`,
-`test`, `add`, `remove`, `update`, `clean`, `emit-llvm`, `explain` and
-`lsp`. Diagnostics are drawn by `ln-ariadne` (`ln-sema/src/render.ln` is
+`test`, `add`, `remove`, `update`, `clean`, `emit-llvm`, `explain`, `fmt`
+(the formatter, [docs/style.md](../docs/style.md)) and `lsp`. Diagnostics are drawn by `ln-ariadne` (`ln-sema/src/render.ln` is
 the glue). When stderr is a terminal and `NO_COLOR` is not set they are in
 color, and the quoted code is syntax highlighted from `ln-lexer`'s tokens
 (`ln-sema/src/highlight.ln`).
@@ -91,7 +91,8 @@ failed builds show no `lunar explain` hint.
 | `ln-toml`    | what manifests and lockfiles need: the whole TOML syntax, every key and value with its place in the text; `edit` sets and removes keys in place, keeping comments and layout |
 | `ln-semver`  | versions and requirements (`^`, `~`, `=`, `<`, `>`, wildcards, several comparators), matching with Cargo's pre-release rules |
 | `ln-json`    | JSON documents as arenas of linked nodes: strict parsing (escapes, `\u` surrogate pairs, numbers kept as written), building, compact writing |
-| `lunar`      | the `lunar` command: `cli.ln` (parsing, help and errors), `commands.ln`, `project.ln` and `git.ln` (packages), `compile.ln`, `explain.ln`, `link.ln`, `testing.ln`, `sysroot.ln`, and the language server, `lsp.ln`, `ide.ln`, `complete.ln`, `refs.ln` and `symbols.ln` (below). Hidden modes, for looking at one stage of the front end: `--lex FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--render [--color] FILE...` the diagnostics drawn as `lunar check` draws them, `--craters DIR` the craters a package build loads |
+| `ln-fmt`     | the formatter, in rustfmt's style: `format_source(text)` gives the text formatted ([docs/style.md](../docs/style.md)), or why not. The syntax tree is printed into layout documents laid out in 100 columns (`doc.ln`: Wadler's algorithm as Prettier has it, with rustfmt's width heuristics); comments, found between the tokens (`source.ln`), are put back by position. Every result is parsed again and must have the same tree and comments (`verify.ln`) |
+| `lunar`      | the `lunar` command: `cli.ln` (parsing, help and errors), `commands.ln`, `project.ln` and `git.ln` (packages), `compile.ln`, `explain.ln`, `link.ln`, `testing.ln`, `sysroot.ln`, `fmt.ln` (`lunar fmt`), and the language server, `lsp.ln`, `ide.ln`, `complete.ln`, `refs.ln` and `symbols.ln` (below). Hidden modes, for looking at one stage of the front end: `--lex FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--render [--color] FILE...` the diagnostics drawn as `lunar check` draws them, `--craters DIR` the craters a package build loads |
 | `lunar-tests` | the tests of the executable (above) |
 
 ### The language server

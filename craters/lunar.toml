@@ -1,3 +1,3 @@
 # The Lunar compiler, written in Lunar, and (lunar-tests) its tests.
 [workspace]
-members = ["ln-lexer", "ln-ast", "ln-parser", "ln-ariadne", "ln-sema", "ln-codegen", "ln-toml", "ln-semver", "ln-json", "lunar", "lunar-tests"]
+members = ["ln-lexer", "ln-ast", "ln-parser", "ln-ariadne", "ln-sema", "ln-codegen", "ln-toml", "ln-semver", "ln-json", "ln-fmt", "lunar", "lunar-tests"]

@@ -1,0 +1,1277 @@
+// Blocks, statements, expressions and macro calls.
+
+use core::arena::{Id, List};
+use core::collections::HashMap;
+use ln_ast::*;
+use ln_lexer::Token;
+use ln_parser::{Expansion, ExpansionKind};
+use crater::{
+    ARRAY_WIDTH, CALL_WIDTH, CHAIN_WIDTH, END, IF_ELSE_WIDTH, LET_ELSE_WIDTH, Printer, SHORT_ITEM,
+    STRUCT_LIT_WIDTH,
+};
+use crater::doc::Doc;
+use crater::source::NONE;
+
+/// How a call's last argument may hug its parentheses: not at all, as it
+/// is (`f(a, |x| {` ... `})`), or also broken (`f(Point {` ... `})`).
+const HUG_NONE: u8 = 0;
+const HUG_FLAT: u8 = 1;
+const HUG_BREAK: u8 = 2;
+
+/// The precedence of a binary operator, as the parser climbs it.
+fn prec(op: BinOp): u8 {
+    return match op {
+        BinOp::Or => 1,
+        BinOp::And => 2,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 3,
+        BinOp::BitOr => 4,
+        BinOp::BitXor => 5,
+        BinOp::BitAnd => 6,
+        BinOp::Shl | BinOp::Shr => 7,
+        BinOp::Add | BinOp::Sub => 8,
+        BinOp::Mul | BinOp::Div | BinOp::Rem => 9,
+    };
+}
+
+fn unop(op: UnOp): str {
+    return match op {
+        UnOp::Neg => "-",
+        UnOp::Not => "!",
+        UnOp::Deref => "*",
+    };
+}
+
+impl Printer {
+    // ===================================================================== blocks
+
+    /// A block. `flat_ok`: a block of just an expression may be one line,
+    /// `{ x }` (not a function's or a loop's body).
+    pub fn block(&mut self, id: Id::<Block>, flat_ok: bool) {
+        let b = self.ast.blocks.get(id);
+        let open = b.span.lo;
+        let close = b.span.hi - 1;
+        let ns = b.stmts.len();
+        if flat_ok && ns == 0 && b.tail.is_some() && !self.s.has_cmts(open, close + 1) {
+            self.open();
+            self.block_lines(id);
+            let c = self.close();
+            let g = self.d.group(c, 0);
+            self.emit(g);
+            self.after(close);
+            return;
+        }
+        let trailed = self.brace(open);
+        if ns == 0 && b.tail.is_none() && !self.cmt_before(close) {
+            if trailed {
+                self.hard();
+            }
+            self.tok(close, "}");
+            return;
+        }
+        self.open();
+        self.hard();
+        let mut i: usize = 0;
+        while i < ns {
+            let s = self.ast.stmts.list(b.stmts)[i];
+            self.next_elem(s.span.lo, i == 0);
+            self.stmt(s);
+            i += 1;
+        }
+        if let Some(t) = b.tail {
+            self.next_elem(self.ast.exprs.get(t).span.lo, ns == 0);
+            self.expr(t);
+        }
+        self.end_list(close, ns == 0 && b.tail.is_none());
+        let inner = self.close();
+        self.body(inner);
+        self.tok(close, "}");
+    }
+
+    /// `{ tail }` of a block of just an expression, its lines those of the
+    /// enclosing group: flat on one line, broken on three.
+    fn block_lines(&mut self, id: Id::<Block>) {
+        let b = self.ast.blocks.get(id);
+        self.tok(b.span.lo, "{");
+        self.open();
+        self.line();
+        if let Some(t) = b.tail {
+            self.expr(t);
+        }
+        let inner = self.close();
+        let ind = self.d.indent(inner);
+        self.emit(ind);
+        self.line();
+        self.tok_bare(b.span.hi - 1, "}");
+    }
+
+    /// Whether a block is just an expression, without comments.
+    fn just_tail(&self, id: Id::<Block>): bool {
+        let b = self.ast.blocks.get(id);
+        return b.stmts.len() == 0 && b.tail.is_some() && !self.s.has_cmts(b.span.lo, b.span.hi);
+    }
+
+    pub fn stmt(&mut self, s: Stmt) {
+        match s.kind {
+            StmtKind::Let {
+                pat,
+                ty,
+                init,
+                else_,
+            } => {
+                // `let Some(x) = y else { return };` on one line if short.
+                let single = match else_ {
+                    Some(b) => self.just_tail(b) && !self.s.has_cmts(s.span.lo, s.span.hi),
+                    None => false,
+                };
+                if single {
+                    self.open();
+                }
+                self.tok(s.span.lo, "let");
+                self.text(" ");
+                self.pat(pat);
+                if let Some(t) = ty {
+                    self.tok(self.s.find(self.last_end, Token::Colon), ":");
+                    self.text(" ");
+                    self.ty(t);
+                }
+                if let Some(e) = init {
+                    self.text(" ");
+                    self.tok(self.s.find(self.last_end, Token::Eq), "=");
+                    self.rhs(e);
+                }
+                if let Some(b) = else_ {
+                    self.text(" ");
+                    self.tok(self.s.find(self.last_end, Token::Else), "else");
+                    self.text(" ");
+                    if single {
+                        self.block_lines(b);
+                    } else {
+                        self.block(b, false);
+                    }
+                }
+                self.semi(s.span.hi);
+                if single {
+                    let c = self.close();
+                    let g = self.d.group(c, LET_ELSE_WIDTH);
+                    self.emit(g);
+                }
+            }
+            StmtKind::Expr(e) => {
+                self.expr(e);
+                let hi = self.ast.exprs.get(e).span.hi;
+                if s.span.hi > hi && self.src.as_bytes()[(s.span.hi - 1) as usize] == b';' {
+                    self.tok(s.span.hi - 1, ";");
+                }
+            }
+            StmtKind::Item(id) => self.item(id),
+        }
+    }
+
+    /// What follows `=` (or `:` in a struct literal, `=>` in a match):
+    /// after a space, or on the next line if it fits there and not here.
+    pub fn rhs(&mut self, e: Id::<Expr>) {
+        let lo = self.ast.exprs.get(e).span.lo;
+        if self.cmt_before(lo) {
+            // Comments before it: it goes on the next line, after them.
+            self.open();
+            self.hard();
+            self.flush(lo, 0);
+            self.expr(e);
+            let c = self.close();
+            let ind = self.d.indent(c);
+            let g = self.d.broken(ind);
+            self.emit(g);
+            return;
+        }
+        self.open();
+        self.expr(e);
+        let d = self.close();
+        let r = self.d.rhs(d);
+        self.emit(r);
+    }
+
+    // ===================================================================== expressions
+
+    pub fn expr(&mut self, id: Id::<Expr>) {
+        let e = self.ast.exprs.get(id);
+        let lo = e.span.lo;
+        let hi = e.span.hi;
+        match e.kind {
+            ExprKind::Lit(_) => self.tok_src(lo, hi),
+            ExprKind::Path(p) => self.path(p),
+            ExprKind::Unary(op, x) => {
+                self.tok(lo, unop(op));
+                self.expr(x);
+            }
+            ExprKind::Borrow { mutable, expr: x } => {
+                self.tok(lo, "&");
+                if mutable {
+                    self.tok(self.s.find(lo + 1, Token::Mut), "mut");
+                    self.text(" ");
+                } else if let ExprKind::Borrow { .. } = self.ast.exprs.get(x).kind {
+                    // `& &x`: `&&` is one token.
+                    self.text(" ");
+                }
+                self.expr(x);
+            }
+            ExprKind::Binary(_, _, _) => self.binary(id),
+            ExprKind::Assign(l, r) => {
+                self.expr(l);
+                self.text(" ");
+                self.tok(self.s.find(self.ast.exprs.get(l).span.hi, Token::Eq), "=");
+                self.rhs(r);
+            }
+            ExprKind::AssignOp(op, l, r) => {
+                self.expr(l);
+                self.text(" ");
+                let at = match self.s.next(self.ast.exprs.get(l).span.hi) {
+                    Some(t) => t.lo,
+                    None => NONE,
+                };
+                let mut s = String::from(op.as_str());
+                s.push('=');
+                self.tok(at, s.as_str());
+                self.rhs(r);
+            }
+            ExprKind::Call(f, args) => {
+                self.expr(f);
+                let open = self.s.find(self.ast.exprs.get(f).span.hi, Token::LParen);
+                self.args(open, hi - 1, args, CALL_WIDTH);
+            }
+            ExprKind::MethodCall { .. }
+            | ExprKind::Field(_, _)
+            | ExprKind::TupleField(_, _, _)
+            | ExprKind::Index(_, _)
+            | ExprKind::Try(_) => self.postfix(id),
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                let mut at = lo;
+                if let Some(x) = start {
+                    self.expr(x);
+                    let xh = self.ast.exprs.get(x).span.hi;
+                    at = match self.s.next(xh) {
+                        Some(t) => t.lo,
+                        None => NONE,
+                    };
+                    if self.src.as_bytes()[(xh - 1) as usize] == b'.' {
+                        // `1. ..2`, not `1...2`.
+                        self.text(" ");
+                    }
+                }
+                self.tok(at, if inclusive { "..=" } else { ".." });
+                if let Some(x) = end {
+                    self.expr(x);
+                }
+            }
+            ExprKind::Array(es) => self.array(lo, hi - 1, es),
+            ExprKind::ArrayRepeat(v, n) => {
+                self.tok(lo, "[");
+                self.expr(v);
+                self.tok(self.s.find(self.ast.exprs.get(v).span.hi, Token::Semi), ";");
+                self.text(" ");
+                self.expr(n);
+                self.tok(hi - 1, "]");
+            }
+            ExprKind::Tuple(es) => self.tuple(lo, hi - 1, es),
+            ExprKind::StructLit { path, fields } => self.struct_lit(path, fields, hi - 1),
+            ExprKind::Block(b) => self.block(b, true),
+            ExprKind::Unsafe(b) => {
+                self.tok(lo, "unsafe");
+                self.text(" ");
+                self.block(b, true);
+            }
+            ExprKind::If { .. } | ExprKind::IfLet { .. } => self.if_expr(id),
+            ExprKind::Match { scrut, arms } => self.match_expr(lo, scrut, arms, hi - 1),
+            ExprKind::While { cond, body } => {
+                self.open();
+                self.tok(lo, "while");
+                self.text(" ");
+                self.header_expr(cond);
+                self.line();
+                self.header_end();
+                self.block(body, false);
+            }
+            ExprKind::WhileLet { pat, scrut, body } => {
+                self.open();
+                self.tok(lo, "while");
+                self.text(" ");
+                self.tok(self.s.find(lo + 5, Token::Let), "let");
+                self.text(" ");
+                self.pat(pat);
+                self.text(" ");
+                self.tok(self.s.find(self.ast.pats.get(pat).span.hi, Token::Eq), "=");
+                self.text(" ");
+                self.expr(scrut);
+                self.line();
+                self.header_end();
+                self.block(body, false);
+            }
+            ExprKind::Loop(b) => {
+                self.tok(lo, "loop");
+                self.text(" ");
+                self.block(b, false);
+            }
+            ExprKind::For { pat, iter, body } => {
+                self.open();
+                self.tok(lo, "for");
+                self.text(" ");
+                self.pat(pat);
+                self.text(" ");
+                self.tok(self.s.find(self.ast.pats.get(pat).span.hi, Token::In), "in");
+                self.text(" ");
+                self.expr(iter);
+                self.line();
+                self.header_end();
+                self.block(body, false);
+            }
+            ExprKind::Break(v) => {
+                self.tok(lo, "break");
+                if let Some(x) = v {
+                    self.text(" ");
+                    self.expr(x);
+                }
+            }
+            ExprKind::Continue => self.tok(lo, "continue"),
+            ExprKind::Return(v) => {
+                self.tok(lo, "return");
+                if let Some(x) = v {
+                    self.text(" ");
+                    self.expr(x);
+                }
+            }
+            ExprKind::Cast(x, t) => {
+                self.expr(x);
+                self.text(" ");
+                self.tok(self.s.find(self.ast.exprs.get(x).span.hi, Token::As), "as");
+                self.text(" ");
+                self.ty(t);
+            }
+            ExprKind::Paren(x) => {
+                self.tok(lo, "(");
+                self.expr(x);
+                self.tok(hi - 1, ")");
+            }
+            ExprKind::MacCall(m) => self.mac_call(m),
+            ExprKind::Closure(c) => self.closure(lo, c),
+            ExprKind::Error => self.verbatim(lo, hi),
+        }
+    }
+
+    /// The end of a control flow header (`if c`, `while c`, `for x in y`,
+    /// `match x`) begun with `open` and ending with a line: a group, so
+    /// that the `{` goes on a line of its own when the header is broken.
+    fn header_end(&mut self) {
+        let h = self.close();
+        let g = self.d.group(h, 0);
+        self.emit(g);
+    }
+
+    /// A chain of binary operators of one precedence, broken before the
+    /// operators.
+    fn binary(&mut self, id: Id::<Expr>) {
+        self.binary_in(id, true);
+    }
+
+    /// The expression of a control flow header (`if c`, `while c`, ...):
+    /// a chain of operators breaks with the header (and its `{`).
+    fn header_expr(&mut self, id: Id::<Expr>) {
+        match self.ast.exprs.get(id).kind {
+            ExprKind::Binary(_, _, _) => self.binary_in(id, false),
+            _ => self.expr(id),
+        }
+    }
+
+    /// A chain of operators, in a group of its own (`grouped`) or in the
+    /// enclosing one.
+    fn binary_in(&mut self, id: Id::<Expr>, grouped: bool) {
+        let p = match self.ast.exprs.get(id).kind {
+            ExprKind::Binary(op, _, _) => prec(op),
+            _ => 0,
+        };
+        // The operators of the chain, outermost first, and its first operand.
+        let mut chain: [Id::<Expr>; -..+] = [];
+        let mut cur = id;
+        loop {
+            match self.ast.exprs.get(cur).kind {
+                ExprKind::Binary(op, l, _) => {
+                    if prec(op) != p {
+                        break;
+                    }
+                    chain.push(cur);
+                    cur = l;
+                }
+                _ => break,
+            }
+        }
+        self.open();
+        self.expr(cur);
+        self.open();
+        let mut k = chain.len();
+        while k > 0 {
+            k -= 1;
+            if let ExprKind::Binary(op, l, r) = self.ast.exprs.get(chain[k]).kind {
+                self.line();
+                let at = match self.s.next(self.ast.exprs.get(l).span.hi) {
+                    Some(t) => t.lo,
+                    None => NONE,
+                };
+                self.tok(at, op.as_str());
+                self.text(" ");
+                self.expr(r);
+            }
+        }
+        let rest = self.close();
+        let ind = self.d.indent(rest);
+        self.emit(ind);
+        let c = self.close();
+        if grouped {
+            let g = self.d.group(c, 0);
+            self.emit(g);
+        } else {
+            self.emit(c);
+        }
+    }
+
+    // ===================================================================== calls and chains
+
+    /// `(a, b)` of a call, its brackets at `open` and `close`. The last
+    /// argument may hug the parentheses: `f(a, |x| {` ... `})`.
+    pub fn args(&mut self, open: u32, close: u32, args: List::<Id::<Expr>>, limit: u32) {
+        let n = args.len();
+        if n == 0 {
+            self.tok(open, "(");
+            self.flush(close, END);
+            self.tok(close, ")");
+            return;
+        }
+        let comments = self.cmts_between(open, close, args);
+        // A single argument may be as wide as the line (rustfmt).
+        let limit = if n == 1 { 0 } else { limit };
+        self.open();
+        self.tok(open, "(");
+        let lp = self.close();
+        let (parts, had) = self.expr_items(args, close);
+        self.open();
+        self.tok_bare(close, ")");
+        let rp = self.close();
+        let trailing = self.trailing_comma(had);
+        let soft = self.d.softline();
+        let broken = self.list_doc(lp, parts[..], rp, trailing, soft, limit);
+        self.args_layout(lp, parts[..], rp, broken, args, had, comments, limit);
+        self.after(close);
+    }
+
+    /// The layouts of a call's arguments: flat, hugging the last one, or
+    /// one a line (`broken`).
+    fn args_layout(
+        &mut self,
+        lp: Id::<Doc>,
+        parts: [Id::<Doc>; &],
+        rp: Id::<Doc>,
+        broken: Id::<Doc>,
+        args: List::<Id::<Expr>>,
+        had: bool,
+        comments: bool,
+        limit: u32,
+    ) {
+        let n = args.len();
+        let last = self.ast.expr_ids.list(args)[n - 1];
+        let hug = if comments {
+            HUG_NONE
+        } else {
+            self.hug(last, n)
+        };
+        let mut i: usize = 0;
+        let mut early_hard = false;
+        while i + 1 < n {
+            if self.d.will_break(parts[2 * i]) {
+                early_hard = true;
+            }
+            i += 1;
+        }
+        if hug == HUG_NONE || early_hard {
+            self.emit(broken);
+            return;
+        }
+        let flat = self.flat_items(parts, had);
+        let a0 = [lp, flat, rp];
+        let alt0 = self.d.concat(a0[..]);
+        let mut alts: [Id::<Doc>; -..+] = [alt0];
+        if hug == HUG_BREAK {
+            let sep = self.d.text(", ");
+            let mut v: [Id::<Doc>; -..+] = [lp];
+            i = 0;
+            while i + 1 < n {
+                v.push(parts[2 * i]);
+                v.push(sep);
+                i += 1;
+            }
+            let fb = self.d.force_break(parts[2 * (n - 1)]);
+            v.push(fb);
+            if had && self.in_macro > 0 {
+                let c = self.d.text(",");
+                v.push(c);
+            }
+            v.push(rp);
+            let alt1 = self.d.concat(v[..]);
+            alts.push(alt1);
+        }
+        alts.push(broken);
+        let c = self.d.cond(alts[..], limit);
+        self.emit(c);
+    }
+
+    /// Whether comments are between the items of a list (or between them
+    /// and its brackets at `open` and `close`), not inside them.
+    fn cmts_between(&self, open: u32, close: u32, l: List::<Id::<Expr>>): bool {
+        let mut from = open + 1;
+        let mut i: usize = 0;
+        while i < l.len() {
+            let sp = self.ast.exprs.get(self.ast.expr_ids.list(l)[i]).span;
+            if self.s.has_cmts(from, sp.lo) {
+                return true;
+            }
+            from = sp.hi;
+            i += 1;
+        }
+        return self.s.has_cmts(from, close);
+    }
+
+    /// The documents of a list of expressions, each followed by its
+    /// separator's comments, and whether the source has a trailing comma.
+    fn expr_items(&mut self, l: List::<Id::<Expr>>, close: u32): ([Id::<Doc>; -..+], bool) {
+        let n = l.len();
+        let mut parts: [Id::<Doc>; -..+] = [];
+        let mut had = false;
+        let mut i: usize = 0;
+        while i < n {
+            let x = self.ast.expr_ids.list(l)[i];
+            self.assume_break();
+            self.open();
+            self.expr(x);
+            let d = self.close();
+            let (s, h) = self.sep(self.ast.exprs.get(x).span.hi, close, i + 1 == n);
+            had = h;
+            parts.push(d);
+            parts.push(s);
+            i += 1;
+        }
+        return (parts, had);
+    }
+
+    /// How the last of `n` arguments may hug the parentheses (rustfmt's
+    /// `can_be_overflowed_expr`).
+    fn hug(&self, e: Id::<Expr>, n: usize): u8 {
+        let one = if n == 1 { HUG_BREAK } else { HUG_NONE };
+        return match self.ast.exprs.get(e).kind {
+            ExprKind::Closure(c) => match self.ast.exprs.get(c.body).kind {
+                ExprKind::Block(_)
+                | ExprKind::Match { .. }
+                | ExprKind::If { .. }
+                | ExprKind::IfLet { .. }
+                | ExprKind::Unsafe(_) => HUG_BREAK,
+                _ => HUG_FLAT,
+            },
+            ExprKind::Block(_) | ExprKind::Unsafe(_) => HUG_BREAK,
+            ExprKind::Match { .. } | ExprKind::If { .. } | ExprKind::IfLet { .. } => one,
+            ExprKind::While { .. }
+            | ExprKind::WhileLet { .. }
+            | ExprKind::Loop(_)
+            | ExprKind::For { .. } => one,
+            ExprKind::Array(_) | ExprKind::StructLit { .. } | ExprKind::Tuple(_) => one,
+            ExprKind::Call(_, _) | ExprKind::MacCall(_) => one,
+            // A chain hugs only if its last call does: `f(xs.iter().map(|x| {`.
+            ExprKind::MethodCall { args, .. } => {
+                if !self.is_chain(e) {
+                    one
+                } else if args.len() > 0
+                    && self.hug(self.ast.expr_ids.list(args)[args.len() - 1], args.len())
+                        != HUG_NONE
+                {
+                    one
+                } else {
+                    HUG_NONE
+                }
+            }
+            ExprKind::Borrow { expr, .. } => self.hug(expr, n),
+            ExprKind::Unary(_, x) => self.hug(x, n),
+            ExprKind::Try(x) => self.hug(x, n),
+            ExprKind::Cast(x, _) => self.hug(x, n),
+            _ => HUG_NONE,
+        };
+    }
+
+    /// Whether `postfix` prints `id` as a chain that may break before its
+    /// `.`s: `a.b().c()` or `f(x).y()`, not `a.b()`.
+    fn is_chain(&self, id: Id::<Expr>): bool {
+        let mut cur = id;
+        let mut dots: usize = 0;
+        let mut calls: usize = 0;
+        loop {
+            match self.ast.exprs.get(cur).kind {
+                ExprKind::MethodCall { recv, .. } => {
+                    dots += 1;
+                    calls += 1;
+                    cur = recv;
+                }
+                ExprKind::Field(x, _) | ExprKind::TupleField(x, _, _) => {
+                    dots += 1;
+                    cur = x;
+                }
+                ExprKind::Index(x, _) | ExprKind::Try(x) => cur = x,
+                _ => break,
+            }
+        }
+        let call_root = match self.ast.exprs.get(cur).kind {
+            ExprKind::Call(_, _) | ExprKind::MacCall(_) => true,
+            _ => false,
+        };
+        return calls > 0 && dots > 0 && (dots >= 2 || call_root);
+    }
+
+    /// Method calls, fields, indexing and `?`: a chain, broken before each
+    /// `.` if it is too long (rustfmt's `chain_width`).
+    fn postfix(&mut self, id: Id::<Expr>) {
+        // The links from the outermost in, and the root.
+        let mut links: [Id::<Expr>; -..+] = [];
+        let mut cur = id;
+        loop {
+            let next = match self.ast.exprs.get(cur).kind {
+                ExprKind::MethodCall { recv, .. } => recv,
+                ExprKind::Field(x, _) | ExprKind::TupleField(x, _, _) => x,
+                ExprKind::Index(x, _) | ExprKind::Try(x) => x,
+                _ => break,
+            };
+            links.push(cur);
+            cur = next;
+        }
+        let n = links.len();
+        if !self.is_chain(id) {
+            self.expr(cur);
+            let mut k = n;
+            while k > 0 {
+                k -= 1;
+                self.link(links[k]);
+            }
+            return;
+        }
+        let root = self.ast.exprs.get(cur);
+        self.open();
+        self.expr(cur);
+        let mut k = n;
+        while k > 0 && !self.is_dot(links[k - 1]) {
+            k -= 1;
+            self.link(links[k]);
+        }
+        // A short root keeps the first link: `self.items` ... `.iter()`.
+        let short = match root.kind {
+            ExprKind::Path(_) => root.span.hi - root.span.lo <= 4,
+            _ => false,
+        };
+        if short && k > 0 {
+            k -= 1;
+            self.link(links[k]);
+            while k > 0 && !self.is_dot(links[k - 1]) {
+                k -= 1;
+                self.link(links[k]);
+            }
+        }
+        let head = self.close();
+        let mut pieces: [Id::<Doc>; -..+] = [];
+        while k > 0 {
+            self.open();
+            k -= 1;
+            self.link(links[k]);
+            while k > 0 && !self.is_dot(links[k - 1]) {
+                k -= 1;
+                self.link(links[k]);
+            }
+            let p = self.close();
+            pieces.push(p);
+        }
+        if pieces.len() == 0 {
+            self.emit(head);
+            return;
+        }
+        let soft = self.d.softline();
+        let mut inner: [Id::<Doc>; -..+] = [];
+        for p in pieces {
+            inner.push(soft);
+            inner.push(p);
+        }
+        let body = self.d.concat(inner[..]);
+        let c = self.d.chain(head, body);
+        // A link before the last that takes several lines (a closure with
+        // a block, even hugged) breaks the chain.
+        let np = pieces.len();
+        let mut early = self.d.will_break(head);
+        let mut i: usize = 0;
+        while i + 1 < np {
+            if self.d.will_break(pieces[i]) {
+                early = true;
+            }
+            i += 1;
+        }
+        let broken = if early {
+            self.d.broken(c)
+        } else {
+            self.d.group(c, CHAIN_WIDTH)
+        };
+        // Else the last call may hug its arguments with the chain on one
+        // line: `xs.iter().map(|x| {` ... `})`. (Comments are inside the
+        // pieces, which every layout shares.)
+        let mut hug = !early;
+        if hug {
+            hug = match self.ast.exprs.get(links[0]).kind {
+                ExprKind::MethodCall { args, .. } => args.len() > 0
+                    && self.hug(self.ast.expr_ids.list(args)[args.len() - 1], args.len())
+                        != HUG_NONE,
+                _ => false,
+            };
+        }
+        if !hug {
+            self.emit(broken);
+            return;
+        }
+        let mut flat: [Id::<Doc>; -..+] = [head];
+        flat.extend(pieces[..]);
+        let alt0 = self.d.concat(flat[..]);
+        // ... or with the last call's arguments broken: `v.push(Point {`.
+        let last = flat.len() - 1;
+        let fb = self.d.force_break(flat[last]);
+        flat[last] = fb;
+        let alt1 = self.d.concat(flat[..]);
+        let alts = [alt0, alt1, broken];
+        let cd = self.d.cond(alts[..], CHAIN_WIDTH);
+        self.emit(cd);
+    }
+
+    /// Whether a link of a chain starts with `.`.
+    fn is_dot(&self, id: Id::<Expr>): bool {
+        return match self.ast.exprs.get(id).kind {
+            ExprKind::MethodCall { .. }
+            | ExprKind::Field(_, _)
+            | ExprKind::TupleField(_, _, _) => true,
+            _ => false,
+        };
+    }
+
+    /// A link of a chain, without its receiver: `.f(x)`, `.f`, `.0`, `[i]`
+    /// or `?`.
+    fn link(&mut self, id: Id::<Expr>) {
+        let e = self.ast.exprs.get(id);
+        match e.kind {
+            ExprKind::MethodCall {
+                recv,
+                name,
+                generics,
+                args,
+            } => {
+                self.tok(
+                    self.s.find(self.ast.exprs.get(recv).span.hi, Token::Dot),
+                    ".",
+                );
+                self.ident(name);
+                if let Some(g) = generics {
+                    self.type_args(g);
+                }
+                let open = self.s.find(self.last_end, Token::LParen);
+                self.args(open, e.span.hi - 1, args, CALL_WIDTH);
+            }
+            ExprKind::Field(x, name) => {
+                self.tok(self.s.find(self.ast.exprs.get(x).span.hi, Token::Dot), ".");
+                self.ident(name);
+            }
+            ExprKind::TupleField(x, _, sp) => {
+                self.tok(self.s.find(self.ast.exprs.get(x).span.hi, Token::Dot), ".");
+                self.tok_src(sp.lo, sp.hi);
+            }
+            ExprKind::Index(x, i) => {
+                self.tok(
+                    self.s.find(self.ast.exprs.get(x).span.hi, Token::LBracket),
+                    "[",
+                );
+                self.expr(i);
+                self.tok(e.span.hi - 1, "]");
+            }
+            ExprKind::Try(_) => self.tok(e.span.hi - 1, "?"),
+            _ => {}
+        }
+    }
+
+    // ===================================================================== literals
+
+    /// `[a, b]`: short items filled several to a line.
+    fn array(&mut self, open: u32, close: u32, es: List::<Id::<Expr>>) {
+        let n = es.len();
+        if n == 0 {
+            self.tok(open, "[");
+            self.flush(close, END);
+            self.tok(close, "]");
+            return;
+        }
+        let comments = self.s.has_cmts(open, close);
+        let mut short = n > 1 && !comments;
+        let mut i: usize = 0;
+        while short && i < n {
+            let x = self.ast.exprs.get(self.ast.expr_ids.list(es)[i]);
+            let simple = match x.kind {
+                ExprKind::Lit(_) | ExprKind::Path(_) => true,
+                ExprKind::Unary(_, _) => true,
+                _ => false,
+            };
+            if !simple || x.span.hi - x.span.lo > SHORT_ITEM {
+                short = false;
+            }
+            i += 1;
+        }
+        self.open();
+        self.tok(open, "[");
+        let lp = self.close();
+        let (parts, had) = self.expr_items(es, close);
+        self.open();
+        self.tok_bare(close, "]");
+        let rp = self.close();
+        let trailing = self.trailing_comma(had);
+        let soft = self.d.softline();
+        if !short {
+            let g = self.list_doc(lp, parts[..], rp, trailing, soft, ARRAY_WIDTH);
+            self.emit(g);
+            self.after(close);
+            return;
+        }
+        let comma_line = [self.d.text(","), self.d.line()];
+        let sep = self.d.concat(comma_line[..]);
+        let mut fill: [Id::<Doc>; -..+] = [];
+        i = 0;
+        while i < n {
+            if i > 0 {
+                fill.push(sep);
+            }
+            fill.push(parts[2 * i]);
+            i += 1;
+        }
+        let f = self.d.fill(fill[..]);
+        let body = [soft, f, trailing];
+        let b = self.d.concat(body[..]);
+        let ind = self.d.indent(b);
+        let all = [lp, ind, soft, rp];
+        let c = self.d.concat(all[..]);
+        let g = self.d.group(c, ARRAY_WIDTH);
+        self.emit(g);
+        self.after(close);
+    }
+
+    /// `(a, b)` or `(a,)`.
+    fn tuple(&mut self, open: u32, close: u32, es: List::<Id::<Expr>>) {
+        let n = es.len();
+        if n == 0 {
+            self.tok(open, "(");
+            self.flush(close, END);
+            self.tok(close, ")");
+            return;
+        }
+        self.open();
+        self.tok(open, "(");
+        let lp = self.close();
+        let (parts, had) = self.expr_items(es, close);
+        self.open();
+        self.tok_bare(close, ")");
+        let rp = self.close();
+        let trailing = if n == 1 {
+            self.d.text(",")
+        } else {
+            self.trailing_comma(had)
+        };
+        let soft = self.d.softline();
+        let g = self.list_doc(lp, parts[..], rp, trailing, soft, CALL_WIDTH);
+        self.emit(g);
+        self.after(close);
+    }
+
+    /// `Path { a: x, b }` (rustfmt's `struct_lit_width`).
+    fn struct_lit(&mut self, path: Path, fields: List::<FieldInit>, close: u32) {
+        self.path(path);
+        self.text(" ");
+        let open = self.s.find(path.span.hi, Token::LBrace);
+        let n = fields.len();
+        if n == 0 {
+            self.tok(open, "{");
+            self.flush(close, END);
+            self.tok(close, "}");
+            return;
+        }
+        self.open();
+        self.tok(open, "{");
+        let lp = self.close();
+        let mut parts: [Id::<Doc>; -..+] = [];
+        let mut had = false;
+        let mut i: usize = 0;
+        while i < n {
+            let f = self.ast.field_inits.list(fields)[i];
+            self.assume_break();
+            self.open();
+            self.ident(f.name);
+            if let Some(v) = f.value {
+                self.tok(self.s.find(f.name.span.hi, Token::Colon), ":");
+                self.rhs(v);
+            }
+            let d = self.close();
+            let (s, h) = self.sep(f.span.hi, close, i + 1 == n);
+            had = h;
+            parts.push(d);
+            parts.push(s);
+            i += 1;
+        }
+        self.open();
+        self.tok_bare(close, "}");
+        let rp = self.close();
+        let trailing = self.trailing_comma(had);
+        let line = self.d.line();
+        let g = self.list_doc(lp, parts[..], rp, trailing, line, STRUCT_LIT_WIDTH);
+        self.emit(g);
+        self.after(close);
+    }
+
+    // ===================================================================== control flow
+
+    /// `if`: on one line if it is a short `if c { a } else { b }` (rustfmt's
+    /// `single_line_if_else_max_width`), else with its blocks broken.
+    fn if_expr(&mut self, id: Id::<Expr>) {
+        let e = self.ast.exprs.get(id);
+        let (then, else_) = match e.kind {
+            ExprKind::If { then, else_, .. } => (then, else_),
+            ExprKind::IfLet { then, else_, .. } => (then, else_),
+            _ => return,
+        };
+        let mut single = false;
+        if let Some(x) = else_ {
+            if let ExprKind::Block(b) = self.ast.exprs.get(x).kind {
+                single = self.just_tail(then)
+                    && self.just_tail(b)
+                    && !self.s.has_cmts(e.span.lo, e.span.hi);
+            }
+        }
+        if single {
+            self.open();
+            self.if_chain(id, true);
+            let c = self.close();
+            let g = self.d.group(c, IF_ELSE_WIDTH);
+            self.emit(g);
+            self.after(e.span.hi - 1);
+        } else {
+            self.if_chain(id, false);
+        }
+    }
+
+    fn if_chain(&mut self, id: Id::<Expr>, single: bool) {
+        let e = self.ast.exprs.get(id);
+        let lo = e.span.lo;
+        self.open();
+        self.tok(lo, "if");
+        self.text(" ");
+        let (then, else_) = match e.kind {
+            ExprKind::If { cond, then, else_ } => {
+                self.header_expr(cond);
+                (then, else_)
+            }
+            ExprKind::IfLet {
+                pat,
+                scrut,
+                then,
+                else_,
+            } => {
+                self.tok(self.s.find(lo + 2, Token::Let), "let");
+                self.text(" ");
+                self.pat(pat);
+                self.text(" ");
+                self.tok(self.s.find(self.ast.pats.get(pat).span.hi, Token::Eq), "=");
+                self.text(" ");
+                self.expr(scrut);
+                (then, else_)
+            }
+            _ => return,
+        };
+        self.line();
+        self.header_end();
+        if single {
+            self.block_lines(then);
+        } else {
+            self.block(then, false);
+        }
+        if let Some(x) = else_ {
+            let then_hi = self.ast.blocks.get(then).span.hi;
+            if self.line_comment_after(then_hi - 1) {
+                // A comment after the `}`: `else` on the next line.
+                self.hard();
+            } else {
+                self.text(" ");
+            }
+            self.tok(self.s.find(then_hi, Token::Else), "else");
+            self.text(" ");
+            match self.ast.exprs.get(x).kind {
+                ExprKind::Block(b) => {
+                    if single {
+                        self.block_lines(b);
+                    } else {
+                        self.block(b, false);
+                    }
+                }
+                _ => self.if_chain(x, false),
+            }
+        }
+    }
+
+    fn match_expr(&mut self, lo: u32, scrut: Id::<Expr>, arms: List::<Arm>, close: u32) {
+        self.open();
+        self.tok(lo, "match");
+        self.text(" ");
+        self.expr(scrut);
+        self.line();
+        self.header_end();
+        let open = self.s
+            .find(self.ast.exprs.get(scrut).span.hi, Token::LBrace);
+        let n = arms.len();
+        let trailed = self.brace(open);
+        if n == 0 && !self.cmt_before(close) {
+            if trailed {
+                self.hard();
+            }
+            self.tok(close, "}");
+            return;
+        }
+        self.open();
+        self.hard();
+        let mut i: usize = 0;
+        while i < n {
+            let a = self.ast.arms.list(arms)[i];
+            self.next_elem(a.span.lo, i == 0);
+            self.arm(a, close);
+            i += 1;
+        }
+        self.end_list(close, n == 0);
+        let inner = self.close();
+        self.body(inner);
+        self.tok(close, "}");
+    }
+
+    /// `pat if guard => body,`: no comma after a block.
+    fn arm(&mut self, a: Arm, close: u32) {
+        self.pat(a.pat);
+        if let Some(g) = a.guard {
+            self.text(" ");
+            self.tok(
+                self.s.find(self.ast.pats.get(a.pat).span.hi, Token::If),
+                "if",
+            );
+            self.text(" ");
+            self.expr(g);
+        }
+        self.text(" ");
+        self.tok(self.s.find(self.last_end, Token::FatArrow), "=>");
+        let body = self.ast.exprs.get(a.body);
+        let block = match body.kind {
+            ExprKind::Block(_) | ExprKind::Unsafe(_) => true,
+            _ => false,
+        };
+        if block {
+            self.text(" ");
+            self.expr(a.body);
+        } else {
+            self.rhs(a.body);
+        }
+        let comma = self.s.find(body.span.hi, Token::Comma);
+        let has = comma != NONE && comma < close;
+        if self.in_macro > 0 {
+            if has {
+                self.tok(comma, ",");
+            }
+        } else if block {
+            if has {
+                self.flush(comma, 0);
+                self.done(comma + 1);
+            }
+        } else if has {
+            self.tok(comma, ",");
+        } else {
+            self.text(",");
+        }
+    }
+
+    /// `move |a, b: T| body` or `|x|: R { ... }`.
+    fn closure(&mut self, lo: u32, c: Closure) {
+        let mut at = lo;
+        if c.is_move {
+            self.tok(lo, "move");
+            self.text(" ");
+            at = lo + 4;
+        }
+        let n = c.params.len();
+        if n == 0 {
+            self.tok(self.s.find(at, Token::PipePipe), "||");
+        } else {
+            self.tok(self.s.find(at, Token::Pipe), "|");
+            let mut i: usize = 0;
+            while i < n {
+                let p = self.ast.closure_params.list(c.params)[i];
+                if i > 0 {
+                    self.tok(self.s.find(self.last_end, Token::Comma), ",");
+                    self.text(" ");
+                }
+                if p.is_mut {
+                    self.tok(p.span.lo, "mut");
+                    self.text(" ");
+                }
+                match p.name {
+                    Some(name) => self.ident(name),
+                    None => self.tok(self.s.find(self.last_end, Token::Placeholder), "_"),
+                }
+                if let Some(t) = p.ty {
+                    self.tok(self.s.find(self.last_end, Token::Colon), ":");
+                    self.text(" ");
+                    if let Some(m) = p.mode {
+                        self.mode(m);
+                    }
+                    self.ty(t);
+                }
+                i += 1;
+            }
+            // A trailing comma: kept in a macro's arguments, and its comments.
+            let comma = self.s.find(self.last_end, Token::Comma);
+            if comma != NONE {
+                if self.in_macro > 0 {
+                    self.tok(comma, ",");
+                } else {
+                    self.flush(comma, 0);
+                    self.done(comma + 1);
+                }
+            }
+            self.tok(self.s.find(self.last_end, Token::Pipe), "|");
+        }
+        if let Some(r) = c.ret {
+            self.tok(self.s.find(self.last_end, Token::Colon), ":");
+            self.text(" ");
+            self.ty(r);
+        }
+        self.text(" ");
+        self.expr(c.body);
+    }
+
+    // ===================================================================== macro calls
+
+    /// `path!(...)`: formatted as a call when its arguments are
+    /// expressions (`assert_eq!(a, b)`), else kept as written.
+    pub fn mac_call(&mut self, m: MacCall) {
+        self.path(m.path);
+        let bang = self.s.find(m.path.span.hi, Token::Bang);
+        self.tok(bang, "!");
+        let open = match self.s.next(self.last_end) {
+            Some(t) => t.lo,
+            None => NONE,
+        };
+        let close = m.span.hi - 1;
+        let call = match m.delim {
+            Delim::Brace => false,
+            _ => true,
+        };
+        if call && open != NONE {
+            if let Some(args) = self.mac_args(m) {
+                self.in_macro += 1;
+                match m.delim {
+                    Delim::Paren => self.args(open, close, args, CALL_WIDTH),
+                    _ => self.array(open, close, args),
+                }
+                self.in_macro -= 1;
+                return;
+            }
+        }
+        if open != NONE {
+            if !call {
+                self.text(" ");
+            }
+            self.verbatim(open, close + 1);
+        }
+    }
+
+    /// A macro call's arguments as expressions, if each comma-separated
+    /// part of its tokens parses as one.
+    fn mac_args(&mut self, m: MacCall): Option::<List::<Id::<Expr>>> {
+        // Their tokens must survive formatting as they are: no items (whose
+        // lists this printer may change) and no empty statements.
+        let mut k = self.s.first_at(m.path.span.hi);
+        let mut prev = Token::Bang;
+        while k < self.s.toks.len() && self.s.toks[k].lo < m.span.hi {
+            let t = self.s.toks[k].kind;
+            let item = match t {
+                Token::Fn
+                | Token::Struct
+                | Token::Enum
+                | Token::Trait
+                | Token::Impl
+                | Token::Use
+                | Token::Mod
+                | Token::Macro => true,
+                Token::Const | Token::Static | Token::Extern | Token::Type => true,
+                _ => false,
+            };
+            if item || (t == Token::Semi && (prev == Token::Semi || prev == Token::LBrace)) {
+                return None;
+            }
+            prev = t;
+            k += 1;
+        }
+        let n = m.tokens.len();
+        let mut out: [Id::<Expr>; -..+] = [];
+        let mut lo = NONE;
+        let mut hi: u32 = 0;
+        let mut i: usize = 0;
+        while i <= n {
+            let mut comma = i == n;
+            if i < n {
+                let t = self.ast.tokens.list(m.tokens)[i];
+                if let TokenTree::Token(tt) = t {
+                    if tt.kind == Token::Comma {
+                        comma = true;
+                    }
+                }
+                if !comma {
+                    let sp = t.span();
+                    if lo == NONE {
+                        lo = sp.lo;
+                    }
+                    hi = sp.hi;
+                }
+            }
+            if comma {
+                if lo == NONE {
+                    // `,,` or a leading comma; at the end, a trailing one
+                    // (or no arguments), which is fine.
+                    if i < n {
+                        return None;
+                    }
+                } else {
+                    let parsed = ln_parser::parse_expansion(
+                        &mut self.ast,
+                        self.src[lo as usize..hi as usize],
+                        lo,
+                        HashMap::new(),
+                        ExpansionKind::Expr,
+                    );
+                    if parsed.diags.len() > 0 {
+                        return None;
+                    }
+                    match parsed.out {
+                        Some(Expansion::Expr(e)) => out.push(e),
+                        _ => return None,
+                    }
+                    lo = NONE;
+                }
+            }
+            i += 1;
+        }
+        return Some(self.ast.expr_ids.add_list(out[..]));
+    }
+}

@@ -265,6 +265,29 @@ and a fixed example. It also accepts the code as printed, e.g.
 `lunar explain 'err(type::mismatch)'`; without a code it lists every code.
 The explanations live in [docs/errors](docs/errors), one file per code.
 
+## Formatting
+
+`lunar fmt` formats Lunar code in one style, with no options: rustfmt's
+defaults (4-space indentation, 100 columns, trailing commas in vertical
+lists, sorted `use` lists), with rules of its own for Lunar's syntax.
+[docs/style.md](docs/style.md) describes it.
+
+```text
+lunar fmt                # the current package's .ln files (at a workspace root every member's; -p picks one)
+lunar fmt a.ln b.ln      # those files
+lunar fmt --check        # change nothing: list the files that would change, exit with 1 if any would (for CI)
+lunar fmt -              # standard input to standard output (for editors)
+```
+
+Comments stay where they are among the code. Every result is checked
+before it is written: it must parse to the same syntax tree, with the same
+comments in the same order. If it does not (a bug in the formatter), the
+file is left as it is and `lunar fmt` says so. A file with syntax errors is
+left as it is too, and its errors are shown as `lunar check` shows them.
+The formatter is also a library, `ln_fmt::format_source(text)`
+([craters/ln-fmt](craters/ln-fmt)). `lunar fmt` is a command of the
+self-hosted `lunar` (built from [craters/](craters/README.md)).
+
 ## Editor support
 
 `lunar lsp` is a language server: diagnostics as you type, quick fixes,

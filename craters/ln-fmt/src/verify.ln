@@ -1,0 +1,267 @@
+// The check every formatted text passes before it is used: it parses, to
+// the same syntax tree as the original, and has the same comments in the
+// same order.
+//
+// The trees are compared as `ln_ast::dump` prints them, without the spans,
+// the items of `use` lists in any order (the formatter sorts them), and
+// without trailing whitespace in doc comments.
+
+use ln_ast::Span;
+use crater::source::scan;
+
+/// Whether `out`, the formatting of `src` (whose tree `ln_ast::dump`
+/// printed as `before`), means the same; else what differs.
+pub fn check(src: str, before: str, out: str): Result::<(), String> {
+    let parsed = ln_parser::parse_file(out);
+    if parsed.diags.len() > 0 {
+        let d = parsed.diags[0];
+        let mut m = String::new();
+        m.write(
+            "the formatted text does not parse: {parsed.ast.text(d.message)} (line {line_of(out, d.span.lo)} of the result)",
+        );
+        return Err(m);
+    }
+    let mut after = String::new();
+    ln_ast::dump(&parsed.ast, &mut after);
+    let a = canonical(before);
+    let b = canonical(after.as_str());
+    if a.as_str() != b.as_str() {
+        let mut m = String::from("formatting would change the syntax tree: ");
+        first_difference(a.as_str(), b.as_str(), &mut m);
+        return Err(m);
+    }
+    return same_comments(src, out);
+}
+
+/// The comments of `src` and `out` are the same, in the same order.
+fn same_comments(src: str, out: str): Result::<(), String> {
+    let x = scan(src);
+    let y = scan(out);
+    let n = if x.cmts.len() < y.cmts.len() {
+        x.cmts.len()
+    } else {
+        y.cmts.len()
+    };
+    let mut i: usize = 0;
+    while i < n {
+        let a = src[x.cmts[i].lo as usize..x.cmts[i].hi as usize];
+        let b = out[y.cmts[i].lo as usize..y.cmts[i].hi as usize];
+        if a != b {
+            let mut m = String::new();
+            m.write(
+                "formatting would change comment {i + 1} (line {line_of(src, x.cmts[i].lo)}): `{a}` became `{b}`",
+            );
+            return Err(m);
+        }
+        i += 1;
+    }
+    if x.cmts.len() != y.cmts.len() {
+        let mut m = String::new();
+        m.write(
+            "formatting would change the number of comments from {x.cmts.len()} to {y.cmts.len()}",
+        );
+        return Err(m);
+    }
+    return Ok(());
+}
+
+/// The line (from 1) of byte `pos` of `s`.
+fn line_of(s: str, pos: u32): usize {
+    let b = s.as_bytes();
+    let mut line: usize = 1;
+    let mut i: usize = 0;
+    while i < pos as usize && i < b.len() {
+        if b[i] == b'\n' {
+            line += 1;
+        }
+        i += 1;
+    }
+    return line;
+}
+
+/// The first line where `a` and `b` differ, into `out`.
+fn first_difference(a: str, b: str, out: &mut +String) {
+    let x = a.as_bytes();
+    let y = b.as_bytes();
+    let mut i: usize = 0;
+    let mut start: usize = 0;
+    while i < x.len() && i < y.len() && x[i] == y[i] {
+        if x[i] == b'\n' {
+            start = i + 1;
+        }
+        i += 1;
+    }
+    let ea = line_end(x, start);
+    let eb = line_end(y, start);
+    out.write("`{a[start..ea].trim()}` became `{b[start..eb].trim()}`");
+}
+
+fn line_end(b: [u8; &], from: usize): usize {
+    let mut i = from;
+    while i < b.len() && b[i] != b'\n' {
+        i += 1;
+    }
+    return i;
+}
+
+/// A tree dump without spans (`@1..2`), with `use` lists sorted and doc
+/// comments without trailing whitespace.
+pub fn canonical(dump: str): String {
+    let mut text = String::new();
+    strip_spans(dump, &mut text);
+    let t = text.as_str();
+    let b = t.as_bytes();
+    let mut lines: [Span; -..+] = [];
+    let mut start: usize = 0;
+    let mut i: usize = 0;
+    while i < b.len() {
+        if b[i] == b'\n' {
+            lines.push(Span::new(start as u32, i as u32));
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if start < b.len() {
+        lines.push(Span::new(start as u32, b.len() as u32));
+    }
+    let mut out = String::new();
+    canon_lines(t, lines[..], &mut out);
+    return out;
+}
+
+/// `s` without `@lo..hi`.
+fn strip_spans(s: str, out: &mut +String) {
+    let b = s.as_bytes();
+    let mut start: usize = 0;
+    let mut i: usize = 0;
+    while i < b.len() {
+        if b[i] == b'@' && i + 1 < b.len() && is_digit(b[i + 1]) {
+            let mut j = i + 1;
+            while j < b.len() && is_digit(b[j]) {
+                j += 1;
+            }
+            if j + 1 < b.len() && b[j] == b'.' && b[j + 1] == b'.' {
+                j += 2;
+                while j < b.len() && is_digit(b[j]) {
+                    j += 1;
+                }
+                out.push_str(s[start..i]);
+                start = j;
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(s[start..]);
+}
+
+fn is_digit(c: u8): bool {
+    return c >= b'0' && c <= b'9';
+}
+
+fn indent_of(s: str): usize {
+    let b = s.as_bytes();
+    let mut n: usize = 0;
+    while n < b.len() && b[n] == b' ' {
+        n += 1;
+    }
+    return n;
+}
+
+/// The lines `lines` of `t`, each with a line break, the items of every
+/// nested `use` list sorted.
+fn canon_lines(t: str, lines: [Span; &], out: &mut +String) {
+    let n = lines.len();
+    let mut i: usize = 0;
+    while i < n {
+        let line = t[lines[i].lo as usize..lines[i].hi as usize];
+        push_line(line, out);
+        let ind = indent_of(line);
+        let body = line[ind..];
+        if !(body.starts_with("use [") && body.ends_with(" nested")) {
+            i += 1;
+            continue;
+        }
+        // Its items: the lines indented deeper, each starting at `ind + 2`.
+        let mut j = i + 1;
+        while j < n && indent_of(t[lines[j].lo as usize..lines[j].hi as usize]) > ind {
+            j += 1;
+        }
+        let mut buf = String::new();
+        let mut parts: [Span; -..+] = [];
+        let mut k = i + 1;
+        while k < j {
+            let mut e = k + 1;
+            while e < j && indent_of(t[lines[e].lo as usize..lines[e].hi as usize]) > ind + 2 {
+                e += 1;
+            }
+            let lo = buf.len() as u32;
+            canon_lines(t, lines[k..e], &mut buf);
+            parts.push(Span::new(lo, buf.len() as u32));
+            k = e;
+        }
+        // Insertion sort of the items' texts.
+        let m = parts.len();
+        let mut a: usize = 1;
+        while a < m {
+            let mut c = a;
+            while c > 0 {
+                let x = parts[c - 1];
+                let y = parts[c];
+                if !less(
+                    buf.as_str()[y.lo as usize..y.hi as usize],
+                    buf.as_str()[x.lo as usize..x.hi as usize],
+                )
+                {
+                    break;
+                }
+                parts[c - 1] = y;
+                parts[c] = x;
+                c -= 1;
+            }
+            a += 1;
+        }
+        for p in parts {
+            out.push_str(buf.as_str()[p.lo as usize..p.hi as usize]);
+        }
+        i = j;
+    }
+}
+
+/// Whether `a` sorts before `b`, byte by byte.
+fn less(a: str, b: str): bool {
+    let x = a.as_bytes();
+    let y = b.as_bytes();
+    let mut i: usize = 0;
+    while i < x.len() && i < y.len() {
+        if x[i] != y[i] {
+            return x[i] < y[i];
+        }
+        i += 1;
+    }
+    return x.len() < y.len();
+}
+
+/// A line of the dump; a doc comment's text without trailing whitespace.
+fn push_line(line: str, out: &mut +String) {
+    let body = line[indent_of(line)..];
+    if body.starts_with("name_value doc ") && line.ends_with("\"") {
+        let mut end = line.len() - 1;
+        loop {
+            let s = line[..end];
+            if s.ends_with(" ") && !s.ends_with("\" ") {
+                end -= 1;
+            } else if s.ends_with("\\t") && !s.ends_with("\\\\t") {
+                end -= 2;
+            } else {
+                break;
+            }
+        }
+        out.push_str(line[..end]);
+        out.push_str("\"\n");
+        return;
+    }
+    out.push_str(line);
+    out.push('\n');
+}
