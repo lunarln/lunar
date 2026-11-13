@@ -218,6 +218,8 @@ pub struct Project {
     member_list: Arena::<Member>,
     pub specs: [CraterSpec; -..+],
     pub crater_deps: Arena::<CraterDep>,
+    /// The package `specs` builds (`None` for a single file).
+    pub building: Option::<usize>,
 }
 
 impl Project {
@@ -236,6 +238,7 @@ impl Project {
             member_list: Arena::new(),
             specs: [],
             crater_deps: Arena::new(),
+            building: None,
         };
     }
 
@@ -959,6 +962,7 @@ impl Project {
     /// it depends on, directly or not.
     pub fn craters(&mut self, pkg: usize, target: Target): Result::<(), ProjectError> from static {
         self.specs.clear();
+        self.building = Some(pkg);
         let p = self.packages[pkg];
         let own = crater_name(self.text(p.name));
         let own_sym = self.names.intern(own.as_str());
@@ -1023,6 +1027,7 @@ impl Project {
     /// Set `specs` to one crater: the file `path`, named `name`.
     pub fn single(&mut self, name: str, path: str) {
         self.specs.clear();
+        self.building = None;
         let n = self.names.intern(name);
         let r = self.names.intern(path);
         self.specs.push(CraterSpec { name: n, root: r, deps: List::empty() });
