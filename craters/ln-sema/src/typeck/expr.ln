@@ -10,7 +10,7 @@ use crater::resolve::{ModRes, prim_type};
 use crater::sema::Sema;
 use crater::thir::{Arg, Arm, Block, Callee, Coercion, Expr, ExprKind, FieldExpr, FieldPat, FmtPiece, LocalId, LocalKind, Pat, PatKind, ReadMode, Stmt};
 use crater::ty::*;
-use crater::typeck::{is_place, lang_trait_ref, match_ty, LitCheck};
+use crater::typeck::{is_place, lang_trait_ref, match_ty, FmtCheck, LitCheck};
 use ln_ast as ast;
 use ln_ast::{BinOp, Ident, Span, UnOp};
 
@@ -714,15 +714,33 @@ impl Sema {
             match self.p.ast.fmt_pieces.list(pieces)[i] {
                 ast::FmtPiece::Text(t) => out.push(FmtPiece::Text(t)),
                 ast::FmtPiece::Hole(e, spec) => {
+                    // A `name$` width and precision come first, as values
+                    // of their own (`FmtSpec::Count`).
+                    let mut kind = ast::FmtKind::Display;
+                    if let ast::FmtSpec::Full(id) = spec {
+                        let f = self.p.ast.fmt_formats.get(id);
+                        kind = f.kind;
+                        self.check_fmt_count(f.width, &mut out);
+                        self.check_fmt_count(f.precision, &mut out);
+                    } else if let ast::FmtSpec::Debugged = spec {
+                        kind = ast::FmtKind::Debug;
+                    }
                     let v = self.check_expr_borrow(e, None);
                     let v = self.auto_read_bang(v);
-                    let tr = match spec {
-                        ast::FmtSpec::Show => display,
-                        ast::FmtSpec::Debugged => debug,
+                    // The radix and exponent types are built in, for
+                    // integers and floats (checked with the rest of the
+                    // spec, once the type is known).
+                    let tr = match kind {
+                        ast::FmtKind::Display => display,
+                        ast::FmtKind::Debug => debug,
+                        _ => None,
                     };
+                    let es = self.ast_span(e);
                     if let Some(t) = tr {
-                        let es = self.ast_span(e);
                         self.oblige(v.ty, t, es);
+                    }
+                    if let ast::FmtSpec::Full(id) = spec {
+                        self.fcx.fmt_checks.push(FmtCheck { ty: v.ty, id, span: es });
                     }
                     let vn = self.node(v);
                     out.push(FmtPiece::Arg(vn, spec));
@@ -731,6 +749,92 @@ impl Sema {
         }
         let l = self.p.thir.fmt_pieces.add_list(out[..]);
         return self.mk(ExprKind::FmtArgs(l), fmt_ty, span);
+    }
+
+    /// A `name$` width or precision: a `usize`, computed with the values.
+    fn check_fmt_count(&mut self, c: ast::FmtCount, out: &mut +[FmtPiece; ..+]) {
+        if let ast::FmtCount::Arg(x) = c {
+            let t = self.p.types.usize();
+            let v = self.check_expr_coerce(x, t);
+            let vn = self.node(v);
+            out.push(FmtPiece::Arg(vn, ast::FmtSpec::Count));
+        }
+    }
+
+    /// Check each format spec of this function against its value's type
+    /// (now known): `x`, `X`, `o` and `b` take integers, `e` and `E`
+    /// floats; `+` and `0` are for numbers; a precision is the digits of a
+    /// float, the characters kept of a string (with `Display`), and means
+    /// nothing for integers, as in Rust.
+    pub fn check_fmt_specs(&mut self) {
+        for i in 0..self.fcx.fmt_checks.len() {
+            let c = self.fcx.fmt_checks[i];
+            let rt = self.resolve(c.ty);
+            let t = self.p.types.strip_grow(rt);
+            if self.p.types.has_infer(t) || self.p.types.has_error(t) {
+                continue;
+            }
+            let f = self.p.ast.fmt_formats.get(c.id);
+            let (is_int, is_float, is_text) = match self.p.types.kind(t) {
+                TyKind::Int(_) => (true, false, false),
+                TyKind::Float(_) => (false, true, false),
+                TyKind::Str | TyKind::String | TyKind::Char | TyKind::Bool => (false, false, true),
+                _ => (false, false, false),
+            };
+            let ts = self.p.ty_str(t);
+            let kt = f.kind.text();
+            if f.kind.radix() != 0 && !is_int {
+                let mut m = String::new();
+                m.write("format type `{kt}` needs an integer, but the value is `{ts}`");
+                self.error_at(codes::ty::BAD_FORMAT_SPEC(), f.kind_span, m.as_str());
+                self.with_secondary(c.span, "this value");
+                if is_float {
+                    self.with_help("`e` and `E` format floats; for the bits of a float, convert it first: `x.to_bits()`");
+                }
+                self.emit();
+                continue;
+            }
+            if f.kind.is_exp() && !is_float {
+                let mut m = String::new();
+                m.write("format type `{kt}` needs a float, but the value is `{ts}`");
+                self.error_at(codes::ty::BAD_FORMAT_SPEC(), f.kind_span, m.as_str());
+                self.with_secondary(c.span, "this value");
+                if is_int {
+                    self.with_help("convert the integer first: `{n as f64:e}`");
+                }
+                self.emit();
+                continue;
+            }
+            if f.plus && !is_int && !is_float {
+                let mut m = String::new();
+                m.write("`+` shows the sign of a number, but the value is `{ts}`");
+                self.error_at(codes::ty::BAD_FORMAT_SPEC(), f.plus_span, m.as_str());
+                self.with_secondary(c.span, "this value");
+                self.emit();
+            }
+            if f.zero && !is_int && !is_float {
+                let mut m = String::new();
+                m.write("`0` pads a number with zeros after its sign, but the value is `{ts}`");
+                self.error_at(codes::ty::BAD_FORMAT_SPEC(), f.zero_span, m.as_str());
+                self.with_secondary(c.span, "this value");
+                self.with_help("to pad with zeros anyway, make `0` the fill: `{x:0>8}`");
+                self.emit();
+            }
+            let prec_ok = is_int || is_float || (is_text && f.kind == ast::FmtKind::Display);
+            if !f.precision.is_none() && !prec_ok {
+                let mut m = String::new();
+                m.write("a precision has no meaning for `{ts}`");
+                self.error_at(codes::ty::BAD_FORMAT_SPEC(), f.prec_span, m.as_str());
+                self.with_secondary(c.span, "this value");
+                if is_text {
+                    self.with_note("with `?`, a precision applies to floats only; with `Display` it keeps that many characters of a string, character or boolean");
+                } else {
+                    self.with_note("a precision is the digits after the point of a float, or how many characters of a string, character or boolean to keep");
+                }
+                self.emit();
+            }
+        }
+        self.fcx.fmt_checks.clear();
     }
 
     fn auto_read_bang(&mut self, v: Expr): Expr {

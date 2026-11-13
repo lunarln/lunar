@@ -159,7 +159,9 @@ impl Arg {
 
 pub enum FmtPiece {
     Text(Symbol),
-    /// A value, shown with `Display` or (for `{x:?}`) `Debug`.
+    /// A value, shown with `Display` or (for `{x:?}`) `Debug`, or as its
+    /// spec (`FmtSpec::Full`) says; or (`FmtSpec::Count`) not shown: the
+    /// `name$` width or precision of the next `Full` value.
     Arg(Id::<Expr>, FmtSpec),
 }
 

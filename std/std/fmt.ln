@@ -1,4 +1,5 @@
-// Float formatting: the shortest decimal representation that round-trips.
+// Float formatting: the shortest decimal representation that round-trips,
+// and (for format specs) a given number of digits, correctly rounded.
 
 use core::fmt::Display;
 use core::intrinsics;
@@ -6,19 +7,40 @@ use core::intrinsics;
 extern "C" {
     fn sprintf(buf: *mut u8, fmt: *u8, ...): i32;
     fn strtod(s: *u8, end: *mut *mut u8): f64;
+    fn strtof(s: *u8, end: *mut *mut u8): f32;
 }
 
-fn write_f64(out: &mut +String, v: f64) {
+const F64_MAX: f64 = 1.7976931348623157e308;
+
+/// Whether the number C wrote at the start of `buf` reads back as `v`
+/// (as an `f32`, if `single`).
+fn round_trips(buf: [u8; &], v: f64, single: bool): bool {
+    unsafe {
+        if single {
+            return strtof(buf.as_ptr(), intrinsics::ptr_null_mut::<*mut u8>()) == v as f32;
+        }
+        return strtod(buf.as_ptr(), intrinsics::ptr_null_mut::<*mut u8>()) == v;
+    }
+}
+
+/// `NaN`, `inf` and `-inf`; false for finite numbers.
+fn write_special(out: &mut +String, v: f64): bool {
     if v != v {
         out.push_str("NaN");
-        return;
-    }
-    if v > 1.7976931348623157e308 {
+    } else if v > F64_MAX {
         out.push_str("inf");
-        return;
-    }
-    if v < -1.7976931348623157e308 {
+    } else if v < -F64_MAX {
         out.push_str("-inf");
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/// The shortest decimal that reads back as `v` (an `f32` widened, if
+/// `single`).
+fn write_f64(out: &mut +String, v: f64, single: bool) {
+    if write_special(out, v) {
         return;
     }
     let mut buf: [u8; 64] = [0; 64];
@@ -27,15 +49,91 @@ fn write_f64(out: &mut +String, v: f64) {
     while prec <= 17 {
         unsafe {
             n = sprintf(buf.as_mut_ptr(),"%.*g\0".as_bytes().as_ptr(), prec, v);
-            let back = strtod(buf.as_ptr(), intrinsics::ptr_null_mut::<*mut u8>());
-            if back == v {
-                break;
-            }
+        }
+        if round_trips(buf[..], v, single) {
+            break;
         }
         prec += 1;
     }
     let s = unsafe { intrinsics::str_from_bytes(buf[..n as usize]) };
     out.push_str(s);
+}
+
+/// `fmt_float` flags: a precision was given; scientific notation (`e`);
+/// with `E`; the value is an `f32`.
+const FLOAT_PRECISION: u32 = 1;
+const FLOAT_EXP: u32 = 2;
+const FLOAT_UPPER: u32 = 4;
+const FLOAT_SINGLE: u32 = 8;
+
+/// Past this many digits after the point, the exact decimal expansion of
+/// any `f64` (at most 1074 digits there, 767 of them significant) has only
+/// zeros left.
+const MAX_EXACT: usize = 1100;
+
+/// A float in a format hole with a spec: `{x:.3}` (`precision` digits
+/// after the point, correctly rounded, ties to even, as in Rust), `{x:e}`
+/// (scientific, shortest: `1.2345e3`) and `{x:.2e}` (`precision` digits
+/// after the mantissa's point).
+#[lang = "fmt_float"]
+fn fmt_float(out: &mut +String, v: f64, precision: usize, flags: u32) {
+    if write_special(out, v) {
+        return;
+    }
+    // C's own rounding is exact; past `MAX_EXACT` digits come only zeros.
+    let p = if precision > MAX_EXACT { MAX_EXACT } else { precision };
+    let zeros = precision - p;
+    let mut buf: [u8; 1500] = [0; 1500];
+    let mut n: i32 = 0;
+    if flags & FLOAT_EXP == 0 {
+        unsafe {
+            n = sprintf(buf.as_mut_ptr(), "%.*f\0".as_bytes().as_ptr(), p as i32, v);
+        }
+        out.push_str(unsafe { intrinsics::str_from_bytes(buf[..n as usize]) });
+        for _ in 0..zeros {
+            out.push('0');
+        }
+        return;
+    }
+    if flags & FLOAT_PRECISION != 0 {
+        unsafe {
+            n = sprintf(buf.as_mut_ptr(), "%.*e\0".as_bytes().as_ptr(), p as i32, v);
+        }
+    } else {
+        let mut prec: i32 = 0;
+        while prec <= 17 {
+            unsafe {
+                n = sprintf(buf.as_mut_ptr(), "%.*e\0".as_bytes().as_ptr(), prec, v);
+            }
+            if round_trips(buf[..], v, flags & FLOAT_SINGLE != 0) {
+                break;
+            }
+            prec += 1;
+        }
+    }
+    // C writes `1.25e+03`; Rust, `1.25e3`.
+    let s = unsafe { intrinsics::str_from_bytes(buf[..n as usize]) };
+    let b = s.as_bytes();
+    let mut e: usize = 0;
+    while e < b.len() && b[e] != b'e' {
+        e += 1;
+    }
+    out.push_str(s[..e]);
+    for _ in 0..zeros {
+        out.push('0');
+    }
+    out.push(if flags & FLOAT_UPPER != 0 { 'E' } else { 'e' });
+    let mut i = e + 1;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        if b[i] == b'-' {
+            out.push('-');
+        }
+        i += 1;
+    }
+    while i + 1 < b.len() && b[i] == b'0' {
+        i += 1;
+    }
+    out.push_str(s[i..]);
 }
 
 /// Parse a decimal number such as `1.5`, `-2e10` or `0.1` (all of `s`:
@@ -98,24 +196,24 @@ impl core::str::FromStr for f32 {
 
 impl Display for f64 {
     fn fmt(&self, out: &mut +String) {
-        write_f64(out, self);
+        write_f64(out, self, false);
     }
 }
 
 impl Display for f32 {
     fn fmt(&self, out: &mut +String) {
-        write_f64(out, self as f64);
+        write_f64(out, self as f64, true);
     }
 }
 
 impl core::fmt::Debug for f64 {
     fn debug(&self, out: &mut +String) {
-        write_f64(out, self);
+        write_f64(out, self, false);
     }
 }
 
 impl core::fmt::Debug for f32 {
     fn debug(&self, out: &mut +String) {
-        write_f64(out, self as f64);
+        write_f64(out, self as f64, true);
     }
 }

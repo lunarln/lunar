@@ -127,6 +127,14 @@ impl Cg {
     fn vtable_method(&mut self, p: &mut +Program, t: Ty, s: TraitRef, m: Symbol): ValueRef {
         return match p.resolve_method(s, t, m, List::empty()) {
             Some(MethodImpl::Fn { def, args }) => self.instance(p, def, args),
+            // `Debug` of a fixed array.
+            Some(MethodImpl::Builtin { lang, .. }) if p.text(lang) == "debug" => match self.array_debug_fn(p, t) {
+                Ok(g) => g,
+                Err(e) => {
+                    self.ice(p, e.as_str());
+                    self.const_null(self.ptr_ty())
+                }
+            },
             _ => {
                 let ts = p.ty_str(t);
                 let tn = p.trait_ref_str(s);

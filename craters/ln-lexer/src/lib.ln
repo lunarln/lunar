@@ -505,13 +505,22 @@ fn string_end_in(b: [u8; &], i: usize, nested: bool): Result::<usize, usize> {
 /// `(`, `[`, `{` or `,`; never first in the hole) that ends on its line.
 /// Anything else (a backslash, a `"` right after an operand, a bracket that
 /// closes nothing, the end of the input) means the `{` was text.
+///
+/// A `:` outside brackets that is not part of `::` starts the format spec
+/// (`{x:>8}`, `{x:'^5}`), which runs to the next `}`; it may not hold an
+/// unescaped `"`, a line break or a `{`.
 pub fn hole_end(b: [u8; &], i: usize): Option::<usize> {
     let mut depth: u32 = 0;
     let mut operand_next = false;
     let mut k = i;
     while k < b.len() {
         let c = b[k];
-        if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' {
+        if c == b':' && at(b, k + 1) == b':' {
+            k += 2;
+            operand_next = true;
+        } else if c == b':' && depth == 0 {
+            return spec_end(b, k + 1);
+        } else if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' {
             k += 1;
         } else if c == b'"' && operand_next {
             k = match string_end_in(b, k, true) {
@@ -544,6 +553,32 @@ pub fn hole_end(b: [u8; &], i: usize): Option::<usize> {
             }
             k += char_len(c);
         }
+    }
+    None
+}
+
+/// The end (after the closing `}`) of the format spec starting at `i`. A
+/// backslash escapes the next character (the fill may be `\"`), but not
+/// `\u{..}`.
+fn spec_end(b: [u8; &], i: usize): Option::<usize> {
+    let mut k = i;
+    while k < b.len() {
+        let c = b[k];
+        if c == b'}' {
+            return Some(k + 1);
+        }
+        if c == b'\\' {
+            let e = at(b, k + 1);
+            if e == b'u' || e == b'\n' || e == b'\r' || e == 0 {
+                return None;
+            }
+            k += 1 + char_len(e);
+            continue;
+        }
+        if c == b'"' || c == b'\n' || c == b'\r' || c == b'{' {
+            return None;
+        }
+        k += char_len(c);
     }
     None
 }
@@ -896,6 +931,21 @@ fn array_types() {
 fn comments_and_strings() {
     assert_eq!(kinds("/* a /* b */ c */ x // y\n\"s\\\"{x}\" 'a' '\\n'").as_str(), "Ident Str Char Char");
     assert_eq!(kinds("b'a' b'\\xff' b 'c' b2'd'").as_str(), "Byte Byte Ident Char Ident Char");
+}
+
+#[test]
+fn format_specs_in_strings() {
+    // A spec's fill may be a quote or a bracket; `::` is a path.
+    assert_eq!(kinds("\"{x:'^5} {y:(>3} {z:]<2} {a::b:?}\" c").as_str(), "Str Ident");
+    assert_eq!(hole_end("x:'^5}".as_bytes(), 0), Some(6));
+    assert_eq!(hole_end("a::b}".as_bytes(), 0), Some(5));
+    // A spec ends at its line, and holds no string or `{`.
+    assert_eq!(hole_end("x:\n}".as_bytes(), 0), None);
+    assert_eq!(hole_end("x:{}".as_bytes(), 0), None);
+    assert_eq!(hole_end("x:\"}".as_bytes(), 0), None);
+    // An escaped fill: `{x:\"<4}`.
+    assert_eq!(hole_end("x:\\\"<4}".as_bytes(), 0), Some(7));
+    assert_eq!(kinds("\"{x:\\\"<4}\" c").as_str(), "Str Ident");
 }
 
 #[test]
