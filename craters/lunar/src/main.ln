@@ -31,6 +31,7 @@ mod cli;
 mod commands;
 mod compile;
 mod explain;
+mod fmt;
 mod git;
 mod ide;
 mod link;
@@ -103,6 +104,9 @@ fn run(c: &cli::Cli): i32 {
     }
     if cmd == "test" {
         return commands::test(c.positionals[..], c.package, c.release);
+    }
+    if cmd == "fmt" {
+        return fmt::command(c.positionals[..], c.package, c.check);
     }
     if cmd == "add" {
         let spec = DepSpec { version: None, path: c.path, git: c.git, tag: c.tag, branch: c.branch, rev: c.rev, package: c.package };

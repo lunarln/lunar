@@ -16,6 +16,8 @@ pub struct Cli {
     pub release: bool,
     pub test: bool,
     pub list: bool,
+    /// `lunar fmt --check`.
+    pub check: bool,
     pub package: Option::<str>,
     pub output: Option::<str>,
     pub target_os: Option::<str>,
@@ -37,7 +39,7 @@ struct Opt {
 }
 
 /// The subcommands, in help order, with their one-line descriptions.
-fn commands(): [(str, str); 14] {
+fn commands(): [(str, str); 15] {
     return [
         ("new", "Create a new package in a new directory"),
         ("init", "Create a new package in the current directory"),
@@ -45,6 +47,7 @@ fn commands(): [(str, str); 14] {
         ("build", "Compile a file, or the current project's programs, to executables"),
         ("run", "Compile and run a file, or the current project's program"),
         ("test", "Run the `#[test]` functions of a file (`lunar test file.ln [filter]`) or of the current project (`lunar test [filter]`)"),
+        ("fmt", "Format source files: the current project's, or the files given (`-` for standard input)"),
         ("add", "Add a dependency to the current package"),
         ("remove", "Remove a dependency from the current package"),
         ("update", "Re-resolve dependencies, updating git dependencies to the newest commit of their branch or tag, and rewrite lunar.lock"),
@@ -73,6 +76,9 @@ fn options(cmd: str, out: &mut +[Opt; ..+]) {
     } else if cmd == "run" || cmd == "test" {
         out.push(p);
         out.push(release);
+    } else if cmd == "fmt" {
+        out.push(p);
+        out.push(Opt { long: "check", short: "", value: "" });
     } else if cmd == "add" {
         out.push(Opt { long: "path", short: "", value: "PATH" });
         out.push(Opt { long: "git", short: "", value: "GIT" });
@@ -101,7 +107,7 @@ fn positional_counts(cmd: str): (usize, usize) {
     if cmd == "check" || cmd == "build" || cmd == "run" || cmd == "explain" {
         return (1, 0);
     }
-    if cmd == "test" || cmd == "help" {
+    if cmd == "test" || cmd == "fmt" || cmd == "help" {
         return (1000, 0);
     }
     return (0, 0);
@@ -126,6 +132,9 @@ fn usage(cmd: str): str {
     }
     if cmd == "test" {
         return "test [OPTIONS] [ARGS]...";
+    }
+    if cmd == "fmt" {
+        return "fmt [OPTIONS] [FILES]...";
     }
     if cmd == "add" {
         return "add [OPTIONS] <NAME>";
@@ -198,6 +207,9 @@ fn sections(cmd: str): str {
     }
     if cmd == "test" {
         return "Arguments:\n  [ARGS]...  A `.ln` file and/or a filter: only tests whose name contains it run\n\nOptions:\n  -p, --package <PACKAGE>  In a workspace, only this member package\n      --release            \n  -h, --help               Print help\n";
+    }
+    if cmd == "fmt" {
+        return "Arguments:\n  [FILES]...  The files to format, in place; `-` formats standard input to standard output. Without any, the `.ln` files of the current package (or of the workspace's packages)\n\nOptions:\n  -p, --package <PACKAGE>  In a workspace, only this member package\n      --check              Change nothing: list the files that would change, and exit with 1 if any would\n  -h, --help               Print help\n";
     }
     if cmd == "add" {
         return "Arguments:\n  <NAME>  The dependency's name, optionally with a version: `json` or `json@1.2`\n\nOptions:\n      --path <PATH>        A local package directory\n      --git <GIT>          A git repository URL\n      --tag <TAG>          \n      --branch <BRANCH>    \n      --rev <REV>          \n      --package <PACKAGE>  The package's real name, if the dependency is renamed\n  -h, --help               Print help\n";
@@ -326,6 +338,7 @@ pub fn parse(): Result::<Cli, i32> {
         release: false,
         test: false,
         list: false,
+        check: false,
         package: None,
         output: None,
         target_os: None,
@@ -523,6 +536,8 @@ fn set_flag(cli: &mut Cli, long: str) {
         cli.test = true;
     } else if long == "list" {
         cli.list = true;
+    } else if long == "check" {
+        cli.check = true;
     }
 }
 
