@@ -347,7 +347,9 @@ pub fn parse(): Result::<Cli, i32> {
         return Err(0);
     }
     if first == "-V" || first == "--version" {
-        println("lunar 0.1.0");
+        // The version in this package's lunar.toml.
+        let version = env!("LUNAR_PKG_VERSION");
+        println("lunar {version}");
         return Err(0);
     }
     if first.starts_with("-") {

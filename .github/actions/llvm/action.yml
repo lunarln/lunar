@@ -1,0 +1,86 @@
+name: Install LLVM 20
+description: >
+  Installs LLVM 20 (its shared library, which the Lunar compiler links) and
+  sets LUNAR_LIB_PATH to the directory to link it from, LLVM_SHLIB_DIR to
+  the directory of the shared library itself, and LLVM_CONFIG (Unix) or
+  LLVM_SYS_201_PREFIX (Windows). Downloads are cached.
+
+runs:
+  using: composite
+  steps:
+    - name: Name the system
+      id: system
+      shell: bash
+      run: |
+        case "$RUNNER_OS" in
+          Linux) system=$(. /etc/os-release && echo "$ID-$VERSION_ID") ;;
+          macOS) system=macos-$(sw_vers -productVersion | cut -d. -f1) ;;
+          *) system=windows ;;
+        esac
+        echo "name=$system" >> "$GITHUB_OUTPUT"
+
+    - name: Cache LLVM downloads
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/lunar-llvm
+        key: llvm-20.1.8-${{ steps.system.outputs.name }}-${{ runner.arch }}
+
+    - name: Install LLVM 20 (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        debs="$HOME/.cache/lunar-llvm/debs"
+        # apt.llvm.org, for later `apt-get install`s too.
+        codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+        wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+        echo "deb http://apt.llvm.org/$codename/ llvm-toolchain-$codename-20 main" | sudo tee /etc/apt/sources.list.d/llvm-20.list
+        # The cached packages install offline; if the runner image changed
+        # under them, they are downloaded again.
+        if ! { ls "$debs"/*.deb >/dev/null 2>&1 && sudo dpkg -i "$debs"/*.deb; }; then
+          rm -rf "$debs"
+          sudo apt-get update -q
+          mkdir -p "$debs/partial"
+          sudo apt-get install -y -q -o Dir::Cache::Archives="$debs" llvm-20-dev
+          sudo chown -R "$USER" "$debs"
+          rm -rf "$debs/partial" "$debs/lock"
+        fi
+        prefix=/usr/lib/llvm-20
+        echo "LLVM_CONFIG=$prefix/bin/llvm-config" >> "$GITHUB_ENV"
+        echo "LUNAR_LIB_PATH=$prefix/lib" >> "$GITHUB_ENV"
+        echo "LLVM_SHLIB_DIR=$prefix/lib" >> "$GITHUB_ENV"
+
+    - name: Install LLVM 20 (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      env:
+        HOMEBREW_NO_AUTO_UPDATE: '1'
+        HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      run: |
+        set -euo pipefail
+        # Bottles are kept in the cached directory.
+        export HOMEBREW_CACHE="$HOME/.cache/lunar-llvm/homebrew"
+        brew install llvm@20
+        prefix=$(brew --prefix llvm@20)
+        echo "LLVM_CONFIG=$prefix/bin/llvm-config" >> "$GITHUB_ENV"
+        echo "LUNAR_LIB_PATH=$prefix/lib" >> "$GITHUB_ENV"
+        echo "LLVM_SHLIB_DIR=$prefix/lib" >> "$GITHUB_ENV"
+
+    - name: Install LLVM 20 (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $v = "20.1.8"
+        $dir = Join-Path $HOME ".cache/lunar-llvm"
+        $exe = Join-Path $dir "LLVM-$v-win64.exe"
+        if (-not (Test-Path $exe)) {
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$v/LLVM-$v-win64.exe"
+          # GitHub's release CDN occasionally times out (504); retry.
+          Invoke-WebRequest $url -OutFile $exe -MaximumRetryCount 3 -RetryIntervalSec 15
+        }
+        Start-Process -Wait -FilePath $exe -ArgumentList "/S", "/D=C:\LLVM"
+        "LLVM_SYS_201_PREFIX=C:\LLVM" >> $env:GITHUB_ENV
+        "LUNAR_LIB_PATH=C:/LLVM/lib" >> $env:GITHUB_ENV
+        "LLVM_SHLIB_DIR=C:/LLVM/bin" >> $env:GITHUB_ENV
+        "C:\LLVM\bin" >> $env:GITHUB_PATH

@@ -15,3 +15,4 @@ pub use crater::hash::Hash;
 pub use std::io::{print, println, eprint, eprintln};
 pub use std::process::panic;
 pub use std::test::{assert, assert_eq, assert_ne};
+pub use std::env::env;

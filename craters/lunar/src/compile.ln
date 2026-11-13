@@ -20,7 +20,11 @@ use crater::ui::use_color;
 /// and `std`, and analyze them for the host (or `target_os`). If a file
 /// cannot be read, the result is not analyzed and has the errors.
 pub fn analyze_specs(proj: &Project, test: bool, target_os: Option::<str>): Sema from static {
-    let opts = options(test, target_os);
+    let mut opts = options(test, target_os);
+    if let Some(pkg) = proj.building {
+        opts.pkg_name = String::from(proj.text(proj.packages[pkg].name));
+        opts.pkg_version = String::from(proj.text(proj.packages[pkg].version));
+    }
     let mut p = Program::new();
     let mut cs = Craters::new();
     for s in proj.specs {

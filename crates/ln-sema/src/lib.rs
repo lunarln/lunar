@@ -36,13 +36,36 @@ pub struct Options {
     /// Type-check function bodies even after errors in item signatures, and
     /// return the (partial) program despite errors. For editor tooling.
     pub keep_going: bool,
+    /// The package being built (empty for a single file): what
+    /// `env!("LUNAR_PKG_NAME")` and `env!("LUNAR_PKG_VERSION")` expand to.
+    pub pkg_name: String,
+    pub pkg_version: String,
 }
 
 impl Options {
     pub fn host(test: bool) -> Self {
         let os = std::env::consts::OS.to_string();
         let family = if cfg!(windows) { "windows" } else { "unix" }.to_string();
-        Self { target_os: os, target_family: family, target_arch: std::env::consts::ARCH.to_string(), test, keep_going: false }
+        Self {
+            target_os: os,
+            target_family: family,
+            target_arch: std::env::consts::ARCH.to_string(),
+            test,
+            keep_going: false,
+            pkg_name: String::new(),
+            pkg_version: String::new(),
+        }
+    }
+
+    /// The value of `${env(name)}`: the package being built for
+    /// `LUNAR_PKG_NAME` and `LUNAR_PKG_VERSION`, else the compiler's
+    /// environment.
+    pub fn compile_time_var(&self, name: &str) -> Option<String> {
+        match name {
+            "LUNAR_PKG_NAME" if !self.pkg_name.is_empty() => Some(self.pkg_name.clone()),
+            "LUNAR_PKG_VERSION" if !self.pkg_version.is_empty() => Some(self.pkg_version.clone()),
+            _ => std::env::var(name).ok(),
+        }
     }
 }
 

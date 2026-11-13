@@ -75,7 +75,11 @@ fn link_windows(obj: str, out: str, libs: [str; &], search: str): Result::<(), L
         return run("clang", &b);
     }
     if !which("link") {
-        return Err(LinkError { message: String::from("no linker found"), note: String::new(), help: String::from("install the MSVC build tools or LLVM `clang`, or set `LUNAR_CC`") });
+        return Err(LinkError {
+            message: String::from("no linker found: neither `clang` nor MSVC `link.exe` is on `PATH`"),
+            note: String::new(),
+            help: String::from("install the Visual Studio Build Tools (C++) and LLVM `clang`, or run from a Developer PowerShell for Visual Studio so that `link.exe` is on `PATH`, or set `LUNAR_CC`"),
+        });
     }
     b.add("/NOLOGO");
     let mut o = String::from("/OUT:");
@@ -163,7 +167,8 @@ fn run(program: str, b: &Args): Result::<(), LinkError> {
         Err(e) => {
             let mut m = String::new();
             m.write("could not run the linker `{program}`: {e}");
-            return Err(LinkError { message: m, note: String::new(), help: String::from("install a linker, or point `LUNAR_CC` at one") });
+            let help = if program == "cc" { missing_cc_help() } else { "install a linker, or point `LUNAR_CC` at one" };
+            return Err(LinkError { message: m, note: String::new(), help: String::from(help) });
         }
     };
     if o.status.success() {
@@ -247,6 +252,16 @@ fn path_sep(): str {
 #[cfg(unix)]
 fn path_sep(): str {
     return ":";
+}
+
+#[cfg(target_os = "macos")]
+fn missing_cc_help(): str {
+    return "install the Xcode command line tools (`xcode-select --install`), which provide `cc`, or point `LUNAR_CC` at a linker";
+}
+
+#[cfg(not(target_os = "macos"))]
+fn missing_cc_help(): str {
+    return "install a C toolchain that provides `cc` (gcc or clang; on Debian and Ubuntu, the `build-essential` package), or point `LUNAR_CC` at a linker";
 }
 
 #[cfg(windows)]

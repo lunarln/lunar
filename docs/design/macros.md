@@ -212,6 +212,7 @@ Derives need them to name and count fields:
 | `${ignore($x)}` | nothing; a repetition that uses it repeats once per match of `$x` |
 | `${concat(a, index())}` | one identifier made of identifiers, literals, `$x` (an `ident` or `lit`) and `index()`: `a0`, `a1` |
 | `${stringify(...)}` | a string literal of the tokens: `${stringify($n)}` is `"Point"` |
+| `${env("NAME")}` | a string literal of a compile-time variable (the name may be `$x`, an `ident` or `lit`): `LUNAR_PKG_NAME` and `LUNAR_PKG_VERSION` are the package being built, other names are read from the compiler's environment; undefined, the expansion fails with `macro::error` (editors get `""`). `std::env::env!` is built on it |
 | `${error("message")}` | nothing; the expansion fails with `macro::error` and the message |
 
 Identifiers made by `${concat(...)}` belong to the expansion (they are

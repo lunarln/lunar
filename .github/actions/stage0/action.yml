@@ -1,0 +1,43 @@
+name: Stage 0 compiler
+description: >
+  Installs the released Lunar compiler named in craters/stage0.txt (with
+  install.sh or install.ps1) and sets STAGE0 to its executable. The
+  installation is cached per version.
+
+runs:
+  using: composite
+  steps:
+    - name: Read craters/stage0.txt
+      id: version
+      shell: bash
+      run: |
+        version=$(grep -v '^[[:space:]]*\(#\|$\)' craters/stage0.txt | head -n 1 | tr -d '[:space:]')
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        dir="$HOME/.cache/lunar-stage0/$version"
+        if [ "$RUNNER_OS" = Windows ]; then
+          dir=$(cygpath -m "$dir")
+        fi
+        echo "STAGE0_DIR=$dir" >> "$GITHUB_ENV"
+
+    - name: Cache the stage 0 compiler
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/lunar-stage0/${{ steps.version.outputs.version }}
+        key: lunar-stage0-${{ steps.version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Install Lunar ${{ steps.version.outputs.version }} (Unix)
+      if: steps.cache.outputs.cache-hit != 'true' && runner.os != 'Windows'
+      shell: bash
+      run: sh install.sh --prefix "$STAGE0_DIR" --version "${{ steps.version.outputs.version }}"
+
+    - name: Install Lunar ${{ steps.version.outputs.version }} (Windows)
+      if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Windows'
+      shell: pwsh
+      run: ./install.ps1 -Prefix $env:STAGE0_DIR -Version "${{ steps.version.outputs.version }}"
+
+    - name: Use it
+      shell: bash
+      run: |
+        "$STAGE0_DIR/bin/lunar" --version
+        echo "STAGE0=$STAGE0_DIR/bin/lunar" >> "$GITHUB_ENV"
