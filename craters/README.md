@@ -25,6 +25,13 @@ cmp stage2/lunar stage3/lunar                        # identical
 (Both stages get the same file name because on macOS the linker's ad hoc
 code signature records it.)
 
+Stages 2 and 3 are debug builds, so they carry full debug information
+(`--debug-info none` leaves it out) and are still the same bytes: the
+metadata has no timestamps or addresses, source paths are recorded relative
+to `craters/` (std's under its own directory), and on Windows the
+executable names its PDB without a directory (`/PDBALTPATH:%_PDB%`) and is
+linked with `/Brepro`, so where the stages are built does not matter.
+
 The executable, `target/release/lunar`, is a drop-in replacement for the
 Rust `lunar`: the same commands (`new`, `init`, `check`, `build`, `run`,
 `test`, `add`, `remove`, `update`, `clean`, `emit-llvm`, `explain`, `lsp`), options, help and error texts, status lines, exit codes
@@ -101,6 +108,7 @@ compares its answers with the Rust server's.
 | borrow checker | `borrowck.rs` | `ln-sema/src/borrowck.ln` | done (unit checks on hand-built THIR in `tests.ln`) |
 | type checker | `typeck/*.rs` | `ln-sema/src/typeck/{mod,expr,call,pat,closure}.ln` | done; Rust's `FnCtx` is the `Sema::fcx` field |
 | code generation | `crates/ln-codegen` | `ln-codegen/src/{lib,func,ops,init,llvm}.ln` | done; the state of the function being lowered (Rust's `FnCg`) lives in `Cg` |
+| debug information | (none in Rust) | `ln-codegen/src/debug.ln` | CodeView / DWARF through LLVM's DIBuilder: functions, lines, variables in lexical blocks, types |
 | driver | `crates/ln-driver` (all but `lsp.rs`, `ide.rs`) | `lunar/src/*.ln` | done; std and `docs/errors` are read from the sysroot, not embedded |
 | language server | `lsp.rs`, `ide.rs`, `ln-ast/src/pretty.rs` | `lunar/src/{lsp,ide}.ln`, `ln-ast/src/pretty.ln` | done; the same answers as the Rust server (`tests/lsp_session.rs`) |
 
@@ -181,6 +189,13 @@ the command-line and language server tests (`tests/lang.rs`,
 
 * `std/` and `docs/errors/` come from the sysroot (above), not from the
   executable.
+* Programs get debug information (`ln-codegen/src/debug.ln`; see
+  [Debugging](../README.md#debugging)): `build`, `run`, `test` and
+  `emit-llvm` also take `--debug-info none|lines|full` and
+  `--remap-path-prefix FROM=TO`. Tests: `lunar test -p lunar` in
+  `craters/` (`lunar/src/debuginfo_tests.ln`: the IR, a scripted lldb
+  session when lldb starts, and on Windows the PDB through
+  `llvm-pdbutil`).
 * On Windows, linking falls back from `clang` to a `link.exe` on `PATH`;
   the Rust driver also finds an installed MSVC through the registry.
 * I/O errors are worded by `std` (`not found (os error 2)`), not by the
