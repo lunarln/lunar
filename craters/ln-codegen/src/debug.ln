@@ -174,7 +174,7 @@ impl Cg {
         self.module_flag("Debug Info Version", 3);
         let file = self.di_main_file(p);
         self.di_cu_file = file;
-        let producer = "lunar 0.1.0";
+        let producer = "lunar 0.2.0";
         let none = "";
         let kind = if self.dbg_full() { EMISSION_FULL } else { EMISSION_LINE_TABLES_ONLY };
         let optimized = (self.opts.opt_level > 0) as i32;
