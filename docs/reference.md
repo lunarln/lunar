@@ -528,7 +528,10 @@ must be `let mut`) or `FnOnce` (gives one away; calling consumes the
 closure). Functions are generic over them: `fn apply::<F: Fn(i32): i32>(f:
 F, x: i32)`; the parameter types in `Fn(...)` carry modes (`Fn(&String)`,
 `FnMut(&mut i32)`). Named functions and function pointers implement all
-three.
+three. A closure given where `Fn(&mut +String)` is expected takes that
+parameter as `&mut +`, so it may only grow it, and calling `f(s)` through
+such a bound keeps the views into `s`, as for a `&mut +` parameter of a
+function.
 
 A function can return a closure (or any value) without naming its type:
 `fn make_adder(n: i32): impl Fn(i32): i32 { return move |x| x + n; }`.
