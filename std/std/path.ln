@@ -1,0 +1,747 @@
+// Paths as text: `Path`, a view of a path (a `str`), and `PathBuf`, an
+// owned path that can be built up (a `String`). There are no arrays of
+// owned paths; components come out of an iterator as views.
+//
+// On Windows both `/` and `\` separate components and a path may start
+// with a prefix (`C:`, `\\server\share`, `\\?\...`); elsewhere only `/`
+// separates. Nothing here touches the file system except `absolute`.
+
+use crater::io::Error;
+
+#[cfg(windows)]
+const WIN: bool = true;
+#[cfg(not(windows))]
+const WIN: bool = false;
+
+/// The separator this system writes between components: `\` on Windows,
+/// `/` elsewhere.
+#[cfg(windows)]
+pub const MAIN_SEPARATOR: char = '\\';
+#[cfg(not(windows))]
+pub const MAIN_SEPARATOR: char = '/';
+
+/// `MAIN_SEPARATOR` as text.
+#[cfg(windows)]
+pub const MAIN_SEPARATOR_STR: str = "\\";
+#[cfg(not(windows))]
+pub const MAIN_SEPARATOR_STR: str = "/";
+
+/// Whether `c` separates components here (`/`, and on Windows also `\`).
+pub fn is_separator(c: char): bool {
+    return c == '/' || (WIN && c == '\\');
+}
+
+fn is_sep(b: u8): bool {
+    return b == b'/' || (WIN && b == b'\\');
+}
+
+fn is_letter(b: u8): bool {
+    return (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z');
+}
+
+/// The end of the component of `b` that starts at `i`.
+fn component_end(b: [u8; &], i: usize, verbatim: bool): usize {
+    let mut j = i;
+    while j < b.len() && !(if verbatim { b[j] == b'\\' } else { is_sep(b[j]) }) {
+        j += 1;
+    }
+    return j;
+}
+
+/// How long the Windows prefix of `b` is (0 if none, and always 0
+/// elsewhere), and whether it brings its own root (UNC and verbatim
+/// prefixes do).
+fn prefix(b: [u8; &]): (usize, bool) {
+    if !WIN || b.len() < 2 {
+        return (0, false);
+    }
+    if is_letter(b[0]) && b[1] == b':' {
+        return (2, false);
+    }
+    if !(is_sep(b[0]) && is_sep(b[1])) {
+        return (0, false);
+    }
+    if b.len() >= 4 && b[0] == b'\\' && b[1] == b'\\' && b[2] == b'?' && b[3] == b'\\' {
+        // Verbatim: `\\?\UNC\server\share`, `\\?\C:`, `\\?\name`.
+        let rest = b[4..];
+        if rest.len() >= 4 && rest[0] == b'U' && rest[1] == b'N' && rest[2] == b'C' && rest[3] == b'\\' {
+            let server = component_end(b, 8, true);
+            if server >= b.len() {
+                return (server, true);
+            }
+            return (component_end(b, server + 1, true), true);
+        }
+        if rest.len() >= 2 && is_letter(rest[0]) && rest[1] == b':' {
+            return (6, true);
+        }
+        return (component_end(b, 4, true), true);
+    }
+    if b.len() >= 4 && b[2] == b'.' && is_sep(b[3]) {
+        // A device: `\\.\COM1`.
+        return (component_end(b, 4, false), true);
+    }
+    // UNC: `\\server\share`.
+    let server = component_end(b, 2, false);
+    if server == 2 {
+        return (0, false);
+    }
+    if server >= b.len() {
+        return (server, true);
+    }
+    return (component_end(b, server + 1, false), true);
+}
+
+/// Where the components after the prefix and root start, and whether
+/// there is a root.
+fn body_start(b: [u8; &]): (usize, bool) {
+    let (p, implied_root) = prefix(b);
+    if p < b.len() && is_sep(b[p]) {
+        return (p + 1, true);
+    }
+    return (p, implied_root);
+}
+
+// ===================================================================== Path
+
+/// A path: a view of its text. Methods take it by value (it is a view,
+/// copied freely) and return views into the same text.
+/// `Path::new("src/main.ln").extension()` is `Some("ln")`.
+pub struct Path {
+    s: str,
+}
+
+/// One part of a path, from `Path::components`.
+pub enum Component {
+    /// A Windows prefix: `C:`, `\\server\share`, `\\?\C:`.
+    Prefix(str),
+    /// The root: a separator after the prefix (or the start).
+    RootDir,
+    /// `.` at the start of a relative path.
+    CurDir,
+    /// `..`.
+    ParentDir,
+    /// A name.
+    Normal(str),
+}
+
+impl Component {
+    /// The text of the component (`/` for the root on Unix, `\` on
+    /// Windows).
+    pub fn as_str(self): str {
+        return match self {
+            Component::Prefix(p) => p,
+            Component::RootDir => MAIN_SEPARATOR_STR,
+            Component::CurDir => ".",
+            Component::ParentDir => "..",
+            Component::Normal(n) => n,
+        };
+    }
+}
+
+impl Eq for Component {
+    fn eq(&self, other: &Component): bool {
+        return match (self, other) {
+            (Component::Prefix(a), Component::Prefix(b)) => prefix_eq(a, b),
+            (Component::RootDir, Component::RootDir) => true,
+            (Component::CurDir, Component::CurDir) => true,
+            (Component::ParentDir, Component::ParentDir) => true,
+            (Component::Normal(a), Component::Normal(b)) => a == b,
+            _ => false,
+        };
+    }
+}
+
+impl Debug for Component {
+    fn debug(&self, out: &mut +String) {
+        match self {
+            Component::Prefix(p) => out.write("Prefix({p:?})"),
+            Component::RootDir => out.push_str("RootDir"),
+            Component::CurDir => out.push_str("CurDir"),
+            Component::ParentDir => out.push_str("ParentDir"),
+            Component::Normal(n) => out.write("Normal({n:?})"),
+        }
+    }
+}
+
+/// Prefixes compare with either separator.
+fn prefix_eq(a: str, b: str): bool {
+    let x = a.as_bytes();
+    let y = b.as_bytes();
+    if x.len() != y.len() {
+        return false;
+    }
+    for i in 0..x.len() {
+        if x[i] != y[i] && !(is_sep(x[i]) && is_sep(y[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The components of a path (`Path::components`): the prefix, the root,
+/// then each name, `..` and a leading `.`; repeated separators and other
+/// `.`s are skipped.
+pub struct Components {
+    s: str,
+    /// 0: the prefix is next; 1: the root; 2: names from `pos`.
+    state: u8,
+    pos: usize,
+}
+
+impl Components {
+    /// The part of the path not yet returned.
+    pub fn rest(&self): str {
+        let b = self.s.as_bytes();
+        let mut p = self.pos;
+        if self.state == 2 {
+            while p < b.len() && is_sep(b[p]) {
+                p += 1;
+            }
+        }
+        return self.s[p..];
+    }
+}
+
+impl Iterator::<Component> for Components {
+    fn next(&mut self): Option::<Component> {
+        let b = self.s.as_bytes();
+        if self.state == 0 {
+            self.state = 1;
+            let (p, _) = prefix(b);
+            if p > 0 {
+                self.pos = p;
+                return Some(Component::Prefix(self.s[..p]));
+            }
+        }
+        if self.state == 1 {
+            self.state = 2;
+            let (start, root) = body_start(b);
+            let at = self.pos;
+            self.pos = start;
+            if root {
+                return Some(Component::RootDir);
+            }
+            // A leading `.` is kept, as `CurDir`.
+            if at == 0 && start == 0 {
+                let end = component_end(b, 0, false);
+                if end == 1 && b[0] == b'.' {
+                    self.pos = end;
+                    return Some(Component::CurDir);
+                }
+            }
+        }
+        loop {
+            while self.pos < b.len() && is_sep(b[self.pos]) {
+                self.pos += 1;
+            }
+            if self.pos >= b.len() {
+                return None;
+            }
+            let start = self.pos;
+            let end = component_end(b, start, false);
+            self.pos = end;
+            let name = self.s[start..end];
+            if name == "." {
+                continue;
+            }
+            if name == ".." {
+                return Some(Component::ParentDir);
+            }
+            return Some(Component::Normal(name));
+        }
+    }
+}
+
+impl Path {
+    /// The path whose text is `s`.
+    pub fn new(s: str): Path {
+        return Path { s };
+    }
+
+    pub fn as_str(self): str {
+        return self.s;
+    }
+
+    pub fn is_empty(self): bool {
+        return self.s.is_empty();
+    }
+
+    /// The parts of the path, in order.
+    pub fn components(self): Components {
+        return Components { s: self.s, state: 0, pos: 0 };
+    }
+
+    /// Whether the path does not depend on the current directory: starts
+    /// with `/` on Unix; on Windows has a drive and a root (`C:\x`), or is
+    /// UNC or verbatim (`\\server\share`, `\\?\...`).
+    pub fn is_absolute(self): bool {
+        let b = self.s.as_bytes();
+        if !WIN {
+            return b.len() > 0 && b[0] == b'/';
+        }
+        let (p, implied) = prefix(b);
+        return p > 0 && (implied || (p < b.len() && is_sep(b[p])));
+    }
+
+    pub fn is_relative(self): bool {
+        return !self.is_absolute();
+    }
+
+    /// Whether there is a root: a separator at the start, after a
+    /// Windows drive (`C:\`), or a UNC or verbatim prefix.
+    pub fn has_root(self): bool {
+        let (_, root) = body_start(self.s.as_bytes());
+        return root;
+    }
+
+    /// The text before and of the last component, if there is one (not
+    /// just a prefix or a root).
+    fn split_last(self): Option::<(str, str)> {
+        let b = self.s.as_bytes();
+        let (body, _) = body_start(b);
+        let mut end = b.len();
+        loop {
+            while end > body && is_sep(b[end - 1]) {
+                end -= 1;
+            }
+            if end <= body {
+                return None;
+            }
+            let mut start = end;
+            while start > body && !is_sep(b[start - 1]) {
+                start -= 1;
+            }
+            let last = self.s[start..end];
+            // `.` is skipped, except at the very start.
+            if last == "." && start > body {
+                end = start;
+                continue;
+            }
+            let mut pend = start;
+            while pend > body && is_sep(b[pend - 1]) {
+                pend -= 1;
+            }
+            return Some((self.s[..pend], last));
+        }
+    }
+
+    /// The path without its last component: `a/b` for `a/b/c`, `/` for
+    /// `/a`, the empty path for `a`; `None` for a root, a prefix or the
+    /// empty path.
+    pub fn parent(self): Option::<Path> {
+        let (parent, _) = self.split_last()?;
+        return Some(Path { s: parent });
+    }
+
+    /// The last component if it is a name (not `.` or `..`): `c.txt` for
+    /// `a/b/c.txt`.
+    pub fn file_name(self): Option::<str> {
+        let (_, last) = self.split_last()?;
+        if last == "." || last == ".." {
+            return None;
+        }
+        return Some(last);
+    }
+
+    /// The file name without its extension: `c` for `c.txt`, `archive.tar`
+    /// for `archive.tar.gz`, `.bashrc` for `.bashrc`.
+    pub fn file_stem(self): Option::<str> {
+        let name = self.file_name()?;
+        return match name.rfind(".") {
+            Some(i) => if i == 0 { Some(name) } else { Some(name[..i]) },
+            None => Some(name),
+        };
+    }
+
+    /// The extension of the file name, after its last `.`: `gz` for
+    /// `archive.tar.gz`; `None` for `.bashrc` or a name without a `.`.
+    pub fn extension(self): Option::<str> {
+        let name = self.file_name()?;
+        return match name.rfind(".") {
+            Some(i) => if i == 0 { None } else { Some(name[i + 1..]) },
+            None => None,
+        };
+    }
+
+    /// Whether `base`'s components begin this path's: `a/b/c` starts with
+    /// `a/b` but not with `a/bc`.
+    pub fn starts_with(self, base: str): bool {
+        return self.strip_prefix(base).is_some();
+    }
+
+    /// Whether `child`'s components end this path's: `a/b/c` ends with
+    /// `b/c` but not with `bc`.
+    pub fn ends_with(self, child: str): bool {
+        let mut mine: [Component; ..+] = [];
+        for c in self.components() {
+            mine.push(c);
+        }
+        let mut theirs: [Component; ..+] = [];
+        for c in Path::new(child).components() {
+            theirs.push(c);
+        }
+        if theirs.len() > mine.len() {
+            return false;
+        }
+        let off = mine.len() - theirs.len();
+        for i in 0..theirs.len() {
+            if mine[off + i] != theirs[i] {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// The rest of the path after `base`'s components, or `None` if it
+    /// does not start with them: `c/d` for `a/b/c/d` less `a/b`.
+    pub fn strip_prefix(self, base: str): Option::<Path> {
+        let mut it = self.components();
+        let mut theirs = Path::new(base).components();
+        loop {
+            let mut ahead = it;
+            match theirs.next() {
+                None => return Some(Path { s: it.rest() }),
+                Some(t) => match ahead.next() {
+                    Some(m) => {
+                        if m != t {
+                            return None;
+                        }
+                        it = ahead;
+                    }
+                    None => return None,
+                },
+            }
+        }
+    }
+
+    /// This path with `other` after it, as `PathBuf::push` does.
+    pub fn join(self, other: str): PathBuf {
+        let mut p = PathBuf::from(self.s);
+        p.push(other);
+        return p;
+    }
+
+    /// This path with its extension replaced by `ext` (or removed, if
+    /// `ext` is empty).
+    pub fn with_extension(self, ext: str): PathBuf {
+        let mut p = PathBuf::from(self.s);
+        p.set_extension(ext);
+        return p;
+    }
+
+    /// This path with its file name replaced by `name`.
+    pub fn with_file_name(self, name: str): PathBuf {
+        let mut p = PathBuf::from(self.s);
+        p.set_file_name(name);
+        return p;
+    }
+
+    pub fn to_path_buf(self): PathBuf {
+        return PathBuf::from(self.s);
+    }
+
+    /// The path with `.` and `..` worked out from the text alone (not the
+    /// file system, so links are not followed), repeated separators
+    /// merged, and on Windows every separator made `\`: `a/./b/../c`
+    /// becomes `a/c`. `..` above a root is dropped; at the start of a
+    /// relative path it is kept. An empty result is `.`.
+    pub fn normalize(self): PathBuf {
+        let mut out = String::new();
+        let mut rooted = false;
+        // The names written so far, as byte ends in `out`, so that `..`
+        // can take one back.
+        let mut ends: [usize; -..+] = [];
+        let mut base: usize = 0;
+        let mut leading_parents: usize = 0;
+        for c in self.components() {
+            match c {
+                Component::Prefix(p) => {
+                    push_native(&mut out, p);
+                    base = out.len();
+                }
+                Component::RootDir => {
+                    out.push(MAIN_SEPARATOR);
+                    rooted = true;
+                    base = out.len();
+                }
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if ends.len() > leading_parents {
+                        ends.pop();
+                        let keep = if ends.len() > 0 { ends[ends.len() - 1] } else { base };
+                        out.truncate(keep);
+                    } else if !rooted {
+                        if out.len() > base {
+                            out.push(MAIN_SEPARATOR);
+                        }
+                        out.push_str("..");
+                        ends.push(out.len());
+                        leading_parents += 1;
+                    }
+                }
+                Component::Normal(n) => {
+                    if out.len() > base {
+                        out.push(MAIN_SEPARATOR);
+                    }
+                    out.push_str(n);
+                    ends.push(out.len());
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push('.');
+        }
+        return PathBuf { s: out };
+    }
+
+    /// The same path with every separator made `MAIN_SEPARATOR` (on
+    /// Windows, `/` becomes `\`; elsewhere nothing changes).
+    pub fn to_native(self): PathBuf {
+        let mut out = String::new();
+        push_native(&mut out, self.s);
+        return PathBuf { s: out };
+    }
+}
+
+/// `s` with every separator as `MAIN_SEPARATOR`, onto `out`.
+fn push_native(out: &mut +String, s: str) {
+    if !WIN {
+        out.push_str(s);
+        return;
+    }
+    for c in s.chars() {
+        out.push(if c == '/' { '\\' } else { c });
+    }
+}
+
+impl Eq for Path {
+    /// Paths are equal when their components are: `a//b/` is `a/b`.
+    fn eq(&self, other: &Path): bool {
+        let mut a = self.components();
+        let mut b = other.components();
+        loop {
+            match a.next() {
+                None => return b.next().is_none(),
+                Some(x) => match b.next() {
+                    None => return false,
+                    Some(y) => {
+                        if x != y {
+                            return false;
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+impl Display for Path {
+    fn fmt(&self, out: &mut +String) {
+        out.push_str(self.s);
+    }
+}
+
+impl Debug for Path {
+    fn debug(&self, out: &mut +String) {
+        self.s.debug(out);
+    }
+}
+
+// ===================================================================== PathBuf
+
+/// An owned path that can be built up: `PathBuf::from("a")` then
+/// `push("b")`. `as_path` gives a `Path` view of it.
+pub struct PathBuf {
+    s: String,
+}
+
+impl PathBuf {
+    /// The empty path.
+    pub fn new(): PathBuf {
+        return PathBuf { s: String::new() };
+    }
+
+    /// A copy of `s`.
+    pub fn from(s: str): PathBuf {
+        return PathBuf { s: String::from(s) };
+    }
+
+    /// The path `s`, without copying.
+    pub fn from_string(s: String): PathBuf {
+        return PathBuf { s };
+    }
+
+    pub fn as_path(&self): Path {
+        return Path { s: self.s.as_str() };
+    }
+
+    pub fn as_str(&self): str {
+        return self.s.as_str();
+    }
+
+    pub fn into_string(self): String {
+        return self.s;
+    }
+
+    pub fn is_empty(&self): bool {
+        return self.s.is_empty();
+    }
+
+    // The `Path` methods, for convenience (there is no automatic
+    // dereferencing): each is `self.as_path().method(..)`.
+
+    pub fn join(&self, other: str): PathBuf {
+        return self.as_path().join(other);
+    }
+
+    pub fn parent(&self): Option::<Path> {
+        return self.as_path().parent();
+    }
+
+    pub fn file_name(&self): Option::<str> {
+        return self.as_path().file_name();
+    }
+
+    pub fn file_stem(&self): Option::<str> {
+        return self.as_path().file_stem();
+    }
+
+    pub fn extension(&self): Option::<str> {
+        return self.as_path().extension();
+    }
+
+    pub fn components(&self): Components {
+        return self.as_path().components();
+    }
+
+    pub fn is_absolute(&self): bool {
+        return self.as_path().is_absolute();
+    }
+
+    pub fn is_relative(&self): bool {
+        return self.as_path().is_relative();
+    }
+
+    pub fn with_extension(&self, ext: str): PathBuf {
+        return self.as_path().with_extension(ext);
+    }
+
+    pub fn with_file_name(&self, name: str): PathBuf {
+        return self.as_path().with_file_name(name);
+    }
+
+    pub fn normalize(&self): PathBuf {
+        return self.as_path().normalize();
+    }
+
+    /// Add `p` after the path, with a separator between them. A `p` that
+    /// is absolute (or on Windows has a prefix) replaces the path; on
+    /// Windows a `p` with a root but no drive (`\x`) keeps only the
+    /// path's drive. Adding to the empty path, or after `C:`, adds no
+    /// separator.
+    pub fn push(&mut self, p: str) {
+        let pb = p.as_bytes();
+        let (pp, _) = prefix(pb);
+        let p_root = pb.len() > pp && is_sep(pb[pp]);
+        if pp > 0 || (p_root && !WIN) {
+            self.s.clear();
+            self.s.push_str(p);
+            return;
+        }
+        if p_root {
+            // `\x` on Windows: keep the drive.
+            let (mine, _) = prefix(self.s.as_bytes());
+            self.s.truncate(mine);
+            self.s.push_str(p);
+            return;
+        }
+        let b = self.s.as_bytes();
+        let (mine, _) = prefix(b);
+        let needs_sep = b.len() > 0 && !is_sep(b[b.len() - 1]) && !(WIN && mine == b.len() && mine == 2);
+        if needs_sep {
+            self.s.push(MAIN_SEPARATOR);
+        }
+        self.s.push_str(p);
+    }
+
+    /// Remove the last component; false if there is none (the path is
+    /// empty, a root or a prefix).
+    pub fn pop(&mut self): bool {
+        let n = match self.as_path().parent() {
+            Some(p) => p.as_str().len(),
+            None => return false,
+        };
+        self.s.truncate(n);
+        return true;
+    }
+
+    /// Replace the file name (or add `name` if there is none).
+    pub fn set_file_name(&mut self, name: str) {
+        if self.as_path().file_name().is_some() {
+            self.pop();
+        }
+        self.push(name);
+    }
+
+    /// Replace the extension with `ext`, or remove it if `ext` is empty;
+    /// false (changing nothing) if there is no file name.
+    pub fn set_extension(&mut self, ext: str): bool {
+        let (end, stem_end) = match self.as_path().file_stem() {
+            Some(stem) => {
+                // Where the file name ends, and where its stem does.
+                let name = self.as_path().file_name().unwrap();
+                let base = self.s.as_str();
+                let name_start = name.as_bytes().as_ptr() as usize - base.as_bytes().as_ptr() as usize;
+                (name_start + name.len(), name_start + stem.len())
+            }
+            None => return false,
+        };
+        let tail = String::from(self.s.as_str()[end..]);
+        self.s.truncate(stem_end);
+        if !ext.is_empty() {
+            self.s.push('.');
+            self.s.push_str(ext);
+        }
+        self.s.push_str(tail.as_str());
+        return true;
+    }
+}
+
+impl Clone for PathBuf {
+    fn clone(&self): PathBuf {
+        return PathBuf::from(self.s.as_str());
+    }
+}
+
+impl Eq for PathBuf {
+    fn eq(&self, other: &PathBuf): bool {
+        return self.as_path() == other.as_path();
+    }
+}
+
+impl Display for PathBuf {
+    fn fmt(&self, out: &mut +String) {
+        out.push_str(self.s.as_str());
+    }
+}
+
+impl Debug for PathBuf {
+    fn debug(&self, out: &mut +String) {
+        self.s.as_str().debug(out);
+    }
+}
+
+/// `path` made absolute against the current directory, without touching
+/// the file system otherwise (no links resolved, `..` kept; see
+/// `fs::canonicalize` for the resolved form): a relative path is joined to
+/// the current directory as `PathBuf::push` joins.
+pub fn absolute(path: str): Result::<PathBuf, Error> {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return Ok(PathBuf::from(path));
+    }
+    let cwd = crater::env::current_dir()?;
+    let mut out = PathBuf::from_string(cwd);
+    out.push(path);
+    return Ok(out);
+}

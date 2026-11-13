@@ -102,6 +102,90 @@ impl String {
         intrinsics::string_truncate(self, start);
         return c;
     }
+
+    /// `bytes` as text, or `None` if they are not UTF-8.
+    pub fn from_utf8(bytes: [u8; &]): Option::<String> {
+        let s = str::from_utf8(bytes)?;
+        return Some(String::from(s));
+    }
+
+    /// `bytes` as text, with U+FFFD for each byte that does not start a
+    /// valid UTF-8 sequence.
+    pub fn from_utf8_lossy(bytes: [u8; &]): String {
+        let mut out = String::new();
+        let mut start: usize = 0;
+        while start < bytes.len() {
+            match crater::str::utf8_error_at(bytes[start..]) {
+                None => {
+                    out.push_str(unsafe { intrinsics::str_from_bytes(bytes[start..]) });
+                    return out;
+                }
+                Some(i) => {
+                    out.push_str(unsafe { intrinsics::str_from_bytes(bytes[start..start + i]) });
+                    out.push(crater::str::char_from_u32(0xFFFD));
+                    start = start + i + 1;
+                }
+            }
+        }
+        return out;
+    }
+
+    fn check_boundary(&self, i: usize, what: str) {
+        if !self.as_str().is_char_boundary(i) {
+            panic("String::{what}: {i} is not a char boundary of a string of {self.len()} bytes");
+        }
+    }
+
+    /// Insert `c` at byte `i` (a character boundary), moving what follows.
+    pub fn insert(&mut self, i: usize, c: char) {
+        let mut one = String::new();
+        one.push(c);
+        self.insert_str(i, one.as_str());
+    }
+
+    /// Insert `s` at byte `i` (a character boundary), moving what follows.
+    pub fn insert_str(&mut self, i: usize, s: str) {
+        self.check_boundary(i, "insert");
+        let tail = String::from(self.as_str()[i..]);
+        intrinsics::string_truncate(self, i);
+        intrinsics::string_push_str(self, s);
+        intrinsics::string_push_str(self, tail.as_str());
+    }
+
+    /// Remove and return the character at byte `i` (a character
+    /// boundary), moving what follows.
+    pub fn remove(&mut self, i: usize): char {
+        self.check_boundary(i, "remove");
+        let c = match self.as_str()[i..].chars().next() {
+            Some(c) => c,
+            None => panic("String::remove: {i} is the end of the string"),
+        };
+        let tail = String::from(self.as_str()[i + c.len_utf8()..]);
+        intrinsics::string_truncate(self, i);
+        intrinsics::string_push_str(self, tail.as_str());
+        return c;
+    }
+
+    /// Keep only the characters for which `keep` is true.
+    pub fn retain::<F: FnMut(char): bool>(&mut self, mut keep: F) {
+        let mut out = String::new();
+        for c in self.as_str().chars() {
+            if keep(c) {
+                out.push(c);
+            }
+        }
+        intrinsics::string_truncate(self, 0);
+        intrinsics::string_push_str(self, out.as_str());
+    }
+
+    /// Split off the text from byte `at` (a character boundary), leaving
+    /// the text before it.
+    pub fn split_off(&mut self, at: usize): String {
+        self.check_boundary(at, "split_off");
+        let tail = String::from(self.as_str()[at..]);
+        intrinsics::string_truncate(self, at);
+        return tail;
+    }
 }
 
 impl Clone for String {

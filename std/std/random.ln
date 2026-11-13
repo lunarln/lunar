@@ -1,0 +1,227 @@
+// Randomness: bytes from the operating system's secure source (`fill`,
+// `entropy_u64`), and `Rng`, a fast generator (xoshiro256**) seeded from
+// it or from a number you choose, for simulations, games, sampling and
+// shuffling. `Rng` is not for secrets: use `fill` for keys and tokens.
+
+use crater::sys;
+
+/// Fill `buf` with random bytes from the operating system
+/// (`BCryptGenRandom` on Windows, `getrandom` on Linux, `getentropy` on
+/// macOS): unpredictable, suitable for keys and seeds. Panics if the
+/// system cannot provide them.
+pub fn fill(buf: [u8; &mut]) {
+    if !sys::random_fill(buf) {
+        panic("random::fill: the operating system's random source failed");
+    }
+}
+
+/// A random `u64` from the operating system (see `fill`).
+pub fn entropy_u64(): u64 {
+    let mut b: [u8; 8] = [0; 8];
+    fill(b[..]);
+    return sys::get_u64(b[..], 0);
+}
+
+/// A pseudo-random generator: xoshiro256** (Blackman and Vigna), fast
+/// and statistically strong, with a period of 2^256 - 1. The same seed
+/// always gives the same numbers, on every system.
+pub struct Rng {
+    s0: u64,
+    s1: u64,
+    s2: u64,
+    s3: u64,
+}
+
+/// The SplitMix64 step: spreads a seed over the state.
+fn splitmix(x: &mut u64): u64 {
+    x = x.wrapping_add(0x9e3779b97f4a7c15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    return z ^ (z >> 31);
+}
+
+fn rotl(x: u64, k: u64): u64 {
+    return (x << k) | (x >> (64 - k));
+}
+
+impl Rng {
+    /// A generator seeded from the operating system: different every run.
+    pub fn new(): Rng {
+        return Rng::seeded(entropy_u64());
+    }
+
+    /// A generator that gives the same numbers every time for `seed`.
+    pub fn seeded(seed: u64): Rng {
+        let mut x = seed;
+        let s0 = splitmix(&mut x);
+        let s1 = splitmix(&mut x);
+        let s2 = splitmix(&mut x);
+        let s3 = splitmix(&mut x);
+        return Rng { s0, s1, s2, s3 };
+    }
+
+    /// The next 64 random bits.
+    pub fn next_u64(&mut self): u64 {
+        let result = rotl(self.s1.wrapping_mul(5), 7).wrapping_mul(9);
+        let t = self.s1 << 17;
+        self.s2 = self.s2 ^ self.s0;
+        self.s3 = self.s3 ^ self.s1;
+        self.s1 = self.s1 ^ self.s2;
+        self.s0 = self.s0 ^ self.s3;
+        self.s2 = self.s2 ^ t;
+        self.s3 = rotl(self.s3, 45);
+        return result;
+    }
+
+    /// The next 32 random bits.
+    pub fn next_u32(&mut self): u32 {
+        return (self.next_u64() >> 32) as u32;
+    }
+
+    /// A number from `0` up to (not including) `n`, every one equally
+    /// likely. `n` must not be 0.
+    pub fn below(&mut self, n: u64): u64 {
+        if n == 0 {
+            panic("Rng::below(0): no numbers are below 0");
+        }
+        // Reject the few smallest values so that `r % n` is uniform.
+        let threshold = (0 as u64).wrapping_sub(n) % n;
+        loop {
+            let r = self.next_u64();
+            if r >= threshold {
+                return r % n;
+            }
+        }
+    }
+
+    /// A value from `lo` up to (not including) `hi`, every one equally
+    /// likely (for floats, uniform). Panics if `lo >= hi`.
+    /// `rng.range(1, 7)` rolls a die.
+    pub fn range::<T: Uniform>(&mut self, lo: T, hi: T): T {
+        if !(lo < hi) {
+            panic("Rng::range: the range is empty");
+        }
+        return T::sample(self, lo, hi, false);
+    }
+
+    /// A value from `lo` to `hi`, both included. Panics if `lo > hi`.
+    pub fn range_inclusive::<T: Uniform>(&mut self, lo: T, hi: T): T {
+        if lo > hi {
+            panic("Rng::range_inclusive: the range is empty");
+        }
+        return T::sample(self, lo, hi, true);
+    }
+
+    /// `true` or `false`, equally likely.
+    pub fn bool(&mut self): bool {
+        return (self.next_u64() >> 63) == 1;
+    }
+
+    /// `true` with probability `p` (0 to 1).
+    pub fn chance(&mut self, p: f64): bool {
+        return self.f64() < p;
+    }
+
+    /// A float from 0 up to (not including) 1, uniform: 53 random bits.
+    pub fn f64(&mut self): f64 {
+        return ((self.next_u64() >> 11) as f64) / 9007199254740992.0;
+    }
+
+    /// A float from 0 up to (not including) 1, uniform: 24 random bits.
+    pub fn f32(&mut self): f32 {
+        return ((self.next_u64() >> 40) as f32) / 16777216.0;
+    }
+
+    /// Fill `buf` with random bytes (not for secrets; see
+    /// `random::fill`).
+    pub fn fill_bytes(&mut self, buf: [u8; &mut]) {
+        let mut i: usize = 0;
+        while i < buf.len() {
+            let mut r = self.next_u64();
+            let mut k = 0;
+            while k < 8 && i < buf.len() {
+                buf[i] = r as u8;
+                r = r >> 8;
+                i += 1;
+                k += 1;
+            }
+        }
+    }
+
+    /// Put `items` in a random order, every order equally likely
+    /// (Fisher-Yates).
+    pub fn shuffle::<T: Light>(&mut self, items: [T; &mut]) {
+        let mut i = items.len();
+        while i > 1 {
+            let j = self.below(i as u64) as usize;
+            i -= 1;
+            items.swap(i, j);
+        }
+    }
+
+    /// One of `items`, each equally likely; `None` if there are none.
+    pub fn choose::<T: Light>(&mut self, items: [T; &]): Option::<T> from items {
+        if items.len() == 0 {
+            return None;
+        }
+        return Some(items[self.below(items.len() as u64) as usize]);
+    }
+}
+
+/// Types `Rng::range` can pick from: the integer and float types.
+pub trait Uniform: Ord + Dull {
+    /// A value from `lo` to `hi` (`hi` itself only if `inclusive`).
+    fn sample(rng: &mut Rng, lo: Self, hi: Self, inclusive: bool): Self;
+}
+
+/// `Uniform` for an integer type, through its 64-bit offset from `lo`.
+macro uniform_int {
+    ($t:ty, $wide:ty) => {
+        impl Uniform for $t {
+            fn sample(rng: &mut Rng, lo: $t, hi: $t, inclusive: bool): $t {
+                let a = (lo as $wide) as u64;
+                let span = ((hi as $wide) as u64).wrapping_sub(a);
+                let off = if inclusive {
+                    if span == 18446744073709551615 { rng.next_u64() } else { rng.below(span + 1) }
+                } else {
+                    rng.below(span)
+                };
+                return (a.wrapping_add(off) as $wide) as $t;
+            }
+        }
+    },
+}
+
+uniform_int!(u8, u64);
+uniform_int!(u16, u64);
+uniform_int!(u32, u64);
+uniform_int!(u64, u64);
+uniform_int!(usize, u64);
+uniform_int!(i8, i64);
+uniform_int!(i16, i64);
+uniform_int!(i32, i64);
+uniform_int!(i64, i64);
+uniform_int!(isize, i64);
+
+impl Uniform for f64 {
+    fn sample(rng: &mut Rng, lo: f64, hi: f64, inclusive: bool): f64 {
+        let _ = inclusive;
+        let v = lo + (hi - lo) * rng.f64();
+        // Rounding can land on `hi`; keep the half-open promise.
+        if v >= hi && !inclusive {
+            return lo;
+        }
+        return v;
+    }
+}
+
+impl Uniform for f32 {
+    fn sample(rng: &mut Rng, lo: f32, hi: f32, inclusive: bool): f32 {
+        let v = lo + (hi - lo) * rng.f32();
+        if v >= hi && !inclusive {
+            return lo;
+        }
+        return v;
+    }
+}

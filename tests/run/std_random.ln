@@ -1,0 +1,107 @@
+// std::random: operating system entropy and the seeded generator.
+
+use std::random::{self, Rng};
+
+#[test]
+fn entropy_differs() {
+    let mut a: [u8; 32] = [0; 32];
+    let mut b: [u8; 32] = [0; 32];
+    random::fill(a[..]);
+    random::fill(b[..]);
+    assert!(a[..] != b[..]);
+    assert!(random::entropy_u64() != random::entropy_u64());
+    // More than one request's worth (getentropy takes 256 at a time).
+    let mut big: [u8; ..+] = [];
+    for _ in 0..1000 {
+        big.push(0);
+    }
+    random::fill(big[..]);
+    let mut zeros = 0;
+    for x in big {
+        if x == 0 {
+            zeros += 1;
+        }
+    }
+    assert!(zeros < 30);
+}
+
+#[test]
+fn seeded_is_repeatable() {
+    let mut a = Rng::seeded(7);
+    let mut b = Rng::seeded(7);
+    let mut c = Rng::seeded(8);
+    let x = a.next_u64();
+    assert_eq!(x, b.next_u64());
+    assert!(x != c.next_u64());
+    // The reference implementation's first outputs (xoshiro256**, its
+    // state from SplitMix64 started at 0).
+    let mut r = Rng::seeded(0);
+    assert_eq!(r.next_u64(), 11091344671253066420u64);
+    assert_eq!(r.next_u64(), 13793997310169335082u64);
+}
+
+#[test]
+fn ranges() {
+    let mut r = Rng::seeded(1);
+    let mut seen: [bool; 6] = [false; 6];
+    for _ in 0..1000 {
+        let d = r.range(1, 7);
+        assert!(d >= 1 && d <= 6);
+        seen[(d - 1) as usize] = true;
+        let n = r.range(-5i8, 5i8);
+        assert!(n >= -5 && n < 5);
+        let u = r.range_inclusive(250u8, 255u8);
+        assert!(u >= 250);
+        let f = r.range(2.0, 3.0);
+        assert!(f >= 2.0 && f < 3.0);
+        let z = r.f64();
+        assert!(z >= 0.0 && z < 1.0);
+    }
+    for s in seen {
+        assert!(s);
+    }
+    assert_eq!(r.range_inclusive(9, 9), 9);
+    let full = r.range_inclusive(0u64, 18446744073709551615u64);
+    let _ = full;
+    let mut heads = 0;
+    for _ in 0..10000 {
+        if r.bool() {
+            heads += 1;
+        }
+    }
+    assert!(heads > 4500 && heads < 5500);
+    let mut hits = 0;
+    for _ in 0..10000 {
+        if r.chance(0.1) {
+            hits += 1;
+        }
+    }
+    assert!(hits > 800 && hits < 1200);
+}
+
+#[test]
+fn shuffle_and_choose() {
+    let mut r = Rng::seeded(3);
+    let mut v: [u32; ..+] = [];
+    for i in 0..50 {
+        v.push(i);
+    }
+    r.shuffle(v[..]);
+    let mut moved = 0;
+    let mut sum = 0;
+    for i in 0..50 {
+        if v[i] != i as u32 {
+            moved += 1;
+        }
+        sum += v[i];
+    }
+    assert!(moved > 40);
+    assert_eq!(sum, 1225u32);
+    let words = ["red", "green", "blue"];
+    let w = r.choose(words[..]).unwrap();
+    assert!(w == "red" || w == "green" || w == "blue");
+    let none: [u32; 0] = [];
+    assert!(r.choose(none[..]).is_none());
+    let mut bytes: [u8; 13] = [0; 13];
+    r.fill_bytes(bytes[..]);
+}

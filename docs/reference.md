@@ -544,8 +544,8 @@ alone lists every code. The explanations are the files in
 
 ## 9. Standard library overview
 
-* `core::ptr::Dull`, `core::ops`, `core::cmp::{Eq, Ord, Ordering, min, max}`,
-  `core::clone::Clone`, `core::default::Default`,
+* `core::ptr::Dull`, `core::ops`, `core::cmp::{Eq, Ord, Ordering, min, max,
+  Reverse}`, `core::clone::Clone`, `core::default::Default`,
   `core::fmt::{Display, Debug, write, format}`, `core::option::Option`,
   `core::result::Result`, `core::iter::Iterator`, `core::num::{Int, Float}`,
   `core::mem::{size_of, align_of, swap}`, `core::intrinsics`.
@@ -553,10 +553,22 @@ alone lists every code. The explanations are the files in
 * `core::hash::{Hash, Hasher, hash_of}`: one fixed fast hasher, `Hash` for
   the primitives, `str`, `String`, tuples, `Option` and slices, and
   `#[derive(Hash)]`.
-* `core::collections::{HashMap, OrderedHashMap}`: maps from Dull keys
-  (`Hash + Eq`) to Dull values, with `insert` (returns the old value),
-  `get` (a copy), `get_or`, `contains`, `remove`, `len`, `update(k, |v| ..)`
-  and `iter`/`keys`/`values`. `OrderedHashMap` iterates in insertion order.
+* `core::collections`: containers of Light items, like arrays, sharing one
+  API: `insert`, `get` (a copy), `contains`, `remove`, `len`, `clear`,
+  `iter`, and `update(k, |v| ..)` to change a value in place.
+  * `HashMap` and `OrderedHashMap` (iterates in insertion order): keys
+    `Hash + Eq`, with `insert` returning the old value, `get_or`, and
+    `keys`/`values`.
+  * `HashSet`: `insert`/`remove` return whether anything changed;
+    `from_slice`, `extend`, `is_subset`, `is_disjoint`, `union`,
+    `intersection`, `difference`.
+  * `SortedMap`: keys `Ord`, kept in a sorted array (binary search;
+    inserting moves later entries), iterated in order, with `range(lo,
+    hi)`, `first`, `last`, `pop_first`, `pop_last`.
+  * `Deque`: a growable ring buffer (`push_back`, `push_front`,
+    `pop_back`, `pop_front`, `front`, `back`, `get`, `set`).
+  * `BinaryHeap`: a max-heap (`push`, `pop`, `peek`, `from_slice`,
+    `into_sorted`); push `cmp::Reverse(x)` to pop the smallest first.
 * `core::arena::{Arena, Id, List}`: items of one type in one growable
   array, reached by typed handles (`add`, `get`, `set`, `update`, `view`,
   `view_mut`, `ids`); `add_list`/`list` store runs of items, such as a
@@ -565,22 +577,116 @@ alone lists every code. The explanations are the files in
 * Methods on slices (`len`, `get`, `first`, `last`, `contains`, `index_of`,
   `fill`, `swap`, `reverse`, `sort`, `to_dyn`, `to_grow`), growable arrays
   (`push`, `extend`, `reserve`), shrinkable arrays (`pop`, `truncate`,
-  `clear`, `remove`, `insert`), `str` (`len`, `as_bytes`, `chars`, `bytes`,
-  `find`, `contains`, `starts_with`, `ends_with`, `trim`, `split`, `lines`,
-  `parse_i64`,
-  `to_string`, and `str::from_utf8(bytes): Option::<str>`) and `String` (`new`, `from`, `push`, `push_str`, `write`,
-  `as_str`, `len`, `clear`, `truncate`, `pop`).
-* `std::io::{print, println, eprint, eprintln, write_str, read_line}`, and
-  `std::io::{Error, ErrorKind}` for failures (`kind()`, `os_code()`,
-  `Display`),
-* `std::fs::{read_to_string, read, write, remove_file}`: whole files by
-  path, returning `Result::<_, io::Error>`; `read_to_string` fails with
-  `ErrorKind::InvalidData` on text that is not UTF-8,
-  `std::math` (`pow`, `min`, `max`, `clamp`, float functions),
+  `clear`, `remove`, `insert`).
+* `str`: `len`, `as_bytes`, `chars`, `char_indices`, `char_count`, `bytes`,
+  `find`, `rfind`, `contains`, `starts_with`, `ends_with`, `strip_prefix`,
+  `strip_suffix`, `trim` (also `trim_start`, `trim_end` and the `_matches`
+  forms), `split`, `splitn`, `rsplit`, `rsplitn`, `split_once`,
+  `rsplit_once`, `split_whitespace`, `split_at`, `lines`, `replace`,
+  `replacen`, `repeat`, `to_lowercase`/`to_uppercase` (Unicode simple case
+  mapping, one character for one, from the table in `core::unicode`) and
+  the `to_ascii_` forms, `eq_ignore_ascii_case`, `parse::<T>()`,
+  `to_string`, and `str::from_utf8(bytes): Option::<str>`. `char`:
+  `to_lowercase`, `to_uppercase`, `is_lowercase`, `is_uppercase`, the
+  `is_ascii_` classes, `to_digit`, `char::from_digit`.
+* `String`: `new`, `from`, `from_utf8`, `from_utf8_lossy`, `push`,
+  `push_str`, `write`, `as_str`, `len`, `clear`, `truncate`, `pop`,
+  `insert`, `insert_str`, `remove`, `retain(|c| ..)`, `split_off`.
+* Parsing: `core::str::FromStr` (`fn from_str(s: str): Result::<Self,
+  ParseError>`) for every integer and float type, `bool`, `char` and the
+  `std::net` addresses; `s.parse::<T>()` calls it. `core::num::ParseError`
+  says why (`kind()`: `Empty`, `InvalidDigit`, `PosOverflow`,
+  `NegOverflow`, `Invalid`).
+* Integer methods, on every width: `checked_`, `wrapping_` and
+  `saturating_` `add`, `sub`, `mul`, `pow` (and checked `div`, `rem`,
+  `neg`), `pow`, `abs`, `unsigned_abs`, `abs_diff`, `signum`,
+  `div_euclid`/`rem_euclid`, `leading_zeros`, `trailing_zeros`,
+  `count_ones`, `count_zeros`, `rotate_left`/`rotate_right`,
+  `is_power_of_two`, `next_power_of_two`, `to_string`,
+  `to_string_radix(r)` and `T::from_str_radix(s, r)`. `f64`: `sqrt`,
+  `powf`, `powi`, `round`, `trunc`, `fract`, `floor`, `ceil`, `abs`, the
+  trigonometric and logarithm functions, `is_nan`, `is_finite`, `min`,
+  `max`, `clamp`, `to_string`.
+* `std::io`:
+  * `print`, `println`, `eprint`, `eprintln` (one write per call: lines
+    from different calls never mix), `write_str`, and the unbuffered
+    `read_line`, `read`, `read_exact`, `write_bytes`.
+  * `Error` and `ErrorKind` for failures (`kind()`, `os_code()`,
+    `Display`): `NotFound`, `PermissionDenied`, `AlreadyExists`,
+    `WouldBlock`, `TimedOut`, `ConnectionRefused`, `BrokenPipe`,
+    `UnexpectedEof`, `InvalidInput`, `InvalidData` and more.
+  * The traits `Read` (`read` into a slice; `read_exact`, and
+    `read_to_end`/`read_to_string` onto a `&mut +` buffer) and `Write`
+    (`write`, `flush`; `write_all`, `write_str`, and `print(..)` /
+    `println(..)` for format strings), implemented by `fs::File`, the
+    standard streams, `net::TcpStream`, `Cursor` (reading a byte slice)
+    and growable byte arrays (writing).
+  * `stdin()` (buffered for the whole program: `read_line(&mut +String)`,
+    `lines()`), `stdout()` and `stderr()`. `stdout().buffered()` is a
+    `BufWriter` for printing much in a loop: one write per 8 KiB instead
+    of one per line.
+  * `BufReader` (`read_line` onto a `String`; `next_line()` and then
+    `line()`, a `str` view into its buffer valid until the next read;
+    `lines()`, an iterator of `String`s; `read_until`, `fill_buf`,
+    `consume`) and `BufWriter` (`flush`, `into_inner`). A `BufWriter` over
+    a file, standard stream or socket writes what it holds when it is
+    freed; over anything else, `flush` it first. Both lend the stream
+    inside to a closure with `with_inner(|s| ..)`.
+* `std::fs`:
+  * `File` (`open`, `create`, `create_new`, `options`; `Read`, `Write`,
+    `seek(SeekFrom)`, `rewind`, `stream_position`, `sync_all`,
+    `set_len`, `metadata`, `close`). A file is closed when it is freed:
+    the runtime closes handles owned by an `rt::OwnedHandle`, and holding
+    one makes a type move rather than copy.
+  * `OpenOptions::new().read(true).append(true)...open(path)`, with
+    `read`, `write`, `append`, `truncate`, `create`, `create_new`.
+  * `metadata` and `symlink_metadata` give a `Metadata`: `len`,
+    `is_file`, `is_dir`, `is_symlink`, `readonly`, `modified`,
+    `accessed`, `created` (`SystemTime`s).
+  * Whole files by path: `read_to_string` (`ErrorKind::InvalidData` if not
+    UTF-8), `read`, `write`.
+  * `copy`, `rename`, `remove_file`, `hard_link`, `symlink`, `symlink_dir`
+    (Windows needs Developer Mode or administrator rights for links),
+    `set_readonly`, `exists`, `is_file`, `is_dir`, `create_dir`,
+    `create_dir_all`, `remove_dir`, `remove_dir_all`, `read_dir`,
+    `canonicalize`. Paths are `str`s; everything returns
+    `Result::<_, io::Error>`.
+* `std::path`: `Path::new(s)`, a view of a path (`parent`, `file_name`,
+  `file_stem`, `extension`, `components`, `is_absolute`, `has_root`,
+  `starts_with`, `ends_with`, `strip_prefix`, `join`, `with_extension`,
+  `with_file_name`, `normalize` (`.` and `..` from the text alone),
+  `to_native`), and `PathBuf`, an owned path built with `push`, `pop`,
+  `set_file_name`, `set_extension`. On Windows both separators and
+  prefixes (`C:`, `\\server\share`, `\\?\`) are understood; `MAIN_SEPARATOR`
+  is `\` there. `path::absolute(p)` joins to the current directory.
+* `std::time`: `Duration` (`from_secs`, `from_millis`, `from_micros`,
+  `from_nanos`, `from_secs_f64`, `as_secs`, `as_millis`, `subsec_nanos`,
+  ..., `+`, `-`, `checked_`/`saturating_` arithmetic, `Display` such as
+  `1.5s`), `Instant` (monotonic: `now`, `elapsed`, `duration_since`,
+  `checked_add`), `SystemTime` (`now`, `duration_since`, `elapsed`,
+  `time::unix_epoch()`), and `sleep(d)` (here, not in a `thread` module:
+  there are no threads yet).
+* `std::random`: `fill(buf)` and `entropy_u64()` from the operating
+  system's secure source, and `Rng`, a xoshiro256** generator
+  (`Rng::new()` seeded from the system, `Rng::seeded(n)` repeatable):
+  `next_u64`, `below(n)`, `range(lo, hi)` and `range_inclusive` for every
+  number type, `bool`, `chance(p)`, `f64`, `shuffle(slice)`,
+  `choose(slice)`.
+* `std::net`: `Ipv4Addr`, `Ipv6Addr`, `IpAddr` and `SocketAddr` (parsed
+  with `FromStr`, displayed per RFC 5952); `lookup_host(name)` and
+  `resolve("host:port")`; `TcpListener` (`bind`, `accept`, `local_addr`),
+  `TcpStream` (`connect`, `connect_timeout`, `Read`, `Write`, `peek`,
+  `shutdown`, `set_nodelay`, read and write timeouts) and `UdpSocket`
+  (`send_to`, `recv_from`, `connect`, `send`, `recv`). I/O blocks, or
+  fails with `WouldBlock` after `set_nonblocking(true)`. Sockets are
+  closed when freed.
+* `std::math` (`pow`, `min`, `max`, `clamp`, float functions),
   `std::test::{assert, assert_eq, assert_ne}` (functions taking `&T`, and
   the macros `assert!(c)`, `assert_eq!(a, b)`, `assert_ne!(a, b)`, which
   lend their arguments and describe the assertion),
-  `std::process::{exit, abort, panic}`, `std::env::{arg_count, arg}`, and
+  `std::process::{exit, abort, panic}`, `std::env::{arg_count, arg, args,
+  var, vars}` (`args()` iterates `str`s; `vars()` is a snapshot whose
+  `iter()` gives `(name, value)` views), and
   the macro `std::env::env!("NAME")`: a `str` literal with the value the
   variable had when the program was compiled. `LUNAR_PKG_NAME` and
   `LUNAR_PKG_VERSION` are the name and version of the package being built
@@ -593,8 +699,9 @@ alone lists every code. The explanations are the files in
   `assert_eq` and `assert_ne`, with the derives and macros of the same
   names, and the macro `env!`.
 * Format strings: `{x}` uses `Display`, `{x:?}` uses `Debug` (strings and
-  characters quoted and escaped, arrays as `[1, 2]`, derived types as
-  `Point { x: 1, y: 2 }`).
+  characters quoted and escaped, arrays as `[1, 2]`, tuples as `(1, 2)`,
+  derived types as `Point { x: 1, y: 2 }`). Fixed arrays (`[T; 4]`) have no
+  impls of their own (there are no const generics): `{a[..]:?}` shows one.
 * Derives in `core`: `#[derive(Eq, Ord, Debug, Clone, Default, Hash)]` on structs
   and enums (`Default` uses the variant marked `#[default]`), and
   `#[derive(Display)]` on enums whose variants have no fields. They are

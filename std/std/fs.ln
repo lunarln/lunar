@@ -1,73 +1,441 @@
-// Files: reading and writing whole files by path.
+// Files and directories: open files (`File`, `OpenOptions`), whole files
+// by path (`read_to_string`, `read`, `write`), metadata, and directory
+// and link operations. Paths are `str`s (see `std::path` for building
+// them).
 
-use crater::io::{Error, ErrorKind};
+use crater::io::{Error, ErrorKind, Read, Write};
+use crater::rt;
 use crater::sys;
+use crater::time::SystemTime;
+
+// ===================================================================== File
+
+/// An open file. It is closed when it is freed (when the variable holding
+/// it goes out of scope, or when it is replaced), or by `close`, which
+/// also reports failure. `File` moves rather than copies: there is one
+/// owner of each open file.
+///
+/// Reads and writes are unbuffered system calls; wrap a `File` in an
+/// `io::BufReader` or `io::BufWriter` for many small ones.
+pub struct File {
+    h: rt::OwnedHandle,
+}
+
+/// Where `File::seek` measures from.
+pub enum SeekFrom {
+    /// This many bytes from the start.
+    Start(u64),
+    /// This many bytes from the end (usually 0 or negative).
+    End(i64),
+    /// This many bytes from the current position.
+    Current(i64),
+}
+
+impl File {
+    /// Open the existing file at `path` for reading.
+    pub fn open(path: str): Result::<File, Error> {
+        return OpenOptions::new().read(true).open(path);
+    }
+
+    /// Open the file at `path` for writing, creating it if it does not
+    /// exist and emptying it if it does.
+    pub fn create(path: str): Result::<File, Error> {
+        return OpenOptions::new().write(true).create(true).truncate(true).open(path);
+    }
+
+    /// Create a new file at `path` for writing; fails with
+    /// `AlreadyExists` if there is one.
+    pub fn create_new(path: str): Result::<File, Error> {
+        return OpenOptions::new().write(true).create_new(true).open(path);
+    }
+
+    /// Options for opening a file: `File::options().append(true).open(p)`.
+    pub fn options(): OpenOptions {
+        return OpenOptions::new();
+    }
+
+    /// Size, kind, permissions and times of the open file.
+    pub fn metadata(&self): Result::<Metadata, Error> {
+        let mut st = sys::FileStat::new();
+        if !sys::fstat(self.h.raw(), &mut st) {
+            return Err(Error::last_os_error());
+        }
+        return Ok(Metadata { st });
+    }
+
+    /// Move the position of the next read or write; returns it, from the
+    /// start.
+    pub fn seek(&mut self, pos: SeekFrom): Result::<u64, Error> {
+        let (offset, whence): (i64, i32) = match pos {
+            SeekFrom::Start(n) => (n as i64, 0),
+            SeekFrom::Current(n) => (n, 1),
+            SeekFrom::End(n) => (n, 2),
+        };
+        let r = sys::seek(self.h.raw(), offset, whence);
+        if r < 0 {
+            return Err(Error::last_os_error());
+        }
+        return Ok(r as u64);
+    }
+
+    /// Go back to the start.
+    pub fn rewind(&mut self): Result::<(), Error> {
+        self.seek(SeekFrom::Start(0))?;
+        return Ok(());
+    }
+
+    /// The position of the next read or write, from the start.
+    pub fn stream_position(&mut self): Result::<u64, Error> {
+        return self.seek(SeekFrom::Current(0));
+    }
+
+    /// Wait until the file's data and metadata are on the device.
+    pub fn sync_all(&self): Result::<(), Error> {
+        if !sys::sync(self.h.raw()) {
+            return Err(Error::last_os_error());
+        }
+        return Ok(());
+    }
+
+    /// Wait until the file's data is on the device (here the same as
+    /// `sync_all`).
+    pub fn sync_data(&self): Result::<(), Error> {
+        return self.sync_all();
+    }
+
+    /// Cut the file down, or extend it with zeros, to `len` bytes. The
+    /// position does not move.
+    pub fn set_len(&self, len: u64): Result::<(), Error> {
+        if !sys::set_len(self.h.raw(), len) {
+            return Err(Error::last_os_error());
+        }
+        return Ok(());
+    }
+
+    /// Close the file now, reporting failure (which being freed ignores).
+    pub fn close(self): Result::<(), Error> {
+        if !self.h.close() {
+            return Err(Error::last_os_error());
+        }
+        return Ok(());
+    }
+
+    /// The operating system's handle (a descriptor on Unix, a `HANDLE` on
+    /// Windows), still owned by this `File`.
+    pub fn raw_handle(&self): i64 {
+        return self.h.raw();
+    }
+}
+
+impl Read for File {
+    fn read(&mut self, buf: [u8; &mut]): Result::<usize, Error> {
+        let n = sys::handle_read(self.h.raw(), buf);
+        if n < 0 {
+            return Err(Error::last_os_error());
+        }
+        return Ok(n as usize);
+    }
+}
+
+impl Write for File {
+    fn write(&mut self, bytes: [u8; &]): Result::<usize, Error> {
+        let n = sys::handle_write(self.h.raw(), bytes);
+        if n < 0 {
+            return Err(Error::last_os_error());
+        }
+        return Ok(n as usize);
+    }
+
+    /// Nothing to do: a `File` buffers nothing (see `sync_all` for the
+    /// device).
+    fn flush(&mut self): Result::<(), Error> {
+        return Ok(());
+    }
+
+    fn os_target(&self): (usize, i64) {
+        return (rt::FLUSH_FILE, self.h.raw());
+    }
+}
+
+/// How to open a file: `OpenOptions::new().read(true).write(true).open(p)`.
+/// Each setting returns the changed options.
+pub struct OpenOptions {
+    read: bool,
+    write: bool,
+    append: bool,
+    truncate: bool,
+    create: bool,
+    create_new: bool,
+}
+
+impl OpenOptions {
+    /// Everything off.
+    pub fn new(): OpenOptions {
+        return OpenOptions { read: false, write: false, append: false, truncate: false, create: false, create_new: false };
+    }
+
+    /// Open for reading.
+    pub fn read(mut self, on: bool): OpenOptions {
+        self.read = on;
+        return self;
+    }
+
+    /// Open for writing.
+    pub fn write(mut self, on: bool): OpenOptions {
+        self.write = on;
+        return self;
+    }
+
+    /// Open for writing at the end: every write appends, wherever the
+    /// position is.
+    pub fn append(mut self, on: bool): OpenOptions {
+        self.append = on;
+        return self;
+    }
+
+    /// Empty an existing file (needs `write`).
+    pub fn truncate(mut self, on: bool): OpenOptions {
+        self.truncate = on;
+        return self;
+    }
+
+    /// Create the file if it does not exist (needs `write` or `append`).
+    pub fn create(mut self, on: bool): OpenOptions {
+        self.create = on;
+        return self;
+    }
+
+    /// Create the file, failing with `AlreadyExists` if it exists (needs
+    /// `write` or `append`; `create` and `truncate` are then ignored).
+    pub fn create_new(mut self, on: bool): OpenOptions {
+        self.create_new = on;
+        return self;
+    }
+
+    /// Open `path` with these options. Fails with `InvalidInput` for
+    /// options that do not go together (nothing to read or write;
+    /// creating or truncating without writing; truncating while
+    /// appending).
+    pub fn open(self, path: str): Result::<File, Error> {
+        check_path(path)?;
+        let writes = self.write || self.append;
+        if !self.read && !writes {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        if !writes && (self.truncate || self.create || self.create_new) {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        if self.append && self.truncate && !self.create_new {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let h = sys::open_options(path, self.read, self.write, self.append, self.truncate, self.create, self.create_new);
+        if h < 0 {
+            return Err(Error::last_os_error());
+        }
+        return Ok(File { h: rt::OwnedHandle::new(h, rt::HANDLE_FILE) });
+    }
+}
+
+// ===================================================================== metadata
+
+/// What a file or directory is: its size, kind, permissions and times.
+pub struct Metadata {
+    st: sys::FileStat,
+}
+
+impl Metadata {
+    /// The size in bytes.
+    pub fn len(&self): u64 {
+        return self.st.len;
+    }
+
+    pub fn is_file(&self): bool {
+        return self.st.kind == 1;
+    }
+
+    pub fn is_dir(&self): bool {
+        return self.st.kind == 2;
+    }
+
+    /// Whether it is a symbolic link (only from `symlink_metadata`, which
+    /// does not follow links; on Windows also a junction).
+    pub fn is_symlink(&self): bool {
+        return self.st.kind == 3;
+    }
+
+    /// Whether writing is not allowed: the read-only attribute on
+    /// Windows, no write permission for anyone on Unix.
+    pub fn readonly(&self): bool {
+        return self.st.readonly;
+    }
+
+    /// When the contents last changed.
+    pub fn modified(&self): Result::<SystemTime, Error> {
+        return Ok(SystemTime::from_unix(self.st.modified_s, self.st.modified_ns));
+    }
+
+    /// When it was last read (many systems update this lazily, or not at
+    /// all).
+    pub fn accessed(&self): Result::<SystemTime, Error> {
+        return Ok(SystemTime::from_unix(self.st.accessed_s, self.st.accessed_ns));
+    }
+
+    /// When it was created; `Unsupported` where the system does not say
+    /// (Linux).
+    pub fn created(&self): Result::<SystemTime, Error> {
+        if !self.st.has_created {
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
+        return Ok(SystemTime::from_unix(self.st.created_s, self.st.created_ns));
+    }
+}
+
+/// What is at `path`, following symbolic links.
+pub fn metadata(path: str): Result::<Metadata, Error> {
+    check_path(path)?;
+    let mut st = sys::FileStat::new();
+    if !sys::stat(path, true, &mut st) {
+        return Err(Error::last_os_error());
+    }
+    return Ok(Metadata { st });
+}
+
+/// What is at `path`, without following a symbolic link there (so
+/// `is_symlink` can be true).
+pub fn symlink_metadata(path: str): Result::<Metadata, Error> {
+    check_path(path)?;
+    let mut st = sys::FileStat::new();
+    if !sys::stat(path, false, &mut st) {
+        return Err(Error::last_os_error());
+    }
+    return Ok(Metadata { st });
+}
+
+/// Make the file at `path` read-only, or writable again (on Unix, for
+/// its owner, group and others alike).
+pub fn set_readonly(path: str, readonly: bool): Result::<(), Error> {
+    check_path(path)?;
+    if !sys::set_readonly(path, readonly) {
+        return Err(Error::last_os_error());
+    }
+    return Ok(());
+}
+
+// ===================================================================== whole files
 
 /// Read the whole file at `path` as text. Fails with `ErrorKind::InvalidData`
 /// if it is not UTF-8.
 pub fn read_to_string(path: str): Result::<String, Error> {
-    let h = open(path, false)?;
+    let mut f = File::open(path)?;
     let mut out = String::new();
-    let mut buf: [u8; 16384] = [0; 16384];
-    loop {
-        let n = sys::read_file(h, buf[..]);
-        if n < 0 {
-            let e = Error::last_os_error();
-            sys::close_file(h);
-            return Err(e);
-        }
-        if n == 0 {
-            break;
-        }
-        // Not yet known to be UTF-8 (a character may also straddle two
-        // reads); the whole text is checked below before anyone sees it.
-        out.push_str(unsafe { core::intrinsics::str_from_bytes(buf[..n as usize]) });
-    }
-    sys::close_file(h);
-    if core::str::utf8_error_at(out.as_bytes()).is_some() {
-        return Err(Error::new(ErrorKind::InvalidData));
-    }
+    f.read_to_string(&mut out)?;
     return Ok(out);
 }
 
 /// Read the whole file at `path` as bytes.
 pub fn read(path: str): Result::<[u8; -..+], Error> {
-    let h = open(path, false)?;
+    let mut f = File::open(path)?;
     let mut out: [u8; -..+] = [];
-    let mut buf: [u8; 16384] = [0; 16384];
-    loop {
-        let n = sys::read_file(h, buf[..]);
-        if n < 0 {
-            let e = Error::last_os_error();
-            sys::close_file(h);
-            return Err(e);
-        }
-        if n == 0 {
-            break;
-        }
-        out.extend(buf[..n as usize]);
-    }
-    sys::close_file(h);
+    f.read_to_end(&mut out)?;
     return Ok(out);
 }
 
 /// Create the file at `path`, or replace its contents, with `contents`.
 /// Text is written with `fs::write(path, text.as_bytes())`.
 pub fn write(path: str, contents: [u8; &]): Result::<(), Error> {
-    let h = open(path, true)?;
-    if !sys::write_file(h, contents) {
-        let e = Error::last_os_error();
-        sys::close_file(h);
-        return Err(e);
-    }
-    sys::close_file(h);
-    return Ok(());
+    let mut f = File::create(path)?;
+    f.write_all(contents)?;
+    return f.close();
 }
+
+/// Copy the contents of the file `from` to `to` (created, or emptied
+/// first); how many bytes. A read-only `from` makes `to` read-only too.
+pub fn copy(from: str, to: str): Result::<u64, Error> {
+    if is_dir(from) {
+        return Err(Error::new(ErrorKind::IsADirectory));
+    }
+    let mut src = File::open(from)?;
+    let meta = src.metadata()?;
+    let mut dst = File::create(to)?;
+    let mut buf: [u8; 65536] = [0; 65536];
+    let mut total: u64 = 0;
+    loop {
+        let n = src.read(buf[..])?;
+        if n == 0 {
+            break;
+        }
+        dst.write_all(buf[..n])?;
+        total += n as u64;
+    }
+    dst.close()?;
+    if meta.readonly() {
+        set_readonly(to, true)?;
+    }
+    return Ok(total);
+}
+
+// ===================================================================== names and links
 
 /// Delete the file at `path`.
 pub fn remove_file(path: str): Result::<(), Error> {
     check_path(path)?;
     if !sys::remove_file(path) {
+        return Err(Error::last_os_error());
+    }
+    return Ok(());
+}
+
+/// Rename (move) `from` to `to`, replacing a file at `to`. Both must be on
+/// the same file system.
+pub fn rename(from: str, to: str): Result::<(), Error> {
+    check_path(from)?;
+    check_path(to)?;
+    if !sys::rename(from, to) {
+        return Err(Error::last_os_error());
+    }
+    return Ok(());
+}
+
+/// Make `dst` a second name (a hard link) for the file `src`.
+pub fn hard_link(src: str, dst: str): Result::<(), Error> {
+    check_path(src)?;
+    check_path(dst)?;
+    if !sys::hard_link(src, dst) {
+        return Err(Error::last_os_error());
+    }
+    return Ok(());
+}
+
+/// Make `dst` a symbolic link to `src` (a relative `src` is relative to
+/// `dst`'s directory). On Windows, links to directories and to files
+/// differ: this makes a directory link if `src` is a directory now (see
+/// `symlink_dir`), and creating links needs Developer Mode or
+/// administrator rights (else `PermissionDenied`).
+pub fn symlink(src: str, dst: str): Result::<(), Error> {
+    check_path(src)?;
+    check_path(dst)?;
+    let mut target = String::new();
+    if crater::path::Path::new(src).is_relative() {
+        if let Some(dir) = crater::path::Path::new(dst).parent() {
+            target.push_str(dir.as_str());
+            if !target.is_empty() {
+                target.push('/');
+            }
+        }
+    }
+    target.push_str(src);
+    if !sys::symlink(src, dst, is_dir(target.as_str())) {
+        return Err(Error::last_os_error());
+    }
+    return Ok(());
+}
+
+/// Make `dst` a symbolic link to the directory `src` (on Unix the same as
+/// `symlink`).
+pub fn symlink_dir(src: str, dst: str): Result::<(), Error> {
+    check_path(src)?;
+    check_path(dst)?;
+    if !sys::symlink(src, dst, true) {
         return Err(Error::last_os_error());
     }
     return Ok(());
@@ -88,6 +456,8 @@ pub fn is_dir(path: str): bool {
 pub fn is_file(path: str): bool {
     return check_path(path).is_ok() && sys::file_kind(path) == 1;
 }
+
+// ===================================================================== directories
 
 /// Create the directory `path`. Its parent must exist.
 pub fn create_dir(path: str): Result::<(), Error> {
@@ -244,13 +614,4 @@ fn check_path(path: str): Result::<(), Error> {
         return Err(Error::new(ErrorKind::InvalidInput));
     }
     return Ok(());
-}
-
-fn open(path: str, write: bool): Result::<isize, Error> {
-    check_path(path)?;
-    let h = sys::open_file(path, write);
-    if h < 0 {
-        return Err(Error::last_os_error());
-    }
-    return Ok(h);
 }

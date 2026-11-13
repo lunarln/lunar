@@ -49,6 +49,12 @@ extern "C" {
     fn ceil(x: f64): f64;
     fn log(x: f64): f64;
     fn exp(x: f64): f64;
+    fn tan(x: f64): f64;
+    fn atan2(y: f64, x: f64): f64;
+    fn log10(x: f64): f64;
+    fn log2(x: f64): f64;
+    fn round(x: f64): f64;
+    fn trunc(x: f64): f64;
 }
 
 pub fn sqrt_f64(x: f64): f64 { return unsafe { sqrt(x) }; }
@@ -66,4 +72,45 @@ impl f64 {
     pub fn ceil(self): f64 { return ceil_f64(self); }
     pub fn abs(self): f64 { return abs_f64(self); }
     pub fn powf(self, y: f64): f64 { return powf(self, y); }
+
+    /// `self` to the integer power `n`.
+    pub fn powi(self, n: i32): f64 { return powf(self, n as f64); }
+    /// Rounded to the nearest whole number, halves away from zero.
+    pub fn round(self): f64 { return unsafe { round(self) }; }
+    /// The whole part, towards zero.
+    pub fn trunc(self): f64 { return unsafe { trunc(self) }; }
+    /// The part after the point (with the sign of `self`).
+    pub fn fract(self): f64 { return self - self.trunc(); }
+    pub fn sin(self): f64 { return sin_f64(self); }
+    pub fn cos(self): f64 { return cos_f64(self); }
+    pub fn tan(self): f64 { return unsafe { tan(self) }; }
+    /// The angle of the point (`x`, `self`), from -π to π.
+    pub fn atan2(self, x: f64): f64 { return unsafe { atan2(self, x) }; }
+    /// The natural logarithm.
+    pub fn ln(self): f64 { return ln_f64(self); }
+    pub fn log10(self): f64 { return unsafe { log10(self) }; }
+    pub fn log2(self): f64 { return unsafe { log2(self) }; }
+    /// e to the power `self`.
+    pub fn exp(self): f64 { return exp_f64(self); }
+    pub fn is_nan(self): bool { return self != self; }
+    pub fn is_infinite(self): bool { return self == self && (self - self) != (self - self); }
+    /// Neither infinite nor NaN.
+    pub fn is_finite(self): bool { return (self - self) == (self - self); }
+    /// The smaller of the two (the other if one is NaN).
+    pub fn min(self, other: f64): f64 { if self != self { return other; } if other < self { return other; } return self; }
+    /// The larger of the two (the other if one is NaN).
+    pub fn max(self, other: f64): f64 { if self != self { return other; } if other > self { return other; } return self; }
+    /// `self` limited to `lo..=hi`.
+    pub fn clamp(self, lo: f64, hi: f64): f64 { if self < lo { return lo; } if self > hi { return hi; } return self; }
+    /// -1 for negative numbers, 1 for zero and positive ones, NaN for NaN.
+    pub fn signum(self): f64 { if self != self { return self; } if self < 0.0 { return -1.0; } return 1.0; }
+    /// The shortest decimal text that reads back as the same number.
+    pub fn to_string(self): String { let mut s = String::new(); s.write("{self}"); return s; }
+}
+
+impl f32 {
+    pub fn to_string(self): String { let mut s = String::new(); s.write("{self}"); return s; }
+    pub fn is_nan(self): bool { return self != self; }
+    pub fn abs(self): f32 { if self < 0.0 { return -self; } return self; }
+    pub fn sqrt(self): f32 { return sqrt_f64(self as f64) as f32; }
 }

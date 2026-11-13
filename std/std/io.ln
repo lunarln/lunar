@@ -1,35 +1,123 @@
+// Input and output: errors, the `Read` and `Write` traits, standard
+// input, output and error, buffering (`BufReader`, `BufWriter`) and
+// in-memory readers and writers.
+
 use crater::sys;
+use crater::rt;
+use core::intrinsics;
 
 /// What kind of failure an I/O `Error` is.
+#[derive(Eq, Debug)]
 pub enum ErrorKind {
     /// The file or directory does not exist.
     NotFound,
     /// The operating system refused access.
     PermissionDenied,
+    /// The other end refused the connection.
+    ConnectionRefused,
+    /// The other end reset the connection.
+    ConnectionReset,
+    /// The connection was aborted on this end.
+    ConnectionAborted,
+    /// The socket is not connected.
+    NotConnected,
+    /// The address is already in use (by another socket).
+    AddrInUse,
+    /// The address does not belong to this machine.
+    AddrNotAvailable,
+    /// The other end of a pipe or socket has gone.
+    BrokenPipe,
+    /// The file already exists.
+    AlreadyExists,
+    /// The operation would have to wait, and the handle is non-blocking.
+    WouldBlock,
+    /// A directory was expected.
+    NotADirectory,
+    /// A file was expected, not a directory.
+    IsADirectory,
+    /// The directory is not empty.
+    DirectoryNotEmpty,
     /// An argument was unusable, such as a path containing a NUL byte.
     InvalidInput,
     /// The data was not what was expected, such as text that is not UTF-8.
     InvalidData,
+    /// The operation took longer than its timeout.
+    TimedOut,
+    /// A write wrote nothing.
+    WriteZero,
+    /// The operation was interrupted, and may be retried.
+    Interrupted,
+    /// This system cannot do that.
+    Unsupported,
+    /// The input ended before what was asked for was read.
+    UnexpectedEof,
     /// Any other failure; `Error::os_code` has the details.
     Other,
 }
 
-/// A failed I/O operation.
+impl ErrorKind {
+    /// A short description, such as `not found`.
+    pub fn as_str(self): str {
+        return match self {
+            ErrorKind::NotFound => "not found",
+            ErrorKind::PermissionDenied => "permission denied",
+            ErrorKind::ConnectionRefused => "connection refused",
+            ErrorKind::ConnectionReset => "connection reset",
+            ErrorKind::ConnectionAborted => "connection aborted",
+            ErrorKind::NotConnected => "not connected",
+            ErrorKind::AddrInUse => "address in use",
+            ErrorKind::AddrNotAvailable => "address not available",
+            ErrorKind::BrokenPipe => "broken pipe",
+            ErrorKind::AlreadyExists => "already exists",
+            ErrorKind::WouldBlock => "operation would block",
+            ErrorKind::NotADirectory => "not a directory",
+            ErrorKind::IsADirectory => "is a directory",
+            ErrorKind::DirectoryNotEmpty => "directory not empty",
+            ErrorKind::InvalidInput => "invalid input",
+            ErrorKind::InvalidData => "invalid data",
+            ErrorKind::TimedOut => "timed out",
+            ErrorKind::WriteZero => "write zero",
+            ErrorKind::Interrupted => "interrupted",
+            ErrorKind::Unsupported => "unsupported",
+            ErrorKind::UnexpectedEof => "unexpected end of file",
+            ErrorKind::Other => "I/O error",
+        };
+    }
+}
+
+impl Display for ErrorKind {
+    fn fmt(&self, out: &mut +String) {
+        out.push_str(self.as_str());
+    }
+}
+
+/// A failed I/O operation: its kind, the operating system's error code if
+/// it came from one, and maybe a description.
 pub struct Error {
     kind: ErrorKind,
     code: i32,
+    /// A static description (address and length; 0 for none), kept as
+    /// numbers so that `Error` stays `Dull`.
+    msg: usize,
+    msg_len: usize,
 }
 
 impl Error {
     /// An error of `kind` that did not come from the operating system.
     pub fn new(kind: ErrorKind): Error {
-        return Error { kind, code: 0 };
+        return Error { kind, code: 0, msg: 0, msg_len: 0 };
+    }
+
+    /// An error of `kind` described by `msg`, which must live as long as
+    /// the program (a string literal).
+    pub unsafe fn with_static(kind: ErrorKind, msg: str): Error {
+        return Error { kind, code: 0, msg: msg.as_bytes().as_ptr() as usize, msg_len: msg.len() };
     }
 
     /// The error for operating system error code `code` (`errno` on Unix,
     /// `GetLastError()` on Windows).
     pub fn from_os(code: i32): Error {
-        return Error { kind: sys::error_kind(code), code };
+        return Error { kind: sys::error_kind(code), code, msg: 0, msg_len: 0 };
     }
 
     /// The error for the operating system's most recent failure.
@@ -45,22 +133,756 @@ impl Error {
     pub fn os_code(&self): i32 {
         return self.code;
     }
+
+    /// The description given with `with_static`, if any.
+    pub fn message(&self): Option::<str> from static {
+        if self.msg == 0 {
+            return None;
+        }
+        return Some(unsafe { intrinsics::str_from_bytes(intrinsics::slice_from_raw(self.msg as *u8, self.msg_len)) });
+    }
 }
 
 impl Display for Error {
+    /// `not found (os error 2)`, or the description.
     fn fmt(&self, out: &mut +String) {
-        out.push_str(match self.kind {
-            ErrorKind::NotFound => "not found",
-            ErrorKind::PermissionDenied => "permission denied",
-            ErrorKind::InvalidInput => "invalid input",
-            ErrorKind::InvalidData => "invalid data",
-            ErrorKind::Other => "I/O error",
-        });
+        match self.message() {
+            Some(m) => out.push_str(m),
+            None => out.push_str(self.kind.as_str()),
+        }
         if self.code != 0 {
             out.write(" (os error {self.code})");
         }
     }
 }
+
+impl Debug for Error {
+    fn debug(&self, out: &mut +String) {
+        out.write("Error {{ kind: {self.kind:?}, code: {self.code} }}");
+    }
+}
+
+/// Copy `src` into `dst` (of the same length).
+fn copy_bytes(dst: [u8; &mut], src: [u8; &]) {
+    dst.copy_from(src);
+}
+
+/// An `InvalidData` error for text that is not UTF-8.
+fn not_utf8(): Error {
+    return unsafe { Error::with_static(ErrorKind::InvalidData, "stream did not contain valid UTF-8") };
+}
+
+// ===================================================================== traits
+
+/// Sources of bytes: files, standard input, sockets, `BufReader`s and
+/// in-memory `Cursor`s.
+pub trait Read {
+    /// Read some bytes into `buf`: how many. 0 means the end of the input
+    /// (or an empty `buf`); fewer than `buf.len()` is not an error.
+    fn read(&mut self, buf: [u8; &mut]): Result::<usize, Error>;
+
+    /// Fill all of `buf`, or fail with `UnexpectedEof` if the input ends
+    /// first.
+    fn read_exact(&mut self, buf: [u8; &mut]): Result::<(), Error> {
+        let mut off: usize = 0;
+        while off < buf.len() {
+            let n = self.read(buf[off..])?;
+            if n == 0 {
+                return Err(Error::new(ErrorKind::UnexpectedEof));
+            }
+            off += n;
+        }
+        return Ok(());
+    }
+
+    /// Read everything up to the end onto `out`: how many bytes.
+    fn read_to_end(&mut self, out: &mut +[u8; ..+]): Result::<usize, Error> {
+        let mut chunk: [u8; 16384] = [0; 16384];
+        let mut total: usize = 0;
+        loop {
+            let n = self.read(chunk[..])?;
+            if n == 0 {
+                return Ok(total);
+            }
+            out.extend(chunk[..n]);
+            total += n;
+        }
+    }
+
+    /// Read everything up to the end onto `out` as text: how many bytes.
+    /// Fails with `InvalidData` (adding nothing) if it is not UTF-8.
+    fn read_to_string(&mut self, out: &mut +String): Result::<usize, Error> {
+        let mut bytes: [u8; ..+] = [];
+        let n = self.read_to_end(&mut bytes)?;
+        return match str::from_utf8(bytes[..]) {
+            Some(s) => {
+                out.push_str(s);
+                Ok(n)
+            }
+            None => Err(not_utf8()),
+        };
+    }
+}
+
+/// Sinks of bytes: files, standard output and error, sockets,
+/// `BufWriter`s and growable byte arrays.
+pub trait Write {
+    /// Write some of `bytes`: how many (possibly fewer than all).
+    fn write(&mut self, bytes: [u8; &]): Result::<usize, Error>;
+
+    /// Push out anything buffered.
+    fn flush(&mut self): Result::<(), Error>;
+
+    /// Write all of `bytes`, or fail (`WriteZero` if a write took nothing).
+    fn write_all(&mut self, bytes: [u8; &]): Result::<(), Error> {
+        let mut off: usize = 0;
+        while off < bytes.len() {
+            let n = self.write(bytes[off..])?;
+            if n == 0 {
+                return Err(Error::new(ErrorKind::WriteZero));
+            }
+            off += n;
+        }
+        return Ok(());
+    }
+
+    /// Write text.
+    fn write_str(&mut self, s: str): Result::<(), Error> {
+        return self.write_all(s.as_bytes());
+    }
+
+    /// Write formatted text: `out.print("x = {x}")`.
+    fn print(&mut self, args: FmtArgs): Result::<(), Error> {
+        let mut s = String::new();
+        core::fmt::write(&mut s, args);
+        return self.write_all(s.as_bytes());
+    }
+
+    /// Write formatted text and a newline: `out.println("x = {x}")`.
+    fn println(&mut self, args: FmtArgs): Result::<(), Error> {
+        let mut s = String::new();
+        core::fmt::write(&mut s, args);
+        s.push('\n');
+        return self.write_all(s.as_bytes());
+    }
+
+    /// Where the bytes go, if that is an operating system handle: the kind
+    /// (`rt::FLUSH_FILE` or `rt::FLUSH_SOCKET`) and the handle, or `(0, 0)`.
+    /// `BufWriter` uses it to write what it holds when it is freed.
+    fn os_target(&self): (usize, i64) {
+        return (0, 0);
+    }
+}
+
+/// A growable byte array is written to by appending.
+impl Write for [u8; ..+] {
+    fn write(&mut self, bytes: [u8; &]): Result::<usize, Error> {
+        self.extend(bytes);
+        return Ok(bytes.len());
+    }
+
+    fn flush(&mut self): Result::<(), Error> {
+        return Ok(());
+    }
+}
+
+/// A growable byte array is written to by appending.
+impl Write for [u8; -..+] {
+    fn write(&mut self, bytes: [u8; &]): Result::<usize, Error> {
+        self.extend(bytes);
+        return Ok(bytes.len());
+    }
+
+    fn flush(&mut self): Result::<(), Error> {
+        return Ok(());
+    }
+}
+
+// ===================================================================== in memory
+
+/// Reads the bytes of a slice, from a position that moves as it reads.
+/// `Cursor::new("a\nb".as_bytes())`
+pub struct Cursor {
+    data: [u8; &],
+    pos: usize,
+}
+
+impl Cursor {
+    pub fn new(kept data: [u8; &]): Cursor {
+        return Cursor { data, pos: 0 };
+    }
+
+    /// How many bytes have been read (where the next read starts).
+    pub fn position(&self): usize {
+        return self.pos;
+    }
+
+    /// Move to byte `pos` (past the end means at the end).
+    pub fn set_position(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
+    /// The bytes not yet read.
+    pub fn remaining(&self): [u8; &] {
+        if self.pos >= self.data.len() {
+            return self.data[self.data.len()..];
+        }
+        return self.data[self.pos..];
+    }
+}
+
+impl Read for Cursor {
+    fn read(&mut self, buf: [u8; &mut]): Result::<usize, Error> {
+        let rest = self.remaining();
+        let n = if rest.len() < buf.len() { rest.len() } else { buf.len() };
+        copy_bytes(buf[..n], rest[..n]);
+        self.pos += n;
+        return Ok(n);
+    }
+}
+
+// ===================================================================== standard streams
+
+/// Standard input, buffered: one buffer for the whole program, so reads
+/// through any `Stdin` see the same input. (The unbuffered
+/// `read_line` and `read` below bypass it: use one or the other.)
+pub struct Stdin {}
+
+/// Standard output, unbuffered: each write is one system call. For many
+/// small writes, use `stdout().buffered()`.
+pub struct Stdout {}
+
+/// Standard error, unbuffered.
+pub struct Stderr {}
+
+pub fn stdin(): Stdin {
+    return Stdin {};
+}
+
+pub fn stdout(): Stdout {
+    return Stdout {};
+}
+
+pub fn stderr(): Stderr {
+    return Stderr {};
+}
+
+/// The bytes read from standard input but not yet handed out:
+/// `STDIN_BUF[STDIN_POS..STDIN_END]`.
+static mut STDIN_BUF: [u8; 16384] = [0; 16384];
+static mut STDIN_POS: usize = 0;
+static mut STDIN_END: usize = 0;
+
+/// Refill the standard input buffer if it is empty: false at the end.
+fn stdin_fill(): Result::<bool, Error> {
+    unsafe {
+        if STDIN_POS < STDIN_END {
+            return Ok(true);
+        }
+        let n = sys::handle_read(sys::std_handle(0), STDIN_BUF[..]);
+        if n < 0 {
+            return Err(Error::last_os_error());
+        }
+        STDIN_POS = 0;
+        STDIN_END = n as usize;
+        return Ok(n > 0);
+    }
+}
+
+impl Read for Stdin {
+    fn read(&mut self, buf: [u8; &mut]): Result::<usize, Error> {
+        if !stdin_fill()? {
+            return Ok(0);
+        }
+        unsafe {
+            let avail = STDIN_END - STDIN_POS;
+            let n = if avail < buf.len() { avail } else { buf.len() };
+            copy_bytes(buf[..n], STDIN_BUF[STDIN_POS..STDIN_POS + n]);
+            STDIN_POS += n;
+            return Ok(n);
+        }
+    }
+}
+
+impl Stdin {
+    /// Read a line onto `out`, with its `\n` (if the input does not end
+    /// first): how many bytes, 0 at the end of the input. Fails with
+    /// `InvalidData` (adding nothing) if the line is not UTF-8.
+    /// `while stdin().read_line(&mut line)? > 0 { ...; line.clear(); }`
+    pub fn read_line(&mut self, out: &mut +String): Result::<usize, Error> {
+        let mut bytes: [u8; ..+] = [];
+        loop {
+            if !stdin_fill()? {
+                break;
+            }
+            unsafe {
+                let chunk = STDIN_BUF[STDIN_POS..STDIN_END];
+                match chunk.index_of(b'\n') {
+                    Some(i) => {
+                        bytes.extend(chunk[..i + 1]);
+                        STDIN_POS += i + 1;
+                        break;
+                    }
+                    None => {
+                        bytes.extend(chunk);
+                        STDIN_POS = STDIN_END;
+                    }
+                }
+            }
+        }
+        return match str::from_utf8(bytes[..]) {
+            Some(s) => {
+                out.push_str(s);
+                Ok(bytes.len())
+            }
+            None => Err(not_utf8()),
+        };
+    }
+
+    /// The remaining lines, without their `\n` or `\r\n`.
+    pub fn lines(self): StdinLines {
+        return StdinLines { done: false };
+    }
+}
+
+/// The lines of standard input (`Stdin::lines`).
+pub struct StdinLines {
+    done: bool,
+}
+
+impl Iterator::<Result::<String, Error>> for StdinLines {
+    fn next(&mut self): Option::<Result::<String, Error>> {
+        if self.done {
+            return None;
+        }
+        let mut line = String::new();
+        return match stdin().read_line(&mut line) {
+            Ok(0) => {
+                self.done = true;
+                None
+            }
+            Ok(_) => {
+                trim_newline(&mut line);
+                Some(Ok(line))
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        };
+    }
+}
+
+/// Remove a trailing `\n` or `\r\n`.
+fn trim_newline(s: &mut String) {
+    let b = s.as_bytes();
+    let mut n = b.len();
+    if n > 0 && b[n - 1] == b'\n' {
+        n -= 1;
+        if n > 0 && b[n - 1] == b'\r' {
+            n -= 1;
+        }
+    }
+    s.truncate(n);
+}
+
+/// Write `bytes` to standard output (`fd` 1) or error (2).
+fn write_fd(fd: i32, bytes: [u8; &]): Result::<usize, Error> {
+    let n = sys::handle_write(sys::std_handle(fd), bytes);
+    if n < 0 {
+        return Err(Error::last_os_error());
+    }
+    return Ok(n as usize);
+}
+
+impl Write for Stdout {
+    fn write(&mut self, bytes: [u8; &]): Result::<usize, Error> {
+        return write_fd(1, bytes);
+    }
+
+    fn flush(&mut self): Result::<(), Error> {
+        return Ok(());
+    }
+
+    fn os_target(&self): (usize, i64) {
+        return (rt::FLUSH_FILE, sys::std_handle(1));
+    }
+}
+
+impl Stdout {
+    /// A buffered writer to standard output, for printing much in a loop:
+    /// it writes when its buffer fills, on `flush`, and when it is freed.
+    /// `let mut out = io::stdout().buffered(); out.println("{x}");`
+    pub fn buffered(self): BufWriter::<Stdout> {
+        return BufWriter::new(self);
+    }
+}
+
+impl Write for Stderr {
+    fn write(&mut self, bytes: [u8; &]): Result::<usize, Error> {
+        return write_fd(2, bytes);
+    }
+
+    fn flush(&mut self): Result::<(), Error> {
+        return Ok(());
+    }
+
+    fn os_target(&self): (usize, i64) {
+        return (rt::FLUSH_FILE, sys::std_handle(2));
+    }
+}
+
+// ===================================================================== BufReader
+
+/// Reads from `R` through a buffer, so that many small reads (lines,
+/// bytes) make few system calls.
+///
+/// Lines come in three ways: `read_line` appends one to a `String` you
+/// keep; `next_line` + `line` show it as a `str` view into the reader's own
+/// buffer, valid until the next read (no copy); and `lines` is an iterator
+/// of `String`s.
+pub struct BufReader::<R: Read> {
+    inner: R,
+    /// The bytes read from `inner` are `buf[pos..filled]`; `buf.len()` is
+    /// the room, which grows only for lines longer than it.
+    buf: [u8; -..+],
+    pos: usize,
+    filled: usize,
+    /// The line `next_line` found: `buf[line_start..line_end]`.
+    line_start: usize,
+    line_end: usize,
+}
+
+impl::<R: Read> BufReader::<R> {
+    /// A reader with an 8 KiB buffer.
+    pub fn new(inner: R): BufReader::<R> {
+        return BufReader::with_capacity(8192, inner);
+    }
+
+    /// A reader with a buffer of `cap` bytes (at least 16).
+    pub fn with_capacity(cap: usize, inner: R): BufReader::<R> {
+        let n = if cap < 16 { 16 } else { cap };
+        return BufReader { inner, buf: [0; n], pos: 0, filled: 0, line_start: 0, line_end: 0 };
+    }
+
+    /// The reader inside (anything still buffered is lost).
+    pub fn into_inner(self): R {
+        return self.inner;
+    }
+
+    /// Call `f` with the reader inside, such as to write to a socket being
+    /// read: `r.with_inner(|s| s.write_all(reply))`. Reading from it
+    /// directly skips what is buffered.
+    pub fn with_inner::<T, F: FnOnce(&mut R): T>(&mut self, kept f: F): T from self, f {
+        return f(&mut self.inner);
+    }
+
+    /// The bytes read but not yet consumed.
+    pub fn buffer(&self): [u8; &] {
+        return self.buf[self.pos..self.filled];
+    }
+
+    /// Read more into the buffer, after what is there (moving that to the
+    /// front, and growing the buffer if it is full): how many bytes, 0 at
+    /// the end.
+    fn fill_more(&mut self): Result::<usize, Error> {
+        if self.pos > 0 {
+            let n = self.filled - self.pos;
+            let mut i: usize = 0;
+            while i < n {
+                self.buf[i] = self.buf[self.pos + i];
+                i += 1;
+            }
+            self.filled = n;
+            self.pos = 0;
+            self.line_start = 0;
+            self.line_end = 0;
+        }
+        if self.filled == self.buf.len() {
+            let more = self.buf.len();
+            for _ in 0..more {
+                self.buf.push(0);
+            }
+        }
+        let n = self.inner.read(self.buf[self.filled..])?;
+        self.filled += n;
+        return Ok(n);
+    }
+
+    /// The buffered bytes, reading more first if there are none (empty at
+    /// the end of the input). Use `consume` to mark them read.
+    pub fn fill_buf(&mut self): Result::<[u8; &], Error> {
+        if self.pos == self.filled {
+            self.pos = 0;
+            self.filled = 0;
+            self.fill_more()?;
+        }
+        return Ok(self.buf[self.pos..self.filled]);
+    }
+
+    /// Mark `n` buffered bytes as read.
+    pub fn consume(&mut self, n: usize) {
+        let avail = self.filled - self.pos;
+        self.pos += if n < avail { n } else { avail };
+    }
+
+    /// Read up to and including `delim` onto `out`: how many bytes, 0 at
+    /// the end.
+    pub fn read_until(&mut self, delim: u8, out: &mut +[u8; ..+]): Result::<usize, Error> {
+        let mut total: usize = 0;
+        loop {
+            if self.pos == self.filled {
+                self.pos = 0;
+                self.filled = 0;
+                if self.fill_more()? == 0 {
+                    return Ok(total);
+                }
+            }
+            let chunk = self.buf[self.pos..self.filled];
+            match chunk.index_of(delim) {
+                Some(i) => {
+                    out.extend(chunk[..i + 1]);
+                    self.pos += i + 1;
+                    return Ok(total + i + 1);
+                }
+                None => {
+                    out.extend(chunk);
+                    total += chunk.len();
+                    self.pos = self.filled;
+                }
+            }
+        }
+    }
+
+    /// Read a line onto `out`, with its `\n` (if the input does not end
+    /// first): how many bytes, 0 at the end. Fails with `InvalidData`
+    /// (adding nothing) if it is not UTF-8.
+    pub fn read_line(&mut self, out: &mut +String): Result::<usize, Error> {
+        let mut bytes: [u8; ..+] = [];
+        let n = self.read_until(b'\n', &mut bytes)?;
+        return match str::from_utf8(bytes[..]) {
+            Some(s) => {
+                out.push_str(s);
+                Ok(n)
+            }
+            None => Err(not_utf8()),
+        };
+    }
+
+    /// Read the next line into the buffer: false at the end of the input.
+    /// `line()` then shows it, without its `\n` or `\r\n`, until the next
+    /// read. Fails with `InvalidData` if the line is not UTF-8.
+    /// `while r.next_line()? { let l = r.line(); ... }`
+    pub fn next_line(&mut self): Result::<bool, Error> {
+        let mut scanned: usize = 0;
+        loop {
+            let found = self.buf[self.pos + scanned..self.filled].index_of(b'\n');
+            match found {
+                Some(i) => {
+                    let end = self.pos + scanned + i;
+                    return self.take_line(end, end + 1);
+                }
+                None => {
+                    scanned = self.filled - self.pos;
+                    if self.fill_more()? == 0 {
+                        if self.pos == self.filled {
+                            self.line_start = self.pos;
+                            self.line_end = self.pos;
+                            return Ok(false);
+                        }
+                        let end = self.filled;
+                        return self.take_line(end, end);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Make `buf[pos..end]` the current line (less a `\r` before the `\n`)
+    /// and continue at `next`.
+    fn take_line(&mut self, end: usize, next: usize): Result::<bool, Error> {
+        let mut e = end;
+        if e > self.pos && next > end && self.buf[e - 1] == b'\r' {
+            e -= 1;
+        }
+        let start = self.pos;
+        self.pos = next;
+        if core::str::utf8_error_at(self.buf[start..e]).is_some() {
+            self.line_start = start;
+            self.line_end = start;
+            return Err(not_utf8());
+        }
+        self.line_start = start;
+        self.line_end = e;
+        return Ok(true);
+    }
+
+    /// The line the last `next_line` read, without its line ending; empty
+    /// before the first and after the end.
+    pub fn line(&self): str {
+        return unsafe { intrinsics::str_from_bytes(self.buf[self.line_start..self.line_end]) };
+    }
+
+    /// The remaining lines as `String`s, without their `\n` or `\r\n`.
+    pub fn lines(self): Lines::<R> {
+        return Lines { reader: self, done: false };
+    }
+}
+
+impl::<R: Read> Read for BufReader::<R> {
+    fn read(&mut self, buf: [u8; &mut]): Result::<usize, Error> {
+        if self.pos == self.filled {
+            // Nothing buffered: big reads go straight through.
+            if buf.len() >= self.buf.len() {
+                return self.inner.read(buf);
+            }
+            self.pos = 0;
+            self.filled = 0;
+            self.fill_more()?;
+        }
+        let avail = self.filled - self.pos;
+        let n = if avail < buf.len() { avail } else { buf.len() };
+        copy_bytes(buf[..n], self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        return Ok(n);
+    }
+}
+
+/// The lines of a `BufReader` (`BufReader::lines`).
+pub struct Lines::<R: Read> {
+    reader: BufReader::<R>,
+    done: bool,
+}
+
+impl::<R: Read> Iterator::<Result::<String, Error>> for Lines::<R> {
+    fn next(&mut self): Option::<Result::<String, Error>> {
+        if self.done {
+            return None;
+        }
+        let mut line = String::new();
+        return match self.reader.read_line(&mut line) {
+            Ok(0) => {
+                self.done = true;
+                None
+            }
+            Ok(_) => {
+                trim_newline(&mut line);
+                Some(Ok(line))
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        };
+    }
+}
+
+// ===================================================================== BufWriter
+
+/// Writes to `W` through a buffer, so that many small writes make few
+/// system calls. It writes when the buffer fills and on `flush`.
+///
+/// Lunar has no destructors yet: when `W` writes to an operating system
+/// handle (a `File`, `Stdout`, `Stderr` or `TcpStream`), what is still
+/// buffered is written when the `BufWriter` is freed (errors are then
+/// ignored); for other writers, call `flush` or `into_inner` first.
+pub struct BufWriter::<W: Write> {
+    /// Declared first so that, freed first, it is written out before a
+    /// handle in `inner` is closed.
+    buf: [u8; -..+],
+    inner: W,
+    /// The most `buf` holds.
+    cap: usize,
+    /// Whether freeing `buf` writes it (see `rt::set_flush`).
+    armed: bool,
+}
+
+impl::<W: Write> BufWriter::<W> {
+    /// A writer with an 8 KiB buffer.
+    pub fn new(inner: W): BufWriter::<W> {
+        return BufWriter::with_capacity(8192, inner);
+    }
+
+    /// A writer with a buffer of `cap` bytes.
+    pub fn with_capacity(cap: usize, inner: W): BufWriter::<W> {
+        let n = if cap < 16 { 16 } else { cap };
+        let buf: [u8; -..+] = [].capped(n);
+        let (kind, handle) = inner.os_target();
+        if kind != 0 {
+            rt::set_flush(buf[..].as_ptr(), kind, handle);
+        }
+        return BufWriter { buf, inner, cap: n, armed: kind != 0 };
+    }
+
+    /// The bytes waiting to be written.
+    pub fn buffer(&self): [u8; &] {
+        return self.buf[..];
+    }
+
+    /// Call `f` with the writer inside. Writing to it directly goes ahead
+    /// of what is buffered.
+    pub fn with_inner::<T, F: FnOnce(&mut W): T>(&mut self, kept f: F): T from self, f {
+        return f(&mut self.inner);
+    }
+
+    /// Write out the buffer and return the writer inside.
+    pub fn into_inner(mut self): Result::<W, Error> {
+        self.flush_buf()?;
+        if self.armed {
+            rt::set_flush(self.buf[..].as_ptr(), 0, 0);
+        }
+        return Ok(self.inner);
+    }
+
+    /// Write out the buffer to the writer inside.
+    fn flush_buf(&mut self): Result::<(), Error> {
+        let r = self.inner.write_all(self.buf[..]);
+        self.buf.clear();
+        self.note_pending();
+        return r;
+    }
+
+    fn note_pending(&mut self) {
+        if self.armed {
+            rt::set_pending(self.buf[..].as_ptr(), self.buf.len());
+        }
+    }
+}
+
+impl::<W: Write> Write for BufWriter::<W> {
+    fn write(&mut self, bytes: [u8; &]): Result::<usize, Error> {
+        let cap = self.cap;
+        if self.buf.len() + bytes.len() > cap {
+            self.flush_buf()?;
+        }
+        if bytes.len() >= cap {
+            return self.inner.write(bytes);
+        }
+        self.buf.extend(bytes);
+        self.note_pending();
+        return Ok(bytes.len());
+    }
+
+    fn write_all(&mut self, bytes: [u8; &]): Result::<(), Error> {
+        let cap = self.cap;
+        if self.buf.len() + bytes.len() > cap {
+            self.flush_buf()?;
+        }
+        if bytes.len() >= cap {
+            return self.inner.write_all(bytes);
+        }
+        self.buf.extend(bytes);
+        self.note_pending();
+        return Ok(());
+    }
+
+    fn flush(&mut self): Result::<(), Error> {
+        self.flush_buf()?;
+        return self.inner.flush();
+    }
+}
+
+// ===================================================================== functions
 
 /// Print formatted text to standard output.
 pub fn print(args: FmtArgs) {
@@ -151,8 +973,9 @@ pub fn input_available(fd: i32): bool {
     return sys::input_available(fd);
 }
 
-/// Read one line from standard input (without the trailing newline).
-/// Returns `false` at end of input.
+/// Read one line from standard input (without the trailing newline),
+/// unbuffered: one byte at a time, so it never reads past the line.
+/// Returns `false` at end of input. (`stdin().read_line` is faster.)
 pub fn read_line(out: &mut String): bool {
     let mut buf: [u8; 1] = [0];
     let mut got_any = false;

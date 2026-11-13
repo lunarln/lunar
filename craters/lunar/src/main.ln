@@ -40,6 +40,8 @@ mod ide;
 mod ide_tests;
 mod link;
 mod lsp;
+#[cfg(test)]
+mod method_tests;
 mod paths;
 mod project;
 mod refs;

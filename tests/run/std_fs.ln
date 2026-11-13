@@ -1,0 +1,205 @@
+// std::fs: open files with options, seeking, metadata, renaming,
+// copying, links, read-only files, and files closed when freed.
+
+use std::fs::{self, File, OpenOptions, SeekFrom};
+use std::io::{Read, Write, ErrorKind, BufReader, BufWriter};
+use std::time::SystemTime;
+
+/// A fresh directory for one test, removed by `cleanup`.
+fn scratch(name: str): String {
+    let mut dir = std::env::temp_dir();
+    dir.write("/lunar-std-fs-{std::process::id()}-{name}");
+    let _ = fs::remove_dir_all(dir.as_str());
+    fs::create_dir_all(dir.as_str()).unwrap();
+    return dir;
+}
+
+fn join(dir: &String, name: str): String {
+    let mut p = String::from(dir.as_str());
+    p.push('/');
+    p.push_str(name);
+    return p;
+}
+
+fn kind::<T>(r: Result::<T, std::io::Error>): ErrorKind {
+    return match r {
+        Ok(_) => panic("expected an error"),
+        Err(e) => e.kind(),
+    };
+}
+
+#[test]
+fn create_write_read() {
+    let dir = scratch("cwr");
+    let p = join(&dir, "a.txt");
+    let mut f = File::create(p.as_str()).unwrap();
+    f.write_all("héllo\n".as_bytes()).unwrap();
+    f.print("{1 + 1}\n").unwrap();
+    f.close().unwrap();
+    assert_eq!(fs::read_to_string(p.as_str()).unwrap(), String::from("héllo\n2\n"));
+    let mut g = File::open(p.as_str()).unwrap();
+    let mut bytes: [u8; ..+] = [];
+    assert_eq!(g.read_to_end(&mut bytes).unwrap(), 9);
+    // Writing to a file opened for reading fails.
+    assert!(g.write_all("x".as_bytes()).is_err());
+    fs::remove_dir_all(dir.as_str()).unwrap();
+}
+
+#[test]
+fn open_options() {
+    let dir = scratch("opts");
+    let p = join(&dir, "log.txt");
+    assert_eq!(kind(File::open(p.as_str())), ErrorKind::NotFound);
+    // Appending creates, and every write goes to the end.
+    for i in 0..3 {
+        let mut f = OpenOptions::new().append(true).create(true).open(p.as_str()).unwrap();
+        f.print("{i};").unwrap();
+    }
+    assert_eq!(fs::read_to_string(p.as_str()).unwrap(), String::from("0;1;2;"));
+    assert_eq!(kind(File::create_new(p.as_str())), ErrorKind::AlreadyExists);
+    // Without `create`, a missing file is not made.
+    let q = join(&dir, "missing.txt");
+    assert_eq!(kind(OpenOptions::new().write(true).open(q.as_str())), ErrorKind::NotFound);
+    // Options that do not go together.
+    assert_eq!(kind(OpenOptions::new().open(p.as_str())), ErrorKind::InvalidInput);
+    assert_eq!(kind(OpenOptions::new().read(true).create(true).open(p.as_str())), ErrorKind::InvalidInput);
+    assert_eq!(kind(OpenOptions::new().append(true).truncate(true).open(p.as_str())), ErrorKind::InvalidInput);
+    // Truncating an existing file.
+    let mut t = OpenOptions::new().write(true).truncate(true).open(p.as_str()).unwrap();
+    t.write_all("new".as_bytes()).unwrap();
+    t.close().unwrap();
+    assert_eq!(fs::read_to_string(p.as_str()).unwrap(), String::from("new"));
+    fs::remove_dir_all(dir.as_str()).unwrap();
+}
+
+#[test]
+fn seek_and_set_len() {
+    let dir = scratch("seek");
+    let p = join(&dir, "data.bin");
+    let mut f = OpenOptions::new().read(true).write(true).create(true).open(p.as_str()).unwrap();
+    f.write_all("0123456789".as_bytes()).unwrap();
+    assert_eq!(f.seek(SeekFrom::Start(2)).unwrap(), 2);
+    let mut two: [u8; 2] = [0; 2];
+    f.read_exact(two[..]).unwrap();
+    assert_eq!(str::from_utf8(two[..]).unwrap(), "23");
+    assert_eq!(f.seek(SeekFrom::Current(-1)).unwrap(), 3);
+    assert_eq!(f.seek(SeekFrom::End(-2)).unwrap(), 8);
+    f.write_all("XY".as_bytes()).unwrap();
+    assert_eq!(f.stream_position().unwrap(), 10);
+    f.set_len(4).unwrap();
+    assert_eq!(f.metadata().unwrap().len(), 4);
+    f.set_len(6).unwrap();
+    f.rewind().unwrap();
+    let mut all: [u8; ..+] = [];
+    f.read_to_end(&mut all).unwrap();
+    assert_eq!(all.len(), 6);
+    assert_eq!(all[5], 0u8);
+    f.sync_all().unwrap();
+    f.close().unwrap();
+    fs::remove_dir_all(dir.as_str()).unwrap();
+}
+
+#[test]
+fn metadata() {
+    let dir = scratch("meta");
+    let p = join(&dir, "m.txt");
+    fs::write(p.as_str(), "12345".as_bytes()).unwrap();
+    let m = fs::metadata(p.as_str()).unwrap();
+    assert_eq!(m.len(), 5);
+    assert!(m.is_file());
+    assert!(!m.is_dir());
+    assert!(!m.is_symlink());
+    assert!(!m.readonly());
+    let age = SystemTime::now().duration_since(m.modified().unwrap());
+    // Written just now (allowing for clocks that are a little apart).
+    let secs = match age {
+        Ok(d) => d.as_secs(),
+        Err(d) => d.as_secs(),
+    };
+    assert!(secs < 60);
+    let d = fs::metadata(dir.as_str()).unwrap();
+    assert!(d.is_dir());
+    assert_eq!(kind(fs::metadata(join(&dir, "nope").as_str())), ErrorKind::NotFound);
+    fs::set_readonly(p.as_str(), true).unwrap();
+    assert!(fs::metadata(p.as_str()).unwrap().readonly());
+    fs::set_readonly(p.as_str(), false).unwrap();
+    assert!(!fs::metadata(p.as_str()).unwrap().readonly());
+    fs::remove_dir_all(dir.as_str()).unwrap();
+}
+
+#[test]
+fn rename_copy_and_links() {
+    let dir = scratch("names");
+    let a = join(&dir, "a.txt");
+    let b = join(&dir, "b.txt");
+    let c = join(&dir, "c.txt");
+    fs::write(a.as_str(), "contents".as_bytes()).unwrap();
+    assert_eq!(fs::copy(a.as_str(), b.as_str()).unwrap(), 8);
+    fs::rename(b.as_str(), c.as_str()).unwrap();
+    assert!(!fs::exists(b.as_str()));
+    assert_eq!(fs::read_to_string(c.as_str()).unwrap(), String::from("contents"));
+    // Renaming over a file replaces it.
+    fs::write(b.as_str(), "other".as_bytes()).unwrap();
+    fs::rename(b.as_str(), c.as_str()).unwrap();
+    assert_eq!(fs::read_to_string(c.as_str()).unwrap(), String::from("other"));
+    let h = join(&dir, "hard.txt");
+    fs::hard_link(a.as_str(), h.as_str()).unwrap();
+    fs::write(a.as_str(), "changed".as_bytes()).unwrap();
+    assert_eq!(fs::read_to_string(h.as_str()).unwrap(), String::from("changed"));
+    // Symbolic links may need privileges on Windows.
+    let s = join(&dir, "sym.txt");
+    match fs::symlink("a.txt", s.as_str()) {
+        Ok(_) => {
+            assert!(fs::symlink_metadata(s.as_str()).unwrap().is_symlink());
+            assert!(!fs::metadata(s.as_str()).unwrap().is_symlink());
+            assert_eq!(fs::read_to_string(s.as_str()).unwrap(), String::from("changed"));
+        }
+        Err(e) => assert_eq!(e.kind(), ErrorKind::PermissionDenied),
+    }
+    let sub = join(&dir, "sub");
+    fs::create_dir(sub.as_str()).unwrap();
+    assert_eq!(kind(fs::copy(sub.as_str(), b.as_str())), ErrorKind::IsADirectory);
+    fs::remove_dir_all(dir.as_str()).unwrap();
+    assert!(!fs::exists(dir.as_str()));
+}
+
+/// Opens and frees many files: each is closed when freed, so the process
+/// never runs out of handles.
+#[test]
+fn files_close_when_freed() {
+    let dir = scratch("close");
+    let p = join(&dir, "f.txt");
+    fs::write(p.as_str(), "x".as_bytes()).unwrap();
+    for _ in 0..20000 {
+        let mut f = File::open(p.as_str()).unwrap();
+        let mut b: [u8; 1] = [0];
+        f.read_exact(b[..]).unwrap();
+    }
+    // A closed file can be removed (on Windows an open one cannot).
+    fs::remove_file(p.as_str()).unwrap();
+    fs::remove_dir_all(dir.as_str()).unwrap();
+}
+
+#[test]
+fn buffered_files() {
+    let dir = scratch("buf");
+    let p = join(&dir, "lines.txt");
+    {
+        let mut w = BufWriter::new(File::create(p.as_str()).unwrap());
+        for i in 0..1000 {
+            w.println("line {i}").unwrap();
+        }
+        // Freed here: what is still buffered is written.
+    }
+    let mut r = BufReader::new(File::open(p.as_str()).unwrap());
+    let mut n = 0;
+    let mut last = String::new();
+    while r.next_line().unwrap() {
+        n += 1;
+        last.clear();
+        last.push_str(r.line());
+    }
+    assert_eq!(n, 1000);
+    assert_eq!(last, String::from("line 999"));
+    fs::remove_dir_all(dir.as_str()).unwrap();
+}

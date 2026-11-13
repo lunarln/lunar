@@ -1,0 +1,81 @@
+// std::time: Duration arithmetic and display, Instant, SystemTime and
+// sleep.
+
+use std::time::{self, Duration, Instant, SystemTime};
+
+#[test]
+fn constructors_and_parts() {
+    let d = Duration::from_millis(1500);
+    assert_eq!(d.as_secs(), 1u64);
+    assert_eq!(d.subsec_millis(), 500u32);
+    assert_eq!(d.subsec_nanos(), 500000000u32);
+    assert_eq!(d.as_millis(), 1500u64);
+    assert_eq!(d.as_micros(), 1500000u64);
+    assert_eq!(d.as_secs_f64(), 1.5);
+    assert_eq!(Duration::new(1, 2000000000), Duration::from_secs(3));
+    assert_eq!(Duration::from_secs_f64(0.25), Duration::from_millis(250));
+    assert_eq!(Duration::from_nanos(1000000007).subsec_nanos(), 7u32);
+    assert!(Duration::zero().is_zero());
+    assert_eq!(Duration::max().as_nanos(), 18446744073709551615u64);
+}
+
+#[test]
+fn arithmetic() {
+    let a = Duration::from_millis(1700);
+    let b = Duration::from_millis(400);
+    assert_eq!(a + b, Duration::from_millis(2100));
+    assert_eq!(a - b, Duration::from_millis(1300));
+    assert_eq!(b.checked_sub(a), None);
+    assert_eq!(b.saturating_sub(a), Duration::zero());
+    assert_eq!(a.checked_mul(3), Some(Duration::from_millis(5100)));
+    assert_eq!(a.checked_div(2), Some(Duration::from_millis(850)));
+    assert_eq!(a.checked_div(0), None);
+    assert_eq!(Duration::max().checked_add(Duration::from_nanos(1)), None);
+    assert_eq!(Duration::max().saturating_add(a), Duration::max());
+    assert_eq!(b.mul_f64(2.5), Duration::from_secs(1));
+    assert_eq!(b.abs_diff(a), Duration::from_millis(1300));
+    assert!(b < a);
+}
+
+#[test]
+fn display() {
+    assert_eq!(core::fmt::format("{Duration::from_millis(1500)}"), String::from("1.5s"));
+    assert_eq!(core::fmt::format("{Duration::from_secs(2)}"), String::from("2s"));
+    assert_eq!(core::fmt::format("{Duration::from_micros(1001)}"), String::from("1.001ms"));
+    assert_eq!(core::fmt::format("{Duration::from_micros(3)}"), String::from("3µs"));
+    assert_eq!(core::fmt::format("{Duration::from_nanos(7)}"), String::from("7ns"));
+    assert_eq!(core::fmt::format("{Duration::zero()}"), String::from("0ns"));
+    assert_eq!(core::fmt::format("{Duration::new(1, 1)}"), String::from("1.000000001s"));
+}
+
+#[test]
+fn instants_and_sleep() {
+    let start = Instant::now();
+    time::sleep(Duration::from_millis(30));
+    let later = Instant::now();
+    let slept = later.duration_since(start);
+    assert!(slept >= Duration::from_millis(30));
+    assert!(slept < Duration::from_secs(30));
+    assert!(start.elapsed() >= slept);
+    // Earlier minus later is zero, or `None` when checked.
+    assert_eq!(start.duration_since(later), Duration::zero());
+    assert_eq!(start.checked_duration_since(later), None);
+    let ahead = start.checked_add(Duration::from_secs(1)).unwrap();
+    assert_eq!(ahead.duration_since(start), Duration::from_secs(1));
+    assert_eq!(ahead.checked_sub(Duration::from_secs(1)).unwrap(), start);
+}
+
+#[test]
+fn system_time() {
+    let now = SystemTime::now();
+    let since = now.duration_since(time::unix_epoch()).unwrap();
+    // After 2020 and before 2200.
+    assert!(since.as_secs() > 1577836800);
+    assert!(since.as_secs() < 7258118400);
+    let earlier = now.checked_sub(Duration::from_secs(10)).unwrap();
+    assert_eq!(now.duration_since(earlier), Ok(Duration::from_secs(10)));
+    assert_eq!(earlier.duration_since(now), Err(Duration::from_secs(10)));
+    let before_1970 = SystemTime::from_unix(-1, 500000000);
+    assert_eq!(time::unix_epoch().duration_since(before_1970), Ok(Duration::from_millis(500)));
+    assert_eq!(before_1970.to_unix(), (-1i64, 500000000u32));
+}

@@ -1,0 +1,189 @@
+// core::collections: HashSet, Deque, BinaryHeap (with Reverse) and
+// SortedMap, alongside HashMap.
+
+use core::collections::{HashMap, HashSet, Deque, BinaryHeap, SortedMap};
+use core::cmp::Reverse;
+
+#[test]
+fn hash_set() {
+    let mut s: HashSet::<i32> = HashSet::new();
+    assert!(s.insert(3));
+    assert!(s.insert(1));
+    assert!(!s.insert(3));
+    assert_eq!(s.len(), 2);
+    assert!(s.contains(1));
+    assert!(!s.contains(2));
+    assert!(s.remove(1));
+    assert!(!s.remove(1));
+    let items = [1, 2, 3, 4];
+    let all = HashSet::from_slice(items[..]);
+    let evens = HashSet::from_slice([2, 4][..]);
+    assert!(evens.is_subset(&all));
+    assert!(!all.is_subset(&evens));
+    assert_eq!(all.intersection(&evens).len(), 2);
+    assert_eq!(all.difference(&evens).len(), 2);
+    assert!(all.difference(&evens).is_disjoint(&evens));
+    assert_eq!(evens.union(&HashSet::from_slice([5][..])).len(), 3);
+    let mut sum = 0;
+    for v in all.iter() {
+        sum += v;
+    }
+    assert_eq!(sum, 10);
+    // Views are fine as items: the set borrows what they point into.
+    let text = String::from("b a c a b");
+    let mut words: HashSet::<str> = HashSet::new();
+    for w in text.as_str().split(" ") {
+        words.insert(w);
+    }
+    assert_eq!(words.len(), 3);
+    assert!(words.contains("c"));
+    s.clear();
+    assert!(s.is_empty());
+}
+
+#[test]
+fn hash_map_clear() {
+    let mut m: HashMap::<u32, u32> = HashMap::new();
+    for i in 0..100 {
+        m.insert(i, i * i);
+    }
+    m.clear();
+    assert_eq!(m.len(), 0);
+    assert_eq!(m.get(5), None);
+    m.insert(5, 1);
+    assert_eq!(m.get(5), Some(1u32));
+}
+
+#[test]
+fn deque() {
+    let mut d: Deque::<i32> = Deque::new();
+    assert_eq!(d.pop_front(), None);
+    for i in 0..10 {
+        d.push_back(i);
+    }
+    for i in 1..6 {
+        d.push_front(-i);
+    }
+    assert_eq!(d.len(), 15);
+    assert_eq!(d.front(), Some(-5));
+    assert_eq!(d.back(), Some(9));
+    assert_eq!(d.get(5), Some(0));
+    assert_eq!(d.pop_front(), Some(-5));
+    assert_eq!(d.pop_back(), Some(9));
+    d.set(0, 100);
+    assert!(d.update(1, |v| v * 10));
+    assert!(!d.update(99, |v| v));
+    assert_eq!(core::fmt::format("{d:?}"), String::from("[100, -30, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8]"));
+    assert!(d.contains(-2));
+    // Wrapping around: pop from the front, push at the back, many times.
+    let mut q: Deque::<u32> = Deque::new();
+    let mut next: u32 = 0;
+    let mut expect: u32 = 0;
+    for round in 0..1000 {
+        for _ in 0..(round % 7) {
+            q.push_back(next);
+            next += 1;
+        }
+        for _ in 0..(round % 5) {
+            match q.pop_front() {
+                Some(v) => {
+                    assert_eq!(v, expect);
+                    expect += 1;
+                }
+                None => {}
+            }
+        }
+    }
+    let mut total = 0;
+    for v in q.iter() {
+        assert_eq!(v, expect + total);
+        total += 1;
+    }
+    assert_eq!(total as usize, q.len());
+}
+
+#[test]
+fn binary_heap() {
+    let mut h: BinaryHeap::<i32> = BinaryHeap::new();
+    for v in [5, 1, 8, 3, 9, 2] {
+        h.push(v);
+    }
+    assert_eq!(h.peek(), Some(9));
+    let mut out = String::new();
+    while let Some(v) = h.pop() {
+        out.write("{v} ");
+    }
+    assert_eq!(out, String::from("9 8 5 3 2 1 "));
+    // Smallest first, through `Reverse`.
+    let mut min: BinaryHeap::<Reverse::<u32>> = BinaryHeap::new();
+    for v in [7u32, 3, 9, 1] {
+        min.push(Reverse(v));
+    }
+    let Some(Reverse(first)) = min.pop() else { panic("empty"); };
+    assert_eq!(first, 1u32);
+    assert_eq!(min.len(), 3);
+    let sorted = BinaryHeap::from_slice([4, 1, 3, 2][..]).into_sorted();
+    assert_eq!(sorted[..], [1, 2, 3, 4][..]);
+}
+
+#[test]
+fn sorted_map() {
+    let mut m: SortedMap::<u32, str> = SortedMap::new();
+    assert_eq!(m.insert(30, "thirty"), None);
+    assert_eq!(m.insert(10, "ten"), None);
+    assert_eq!(m.insert(20, "twenty"), None);
+    assert_eq!(m.insert(10, "TEN"), Some("ten"));
+    assert_eq!(m.len(), 3);
+    assert_eq!(m.get(10), Some("TEN"));
+    assert_eq!(m.get(15), None);
+    assert_eq!(m.get_or(15, "none"), "none");
+    assert_eq!(m.first(), Some((10u32, "TEN")));
+    assert_eq!(m.last(), Some((30u32, "thirty")));
+    // Iterating a container of views after changing it trips a borrow
+    // checker limitation (the loop variable of an `impl Iterator` is taken
+    // to borrow the container from before the changes), so iterate one
+    // with Dull values.
+    let mut letters: SortedMap::<u32, char> = SortedMap::new();
+    letters.insert(30, 'c');
+    letters.insert(10, 'a');
+    letters.insert(20, 'b');
+    let mut keys = String::new();
+    for (k, v) in letters.iter() {
+        keys.write("{k}={v} ");
+    }
+    assert_eq!(keys, String::from("10=a 20=b 30=c "));
+    let mut mid = String::new();
+    for (k, _) in letters.range(15, 30) {
+        mid.write("{k} ");
+    }
+    assert_eq!(mid, String::from("20 "));
+    let mut vals = String::new();
+    for v in letters.values() {
+        vals.push(v);
+    }
+    assert_eq!(vals, String::from("abc"));
+    assert!(m.update(20, |v| "TWENTY"));
+    assert_eq!(m.remove(20), Some("TWENTY"));
+    assert_eq!(m.remove(20), None);
+    assert_eq!(m.pop_first(), Some((10u32, "TEN")));
+    assert_eq!(m.pop_last(), Some((30u32, "thirty")));
+    assert!(m.is_empty());
+    // Many keys, inserted out of order, come out sorted.
+    let mut big: SortedMap::<u64, u64> = SortedMap::new();
+    let mut x: u64 = 12345;
+    for _ in 0..2000 {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) % 1000003;
+        big.update(x, |n| n + 1);
+        if !big.contains(x) {
+            big.insert(x, 1);
+        }
+    }
+    let mut prev: u64 = 0;
+    let mut count = 0;
+    for k in big.keys() {
+        assert!(count == 0 || k > prev);
+        prev = k;
+        count += 1;
+    }
+    assert_eq!(count, big.len());
+}

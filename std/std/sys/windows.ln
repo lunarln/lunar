@@ -1,6 +1,8 @@
-// Windows implementation (kernel32).
+// Windows implementation (kernel32, with ws2_32 for sockets and bcrypt
+// for random bytes).
 
 use core::intrinsics;
+use super::{FileStat, RawAddr, encode_addr, decode_addr, get_u32, put_u16, put_u32, put_u64, AF_INET6};
 
 extern "C" {
     fn GetStdHandle(n: u32): *mut u8;
@@ -55,16 +57,37 @@ pub fn last_error(): i32 {
 }
 
 pub fn error_kind(code: i32): crater::io::ErrorKind {
-    if code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND {
-        return crater::io::ErrorKind::NotFound;
-    }
-    if code == ERROR_ACCESS_DENIED {
-        return crater::io::ErrorKind::PermissionDenied;
-    }
-    if code == ERROR_INVALID_NAME {
-        return crater::io::ErrorKind::InvalidInput;
-    }
-    return crater::io::ErrorKind::Other;
+    use crater::io::ErrorKind;
+    return match code {
+        // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_INVALID_DRIVE
+        2 | 3 | 15 => ErrorKind::NotFound,
+        // ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD, WSAEACCES
+        5 | 1314 | 10013 => ErrorKind::PermissionDenied,
+        // ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS
+        80 | 183 => ErrorKind::AlreadyExists,
+        // ERROR_INVALID_PARAMETER, ERROR_INVALID_NAME, WSAEINVAL
+        87 | 123 | 10022 => ErrorKind::InvalidInput,
+        // ERROR_BROKEN_PIPE, ERROR_NO_DATA
+        109 | 232 => ErrorKind::BrokenPipe,
+        // ERROR_NOT_SUPPORTED, ERROR_CALL_NOT_IMPLEMENTED, WSAEAFNOSUPPORT, WSAEOPNOTSUPP
+        50 | 120 | 10047 | 10045 => ErrorKind::Unsupported,
+        // ERROR_DIR_NOT_EMPTY
+        145 => ErrorKind::DirectoryNotEmpty,
+        // ERROR_DIRECTORY (a directory name was expected)
+        267 => ErrorKind::NotADirectory,
+        // WAIT_TIMEOUT, ERROR_TIMEOUT, WSAETIMEDOUT
+        258 | 1460 | 10060 => ErrorKind::TimedOut,
+        // ERROR_OPERATION_ABORTED, WSAEINTR
+        995 | 10004 => ErrorKind::Interrupted,
+        10035 => ErrorKind::WouldBlock,
+        10048 => ErrorKind::AddrInUse,
+        10049 => ErrorKind::AddrNotAvailable,
+        10053 => ErrorKind::ConnectionAborted,
+        10054 => ErrorKind::ConnectionReset,
+        10057 => ErrorKind::NotConnected,
+        10061 => ErrorKind::ConnectionRefused,
+        _ => ErrorKind::Other,
+    };
 }
 
 /// Open `path` for reading, or create or truncate it for writing. Returns
@@ -798,4 +821,658 @@ fn from_wide(w: [u16; &], out: &mut +String) {
         out.push(core::str::char_from_u32(cp));
         i += 1;
     }
+}
+
+// ===================================================================== files by handle
+
+extern "C" {
+    fn SetFilePointerEx(h: *mut u8, distance: i64, new_pos: *mut i64, method: u32): i32;
+    fn FlushFileBuffers(h: *mut u8): i32;
+    fn SetFileInformationByHandle(h: *mut u8, class: i32, info: *mut u8, size: u32): i32;
+    fn GetFileInformationByHandle(h: *mut u8, info: *mut u8): i32;
+    fn GetFileAttributesExW(name: *u16, level: i32, info: *mut u8): i32;
+    fn MoveFileExW(from: *u16, to: *u16, flags: u32): i32;
+    fn CreateHardLinkW(link: *u16, target: *u16, security: *mut u8): i32;
+    fn CreateSymbolicLinkW(link: *u16, target: *u16, flags: u32): u8;
+    fn SetHandleInformation(h: *mut u8, mask: u32, flags: u32): i32;
+}
+
+/// `INVALID_HANDLE_VALUE` and `INVALID_SOCKET`: all bits set.
+const INVALID: usize = 18446744073709551615;
+/// `FILE_FLAG_BACKUP_SEMANTICS`, which lets `CreateFileW` open directories.
+const BACKUP_SEMANTICS: u32 = 33554432;
+
+fn raw_handle(h: i64): *mut u8 {
+    return (h as usize) as *mut u8;
+}
+
+/// The address of `b`'s first byte, for C to write to.
+fn bytes_ptr(b: [u8; &mut]): *mut u8 {
+    return b.as_mut_ptr();
+}
+
+/// The handle of standard input (`fd` 0), output (1) or error (2).
+pub fn std_handle(fd: i32): i64 {
+    return (handle(fd) as usize) as i64;
+}
+
+/// Open `path` as `OpenOptions` describe (validated by `fs`). The handle,
+/// or -1.
+pub fn open_options(path: str, read: bool, write: bool, append: bool, truncate: bool, create: bool, create_new: bool): i64 {
+    let w = wide(path);
+    let mut access: u32 = 0;
+    if read {
+        access = access | GENERIC_READ;
+    }
+    if append {
+        // FILE_GENERIC_WRITE without FILE_WRITE_DATA: every write goes to
+        // the end.
+        access = access | 1179924;
+    } else if write {
+        access = access | GENERIC_WRITE;
+    }
+    // CREATE_NEW 1, CREATE_ALWAYS 2, OPEN_EXISTING 3, OPEN_ALWAYS 4,
+    // TRUNCATE_EXISTING 5
+    let disposition: u32 = if create_new { 1 } else if create && truncate { 2 } else if create { 4 } else if truncate { 5 } else { 3 };
+    // Share read, write and delete, as other systems do.
+    let h = unsafe { CreateFileW(w[..].as_ptr(), access, 7, core::ptr::null_mut(), disposition, FILE_ATTRIBUTE_NORMAL, core::ptr::null_mut()) };
+    if (h as usize) == INVALID {
+        return -1;
+    }
+    return (h as usize) as i64;
+}
+
+/// Read into `buf`: the number of bytes read, 0 at the end (or when the
+/// other end of a pipe has closed), or -1.
+pub fn handle_read(h: i64, buf: [u8; &mut]): isize {
+    let mut got: u32 = 0;
+    let mut n = buf.len();
+    if n > 1073741824 {
+        n = 1073741824;
+    }
+    let ok = unsafe { ReadFile(raw_handle(h), buf.as_mut_ptr(), n as u32, intrinsics::addr_of_mut(&mut got), core::ptr::null_mut()) };
+    if ok == 0 {
+        // ERROR_BROKEN_PIPE: the writer is gone, which is the end.
+        if last_error() == 109 {
+            return 0;
+        }
+        return -1;
+    }
+    return got as isize;
+}
+
+/// Write some of `bytes`: how many, or -1.
+pub fn handle_write(h: i64, bytes: [u8; &]): isize {
+    let mut written: u32 = 0;
+    let mut n = bytes.len();
+    if n > 1073741824 {
+        n = 1073741824;
+    }
+    let ok = unsafe { WriteFile(raw_handle(h), bytes.as_ptr(), n as u32, intrinsics::addr_of_mut(&mut written), core::ptr::null_mut()) };
+    if ok == 0 {
+        return -1;
+    }
+    return written as isize;
+}
+
+/// Move the file position (`whence`: 0 from the start, 1 from the current
+/// position, 2 from the end); the new position, or -1.
+pub fn seek(h: i64, offset: i64, whence: i32): i64 {
+    let mut pos: i64 = 0;
+    if unsafe { SetFilePointerEx(raw_handle(h), offset, intrinsics::addr_of_mut(&mut pos), whence as u32) } == 0 {
+        return -1;
+    }
+    return pos;
+}
+
+/// Write the file's data and metadata to the device.
+pub fn sync(h: i64): bool {
+    return unsafe { FlushFileBuffers(raw_handle(h)) } != 0;
+}
+
+/// Truncate or extend the file to `len` bytes.
+pub fn set_len(h: i64, len: u64): bool {
+    let mut end: u64 = len;
+    // FileEndOfFileInfo = 6
+    let p = (intrinsics::addr_of_mut(&mut end) as usize) as *mut u8;
+    return unsafe { SetFileInformationByHandle(raw_handle(h), 6, p, 8) } != 0;
+}
+
+/// Close a handle of `kind` (`rt::HANDLE_FILE` or `rt::HANDLE_SOCKET`).
+pub fn close_handle(kind: usize, h: i64): bool {
+    if kind == crater::rt::HANDLE_SOCKET {
+        return unsafe { closesocket(h as u64) } == 0;
+    }
+    return unsafe { CloseHandle(raw_handle(h)) } != 0;
+}
+
+/// A `FILETIME` (two `u32`s) as one count of 100 ns ticks since 1601.
+fn ticks(lo: u32, hi: u32): u64 {
+    return (lo as u64) | ((hi as u64) << 32);
+}
+
+/// 100 ns ticks since 1601 as seconds and nanoseconds since 1970.
+fn filetime(t: u64): (i64, u32) {
+    return ((t / 10000000) as i64 - 11644473600, ((t % 10000000) * 100) as u32);
+}
+
+/// Fill `out` from a file's attributes, times (as ticks) and size.
+fn fill_stat(out: &mut FileStat, attrs: u32, created: u64, accessed: u64, written: u64, len: u64, link: bool) {
+    out.len = len;
+    out.kind = if link { 3 } else if (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 { 2 } else { 1 };
+    out.readonly = (attrs & FILE_ATTRIBUTE_READONLY) != 0;
+    let (ms, mns) = filetime(written);
+    out.modified_s = ms;
+    out.modified_ns = mns;
+    let (a_s, a_ns) = filetime(accessed);
+    out.accessed_s = a_s;
+    out.accessed_ns = a_ns;
+    let (cs, cns) = filetime(created);
+    out.has_created = true;
+    out.created_s = cs;
+    out.created_ns = cns;
+}
+
+/// What the open handle `h` is.
+pub fn fstat(h: i64, out: &mut FileStat): bool {
+    // BY_HANDLE_FILE_INFORMATION: attributes, three FILETIMEs (creation,
+    // access, write), the volume, then the size (high, low).
+    let mut info: [u32; 13] = [0; 13];
+    let p = (intrinsics::addr_of_mut(&mut info) as usize) as *mut u8;
+    if unsafe { GetFileInformationByHandle(raw_handle(h), p) } == 0 {
+        return false;
+    }
+    fill_stat(out, info[0], ticks(info[1], info[2]), ticks(info[3], info[4]), ticks(info[5], info[6]), ticks(info[9], info[8]), false);
+    return true;
+}
+
+/// What is at `path`, following a link there if `follow`.
+pub fn stat(path: str, follow: bool, out: &mut FileStat): bool {
+    let w = wide(path);
+    if follow {
+        // Opening the path follows links; access 0 needs no permissions.
+        let h = unsafe { CreateFileW(w[..].as_ptr(), 0, 7, core::ptr::null_mut(), OPEN_EXISTING, BACKUP_SEMANTICS, core::ptr::null_mut()) };
+        if (h as usize) != INVALID {
+            let ok = fstat((h as usize) as i64, out);
+            unsafe {
+                CloseHandle(h);
+            }
+            return ok;
+        }
+        // ERROR_SHARING_VIOLATION (such as a page file): fall back to the
+        // attributes.
+        if last_error() != 32 {
+            return false;
+        }
+    }
+    // WIN32_FILE_ATTRIBUTE_DATA: attributes, three FILETIMEs, size (high,
+    // low).
+    let mut data: [u32; 9] = [0; 9];
+    let p = (intrinsics::addr_of_mut(&mut data) as usize) as *mut u8;
+    if unsafe { GetFileAttributesExW(w[..].as_ptr(), 0, p) } == 0 {
+        return false;
+    }
+    let link = !follow && (data[0] & FILE_ATTRIBUTE_REPARSE_POINT) != 0 && is_symlink_tag(w[..]);
+    fill_stat(out, data[0], ticks(data[1], data[2]), ticks(data[3], data[4]), ticks(data[5], data[6]), ticks(data[8], data[7]), link);
+    return true;
+}
+
+/// Whether the reparse point `w` is a symbolic link or a junction (not
+/// one of the other kinds, such as cloud placeholders).
+fn is_symlink_tag(w: [u16; &]): bool {
+    // WIN32_FIND_DATAW: the reparse tag is `dwReserved0`, at byte 36.
+    let mut data: [u32; 160] = [0; 160];
+    let p = (intrinsics::addr_of_mut(&mut data) as usize) as *mut u8;
+    let h = unsafe { FindFirstFileW(w.as_ptr(), p) };
+    if (h as usize) == INVALID {
+        return true;
+    }
+    unsafe {
+        FindClose(h);
+    }
+    // IO_REPARSE_TAG_SYMLINK, IO_REPARSE_TAG_MOUNT_POINT
+    return data[9] == 2684354572 || data[9] == 2684354563;
+}
+
+/// Rename `from` to `to`, replacing a file at `to`.
+pub fn rename(from: str, to: str): bool {
+    let a = wide(from);
+    let b = wide(to);
+    // MOVEFILE_REPLACE_EXISTING
+    return unsafe { MoveFileExW(a[..].as_ptr(), b[..].as_ptr(), 1) } != 0;
+}
+
+/// Make `dst` another name for the file `src`.
+pub fn hard_link(src: str, dst: str): bool {
+    let a = wide(src);
+    let b = wide(dst);
+    return unsafe { CreateHardLinkW(b[..].as_ptr(), a[..].as_ptr(), core::ptr::null_mut()) } != 0;
+}
+
+/// Make `dst` a symbolic link to `src` (a directory if `dir`). Without
+/// Developer Mode this needs administrator rights.
+pub fn symlink(src: str, dst: str, dir: bool): bool {
+    // Windows follows only `\` in link targets.
+    let mut target = String::new();
+    for c in src.chars() {
+        target.push(if c == '/' { '\\' } else { c });
+    }
+    let a = wide(target.as_str());
+    let b = wide(dst);
+    // SYMBOLIC_LINK_FLAG_DIRECTORY 1, _ALLOW_UNPRIVILEGED_CREATE 2
+    let flags: u32 = if dir { 3 } else { 2 };
+    return unsafe { CreateSymbolicLinkW(b[..].as_ptr(), a[..].as_ptr(), flags) } != 0;
+}
+
+/// Set or clear the read-only attribute of `path`.
+pub fn set_readonly(path: str, readonly: bool): bool {
+    let w = wide(path);
+    let a = unsafe { GetFileAttributesW(w[..].as_ptr()) };
+    if a == INVALID_FILE_ATTRIBUTES {
+        return false;
+    }
+    let mut b = if readonly { a | FILE_ATTRIBUTE_READONLY } else { a & (4294967295 - FILE_ATTRIBUTE_READONLY) };
+    if b == 0 {
+        b = FILE_ATTRIBUTE_NORMAL;
+    }
+    return unsafe { SetFileAttributesW(w[..].as_ptr(), b) } != 0;
+}
+
+// ===================================================================== time
+
+extern "C" {
+    fn QueryPerformanceCounter(count: *mut i64): i32;
+    fn QueryPerformanceFrequency(freq: *mut i64): i32;
+    fn GetSystemTimePreciseAsFileTime(t: *mut u64);
+    fn Sleep(ms: u32);
+}
+
+/// Performance counter ticks per second (fixed at boot), once read.
+static mut COUNTER_HZ: u64 = 0;
+
+/// Nanoseconds on a clock that never goes back, from some fixed point.
+pub fn monotonic_ns(): u64 {
+    let mut c: i64 = 0;
+    unsafe {
+        QueryPerformanceCounter(intrinsics::addr_of_mut(&mut c));
+        if COUNTER_HZ == 0 {
+            let mut f: i64 = 0;
+            QueryPerformanceFrequency(intrinsics::addr_of_mut(&mut f));
+            COUNTER_HZ = f as u64;
+        }
+    }
+    let hz = unsafe { COUNTER_HZ };
+    let t = c as u64;
+    // `t * 1e9 / hz` without overflowing.
+    return (t / hz) * 1000000000 + (t % hz) * 1000000000 / hz;
+}
+
+/// The time of day: seconds and nanoseconds since 1970-01-01 UTC.
+pub fn system_time(): (i64, u32) {
+    let mut t: u64 = 0;
+    unsafe {
+        GetSystemTimePreciseAsFileTime(intrinsics::addr_of_mut(&mut t));
+    }
+    return filetime(t);
+}
+
+/// Sleep at least `ns` nanoseconds (Windows sleeps in milliseconds).
+pub fn sleep_ns(ns: u64) {
+    let mut ms = ns / 1000000;
+    if ns % 1000000 != 0 {
+        ms += 1;
+    }
+    while ms > 0 {
+        let chunk: u64 = if ms > 4294967294 { 4294967294 } else { ms };
+        unsafe {
+            Sleep(chunk as u32);
+        }
+        ms -= chunk;
+    }
+}
+
+// ===================================================================== randomness and the environment
+
+#[link(name = "bcrypt")]
+extern "C" {
+    fn BCryptGenRandom(alg: *mut u8, buf: *mut u8, len: u32, flags: u32): i32;
+}
+
+/// Fill `buf` with random bytes from the operating system.
+pub fn random_fill(buf: [u8; &mut]): bool {
+    let mut off: usize = 0;
+    while off < buf.len() {
+        let mut n = buf.len() - off;
+        if n > 1073741824 {
+            n = 1073741824;
+        }
+        // BCRYPT_USE_SYSTEM_PREFERRED_RNG = 2
+        let r = unsafe { BCryptGenRandom(core::ptr::null_mut(), bytes_ptr(buf[off..]), n as u32, 2) };
+        if r != 0 {
+            return false;
+        }
+        off += n;
+    }
+    return true;
+}
+
+extern "C" {
+    fn GetEnvironmentStringsW(): *mut u16;
+    fn FreeEnvironmentStringsW(block: *mut u16): i32;
+}
+
+/// Every environment variable as `NAME=value` and a NUL, onto `out`.
+pub fn env_block(out: &mut +String) {
+    let block = unsafe { GetEnvironmentStringsW() };
+    if core::ptr::is_null(block as *u16) {
+        return;
+    }
+    let p = block as *u16;
+    let mut i: isize = 0;
+    loop {
+        let start = i;
+        while unsafe { intrinsics::ptr_read(intrinsics::ptr_offset(p, i)) } != 0 {
+            i += 1;
+        }
+        // An empty entry ends the block.
+        if i == start {
+            break;
+        }
+        let entry = unsafe { intrinsics::slice_from_raw(intrinsics::ptr_offset(p, start), (i - start) as usize) };
+        // `=C:=C:\dir` entries are the current directories of drives, not
+        // variables.
+        if entry[0] != 61 {
+            from_wide(entry, out);
+            out.push('\0');
+        }
+        i += 1;
+    }
+    unsafe {
+        FreeEnvironmentStringsW(block);
+    }
+}
+
+// ===================================================================== sockets
+
+#[link(name = "ws2_32")]
+extern "C" {
+    fn WSAStartup(version: u16, data: *mut u8): i32;
+    fn WSAGetLastError(): i32;
+    fn WSASocketW(af: i32, kind: i32, protocol: i32, info: *mut u8, group: u32, flags: u32): u64;
+    fn closesocket(s: u64): i32;
+    #[link_name = "bind"]
+    fn ws_bind(s: u64, addr: *u8, len: i32): i32;
+    #[link_name = "listen"]
+    fn ws_listen(s: u64, backlog: i32): i32;
+    #[link_name = "accept"]
+    fn ws_accept(s: u64, addr: *mut u8, len: *mut i32): u64;
+    #[link_name = "connect"]
+    fn ws_connect(s: u64, addr: *u8, len: i32): i32;
+    #[link_name = "recv"]
+    fn ws_recv(s: u64, buf: *mut u8, len: i32, flags: i32): i32;
+    #[link_name = "send"]
+    fn ws_send(s: u64, buf: *u8, len: i32, flags: i32): i32;
+    #[link_name = "recvfrom"]
+    fn ws_recvfrom(s: u64, buf: *mut u8, len: i32, flags: i32, from: *mut u8, from_len: *mut i32): i32;
+    #[link_name = "sendto"]
+    fn ws_sendto(s: u64, buf: *u8, len: i32, flags: i32, to: *u8, to_len: i32): i32;
+    #[link_name = "shutdown"]
+    fn ws_shutdown(s: u64, how: i32): i32;
+    fn setsockopt(s: u64, level: i32, name: i32, value: *u8, len: i32): i32;
+    fn getsockopt(s: u64, level: i32, name: i32, value: *mut u8, len: *mut i32): i32;
+    fn getsockname(s: u64, addr: *mut u8, len: *mut i32): i32;
+    fn getpeername(s: u64, addr: *mut u8, len: *mut i32): i32;
+    fn ioctlsocket(s: u64, cmd: i32, arg: *mut u32): i32;
+    fn WSAPoll(fds: *mut u8, n: u32, timeout: i32): i32;
+    fn GetAddrInfoW(node: *u16, service: *u16, hints: *u8, result: *mut *mut u8): i32;
+    fn FreeAddrInfoW(info: *mut u8);
+}
+
+/// Whether `WSAStartup` has run. Winsock is started the first time a
+/// socket is made or a name looked up, and stays up until exit.
+static mut WINSOCK_READY: bool = false;
+
+fn net_init() {
+    if unsafe { WINSOCK_READY } {
+        return;
+    }
+    // WSADATA is 408 bytes on 64-bit Windows.
+    let mut data: [u64; 51] = [0; 51];
+    let p = (intrinsics::addr_of_mut(&mut data) as usize) as *mut u8;
+    unsafe {
+        // Version 2.2
+        WSAStartup(514, p);
+        WINSOCK_READY = true;
+    }
+}
+
+/// The error code of the last failed socket call.
+pub fn net_error(): i32 {
+    return unsafe { WSAGetLastError() };
+}
+
+const SOL_SOCKET: i32 = 65535;
+
+/// A new TCP (`stream`) or UDP socket for IPv4 or IPv6, not inherited by
+/// child processes; -1 on failure.
+pub fn socket(v6: bool, stream: bool): i64 {
+    net_init();
+    let af = if v6 { AF_INET6 } else { 2 };
+    let (kind, protocol) = if stream { (1, 6) } else { (2, 17) };
+    // WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT
+    let s = unsafe { WSASocketW(af, kind, protocol, core::ptr::null_mut(), 0, 129) };
+    if (s as usize) == INVALID {
+        return -1;
+    }
+    return s as i64;
+}
+
+pub fn sock_bind(s: i64, a: RawAddr): bool {
+    let mut buf: [u8; 32] = [0; 32];
+    let n = encode_addr(a, buf[..]);
+    return unsafe { ws_bind(s as u64, buf[..].as_ptr(), n) } == 0;
+}
+
+pub fn sock_listen(s: i64, backlog: i32): bool {
+    return unsafe { ws_listen(s as u64, backlog) } == 0;
+}
+
+/// Accept a connection: the new socket (or -1), and its peer in `peer`.
+pub fn sock_accept(s: i64, peer: &mut RawAddr): i64 {
+    let mut buf: [u8; 128] = [0; 128];
+    let mut len: i32 = 128;
+    let r = unsafe { ws_accept(s as u64, bytes_ptr(buf[..]), intrinsics::addr_of_mut(&mut len)) };
+    if (r as usize) == INVALID {
+        return -1;
+    }
+    unsafe {
+        // Not inherited by child processes (HANDLE_FLAG_INHERIT = 1).
+        SetHandleInformation((r as usize) as *mut u8, 1, 0);
+    }
+    peer = decode_addr(buf[..len as usize]);
+    return r as i64;
+}
+
+pub fn sock_connect(s: i64, a: RawAddr): bool {
+    let mut buf: [u8; 32] = [0; 32];
+    let n = encode_addr(a, buf[..]);
+    return unsafe { ws_connect(s as u64, buf[..].as_ptr(), n) } == 0;
+}
+
+fn clamp_len(n: usize): i32 {
+    if n > 1073741824 {
+        return 1073741824;
+    }
+    return n as i32;
+}
+
+/// Receive into `buf` (leaving the data queued if `peek`): bytes, 0 when
+/// the peer has shut down, or -1.
+pub fn sock_recv(s: i64, buf: [u8; &mut], peek: bool): isize {
+    // MSG_PEEK = 2
+    let r = unsafe { ws_recv(s as u64, buf.as_mut_ptr(), clamp_len(buf.len()), if peek { 2 } else { 0 }) };
+    if r < 0 && net_error() == 10058 {
+        // WSAESHUTDOWN: this side was shut down for reading.
+        return 0;
+    }
+    return r as isize;
+}
+
+pub fn sock_send(s: i64, bytes: [u8; &]): isize {
+    return unsafe { ws_send(s as u64, bytes.as_ptr(), clamp_len(bytes.len()), 0) } as isize;
+}
+
+pub fn sock_recv_from(s: i64, buf: [u8; &mut], peek: bool, from: &mut RawAddr): isize {
+    let mut abuf: [u8; 128] = [0; 128];
+    let mut len: i32 = 128;
+    let r = unsafe { ws_recvfrom(s as u64, buf.as_mut_ptr(), clamp_len(buf.len()), if peek { 2 } else { 0 }, bytes_ptr(abuf[..]), intrinsics::addr_of_mut(&mut len)) };
+    if r >= 0 {
+        from = decode_addr(abuf[..len as usize]);
+    }
+    return r as isize;
+}
+
+pub fn sock_send_to(s: i64, bytes: [u8; &], to: RawAddr): isize {
+    let mut abuf: [u8; 32] = [0; 32];
+    let n = encode_addr(to, abuf[..]);
+    return unsafe { ws_sendto(s as u64, bytes.as_ptr(), clamp_len(bytes.len()), 0, abuf[..].as_ptr(), n) } as isize;
+}
+
+/// Shut down reading (0), writing (1) or both (2).
+pub fn sock_shutdown(s: i64, how: i32): bool {
+    return unsafe { ws_shutdown(s as u64, how) } == 0;
+}
+
+/// The socket's own address, or its peer's.
+pub fn sock_name(s: i64, peer: bool, out: &mut RawAddr): bool {
+    let mut buf: [u8; 128] = [0; 128];
+    let mut len: i32 = 128;
+    let p = bytes_ptr(buf[..]);
+    let r = if peer {
+        unsafe { getpeername(s as u64, p, intrinsics::addr_of_mut(&mut len)) }
+    } else {
+        unsafe { getsockname(s as u64, p, intrinsics::addr_of_mut(&mut len)) }
+    };
+    if r != 0 {
+        return false;
+    }
+    out = decode_addr(buf[..len as usize]);
+    return true;
+}
+
+pub fn sock_set_nonblocking(s: i64, on: bool): bool {
+    let mut arg: u32 = if on { 1 } else { 0 };
+    // FIONBIO
+    return unsafe { ioctlsocket(s as u64, -2147195266, intrinsics::addr_of_mut(&mut arg)) } == 0;
+}
+
+/// Set the receive (or, if `write`, send) timeout in milliseconds; 0 waits
+/// forever.
+pub fn sock_set_timeout(s: i64, write: bool, ms: u64): bool {
+    let v: u32 = if ms > 4294967294 { 4294967294 } else { ms as u32 };
+    let mut b: [u8; 4] = [0; 4];
+    put_u32(b[..], 0, v);
+    // SO_SNDTIMEO 0x1005, SO_RCVTIMEO 0x1006
+    let name = if write { 4101 } else { 4102 };
+    return unsafe { setsockopt(s as u64, SOL_SOCKET, name, b[..].as_ptr(), 4) } == 0;
+}
+
+/// The receive (or send) timeout in milliseconds (0: none), or -1.
+pub fn sock_timeout(s: i64, write: bool): i64 {
+    let mut b: [u8; 8] = [0; 8];
+    let mut len: i32 = 8;
+    let name = if write { 4101 } else { 4102 };
+    if unsafe { getsockopt(s as u64, SOL_SOCKET, name, bytes_ptr(b[..]), intrinsics::addr_of_mut(&mut len)) } != 0 {
+        return -1;
+    }
+    return get_u32(b[..], 0) as i64;
+}
+
+/// The level and name of a `FLAG_*` option.
+fn flag_option(flag: i32): (i32, i32) {
+    return match flag {
+        // IPPROTO_TCP, TCP_NODELAY
+        1 => (6, 1),
+        // SO_BROADCAST
+        2 => (SOL_SOCKET, 32),
+        // SO_REUSEADDR
+        3 => (SOL_SOCKET, 4),
+        // IPPROTO_IPV6, IPV6_V6ONLY
+        _ => (41, 27),
+    };
+}
+
+pub fn sock_set_flag(s: i64, flag: i32, on: bool): bool {
+    let (level, name) = flag_option(flag);
+    let mut b: [u8; 4] = [0; 4];
+    b[0] = if on { 1 } else { 0 };
+    return unsafe { setsockopt(s as u64, level, name, b[..].as_ptr(), 4) } == 0;
+}
+
+/// A `FLAG_*` option: 1 on, 0 off, -1 on failure.
+pub fn sock_flag(s: i64, flag: i32): i32 {
+    let (level, name) = flag_option(flag);
+    let mut b: [u8; 4] = [0; 4];
+    let mut len: i32 = 4;
+    if unsafe { getsockopt(s as u64, level, name, bytes_ptr(b[..]), intrinsics::addr_of_mut(&mut len)) } != 0 {
+        return -1;
+    }
+    return if b[0] != 0 { 1 } else { 0 };
+}
+
+/// The pending error of the socket (`SO_ERROR`), 0 if none, -1 on failure.
+pub fn sock_error(s: i64): i32 {
+    let mut b: [u8; 4] = [0; 4];
+    let mut len: i32 = 4;
+    // SO_ERROR = 0x1007
+    if unsafe { getsockopt(s as u64, SOL_SOCKET, 4103, bytes_ptr(b[..]), intrinsics::addr_of_mut(&mut len)) } != 0 {
+        return -1;
+    }
+    return get_u32(b[..], 0) as i32;
+}
+
+/// Wait up to `ms` milliseconds (-1: forever) for the socket to be
+/// readable (or writable, if `write`): 1 ready, 0 timed out, -1 failed.
+pub fn sock_poll(s: i64, write: bool, ms: i32): i32 {
+    // WSAPOLLFD: the socket, then `events` and `revents` (i16 each).
+    let mut fd: [u8; 16] = [0; 16];
+    put_u64(fd[..], 0, s as u64);
+    // POLLWRNORM 0x10; POLLRDNORM | POLLRDBAND 0x300
+    put_u16(fd[..], 8, if write { 16 } else { 768 });
+    let r = unsafe { WSAPoll(bytes_ptr(fd[..]), 1, ms) };
+    if r < 0 {
+        return -1;
+    }
+    return if r > 0 { 1 } else { 0 };
+}
+
+/// Look up the addresses of `host` onto `out`: 0, or the `getaddrinfo`
+/// error.
+pub fn lookup(host: str, out: &mut +[RawAddr; ..+]): i32 {
+    net_init();
+    let w = wide(host);
+    // ADDRINFOW hints: only stream sockets, so each address comes once.
+    let mut hints: [u8; 48] = [0; 48];
+    put_u32(hints[..], 8, 1);
+    let mut res: *mut u8 = core::ptr::null_mut();
+    let r = unsafe { GetAddrInfoW(w[..].as_ptr(), core::ptr::null(), hints[..].as_ptr(), intrinsics::addr_of_mut(&mut res)) };
+    if r != 0 {
+        return r;
+    }
+    // ADDRINFOW: ai_addrlen at byte 16, ai_addr at 32, ai_next at 40.
+    let mut p = res as *u8;
+    while !core::ptr::is_null(p) {
+        unsafe {
+            let len = intrinsics::ptr_read(intrinsics::ptr_offset(p, 16) as *usize);
+            let addr = intrinsics::ptr_read(intrinsics::ptr_offset(p, 32) as **u8);
+            if !core::ptr::is_null(addr) {
+                out.push(decode_addr(intrinsics::slice_from_raw(addr, len)));
+            }
+            p = intrinsics::ptr_read(intrinsics::ptr_offset(p, 40) as **u8);
+        }
+    }
+    unsafe {
+        FreeAddrInfoW(res);
+    }
+    return 0;
 }

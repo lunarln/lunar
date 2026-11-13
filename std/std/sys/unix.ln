@@ -1,6 +1,7 @@
 // Unix implementation (Linux and macOS) on top of libc.
 
 use core::intrinsics;
+use super::{FileStat, RawAddr, encode_addr, decode_addr, get_u32, get_u64, put_u16, put_u32, put_u64, AF_INET6};
 
 extern "C" {
     fn fork(): i32;
@@ -121,7 +122,53 @@ pub fn error_kind(code: i32): crater::io::ErrorKind {
     if code == EPERM || code == EACCES {
         return crater::io::ErrorKind::PermissionDenied;
     }
-    return crater::io::ErrorKind::Other;
+    return match code {
+        4 => crater::io::ErrorKind::Interrupted,
+        17 => crater::io::ErrorKind::AlreadyExists,
+        20 => crater::io::ErrorKind::NotADirectory,
+        21 => crater::io::ErrorKind::IsADirectory,
+        // EINVAL, ENAMETOOLONG on Linux (63 on macOS)
+        22 => crater::io::ErrorKind::InvalidInput,
+        32 => crater::io::ErrorKind::BrokenPipe,
+        _ => net_error_kind(code),
+    };
+}
+
+/// The errors whose numbers differ between Linux and macOS.
+#[cfg(target_os = "macos")]
+fn net_error_kind(code: i32): crater::io::ErrorKind {
+    return match code {
+        35 => crater::io::ErrorKind::WouldBlock,
+        45 | 78 | 102 => crater::io::ErrorKind::Unsupported,
+        48 => crater::io::ErrorKind::AddrInUse,
+        49 => crater::io::ErrorKind::AddrNotAvailable,
+        53 => crater::io::ErrorKind::ConnectionAborted,
+        54 => crater::io::ErrorKind::ConnectionReset,
+        57 => crater::io::ErrorKind::NotConnected,
+        60 => crater::io::ErrorKind::TimedOut,
+        61 => crater::io::ErrorKind::ConnectionRefused,
+        63 => crater::io::ErrorKind::InvalidInput,
+        66 => crater::io::ErrorKind::DirectoryNotEmpty,
+        _ => crater::io::ErrorKind::Other,
+    };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn net_error_kind(code: i32): crater::io::ErrorKind {
+    return match code {
+        11 => crater::io::ErrorKind::WouldBlock,
+        36 => crater::io::ErrorKind::InvalidInput,
+        38 | 95 => crater::io::ErrorKind::Unsupported,
+        39 => crater::io::ErrorKind::DirectoryNotEmpty,
+        98 => crater::io::ErrorKind::AddrInUse,
+        99 => crater::io::ErrorKind::AddrNotAvailable,
+        103 => crater::io::ErrorKind::ConnectionAborted,
+        104 => crater::io::ErrorKind::ConnectionReset,
+        107 => crater::io::ErrorKind::NotConnected,
+        110 => crater::io::ErrorKind::TimedOut,
+        111 => crater::io::ErrorKind::ConnectionRefused,
+        _ => crater::io::ErrorKind::Other,
+    };
 }
 
 /// Open `path` for reading, or create or truncate it for writing. Returns
@@ -675,6 +722,11 @@ fn mut_ptr(b: [u8; &mut]): *mut u8 {
     return b.as_mut_ptr();
 }
 
+/// The address of `b`'s first item, for C to write to.
+fn i64_ptr(b: [i64; &mut]): *mut i64 {
+    return b.as_mut_ptr();
+}
+
 fn close_fds(fds: [i32; &]) {
     for fd in fds {
         if fd >= 0 {
@@ -683,4 +735,686 @@ fn close_fds(fds: [i32; &]) {
             }
         }
     }
+}
+
+// ===================================================================== files by handle
+
+extern "C" {
+    fn lseek(fd: i32, offset: i64, whence: i32): i64;
+    fn fsync(fd: i32): i32;
+    fn ftruncate(fd: i32, len: i64): i32;
+    #[link_name = "rename"]
+    fn c_rename(from: *u8, to: *u8): i32;
+    fn link(src: *u8, dst: *u8): i32;
+    #[link_name = "symlink"]
+    fn c_symlink(target: *u8, path: *u8): i32;
+    fn chmod(path: *u8, mode: u32): i32;
+}
+
+// `struct stat` with 64-bit inodes, which on Intel macOS has its own names.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+extern "C" {
+    #[link_name = "stat$INODE64"]
+    fn c_stat(path: *u8, buf: *mut u8): i32;
+    #[link_name = "lstat$INODE64"]
+    fn c_lstat(path: *u8, buf: *mut u8): i32;
+    #[link_name = "fstat$INODE64"]
+    fn c_fstat(fd: i32, buf: *mut u8): i32;
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+extern "C" {
+    #[link_name = "stat"]
+    fn c_stat(path: *u8, buf: *mut u8): i32;
+    #[link_name = "lstat"]
+    fn c_lstat(path: *u8, buf: *mut u8): i32;
+    #[link_name = "fstat"]
+    fn c_fstat(fd: i32, buf: *mut u8): i32;
+}
+
+const O_RDWR: i32 = 2;
+
+#[cfg(target_os = "macos")]
+const O_APPEND: i32 = 8;
+#[cfg(target_os = "macos")]
+const O_EXCL: i32 = 2048;
+#[cfg(not(target_os = "macos"))]
+const O_APPEND: i32 = 1024;
+#[cfg(not(target_os = "macos"))]
+const O_EXCL: i32 = 128;
+
+// Where `struct stat` keeps the mode (read as 32 bits and masked to 16),
+// the size, and the access, modification and creation times (each a
+// `timespec`: seconds, then nanoseconds). macOS (64-bit inodes, 144 bytes):
+#[cfg(target_os = "macos")]
+const ST_MODE: usize = 4;
+#[cfg(target_os = "macos")]
+const ST_SIZE: usize = 96;
+#[cfg(target_os = "macos")]
+const ST_ATIME: usize = 32;
+#[cfg(target_os = "macos")]
+const ST_MTIME: usize = 48;
+#[cfg(target_os = "macos")]
+const ST_BIRTHTIME: usize = 80;
+// Linux on arm64 (the generic layout, 128 bytes):
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const ST_MODE: usize = 16;
+// Linux on x86_64 (144 bytes):
+#[cfg(all(not(target_os = "macos"), not(all(target_os = "linux", target_arch = "aarch64"))))]
+const ST_MODE: usize = 24;
+#[cfg(not(target_os = "macos"))]
+const ST_SIZE: usize = 48;
+#[cfg(not(target_os = "macos"))]
+const ST_ATIME: usize = 72;
+#[cfg(not(target_os = "macos"))]
+const ST_MTIME: usize = 88;
+/// Linux's `stat` has no creation time.
+#[cfg(not(target_os = "macos"))]
+const ST_BIRTHTIME: usize = 0;
+
+/// The handle of standard input (`fd` 0), output (1) or error (2): the
+/// descriptor itself.
+pub fn std_handle(fd: i32): i64 {
+    return fd as i64;
+}
+
+/// Open `path` as `OpenOptions` describe (validated by `fs`). The file
+/// descriptor, or -1.
+pub fn open_options(path: str, read: bool, write: bool, append: bool, truncate: bool, create: bool, create_new: bool): i64 {
+    let c = c_path(path);
+    let mut flags = O_CLOEXEC;
+    if write || append {
+        flags = flags | (if read { O_RDWR } else { O_WRONLY });
+    }
+    if append {
+        flags = flags | O_APPEND;
+    }
+    if create_new {
+        flags = flags | O_CREAT | O_EXCL;
+    } else {
+        if create {
+            flags = flags | O_CREAT;
+        }
+        if truncate {
+            flags = flags | O_TRUNC;
+        }
+    }
+    // 0o666, less the umask.
+    let mode: u32 = 438;
+    loop {
+        let fd = unsafe { open(c.as_bytes().as_ptr(), flags, mode) };
+        if fd >= 0 || last_error() != EINTR {
+            return fd as i64;
+        }
+    }
+}
+
+/// Read into `buf`: the number of bytes read, 0 at the end, or -1.
+pub fn handle_read(h: i64, buf: [u8; &mut]): isize {
+    return read_file(h as isize, buf);
+}
+
+/// Write some of `bytes`: how many, or -1.
+pub fn handle_write(h: i64, bytes: [u8; &]): isize {
+    loop {
+        let n = unsafe { c_write(h as i32, bytes.as_ptr(), bytes.len()) };
+        if n >= 0 || last_error() != EINTR {
+            return n;
+        }
+    }
+}
+
+/// Move the file position (`whence`: 0 from the start, 1 from the current
+/// position, 2 from the end); the new position, or -1.
+pub fn seek(h: i64, offset: i64, whence: i32): i64 {
+    return unsafe { lseek(h as i32, offset, whence) };
+}
+
+/// Write the file's data and metadata to the device.
+pub fn sync(h: i64): bool {
+    return unsafe { fsync(h as i32) } == 0;
+}
+
+/// Truncate or extend the file to `len` bytes.
+pub fn set_len(h: i64, len: u64): bool {
+    return unsafe { ftruncate(h as i32, len as i64) } == 0;
+}
+
+/// Close a file or socket descriptor.
+pub fn close_handle(kind: usize, h: i64): bool {
+    let _ = kind;
+    return unsafe { close(h as i32) } == 0;
+}
+
+/// Fill `out` from a `struct stat`.
+fn fill_stat(b: [u8; &], out: &mut FileStat) {
+    let mode = get_u32(b, ST_MODE) & 65535;
+    out.len = get_u64(b, ST_SIZE);
+    // S_IFMT 0o170000; S_IFDIR 0o040000; S_IFLNK 0o120000
+    let format = mode & 61440;
+    out.kind = if format == 16384 { 2 } else if format == 40960 { 3 } else { 1 };
+    // No write permission for anyone (0o222).
+    out.readonly = (mode & 146) == 0;
+    out.modified_s = get_u64(b, ST_MTIME) as i64;
+    out.modified_ns = get_u64(b, ST_MTIME + 8) as u32;
+    out.accessed_s = get_u64(b, ST_ATIME) as i64;
+    out.accessed_ns = get_u64(b, ST_ATIME + 8) as u32;
+    out.has_created = ST_BIRTHTIME != 0;
+    if ST_BIRTHTIME != 0 {
+        out.created_s = get_u64(b, ST_BIRTHTIME) as i64;
+        out.created_ns = get_u64(b, ST_BIRTHTIME + 8) as u32;
+    }
+}
+
+/// What the open descriptor `h` is.
+pub fn fstat(h: i64, out: &mut FileStat): bool {
+    let mut b: [u8; 256] = [0; 256];
+    if unsafe { c_fstat(h as i32, mut_ptr(b[..])) } != 0 {
+        return false;
+    }
+    fill_stat(b[..], out);
+    return true;
+}
+
+/// What is at `path`, following a link there if `follow`.
+pub fn stat(path: str, follow: bool, out: &mut FileStat): bool {
+    let c = c_path(path);
+    let mut b: [u8; 256] = [0; 256];
+    let p = c.as_bytes().as_ptr();
+    let r = if follow { unsafe { c_stat(p, mut_ptr(b[..])) } } else { unsafe { c_lstat(p, mut_ptr(b[..])) } };
+    if r != 0 {
+        return false;
+    }
+    fill_stat(b[..], out);
+    return true;
+}
+
+/// Rename `from` to `to`, replacing a file at `to`.
+pub fn rename(from: str, to: str): bool {
+    let a = c_path(from);
+    let b = c_path(to);
+    return unsafe { c_rename(a.as_bytes().as_ptr(), b.as_bytes().as_ptr()) } == 0;
+}
+
+/// Make `dst` another name for the file `src`.
+pub fn hard_link(src: str, dst: str): bool {
+    let a = c_path(src);
+    let b = c_path(dst);
+    return unsafe { link(a.as_bytes().as_ptr(), b.as_bytes().as_ptr()) } == 0;
+}
+
+/// Make `dst` a symbolic link to `src`.
+pub fn symlink(src: str, dst: str, dir: bool): bool {
+    let _ = dir;
+    let a = c_path(src);
+    let b = c_path(dst);
+    return unsafe { c_symlink(a.as_bytes().as_ptr(), b.as_bytes().as_ptr()) } == 0;
+}
+
+/// Take away (or give back) everyone's write permission on `path`.
+pub fn set_readonly(path: str, readonly: bool): bool {
+    let c = c_path(path);
+    let mut b: [u8; 256] = [0; 256];
+    if unsafe { c_stat(c.as_bytes().as_ptr(), mut_ptr(b[..])) } != 0 {
+        return false;
+    }
+    // The permission bits, 0o7777.
+    let mode = get_u32(b[..], ST_MODE) & 4095;
+    let new = if readonly { mode & (4095 - 146) } else { mode | 146 };
+    return unsafe { chmod(c.as_bytes().as_ptr(), new) } == 0;
+}
+
+// ===================================================================== time
+
+extern "C" {
+    fn clock_gettime(clock: i32, ts: *mut i64): i32;
+    fn nanosleep(req: *i64, rem: *mut i64): i32;
+}
+
+/// The clock `Instant` uses: `CLOCK_UPTIME_RAW` on macOS (as Rust's), else
+/// `CLOCK_MONOTONIC`.
+#[cfg(target_os = "macos")]
+const MONOTONIC: i32 = 8;
+#[cfg(not(target_os = "macos"))]
+const MONOTONIC: i32 = 1;
+
+/// Nanoseconds on a clock that never goes back, from some fixed point.
+pub fn monotonic_ns(): u64 {
+    let mut ts: [i64; 2] = [0, 0];
+    unsafe {
+        clock_gettime(MONOTONIC, i64_ptr(ts[..]));
+    }
+    return (ts[0] as u64) * 1000000000 + (ts[1] as u64);
+}
+
+/// The time of day: seconds and nanoseconds since 1970-01-01 UTC.
+pub fn system_time(): (i64, u32) {
+    let mut ts: [i64; 2] = [0, 0];
+    unsafe {
+        // CLOCK_REALTIME
+        clock_gettime(0, i64_ptr(ts[..]));
+    }
+    return (ts[0], ts[1] as u32);
+}
+
+/// Sleep at least `ns` nanoseconds.
+pub fn sleep_ns(ns: u64) {
+    let mut req: [i64; 2] = [(ns / 1000000000) as i64, (ns % 1000000000) as i64];
+    loop {
+        let mut rem: [i64; 2] = [0, 0];
+        let r = unsafe { nanosleep(req[..].as_ptr(), i64_ptr(rem[..])) };
+        if r == 0 || last_error() != EINTR {
+            return;
+        }
+        req = rem;
+    }
+}
+
+// ===================================================================== randomness and the environment
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn getentropy(buf: *mut u8, len: usize): i32;
+}
+
+/// Fill `buf` with random bytes from the operating system.
+#[cfg(target_os = "macos")]
+pub fn random_fill(buf: [u8; &mut]): bool {
+    let mut off: usize = 0;
+    while off < buf.len() {
+        // At most 256 bytes at a time.
+        let n = if buf.len() - off > 256 { 256 } else { buf.len() - off };
+        if unsafe { getentropy(mut_ptr(buf[off..]), n) } != 0 {
+            return false;
+        }
+        off += n;
+    }
+    return true;
+}
+
+#[cfg(not(target_os = "macos"))]
+extern "C" {
+    fn getrandom(buf: *mut u8, len: usize, flags: u32): isize;
+}
+
+/// Fill `buf` with random bytes from the operating system.
+#[cfg(not(target_os = "macos"))]
+pub fn random_fill(buf: [u8; &mut]): bool {
+    let mut off: usize = 0;
+    while off < buf.len() {
+        let n = unsafe { getrandom(mut_ptr(buf[off..]), buf.len() - off, 0) };
+        if n < 0 {
+            if last_error() == EINTR {
+                continue;
+            }
+            return false;
+        }
+        off += n as usize;
+    }
+    return true;
+}
+
+/// Every environment variable the program started with, as `NAME=value`
+/// and a NUL, onto `out` (variables that are not UTF-8 are left out). The
+/// environment follows the arguments: `envp` is `argv + argc + 1`.
+pub fn env_block(out: &mut +String) {
+    unsafe {
+        let argv = crater::rt::ARGV as **u8;
+        if argv as usize == 0 {
+            return;
+        }
+        let mut i = (crater::rt::ARGC as isize) + 1;
+        loop {
+            let p = intrinsics::ptr_read(intrinsics::ptr_offset(argv, i));
+            if core::ptr::is_null(p) {
+                break;
+            }
+            let bytes = intrinsics::slice_from_raw(p, core::ffi::c_len(p));
+            if core::str::utf8_error_at(bytes).is_none() {
+                out.push_str(intrinsics::str_from_bytes(bytes));
+                out.push('\0');
+            }
+            i += 1;
+        }
+    }
+}
+
+// ===================================================================== sockets
+
+extern "C" {
+    #[link_name = "socket"]
+    fn c_socket(domain: i32, kind: i32, protocol: i32): i32;
+    #[link_name = "bind"]
+    fn c_bind(fd: i32, addr: *u8, len: u32): i32;
+    #[link_name = "listen"]
+    fn c_listen(fd: i32, backlog: i32): i32;
+    #[link_name = "accept"]
+    fn c_accept(fd: i32, addr: *mut u8, len: *mut u32): i32;
+    #[link_name = "connect"]
+    fn c_connect(fd: i32, addr: *u8, len: u32): i32;
+    fn recv(fd: i32, buf: *mut u8, len: usize, flags: i32): isize;
+    fn send(fd: i32, buf: *u8, len: usize, flags: i32): isize;
+    fn recvfrom(fd: i32, buf: *mut u8, len: usize, flags: i32, addr: *mut u8, addr_len: *mut u32): isize;
+    fn sendto(fd: i32, buf: *u8, len: usize, flags: i32, addr: *u8, addr_len: u32): isize;
+    #[link_name = "shutdown"]
+    fn c_shutdown(fd: i32, how: i32): i32;
+    fn setsockopt(fd: i32, level: i32, name: i32, value: *u8, len: u32): i32;
+    fn getsockopt(fd: i32, level: i32, name: i32, value: *mut u8, len: *mut u32): i32;
+    fn getsockname(fd: i32, addr: *mut u8, len: *mut u32): i32;
+    fn getpeername(fd: i32, addr: *mut u8, len: *mut u32): i32;
+    fn getaddrinfo(node: *u8, service: *u8, hints: *u8, result: *mut *mut u8): i32;
+    fn freeaddrinfo(info: *mut u8);
+}
+
+#[cfg(target_os = "macos")]
+const SOL_SOCKET: i32 = 65535;
+#[cfg(target_os = "macos")]
+const SO_REUSEADDR: i32 = 4;
+#[cfg(target_os = "macos")]
+const SO_BROADCAST: i32 = 32;
+#[cfg(target_os = "macos")]
+const SO_SNDTIMEO: i32 = 4101;
+#[cfg(target_os = "macos")]
+const SO_RCVTIMEO: i32 = 4102;
+#[cfg(target_os = "macos")]
+const SO_ERROR: i32 = 4103;
+#[cfg(target_os = "macos")]
+const IPV6_V6ONLY: i32 = 27;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 4;
+/// macOS has no `MSG_NOSIGNAL`; sockets get `SO_NOSIGPIPE` instead.
+#[cfg(target_os = "macos")]
+const MSG_NOSIGNAL: i32 = 0;
+/// Where `struct addrinfo` keeps `ai_addr` (BSD puts `ai_canonname` first).
+#[cfg(target_os = "macos")]
+const AI_ADDR: isize = 32;
+
+#[cfg(not(target_os = "macos"))]
+const SOL_SOCKET: i32 = 1;
+#[cfg(not(target_os = "macos"))]
+const SO_REUSEADDR: i32 = 2;
+#[cfg(not(target_os = "macos"))]
+const SO_BROADCAST: i32 = 6;
+#[cfg(not(target_os = "macos"))]
+const SO_SNDTIMEO: i32 = 21;
+#[cfg(not(target_os = "macos"))]
+const SO_RCVTIMEO: i32 = 20;
+#[cfg(not(target_os = "macos"))]
+const SO_ERROR: i32 = 4;
+#[cfg(not(target_os = "macos"))]
+const IPV6_V6ONLY: i32 = 26;
+#[cfg(not(target_os = "macos"))]
+const O_NONBLOCK: i32 = 2048;
+/// Writing to a closed socket fails with `EPIPE` instead of killing the
+/// process with `SIGPIPE`.
+#[cfg(not(target_os = "macos"))]
+const MSG_NOSIGNAL: i32 = 16384;
+#[cfg(not(target_os = "macos"))]
+const AI_ADDR: isize = 24;
+
+/// The error code of the last failed socket call (`errno`).
+pub fn net_error(): i32 {
+    return last_error();
+}
+
+/// Close-on-exec, and on macOS no `SIGPIPE` (`SO_NOSIGPIPE`), for a new
+/// socket.
+fn prepare_socket(fd: i32) {
+    unsafe {
+        // F_SETFD, FD_CLOEXEC
+        fcntl(fd, 2, 1);
+    }
+    no_sigpipe(fd);
+}
+
+#[cfg(target_os = "macos")]
+fn no_sigpipe(fd: i32) {
+    let one: [u8; 4] = [1, 0, 0, 0];
+    unsafe {
+        setsockopt(fd, SOL_SOCKET, 4130, one[..].as_ptr(), 4);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn no_sigpipe(fd: i32) {
+    let _ = fd;
+}
+
+/// A new TCP (`stream`) or UDP socket for IPv4 or IPv6, closed on exec;
+/// -1 on failure.
+pub fn socket(v6: bool, stream: bool): i64 {
+    let af = if v6 { AF_INET6 } else { 2 };
+    let (kind, protocol) = if stream { (1, 6) } else { (2, 17) };
+    let fd = unsafe { c_socket(af, kind, protocol) };
+    if fd < 0 {
+        return -1;
+    }
+    prepare_socket(fd);
+    return fd as i64;
+}
+
+pub fn sock_bind(s: i64, a: RawAddr): bool {
+    let mut buf: [u8; 32] = [0; 32];
+    let n = encode_addr(a, buf[..]);
+    return unsafe { c_bind(s as i32, buf[..].as_ptr(), n as u32) } == 0;
+}
+
+pub fn sock_listen(s: i64, backlog: i32): bool {
+    return unsafe { c_listen(s as i32, backlog) } == 0;
+}
+
+/// Accept a connection: the new socket (or -1), and its peer in `peer`.
+pub fn sock_accept(s: i64, peer: &mut RawAddr): i64 {
+    let mut buf: [u8; 128] = [0; 128];
+    loop {
+        let mut len: u32 = 128;
+        let fd = unsafe { c_accept(s as i32, mut_ptr(buf[..]), intrinsics::addr_of_mut(&mut len)) };
+        if fd >= 0 {
+            prepare_socket(fd);
+            peer = decode_addr(buf[..len as usize]);
+            return fd as i64;
+        }
+        if last_error() != EINTR {
+            return -1;
+        }
+    }
+}
+
+pub fn sock_connect(s: i64, a: RawAddr): bool {
+    let mut buf: [u8; 32] = [0; 32];
+    let n = encode_addr(a, buf[..]);
+    return unsafe { c_connect(s as i32, buf[..].as_ptr(), n as u32) } == 0;
+}
+
+/// Receive into `buf` (leaving the data queued if `peek`): bytes, 0 when
+/// the peer has shut down, or -1.
+pub fn sock_recv(s: i64, buf: [u8; &mut], peek: bool): isize {
+    loop {
+        // MSG_PEEK = 2
+        let n = unsafe { recv(s as i32, buf.as_mut_ptr(), buf.len(), if peek { 2 } else { 0 }) };
+        if n >= 0 || last_error() != EINTR {
+            return n;
+        }
+    }
+}
+
+pub fn sock_send(s: i64, bytes: [u8; &]): isize {
+    loop {
+        let n = unsafe { send(s as i32, bytes.as_ptr(), bytes.len(), MSG_NOSIGNAL) };
+        if n >= 0 || last_error() != EINTR {
+            return n;
+        }
+    }
+}
+
+pub fn sock_recv_from(s: i64, buf: [u8; &mut], peek: bool, from: &mut RawAddr): isize {
+    let mut abuf: [u8; 128] = [0; 128];
+    loop {
+        let mut len: u32 = 128;
+        let n = unsafe { recvfrom(s as i32, buf.as_mut_ptr(), buf.len(), if peek { 2 } else { 0 }, mut_ptr(abuf[..]), intrinsics::addr_of_mut(&mut len)) };
+        if n >= 0 {
+            from = decode_addr(abuf[..len as usize]);
+            return n;
+        }
+        if last_error() != EINTR {
+            return n;
+        }
+    }
+}
+
+pub fn sock_send_to(s: i64, bytes: [u8; &], to: RawAddr): isize {
+    let mut abuf: [u8; 32] = [0; 32];
+    let n = encode_addr(to, abuf[..]);
+    loop {
+        let r = unsafe { sendto(s as i32, bytes.as_ptr(), bytes.len(), MSG_NOSIGNAL, abuf[..].as_ptr(), n as u32) };
+        if r >= 0 || last_error() != EINTR {
+            return r;
+        }
+    }
+}
+
+/// Shut down reading (0), writing (1) or both (2).
+pub fn sock_shutdown(s: i64, how: i32): bool {
+    return unsafe { c_shutdown(s as i32, how) } == 0;
+}
+
+/// The socket's own address, or its peer's.
+pub fn sock_name(s: i64, peer: bool, out: &mut RawAddr): bool {
+    let mut buf: [u8; 128] = [0; 128];
+    let mut len: u32 = 128;
+    let p = mut_ptr(buf[..]);
+    let r = if peer {
+        unsafe { getpeername(s as i32, p, intrinsics::addr_of_mut(&mut len)) }
+    } else {
+        unsafe { getsockname(s as i32, p, intrinsics::addr_of_mut(&mut len)) }
+    };
+    if r != 0 {
+        return false;
+    }
+    out = decode_addr(buf[..len as usize]);
+    return true;
+}
+
+pub fn sock_set_nonblocking(s: i64, on: bool): bool {
+    // F_GETFL 3, F_SETFL 4
+    let flags = unsafe { fcntl(s as i32, 3) };
+    if flags < 0 {
+        return false;
+    }
+    let new = if on { flags | O_NONBLOCK } else { flags & (-1 - O_NONBLOCK) };
+    return unsafe { fcntl(s as i32, 4, new) } == 0;
+}
+
+/// Set the receive (or, if `write`, send) timeout in milliseconds; 0 waits
+/// forever.
+pub fn sock_set_timeout(s: i64, write: bool, ms: u64): bool {
+    // struct timeval: seconds (64 bits), then microseconds (64 bits on
+    // Linux, 32 on macOS; the high half is zero either way).
+    let mut tv: [u8; 16] = [0; 16];
+    put_u64(tv[..], 0, ms / 1000);
+    put_u32(tv[..], 8, ((ms % 1000) * 1000) as u32);
+    let name = if write { SO_SNDTIMEO } else { SO_RCVTIMEO };
+    return unsafe { setsockopt(s as i32, SOL_SOCKET, name, tv[..].as_ptr(), 16) } == 0;
+}
+
+/// The receive (or send) timeout in milliseconds (0: none), or -1.
+pub fn sock_timeout(s: i64, write: bool): i64 {
+    let mut tv: [u8; 16] = [0; 16];
+    let mut len: u32 = 16;
+    let name = if write { SO_SNDTIMEO } else { SO_RCVTIMEO };
+    if unsafe { getsockopt(s as i32, SOL_SOCKET, name, mut_ptr(tv[..]), intrinsics::addr_of_mut(&mut len)) } != 0 {
+        return -1;
+    }
+    let ms = get_u64(tv[..], 0) * 1000 + (get_u32(tv[..], 8) as u64) / 1000;
+    return ms as i64;
+}
+
+/// The level and name of a `FLAG_*` option.
+fn flag_option(flag: i32): (i32, i32) {
+    return match flag {
+        // IPPROTO_TCP, TCP_NODELAY
+        1 => (6, 1),
+        2 => (SOL_SOCKET, SO_BROADCAST),
+        3 => (SOL_SOCKET, SO_REUSEADDR),
+        // IPPROTO_IPV6
+        _ => (41, IPV6_V6ONLY),
+    };
+}
+
+pub fn sock_set_flag(s: i64, flag: i32, on: bool): bool {
+    let (level, name) = flag_option(flag);
+    let mut b: [u8; 4] = [0; 4];
+    b[0] = if on { 1 } else { 0 };
+    return unsafe { setsockopt(s as i32, level, name, b[..].as_ptr(), 4) } == 0;
+}
+
+/// A `FLAG_*` option: 1 on, 0 off, -1 on failure.
+pub fn sock_flag(s: i64, flag: i32): i32 {
+    let (level, name) = flag_option(flag);
+    let mut b: [u8; 4] = [0; 4];
+    let mut len: u32 = 4;
+    if unsafe { getsockopt(s as i32, level, name, mut_ptr(b[..]), intrinsics::addr_of_mut(&mut len)) } != 0 {
+        return -1;
+    }
+    return if get_u32(b[..], 0) != 0 { 1 } else { 0 };
+}
+
+/// The pending error of the socket (`SO_ERROR`), 0 if none, -1 on failure.
+pub fn sock_error(s: i64): i32 {
+    let mut b: [u8; 4] = [0; 4];
+    let mut len: u32 = 4;
+    if unsafe { getsockopt(s as i32, SOL_SOCKET, SO_ERROR, mut_ptr(b[..]), intrinsics::addr_of_mut(&mut len)) } != 0 {
+        return -1;
+    }
+    return get_u32(b[..], 0) as i32;
+}
+
+/// Wait up to `ms` milliseconds (-1: forever) for the socket to be
+/// readable (or writable, if `write`): 1 ready, 0 timed out, -1 failed.
+pub fn sock_poll(s: i64, write: bool, ms: i32): i32 {
+    // struct pollfd { int fd; short events; short revents; }; POLLIN 1,
+    // POLLOUT 4.
+    let mut fd: [u8; 8] = [0; 8];
+    put_u32(fd[..], 0, s as u32);
+    put_u16(fd[..], 4, if write { 4 } else { 1 });
+    loop {
+        let r = unsafe { poll(mut_ptr(fd[..]) as *mut i32, 1, ms) };
+        if r >= 0 {
+            return if r > 0 { 1 } else { 0 };
+        }
+        if last_error() != EINTR {
+            return -1;
+        }
+    }
+}
+
+/// Look up the addresses of `host` onto `out`: 0, or the `getaddrinfo`
+/// error.
+pub fn lookup(host: str, out: &mut +[RawAddr; ..+]): i32 {
+    let c = c_path(host);
+    // struct addrinfo hints: only stream sockets, so each address comes
+    // once.
+    let mut hints: [u8; 48] = [0; 48];
+    put_u32(hints[..], 8, 1);
+    let mut res: *mut u8 = core::ptr::null_mut();
+    let r = unsafe { getaddrinfo(c.as_bytes().as_ptr(), core::ptr::null(), hints[..].as_ptr(), intrinsics::addr_of_mut(&mut res)) };
+    if r != 0 {
+        return r;
+    }
+    // ai_addrlen (32 bits) at byte 16, ai_next at 40.
+    let mut p = res as *u8;
+    while !core::ptr::is_null(p) {
+        unsafe {
+            let len = intrinsics::ptr_read(intrinsics::ptr_offset(p, 16) as *u32) as usize;
+            let addr = intrinsics::ptr_read(intrinsics::ptr_offset(p, AI_ADDR) as **u8);
+            if !core::ptr::is_null(addr) {
+                out.push(decode_addr(intrinsics::slice_from_raw(addr, len)));
+            }
+            p = intrinsics::ptr_read(intrinsics::ptr_offset(p, 40) as **u8);
+        }
+    }
+    unsafe {
+        freeaddrinfo(res);
+    }
+    return 0;
 }

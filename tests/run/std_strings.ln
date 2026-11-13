@@ -1,0 +1,133 @@
+// `str`, `String` and `char` helpers: splitting, searching, replacing,
+// case mapping, and editing a `String` in place.
+
+/// The pieces an iterator of views gives, joined with `|`.
+fn joined::<I: Iterator::<str>>(it: I): String {
+    let mut out = String::new();
+    let mut first = true;
+    for piece in it {
+        if !first {
+            out.push('|');
+        }
+        first = false;
+        out.push_str(piece);
+    }
+    return out;
+}
+
+#[test]
+fn splitting() {
+    let s = "  one two\tthree\n ";
+    assert_eq!(joined(s.split_whitespace()), String::from("one|two|three"));
+    let csv = "a,b,,c";
+    assert_eq!(joined(csv.splitn(2, ",")), String::from("a|b,,c"));
+    assert_eq!(joined(csv.splitn(1, ",")), String::from("a,b,,c"));
+    assert_eq!(joined(csv.rsplit(",")), String::from("c||b|a"));
+    assert_eq!(joined(csv.rsplitn(2, ",")), String::from("c|a,b,"));
+    let kv = "key=value=more";
+    assert_eq!(kv.split_once("="), Some(("key", "value=more")));
+    assert_eq!(kv.rsplit_once("="), Some(("key=value", "more")));
+    assert_eq!(kv.split_once(":"), None);
+    let empty = "";
+    assert_eq!(joined(empty.split_whitespace()), String::new());
+}
+
+#[test]
+fn searching_and_trimming() {
+    let s = "abcabc";
+    assert_eq!(s.rfind("bc"), Some(4));
+    assert_eq!(s.find("bc"), Some(1));
+    assert_eq!(s.rfind("x"), None);
+    let p = "prefix-body-suffix";
+    assert_eq!(p.strip_prefix("prefix-"), Some("body-suffix"));
+    assert_eq!(p.strip_suffix("-suffix"), Some("prefix-body"));
+    assert_eq!(p.strip_prefix("body"), None);
+    let pad = "  x  ";
+    assert_eq!(pad.trim_start(), "x  ");
+    assert_eq!(pad.trim_end(), "  x");
+    let dashes = "--x--";
+    assert_eq!(dashes.trim_start_matches("-"), "x--");
+    assert_eq!(dashes.trim_end_matches("-"), "--x");
+    let word = "héllo";
+    assert_eq!(word.char_count(), 5);
+    assert!(word.is_char_boundary(1));
+    assert!(!word.is_char_boundary(2));
+    assert_eq!(word.split_at(3), ("hé", "llo"));
+}
+
+#[test]
+fn char_indices() {
+    let s = "aé€😀b";
+    let mut out = String::new();
+    for (i, c) in s.char_indices() {
+        out.write("{i}:{c} ");
+    }
+    assert_eq!(out, String::from("0:a 1:é 3:€ 6:😀 10:b "));
+}
+
+#[test]
+fn replacing_and_repeating() {
+    let s = "the cat sat on the mat";
+    assert_eq!(s.replace("at", "og"), String::from("the cog sog on the mog"));
+    assert_eq!(s.replacen("the", "a", 1), String::from("a cat sat on the mat"));
+    assert_eq!(s.replace("dog", "x"), String::from(s));
+    let ab = "ab";
+    assert_eq!(ab.replace("", "-"), String::from("-a-b-"));
+    assert_eq!(ab.repeat(3), String::from("ababab"));
+    assert_eq!(ab.repeat(0), String::new());
+}
+
+#[test]
+fn case_mapping() {
+    let s = "Hello, Wörld! ÀÉÎ ΣΑΣ Привет Ǆ ß";
+    assert_eq!(s.to_lowercase(), String::from("hello, wörld! àéî σασ привет ǆ ß"));
+    assert_eq!(s.to_uppercase(), String::from("HELLO, WÖRLD! ÀÉÎ ΣΑΣ ПРИВЕТ Ǆ ß"));
+    assert_eq!(s.to_ascii_uppercase(), String::from("HELLO, WöRLD! ÀÉÎ ΣΑΣ Привет Ǆ ß"));
+    let mixed = "MiXeD";
+    assert!(mixed.eq_ignore_ascii_case("mixed"));
+    assert!(!mixed.eq_ignore_ascii_case("mixe"));
+    assert_eq!('ǅ'.to_lowercase(), 'ǆ');
+    assert_eq!('ǅ'.to_uppercase(), 'Ǆ');
+    assert_eq!('ſ'.to_uppercase(), 'S');
+    assert_eq!('İ'.to_lowercase(), 'i');
+    assert_eq!('ÿ'.to_uppercase(), 'Ÿ');
+    assert_eq!('Ꭰ'.to_lowercase(), 'ꭰ');
+    assert_eq!('𐐀'.to_lowercase(), '𐐨');
+    assert_eq!('Ａ'.to_lowercase(), 'ａ');
+    assert!('é'.is_lowercase());
+    assert!('Ж'.is_uppercase());
+    assert!(!'1'.is_uppercase());
+}
+
+#[test]
+fn char_classes() {
+    assert_eq!('7'.to_digit(10), Some(7u32));
+    assert_eq!('f'.to_digit(16), Some(15u32));
+    assert_eq!('g'.to_digit(16), None);
+    assert_eq!(char::from_digit(11, 16), Some('b'));
+    assert!('!'.is_ascii_punctuation());
+    assert!('\u{7f}'.is_control());
+    assert!('é'.is_alphanumeric());
+    assert!(!' '.is_alphanumeric());
+    assert_eq!('x'.to_string(), String::from("x"));
+}
+
+#[test]
+fn string_editing() {
+    let mut s = String::from("héllo");
+    s.insert(0, '>');
+    s.insert_str(s.len(), " world");
+    assert_eq!(s, String::from(">héllo world"));
+    assert_eq!(s.remove(2), 'é');
+    assert_eq!(s, String::from(">hllo world"));
+    s.retain(|c| c != 'l');
+    assert_eq!(s, String::from(">ho word"));
+    let tail = s.split_off(3);
+    assert_eq!(s, String::from(">ho"));
+    assert_eq!(tail, String::from(" word"));
+    let bad: [u8; 4] = [b'a', 0xff, b'b', 0xc3];
+    assert_eq!(String::from_utf8_lossy(bad[..]), String::from("a\u{fffd}b\u{fffd}"));
+    assert!(String::from_utf8(bad[..]).is_none());
+    let good: [u8; 2] = [b'o', b'k'];
+    assert_eq!(String::from_utf8(good[..]).unwrap(), String::from("ok"));
+}

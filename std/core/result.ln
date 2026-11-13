@@ -41,6 +41,21 @@ impl::<T, E> Result::<T, E> {
     }
 }
 
+impl::<T: Eq + Light, E: Eq + Light> Eq for Result::<T, E> {
+    fn eq(&self, other: &Result::<T, E>): bool {
+        return match self {
+            Result::Ok(a) => match other {
+                Result::Ok(b) => a == b,
+                Result::Err(_) => false,
+            },
+            Result::Err(a) => match other {
+                Result::Ok(_) => false,
+                Result::Err(b) => a == b,
+            },
+        };
+    }
+}
+
 impl::<T: crater::fmt::Debug + Light, E: crater::fmt::Debug + Light> crater::fmt::Debug for Result::<T, E> {
     fn debug(&self, out: &mut +String) {
         match self {

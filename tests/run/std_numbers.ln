@@ -1,0 +1,181 @@
+// Integer and float methods: checked, wrapping and saturating arithmetic,
+// powers, bit counts, radix formatting, and parsing with errors.
+
+use core::num::{ParseError, ParseErrorKind};
+
+fn err::<T>(kind: ParseErrorKind): Result::<T, ParseError> {
+    return Err(ParseError::new(kind));
+}
+
+fn kind_of::<T>(r: Result::<T, ParseError>): ParseErrorKind {
+    return match r {
+        Ok(_) => panic("expected an error"),
+        Err(e) => e.kind(),
+    };
+}
+
+#[test]
+fn checked_arithmetic() {
+    assert_eq!(200u8.checked_add(55), Some(255u8));
+    assert_eq!(200u8.checked_add(56), None);
+    assert_eq!(3u32.checked_sub(4), None);
+    assert_eq!(65536u32.checked_mul(65536), None);
+    assert_eq!(65535u32.checked_mul(65537), Some(4294967295u32));
+    assert_eq!(18446744073709551615u64.checked_add(1), None);
+    assert_eq!(4294967296u64.checked_mul(4294967296), None);
+    assert_eq!(5u32.checked_div(0), None);
+    assert_eq!((-128i8).checked_neg(), None);
+    assert_eq!((-128i8).checked_div(-1), None);
+    assert_eq!((-128i8).checked_rem(-1), None);
+    assert_eq!((-127i8).checked_sub(1), Some(-128i8));
+    assert_eq!((-127i8).checked_sub(2), None);
+    assert_eq!(100i8.checked_mul(-2), None);
+    assert_eq!(64i8.checked_mul(-2), Some(-128i8));
+    let min = i64::from_str_radix("-9223372036854775808", 10).unwrap();
+    assert_eq!(min.checked_mul(-1), None);
+    assert_eq!(min.checked_add(-1), None);
+    assert_eq!(9223372036854775807i64.checked_add(1), None);
+    assert_eq!(3037000500i64.checked_mul(3037000500), None);
+    assert_eq!(2i32.checked_pow(30), Some(1073741824));
+    assert_eq!(2i32.checked_pow(31), None);
+    assert_eq!((-2i32).checked_pow(31), Some(-2147483648));
+}
+
+#[test]
+fn wrapping_and_saturating() {
+    assert_eq!(250u8.wrapping_add(10), 4u8);
+    assert_eq!(0u32.wrapping_sub(1), 4294967295u32);
+    assert_eq!(127i8.wrapping_add(1), -128i8);
+    assert_eq!((-128i8).wrapping_neg(), -128i8);
+    assert_eq!(3u8.wrapping_pow(6), 217u8);
+    assert_eq!(250u8.saturating_add(10), 255u8);
+    assert_eq!(5u8.saturating_sub(10), 0u8);
+    assert_eq!(100i8.saturating_add(100), 127i8);
+    assert_eq!((-100i8).saturating_sub(100), -128i8);
+    assert_eq!((-100i8).saturating_mul(2), -128i8);
+    assert_eq!((-100i8).saturating_mul(-2), 127i8);
+    assert_eq!((-128i8).saturating_abs(), 127i8);
+    assert_eq!((-2i32).saturating_pow(33), -2147483648);
+}
+
+#[test]
+fn powers_signs_and_division() {
+    assert_eq!(3u64.pow(4), 81u64);
+    assert_eq!((-3i32).pow(3), -27);
+    assert_eq!((-5i32).abs(), 5);
+    assert_eq!((-128i8).unsigned_abs(), 128u8);
+    assert_eq!((-3i32).signum(), -1);
+    assert_eq!(0i32.signum(), 0);
+    assert_eq!((-7i32).rem_euclid(3), 2);
+    assert_eq!((-7i32).div_euclid(3), -3);
+    assert_eq!(7i32.rem_euclid(-3), 1);
+    assert_eq!((-5i32).abs_diff(10), 15u32);
+    assert_eq!(7u32.abs_diff(10), 3u32);
+    assert_eq!(7u32.div_ceil(2), 4u32);
+}
+
+#[test]
+fn bits() {
+    assert_eq!(1u8.leading_zeros(), 7u32);
+    assert_eq!(0u16.leading_zeros(), 16u32);
+    assert_eq!((-1i32).leading_zeros(), 0u32);
+    assert_eq!(1u64.leading_zeros(), 63u32);
+    assert_eq!(8u32.trailing_zeros(), 3u32);
+    assert_eq!(0u8.trailing_zeros(), 8u32);
+    assert_eq!(0xF0F0u16.count_ones(), 8u32);
+    assert_eq!((-1i64).count_ones(), 64u32);
+    assert_eq!((-1i8).count_zeros(), 0u32);
+    assert_eq!(0x81u8.rotate_left(1), 3u8);
+    assert_eq!(0x81u8.rotate_right(1), 0xC0u8);
+    assert_eq!(1u64.rotate_right(1), 9223372036854775808u64);
+    assert!(64u32.is_power_of_two());
+    assert!(!0u32.is_power_of_two());
+    assert_eq!(65u32.next_power_of_two(), 128u32);
+    assert_eq!(200u8.checked_next_power_of_two(), None);
+}
+
+#[test]
+fn to_string_in_radixes() {
+    assert_eq!(255u32.to_string(), String::from("255"));
+    assert_eq!((-42i32).to_string(), String::from("-42"));
+    assert_eq!(255u32.to_string_radix(16), String::from("ff"));
+    assert_eq!(5u8.to_string_radix(2), String::from("101"));
+    assert_eq!((-255i32).to_string_radix(16), String::from("-ff"));
+    assert_eq!((-128i8).to_string_radix(2), String::from("-10000000"));
+    assert_eq!(35u32.to_string_radix(36), String::from("z"));
+    assert_eq!(1.5f64.to_string(), String::from("1.5"));
+}
+
+#[test]
+fn parse_integers() {
+    let s = "42";
+    assert_eq!(s.parse::<i32>(), Ok(42));
+    let plus = "+7";
+    assert_eq!(plus.parse::<u8>(), Ok(7u8));
+    let neg = "-129";
+    assert_eq!(neg.parse::<i8>(), err::<i8>(ParseErrorKind::NegOverflow));
+    let neg_ok = "-128";
+    assert_eq!(neg_ok.parse::<i8>(), Ok(-128i8));
+    let big = "256";
+    assert_eq!(big.parse::<u8>(), err::<u8>(ParseErrorKind::PosOverflow));
+    let empty = "";
+    assert_eq!(empty.parse::<u32>(), err::<u32>(ParseErrorKind::Empty));
+    let minus = "-1";
+    assert_eq!(minus.parse::<u32>(), err::<u32>(ParseErrorKind::InvalidDigit));
+    let sign_only = "-";
+    assert_eq!(sign_only.parse::<i32>(), err::<i32>(ParseErrorKind::InvalidDigit));
+    let spaced = " 1";
+    assert_eq!(spaced.parse::<i32>(), err::<i32>(ParseErrorKind::InvalidDigit));
+    let max = "18446744073709551615";
+    assert_eq!(max.parse::<u64>(), Ok(18446744073709551615u64));
+    let over = "18446744073709551616";
+    assert_eq!(over.parse::<u64>(), err::<u64>(ParseErrorKind::PosOverflow));
+    let min = "-9223372036854775808";
+    assert_eq!(min.parse::<i64>().unwrap().to_string(), String::from(min));
+    assert_eq!(i32::from_str_radix("-ff", 16), Ok(-255));
+    assert_eq!(u32::from_str_radix("FFFFFFFF", 16), Ok(4294967295u32));
+    assert_eq!(u8::from_str_radix("102", 2), err::<u8>(ParseErrorKind::InvalidDigit));
+    assert_eq!(i64::from_str_radix("zz", 36), Ok(1295i64));
+    assert_eq!(kind_of(u8::from_str_radix("300", 10)), ParseErrorKind::PosOverflow);
+    let e = u8::from_str_radix("300", 10);
+    let text = match e {
+        Ok(_) => String::new(),
+        Err(e) => core::fmt::format("{e}"),
+    };
+    assert_eq!(text, String::from("number too large to fit in target type"));
+}
+
+#[test]
+fn parse_floats_bools_chars() {
+    let f = "1.5";
+    assert_eq!(f.parse::<f64>(), Ok(1.5));
+    let e = "-2e3";
+    assert_eq!(e.parse::<f64>(), Ok(-2000.0));
+    let inf = "-inf";
+    assert!(inf.parse::<f64>().unwrap() < -1.0e308);
+    let nan = "NaN";
+    assert!(nan.parse::<f64>().unwrap().is_nan());
+    let bad = "1.5x";
+    assert!(bad.parse::<f64>().is_err());
+    let t = "true";
+    assert_eq!(t.parse::<bool>(), Ok(true));
+    let yes = "yes";
+    assert!(yes.parse::<bool>().is_err());
+    let c = "é";
+    assert_eq!(c.parse::<char>(), Ok('é'));
+    let two = "ab";
+    assert!(two.parse::<char>().is_err());
+}
+
+#[test]
+fn float_methods() {
+    assert_eq!(2.5f64.round(), 3.0);
+    assert_eq!((-2.7f64).trunc(), -2.0);
+    assert_eq!(2.0f64.powi(10), 1024.0);
+    assert_eq!(1.0f64.min(2.0), 1.0);
+    assert_eq!(5.0f64.clamp(0.0, 1.0), 1.0);
+    assert!(1.0f64.is_finite());
+    let big = 1.7976931348623157e308;
+    assert!(!(big * 10.0).is_finite());
+    assert!((big * 10.0).is_infinite());
+}
