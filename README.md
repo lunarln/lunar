@@ -121,16 +121,18 @@ built by a released Lunar compiler, the one named in
 [craters/stage0.txt](craters/stage0.txt). Requirements:
 
 * that release, installed as above (with `--version`), or unpacked anywhere;
-* LLVM 20, whose shared library the compiler links. Point `LUNAR_LIB_PATH`
+* LLVM 23, whose shared library the compiler links. Point `LUNAR_LIB_PATH`
   at its directory:
-  * Windows: the official installer from
+  * Windows: the official installer (`LLVM-23.*-win64.msi`) from
     [llvm-project releases](https://github.com/llvm/llvm-project/releases);
     `LUNAR_LIB_PATH=C:/Program Files/LLVM/lib`, and `LLVM-C.dll` (in
-    `C:\Program Files\LLVM\bin`) on `PATH` to run what you build;
-  * Linux: `llvm-20-dev` (e.g. from [apt.llvm.org](https://apt.llvm.org));
-    `LUNAR_LIB_PATH=$(llvm-config-20 --libdir)`;
-  * macOS: `brew install llvm@20`;
-    `LUNAR_LIB_PATH=$(brew --prefix llvm@20)/lib`;
+    `C:\Program Files\LLVM\bin`) on `PATH` to run what you build. The
+    `clang+llvm-23.*-x86_64-pc-windows-msvc` archive works too, from its
+    `lib` and `bin`;
+  * Linux: `llvm-23-dev` (e.g. from [apt.llvm.org](https://apt.llvm.org));
+    `LUNAR_LIB_PATH=$(llvm-config-23 --libdir)`;
+  * macOS: `brew install llvm` (LLVM 23; `llvm@23` once Homebrew's `llvm`
+    moves on); `LUNAR_LIB_PATH=$(brew --prefix llvm)/lib`;
 * a linker, as above.
 
 ```sh

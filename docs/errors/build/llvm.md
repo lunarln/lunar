@@ -12,7 +12,7 @@ What to do:
 * for "could not write object file" or "could not write LLVM IR", check that
   the output directory exists and is writable;
 * for "unsupported target", make sure the compiler is linked against an
-  LLVM 20 build that includes the host target;
+  LLVM 23 build that includes the host target;
 * for an internal compiler error, please report it with the program that
   triggers it. Reducing the program to the smallest one that still fails
   helps.
