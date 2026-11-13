@@ -28,7 +28,8 @@ code signature records it.)
 The executable, `target/release/lunar`, is a drop-in replacement for the
 Rust `lunar`: the same commands (`new`, `init`, `check`, `build`, `run`,
 `test`, `add`, `remove`, `update`, `clean`, `emit-llvm`, `explain`, `lsp`), options, help and error texts, status lines, exit codes
-and diagnostics. Diagnostics are drawn by `ln-ariadne` exactly as the Rust
+and diagnostics. It has one command the Rust one does not: `lunar fmt`,
+the formatter (`ln-fmt`, below; [docs/style.md](../docs/style.md)). Diagnostics are drawn by `ln-ariadne` exactly as the Rust
 compiler draws them with ariadne (`ln-sema/src/render.ln` is the glue).
 When stderr is a terminal and `NO_COLOR` is not set they are in color, and
 the quoted code is syntax highlighted from `ln-lexer`'s tokens
@@ -75,8 +76,9 @@ failed builds show no `lunar explain` hint.
 | `ln-codegen` | `crates/ln-codegen` | complete (LLVM through its C API, `llvm.ln`) |
 | `ln-toml`    | the `toml` and `toml_edit` crates | what manifests and lockfiles need: the whole TOML syntax, every key and value with its place in the text; `edit` sets and removes keys in place, keeping comments and layout as `toml_edit` does |
 | `ln-semver`  | the `semver` crate (1.0) | versions, requirements (`^`, `~`, `=`, `<`, `>`, wildcards, several comparators), matching with its pre-release rules, its display and error messages |
+| `ln-fmt`     | (new: rustfmt's style) | the formatter: `format_source(text)` gives the text formatted ([docs/style.md](../docs/style.md)), or why not. The syntax tree is printed into layout documents laid out in 100 columns (`doc.ln`: Wadler's algorithm as Prettier has it, with rustfmt's width heuristics); comments, found between the tokens (`source.ln`), are put back by position. Every result is parsed again and must have the same tree and comments (`verify.ln`). Tests in `src/tests.ln`, one of which formats every `.ln` file of the repository |
 | `ln-json`    | what the language server gets from `serde_json` | JSON documents as arenas of linked nodes: strict parsing (escapes, `\u` surrogate pairs, numbers kept as written), building, compact writing with serde_json's escapes; tests in `src/tests.ln` |
-| `lunar`      | `crates/ln-driver` | the `lunar` command (above): `cli.ln` (clap's parsing, help and errors), `commands.ln` (`main.rs`), `project.ln` and `git.ln` (`project.rs`), `compile.ln` (`lib.rs`), `explain.ln`, `link.ln`, `testing.ln`, `sysroot.ln`, and the language server, `lsp.ln` and `ide.ln` (below). Hidden modes for `selfhost.rs`: `--lex FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--render [--color] FILE...` the diagnostics drawn as `lunar check` draws them, `--craters DIR` the craters a package build loads |
+| `lunar`      | `crates/ln-driver` | the `lunar` command (above): `cli.ln` (clap's parsing, help and errors), `commands.ln` (`main.rs`), `project.ln` and `git.ln` (`project.rs`), `compile.ln` (`lib.rs`), `explain.ln`, `link.ln`, `testing.ln`, `sysroot.ln`, `fmt.ln` (`lunar fmt`, new), and the language server, `lsp.ln` and `ide.ln` (below). Hidden modes for `selfhost.rs`: `--lex FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--render [--color] FILE...` the diagnostics drawn as `lunar check` draws them, `--craters DIR` the craters a package build loads |
 
 ### The language server
 
