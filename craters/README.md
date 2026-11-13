@@ -7,8 +7,8 @@ builds it again into the very same executable.
 
 ## Building and bootstrapping
 
-The code generator calls LLVM's C API, so linking needs the directory of
-LLVM's shared library in `$LUNAR_LIB_PATH` (`LLVM-C.lib` on Windows,
+The code generator calls the C API of LLVM 23, so linking needs the
+directory of LLVM's shared library in `$LUNAR_LIB_PATH` (`LLVM-C.lib` on Windows,
 `libLLVM` elsewhere); on Windows `LLVM-C.dll` must also be on `PATH` at run
 time.
 

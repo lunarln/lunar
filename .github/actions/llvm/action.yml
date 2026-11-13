@@ -1,9 +1,9 @@
-name: Install LLVM 20
+name: Install LLVM 23
 description: >
-  Installs LLVM 20 (its shared library, which the Lunar compiler links) and
+  Installs LLVM 23 (its shared library, which the Lunar compiler links) and
   sets LUNAR_LIB_PATH to the directory to link it from, LLVM_SHLIB_DIR to
-  the directory of the shared library itself, and LLVM_CONFIG (Unix) or
-  LLVM_SYS_201_PREFIX (Windows). Downloads are cached.
+  the directory of the shared library itself, and LLVM_CONFIG (Unix).
+  Downloads are cached.
 
 runs:
   using: composite
@@ -23,9 +23,9 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/lunar-llvm
-        key: llvm-20.1.8-${{ steps.system.outputs.name }}-${{ runner.arch }}
+        key: llvm-23.1.5-${{ steps.system.outputs.name }}-${{ runner.arch }}
 
-    - name: Install LLVM 20 (Linux)
+    - name: Install LLVM 23 (Linux)
       if: runner.os == 'Linux'
       shell: bash
       run: |
@@ -34,23 +34,24 @@ runs:
         # apt.llvm.org, for later `apt-get install`s too.
         codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
         wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
-        echo "deb http://apt.llvm.org/$codename/ llvm-toolchain-$codename-20 main" | sudo tee /etc/apt/sources.list.d/llvm-20.list
+        echo "deb http://apt.llvm.org/$codename/ llvm-toolchain-$codename-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
         # The cached packages install offline; if the runner image changed
         # under them, they are downloaded again.
         if ! { ls "$debs"/*.deb >/dev/null 2>&1 && sudo dpkg -i "$debs"/*.deb; }; then
           rm -rf "$debs"
           sudo apt-get update -q
           mkdir -p "$debs/partial"
-          sudo apt-get install -y -q -o Dir::Cache::Archives="$debs" llvm-20-dev
+          sudo apt-get install -y -q -o Dir::Cache::Archives="$debs" llvm-23-dev
           sudo chown -R "$USER" "$debs"
           rm -rf "$debs/partial" "$debs/lock"
         fi
-        prefix=/usr/lib/llvm-20
+        prefix=/usr/lib/llvm-23
+        echo "LLVM: $("$prefix/bin/llvm-config" --version)"
         echo "LLVM_CONFIG=$prefix/bin/llvm-config" >> "$GITHUB_ENV"
         echo "LUNAR_LIB_PATH=$prefix/lib" >> "$GITHUB_ENV"
         echo "LLVM_SHLIB_DIR=$prefix/lib" >> "$GITHUB_ENV"
 
-    - name: Install LLVM 20 (macOS)
+    - name: Install LLVM 23 (macOS)
       if: runner.os == 'macOS'
       shell: bash
       env:
@@ -60,27 +61,49 @@ runs:
         set -euo pipefail
         # Bottles are kept in the cached directory.
         export HOMEBREW_CACHE="$HOME/.cache/lunar-llvm/homebrew"
-        brew install llvm@20
-        prefix=$(brew --prefix llvm@20)
+        # Homebrew's `llvm` is LLVM 23 until it moves on to 24, when
+        # `llvm@23` appears; take `llvm@23` if there is one, and never build
+        # with another major version.
+        formula=llvm@23
+        if ! brew info --formula "$formula" >/dev/null 2>&1; then
+          formula=llvm
+        fi
+        brew install "$formula"
+        prefix=$(brew --prefix "$formula")
+        version=$("$prefix/bin/llvm-config" --version)
+        echo "LLVM: $version (Homebrew's $formula)"
+        if [ "${version%%.*}" != 23 ]; then
+          echo "::error::Homebrew's $formula is LLVM $version, not LLVM 23"
+          exit 1
+        fi
         echo "LLVM_CONFIG=$prefix/bin/llvm-config" >> "$GITHUB_ENV"
         echo "LUNAR_LIB_PATH=$prefix/lib" >> "$GITHUB_ENV"
         echo "LLVM_SHLIB_DIR=$prefix/lib" >> "$GITHUB_ENV"
 
-    - name: Install LLVM 20 (Windows)
+    - name: Install LLVM 23 (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
-        $v = "20.1.8"
+        $ErrorActionPreference = 'Stop'
+        $v = "23.1.5"
         $dir = Join-Path $HOME ".cache/lunar-llvm"
-        $exe = Join-Path $dir "LLVM-$v-win64.exe"
-        if (-not (Test-Path $exe)) {
+        # The official installer, an MSI since LLVM 23 (the archive has no
+        # lldb, which the debugger tests use).
+        $msi = Join-Path $dir "LLVM-$v-win64.msi"
+        if (-not (Test-Path $msi)) {
           New-Item -ItemType Directory -Force $dir | Out-Null
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$v/LLVM-$v-win64.exe"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$v/LLVM-$v-win64.msi"
           # GitHub's release CDN occasionally times out (504); retry.
-          Invoke-WebRequest $url -OutFile $exe -MaximumRetryCount 3 -RetryIntervalSec 15
+          Invoke-WebRequest $url -OutFile $msi -MaximumRetryCount 3 -RetryIntervalSec 15
         }
-        Start-Process -Wait -FilePath $exe -ArgumentList "/S", "/D=C:\LLVM"
-        "LLVM_SYS_201_PREFIX=C:\LLVM" >> $env:GITHUB_ENV
+        $log = Join-Path $env:RUNNER_TEMP "llvm-msi.log"
+        $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/i", "`"$msi`"", "/qn", "/norestart", "INSTALL_ROOT=C:\LLVM", "/L*", "`"$log`""
+        # 3010: installed, a restart is needed (not for what is used here).
+        if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+          Get-Content $log -Tail 50
+          throw "the LLVM installer failed (exit code $($p.ExitCode))"
+        }
+        if (-not (Test-Path C:\LLVM\bin\LLVM-C.dll)) { throw "the LLVM installer did not install C:\LLVM\bin\LLVM-C.dll" }
         "LUNAR_LIB_PATH=C:/LLVM/lib" >> $env:GITHUB_ENV
         "LLVM_SHLIB_DIR=C:/LLVM/bin" >> $env:GITHUB_ENV
         "C:\LLVM\bin" >> $env:GITHUB_PATH

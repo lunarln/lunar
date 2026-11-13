@@ -34,19 +34,19 @@ jobs:
 
       # For the debugger tests (craters/lunar/src/debuginfo_tests.ln):
       # macOS has lldb with Xcode; LLVM's Windows build has lldb, which
-      # needs Python 3.10, and llvm-pdbutil.
+      # needs a Python 3 on PATH (it loads `python3.dll`), and llvm-pdbutil.
       - name: Install lldb (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q lldb-20
-          echo "/usr/lib/llvm-20/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y -q lldb-23
+          echo "/usr/lib/llvm-23/bin" >> "$GITHUB_PATH"
 
-      - name: Python 3.10 for lldb (Windows)
+      - name: Python for lldb (Windows)
         if: runner.os == 'Windows'
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Debugger tools
         run: |

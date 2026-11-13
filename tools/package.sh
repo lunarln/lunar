@@ -36,7 +36,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 version=$("$exe" --version | awk '{print $2}')
 name="lunar-$version-$target"
 stage="$out/$name"
-llvm_tag=llvmorg-20.1.8
+llvm_tag=llvmorg-23.1.5
 
 case "$(uname -s)" in
     Linux) os=linux ;;

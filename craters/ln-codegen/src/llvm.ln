@@ -1,4 +1,4 @@
-// Bindings to the LLVM-C API (LLVM 20), for what code generation uses.
+// Bindings to the LLVM-C API (LLVM 23), for what code generation uses.
 // Every LLVM object is an opaque pointer; the aliases only document which
 // kind a function expects. Enumerations are passed as `u32`, `LLVMBool` as
 // `i32`, and strings as NUL-terminated `*u8` (see `z` and
