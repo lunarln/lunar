@@ -1,0 +1,42 @@
+// std::env: iterating the arguments and the environment.
+
+use std::env;
+
+#[test]
+fn args() {
+    let mut n = 0;
+    let mut first = String::new();
+    for a in env::args() {
+        if n == 0 {
+            first.push_str(a);
+        }
+        n += 1;
+    }
+    assert!(n >= 1);
+    assert_eq!(n, env::arg_count());
+    assert!(!first.is_empty());
+    let mut it = env::args();
+    assert_eq!(it.len(), n);
+    it.next();
+    assert_eq!(it.len(), n - 1);
+}
+
+#[test]
+fn vars() {
+    let vars = env::vars();
+    assert!(vars.len() > 0);
+    let mut count = 0;
+    let mut empty_names = 0;
+    for v in vars.iter() {
+        count += 1;
+        if v.0.is_empty() || v.0.contains("=") {
+            empty_names += 1;
+        }
+    }
+    assert_eq!(count, vars.len());
+    assert_eq!(empty_names, 0);
+    // `PATH` is set everywhere tests run, and agrees with `env::var`.
+    let path = vars.get("PATH").unwrap();
+    assert_eq!(String::from(path), env::var("PATH").unwrap());
+    assert!(vars.get("LUNAR_SURELY_UNSET_VARIABLE").is_none());
+}
