@@ -671,6 +671,9 @@ for s in shapes { total += s.area(); }
   to generic code; a shared `dyn Trait` implements only traits whose
   vtable methods (with their supertraits') all take `&self`, so generic
   code cannot change a value through it.
+* The crater that defines a trait may give `dyn Trait` methods of its own
+  (`impl dyn Shape { fn double_area(&self): f64 { ... } }`); they are found
+  on `dyn mut Shape` and `dyn Shape + Sync` too.
 * Auto traits follow the trait: `dyn Trait + Send + Sync` (§3); `Dull`,
   `Light` and `Detached` cannot follow it, and a `dyn` names exactly one
   trait besides them (`err(type::bad_dyn)`).
