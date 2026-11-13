@@ -951,6 +951,7 @@ impl Cg {
         let saved = self.insert_block();
         let entry = self.append_block(f, z("entry\0"));
         self.position(entry);
+        let di = self.di_enter(f, "{fmt}", self.di_cur_line());
         let env = unsafe { LLVMGetParam(f, 0) };
         let out = unsafe { LLVMGetParam(f, 1) };
         let mut ai: usize = 0;
@@ -1006,6 +1007,7 @@ impl Cg {
             }
         }
         self.ret_void();
+        self.di_restore(di);
         if !is_null(saved) {
             self.position(saved);
         }
@@ -1082,6 +1084,13 @@ impl Cg {
         let saved = self.insert_block();
         let entry = self.append_block(f, z("entry\0"));
         self.position(entry);
+        let mut glue_name = String::new();
+        if self.dbg_on() {
+            glue_name.push_str("drop_in_place::<");
+            self.di_ty_name(p, t, &mut glue_name);
+            glue_name.push('>');
+        }
+        let di = self.di_enter(f, glue_name.as_str(), 0);
         let pp = unsafe { LLVMGetParam(f, 0) };
         match p.types.kind(t) {
             TyKind::String | TyKind::Array(_, ArrKind::Dyn) | TyKind::Array(_, ArrKind::Grow) | TyKind::Array(_, ArrKind::Shrink) => {
@@ -1178,6 +1187,7 @@ impl Cg {
         if !is_null(cur) && is_null(unsafe { LLVMGetBasicBlockTerminator(cur) }) {
             self.ret_void();
         }
+        self.di_restore(di);
         if !is_null(saved) {
             self.position(saved);
         }

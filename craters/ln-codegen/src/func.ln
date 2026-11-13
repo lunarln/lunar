@@ -43,6 +43,7 @@ impl Cg {
         self.error.clear();
         self.failed = false;
         self.sret = null();
+        self.di_begin_fn(p, f, body);
         let ret = self.t(p, p.fn_data(body.def).sig.ret);
         if self.in_memory(p, ret) {
             self.sret = unsafe { LLVMGetParam(f, 0) };
@@ -61,6 +62,7 @@ impl Cg {
             };
             if by_ref {
                 self.locals[l.index()] = param;
+                self.di_param_at(p, l, i as u32 + 1, param);
             } else {
                 let ty = self.t(p, local.ty);
                 let mut slot = param;
@@ -70,6 +72,9 @@ impl Cg {
                     let name = c_string(p.text(local.name));
                     slot = self.alloca(lt, name.as_ptr());
                     self.store(param, slot);
+                    self.di_param(p, l, i as u32 + 1, slot, false);
+                } else {
+                    self.di_param_at(p, l, i as u32 + 1, param);
                 }
                 self.locals[l.index()] = slot;
                 // A parameter that took ownership is this function's to
@@ -108,10 +113,23 @@ impl Cg {
         } else if !self.terminated() {
             self.unreachable();
         }
+        self.di_end_fn(p);
         if self.failed {
             return Err(String::from(self.error.as_str()));
         }
         return Ok(());
+    }
+
+    /// Describe parameter `l` (argument `arg_no`), which is at the address
+    /// `param`: through a slot holding that address.
+    fn di_param_at(&mut self, p: &mut +Program, l: LocalId, arg_no: u32, param: ValueRef) {
+        if !self.dbg_full() {
+            return;
+        }
+        let name = c_string(p.text(p.thir.local(self.body, l).name));
+        let slot = self.alloca(self.ptr_ty(), name.as_ptr());
+        self.store(param, slot);
+        self.di_param(p, l, arg_no, slot, true);
     }
 
     // ===================================================================== helpers
@@ -167,6 +185,11 @@ impl Cg {
             unsafe { LLVMPositionBuilderAtEnd(self.ab, entry) };
         } else {
             unsafe { LLVMPositionBuilderBefore(self.ab, first) };
+        }
+        if self.dbg_on() {
+            // Allocas have no location (the builder may still hold one of
+            // another function).
+            unsafe { LLVMSetCurrentDebugLocation2(self.ab, null()) };
         }
         return unsafe { LLVMBuildAlloca(self.ab, ty, name) };
     }
@@ -306,11 +329,14 @@ impl Cg {
     /// `value_into`).
     pub fn block_into(&mut self, p: &mut +Program, b: Id::<Block>, dest: ValueRef): Option::<ValueRef> {
         let blk = p.thir.block(b);
+        // The variables its `let`s bind are in scope until it ends.
+        let scope = self.di_scope_mark();
         self.push_mark();
         for i in 0..blk.stmts.len() {
             let s = p.thir.stmts.list(blk.stmts)[i];
             if self.stmt(p, s).is_none() {
                 self.marks.pop();
+                self.di_scope_back(scope);
                 return None;
             }
         }
@@ -329,26 +355,38 @@ impl Cg {
         };
         match v {
             Some(v) => {
+                // Its drops are at its closing brace.
+                self.di_set_end(p, blk.span);
                 self.pop_mark(p);
+                self.di_scope_back(scope);
                 return Some(v);
             }
             None => {
                 self.drop_mark();
+                self.di_scope_back(scope);
                 return None;
             }
         }
     }
 
     fn stmt(&mut self, p: &mut +Program, s: Stmt): Option::<()> {
+        let span = match s {
+            Stmt::Let { span, .. } => span,
+            Stmt::Expr(e) => p.thir.expr(e).span,
+        };
+        self.di_set(p, span);
         match s {
             Stmt::Let { pat, init, .. } => {
                 let Some(init) = init else {
+                    self.di_bind(p, pat, span);
                     return Some(());
                 };
                 let pt = p.thir.pat(pat);
                 let ty = self.t(p, pt.ty);
                 if self.in_memory(p, ty) {
-                    return self.let_in_memory(p, pat, init, ty);
+                    self.let_in_memory(p, pat, init, ty)?;
+                    self.di_bind(p, pat, span);
+                    return Some(());
                 }
                 self.push_mark();
                 let v = match self.value(p, init) {
@@ -377,6 +415,7 @@ impl Cg {
                         self.register_cleanup(p, tmp, ty);
                     }
                 }
+                self.di_bind(p, pat, span);
                 return Some(());
             }
             Stmt::Expr(e) => {
@@ -444,7 +483,19 @@ impl Cg {
 
     // ===================================================================== places
 
+    /// The address of place `e`, at `e`'s location (see `debug.ln`).
     pub fn place(&mut self, p: &mut +Program, e: Id::<Expr>): Option::<ValueRef> {
+        if is_null(self.di_sp) {
+            return self.place_at(p, e);
+        }
+        let back = self.di_mark();
+        self.di_set(p, p.thir.expr(e).span);
+        let r = self.place_at(p, e);
+        self.di_back(back);
+        return r;
+    }
+
+    fn place_at(&mut self, p: &mut +Program, e: Id::<Expr>): Option::<ValueRef> {
         let ex = p.thir.expr(e);
         match ex.kind {
             ExprKind::Local(l) => return Some(self.locals[l.index()]),
@@ -546,7 +597,19 @@ impl Cg {
 
     // ===================================================================== values
 
+    /// The value of `e`, computed at `e`'s location (see `debug.ln`).
     pub fn value(&mut self, p: &mut +Program, e: Id::<Expr>): Option::<ValueRef> {
+        if is_null(self.di_sp) {
+            return self.value_at(p, e);
+        }
+        let back = self.di_mark();
+        self.di_set(p, p.thir.expr(e).span);
+        let r = self.value_at(p, e);
+        self.di_back(back);
+        return r;
+    }
+
+    fn value_at(&mut self, p: &mut +Program, e: Id::<Expr>): Option::<ValueRef> {
         let ex = p.thir.expr(e);
         let ty = self.t(p, ex.ty);
         let built = match ex.kind {
@@ -822,6 +885,17 @@ impl Cg {
     /// evaluated: a new temporary, a variable being declared, a result
     /// slot.
     pub fn value_into(&mut self, p: &mut +Program, e: Id::<Expr>, dest: ValueRef): Option::<()> {
+        if is_null(self.di_sp) {
+            return self.value_into_at(p, e, dest);
+        }
+        let back = self.di_mark();
+        self.di_set(p, p.thir.expr(e).span);
+        let r = self.value_into_at(p, e, dest);
+        self.di_back(back);
+        return r;
+    }
+
+    fn value_into_at(&mut self, p: &mut +Program, e: Id::<Expr>, dest: ValueRef): Option::<()> {
         let ex = p.thir.expr(e);
         let ty = self.t(p, ex.ty);
         if !self.in_memory(p, ty) {
@@ -1233,10 +1307,17 @@ impl Cg {
             let next = self.block_named(z("arm_next\0"));
             self.test_pat(p, arm.pat, sp, st, next);
             self.push_mark();
+            // The arm's bindings are in scope in its guard and body.
+            let scope = self.di_scope_mark();
+            let at = self.di_mark();
+            let pat_span = p.thir.pat(arm.pat).span;
             if let Some(g) = arm.guard {
                 self.bind_pat(p, arm.pat, sp, st, false);
+                self.di_bind(p, arm.pat, pat_span);
                 let Some(gv) = self.scoped_value(p, g) else {
                     self.drop_mark();
+                    self.di_scope_back(scope);
+                    self.di_back(at);
                     self.position(next);
                     continue;
                 };
@@ -1254,6 +1335,7 @@ impl Cg {
                 self.null_moves(p, arm.pat, sp, st);
             } else {
                 self.bind_pat(p, arm.pat, sp, st, true);
+                self.di_bind(p, arm.pat, pat_span);
             }
             match self.value_to(p, arm.body, slot) {
                 Some(()) => {
@@ -1263,6 +1345,8 @@ impl Cg {
                 }
                 None => self.drop_mark(),
             }
+            self.di_scope_back(scope);
+            self.di_back(at);
             self.position(next);
         }
         // No arm matched: unreachable (matches are exhaustive).
@@ -1305,9 +1389,15 @@ impl Cg {
         self.position(body_bb);
         let vslot = self.locals[var.index()];
         self.store(cur, vslot);
+        let scope = self.di_scope_mark();
+        let at = self.di_mark();
+        let body_span = p.thir.block(body).span;
+        self.di_bind_local(p, var, body_span);
         if self.block(p, body).is_some() && !self.terminated() {
             self.br(latch);
         }
+        self.di_scope_back(scope);
+        self.di_back(at);
         self.position(latch);
         let cur = self.load_ty(it, counter, noname());
         if inclusive {
@@ -1349,6 +1439,10 @@ impl Cg {
         let ep = self.gep(et, data, i, noname());
         self.push_mark();
         self.bind_pat(p, pat, ep, elem, false);
+        let scope = self.di_scope_mark();
+        let at = self.di_mark();
+        let pat_span = p.thir.pat(pat).span;
+        self.di_bind(p, pat, pat_span);
         let r = self.block(p, body);
         if r.is_some() {
             self.pop_mark(p);
@@ -1358,6 +1452,8 @@ impl Cg {
         } else {
             self.drop_mark();
         }
+        self.di_scope_back(scope);
+        self.di_back(at);
         self.position(latch);
         let i = self.load_ty(self.usize_ty(), idx, noname());
         let next = self.add(i, self.usize(1), noname());

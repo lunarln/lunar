@@ -1,0 +1,1119 @@
+// Debug information, through LLVM's DIBuilder (`llvm.ln`): CodeView on
+// Windows (the linker writes it to a `.pdb` next to the executable),
+// DWARF 5 on Linux and DWARF 4 on macOS. `Options::dwarf` makes DWARF on
+// Windows too, for lldb, which reads DWARF in executables but (as LLVM's
+// Windows release builds it) not PDBs.
+//
+// * Functions are subprograms in namespaces for their module and, for
+//   methods, their type: `demo::Point::norm`, `demo::max::<i32>`,
+//   `demo::main::{closure#0}`. The linkage name is the symbol. Drop glue
+//   (`drop_in_place::<T>`), format thunks (`{fmt}`) and the C `main` are
+//   artificial.
+// * Every instruction has a location. `value`, `value_into` and `place`
+//   make their expression's span the location of what they emit and give
+//   their caller's back afterwards, so a call is at its call expression
+//   even after its arguments; statements are at their span, and what a
+//   block does when it ends (its drops, the return) at its closing brace.
+//   Spans in macro expansions are at the invocation.
+// * Variables: the parameters, and the bindings of each `let`, match arm
+//   and `for` loop, each `let` (and arm and loop) in a lexical block of
+//   its own that starts where it binds, as rustc does, so a shadowed name
+//   shows the variable in scope at the stopping point.
+// * Types (`di_type`): `str`, `String`, slices and owning arrays are
+//   structs of `data_ptr`, `length` (and `capacity`); enums are unions of
+//   a `tag` enumeration and one struct per variant, with the payload
+//   fields at their offsets. (LLVM's C API cannot make DWARF variant parts,
+//   and CodeView has none.) The visualizers in `std/debugger/` show the
+//   text of strings, the elements of arrays and only the active variant.
+//
+// Paths are recorded relative to the compilation directory (where `lunar`
+// runs) when they are under it, and `--remap-path-prefix FROM=TO` rewrites
+// the directories. Nothing depends on the time or on addresses: the same
+// program gives the same metadata.
+
+use core::arena::Id;
+use core::collections::HashMap;
+use core::intern::Symbol;
+use core::intrinsics::addr_of_mut;
+use ln_ast::Span;
+use ln_sema::defs::{CtorKind, DefId, DefKind};
+use ln_sema::diag::is_dummy;
+use ln_sema::program::Program;
+use ln_sema::thir::{Body, LocalId, LocalKind, Pat, PatKind, Thir};
+use ln_sema::ty::{ArrKind, IntTy, Ty, TyKind, TyList};
+use crater::{Cg, DebugInfo};
+use crater::llvm::*;
+
+/// The debug state of the function being generated, saved while another
+/// one is generated in its middle (drop glue, a format thunk).
+pub struct DiSaved {
+    sp: MetadataRef,
+    scope: MetadataRef,
+    file: MetadataRef,
+    loc: MetadataRef,
+    line: u32,
+}
+
+/// The DWARF version: 5 on Linux; 4 on macOS (what its tools expect) and
+/// on Windows (lldb 20 reads no DWARF 5 from PE executables).
+#[cfg(target_os = "linux")]
+fn dwarf_version(): u64 {
+    return 5;
+}
+
+#[cfg(not(target_os = "linux"))]
+fn dwarf_version(): u64 {
+    return 4;
+}
+
+/// Whether the target's format is CodeView.
+#[cfg(windows)]
+fn native_codeview(): bool {
+    return true;
+}
+
+#[cfg(unix)]
+fn native_codeview(): bool {
+    return false;
+}
+
+/// Whether to make CodeView: on Windows, unless DWARF was asked for
+/// (`Options::dwarf`, for lldb and other DWARF debuggers).
+pub fn use_codeview(dwarf: bool): bool {
+    return native_codeview() && !dwarf;
+}
+
+/// Whether `path` is absolute (`/...` or `C:/...`).
+fn is_absolute(path: str): bool {
+    let b = path.as_bytes();
+    return (b.len() > 0 && b[0] == b'/') || (b.len() > 2 && b[1] == b':' && b[2] == b'/');
+}
+
+/// The directory and file name to record for source file `path`: relative
+/// to the compilation directory `cdir` when it is under it (or relative),
+/// else its own directory and its name.
+fn split_path(cdir: str, path: str): (str, str) {
+    let b = path.as_bytes();
+    if cdir.len() > 0 && b.len() > cdir.len() + 1 && path.starts_with(cdir) && b[cdir.len()] == b'/' {
+        return (cdir, path[cdir.len() + 1..]);
+    }
+    if !is_absolute(path) {
+        return (cdir, path);
+    }
+    let mut i = b.len();
+    while i > 0 {
+        i -= 1;
+        if b[i] == b'/' {
+            return (path[..i], path[i + 1..]);
+        }
+    }
+    return (cdir, path);
+}
+
+/// Append `s` to `out` as an Itanium source name: its length, then it.
+fn source_name(out: &mut +String, s: str) {
+    out.write("{s.len()}");
+    out.push_str(s);
+}
+
+/// The locals pattern `pat` binds (through the first alternative of an
+/// or-pattern: they all bind the same ones).
+fn bindings(thir: &Thir, pat: Id::<Pat>, out: &mut +[LocalId; ..+]) {
+    match thir.pat(pat).kind {
+        PatKind::Binding { local, sub, .. } => {
+            out.push(local);
+            if let Some(s) = sub {
+                bindings(thir, s, out);
+            }
+        }
+        PatKind::Tuple(ps) => {
+            for q in thir.pat_ids.list(ps) {
+                bindings(thir, q, out);
+            }
+        }
+        PatKind::Or(alts) => {
+            if alts.len() > 0 {
+                bindings(thir, thir.pat_ids.list(alts)[0], out);
+            }
+        }
+        PatKind::Adt { fields, .. } => {
+            for f in thir.field_pats.list(fields) {
+                bindings(thir, f.pat, out);
+            }
+        }
+        PatKind::Wild | PatKind::Lit(_) | PatKind::Range { .. } => {}
+    }
+}
+
+impl Cg {
+    /// Whether debug information is generated.
+    pub fn dbg_on(&self): bool {
+        return self.dbg != DebugInfo::None;
+    }
+
+    /// Whether variables and types are described (not only lines).
+    pub fn dbg_full(&self): bool {
+        return self.dbg == DebugInfo::Full;
+    }
+
+    // ===================================================================== the module
+
+    /// Start the module's debug information: the flags that select the
+    /// format, and the compile unit.
+    pub fn di_init(&mut self, p: &mut +Program) {
+        if !self.dbg_on() {
+            return;
+        }
+        self.di = unsafe { LLVMCreateDIBuilder(self.module) };
+        if self.di_cv {
+            self.module_flag("CodeView", 1);
+        } else {
+            self.module_flag("Dwarf Version", dwarf_version());
+        }
+        self.module_flag("Debug Info Version", 3);
+        let file = self.di_main_file(p);
+        self.di_cu_file = file;
+        let producer = "lunar 0.1.0";
+        let none = "";
+        let kind = if self.dbg_full() { EMISSION_FULL } else { EMISSION_LINE_TABLES_ONLY };
+        let optimized = (self.opts.opt_level > 0) as i32;
+        let np = none.as_bytes().as_ptr();
+        self.di_cu = unsafe { LLVMDIBuilderCreateCompileUnit(self.di, DWARF_LANG_CPP, file, producer.as_bytes().as_ptr(), producer.len(), optimized, np, 0, 0, np, 0, kind, 0, 0, 0, np, 0, np, 0) };
+    }
+
+    /// Resolve what is pending (before the module is verified).
+    pub fn di_finish(&mut self) {
+        if self.dbg_on() {
+            unsafe { LLVMDIBuilderFinalize(self.di) };
+        }
+    }
+
+    pub fn di_dispose(&mut self) {
+        if self.dbg_on() && !is_null(self.di) {
+            unsafe { LLVMDisposeDIBuilder(self.di) };
+            self.di = null();
+        }
+    }
+
+    fn module_flag(&mut self, key: str, v: u64) {
+        let c = self.const_int(self.i32_ty(), v);
+        unsafe { LLVMAddModuleFlag(self.module, MODULE_FLAG_WARNING, key.as_bytes().as_ptr(), key.len(), LLVMValueAsMetadata(c)) };
+    }
+
+    // ===================================================================== files and lines
+
+    /// The file of `main` (or the first one), named in the compile unit.
+    fn di_main_file(&mut self, p: &mut +Program): MetadataRef {
+        if p.sources.files.len() == 0 {
+            return self.di_path_file("<unknown>");
+        }
+        let mut fi: u32 = 0;
+        if let Some(m) = p.main {
+            if let Some(pl) = self.di_place(p, p.def(m).span) {
+                let (f, _, _) = pl;
+                fi = f;
+            }
+        }
+        return self.di_file(p, fi);
+    }
+
+    /// The `DIFile` of source file `fi`.
+    fn di_file(&mut self, p: &mut +Program, fi: u32): MetadataRef {
+        if let Some(f) = self.di_files.get(fi) {
+            return f;
+        }
+        let name = String::from(p.text(p.sources.files[fi as usize].name));
+        let f = self.di_path_file(name.as_str());
+        self.di_files.insert(fi, f);
+        return f;
+    }
+
+    fn di_path_file(&self, path: str): MetadataRef {
+        let (dir, name) = split_path(self.di_dir.as_str(), path);
+        let d = self.remap(dir);
+        let ds = d.as_str();
+        return unsafe { LLVMDIBuilderCreateFile(self.di, name.as_bytes().as_ptr(), name.len(), ds.as_bytes().as_ptr(), ds.len()) };
+    }
+
+    /// `dir` with the `--remap-path-prefix` applied.
+    fn remap(&self, dir: str): String {
+        let from = self.remap_from.as_str();
+        if from.len() > 0 && dir.starts_with(from) && (dir.len() == from.len() || dir.as_bytes()[from.len()] == b'/') {
+            let mut out = String::from(self.remap_to.as_str());
+            out.push_str(dir[from.len()..]);
+            return out;
+        }
+        return String::from(dir);
+    }
+
+    /// The offsets of file `fi`'s line starts: their range in
+    /// `line_starts`, made on first use.
+    fn di_lines(&mut self, p: &mut +Program, fi: u32): (u32, u32) {
+        if let Some(r) = self.file_lines.get(fi) {
+            return r;
+        }
+        let f = p.sources.files[fi as usize];
+        let first = self.line_starts.len() as u32;
+        self.line_starts.push(f.start);
+        let bytes = p.sources.text.as_bytes();
+        let start = f.start as usize;
+        let end = (f.start + f.len) as usize;
+        for i in start..end {
+            if bytes[i] == b'\n' {
+                self.line_starts.push((i + 1) as u32);
+            }
+        }
+        let r = (first, self.line_starts.len() as u32 - first);
+        self.file_lines.insert(fi, r);
+        return r;
+    }
+
+    /// The 1-based line and column (in characters) of offset `pos` of file
+    /// `fi`.
+    fn di_line_col(&mut self, p: &mut +Program, fi: u32, pos: u32): (u32, u32) {
+        let (first, count) = self.di_lines(p, fi);
+        let mut lo = first as usize;
+        let mut hi = (first + count) as usize;
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if self.line_starts[mid] <= pos {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let line = (lo - first as usize) as u32 + 1;
+        let bytes = p.sources.text.as_bytes();
+        let mut col: u32 = 1;
+        let mut i = self.line_starts[lo] as usize;
+        while i < pos as usize {
+            if bytes[i] < 128 || bytes[i] >= 192 {
+                col += 1;
+            }
+            i += 1;
+        }
+        return (line, col);
+    }
+
+    /// The file, line and column of `span` in code the user wrote (a span
+    /// in a macro expansion is at the invocation); `None` for no place.
+    fn di_place(&mut self, p: &mut +Program, span: Span): Option::<(u32, u32, u32)> {
+        if is_dummy(span) || p.sources.files.len() == 0 {
+            return None;
+        }
+        let s = p.source_span(span);
+        if is_dummy(s) {
+            return None;
+        }
+        let fi = p.sources.file_of(s.lo);
+        if p.sources.files[fi as usize].expansion_site.is_some() {
+            return None;
+        }
+        let (line, col) = self.di_line_col(p, fi, s.lo);
+        return Some((fi, line, col));
+    }
+
+    /// The `DIFile` and line of `span` (the compile unit's file and 0 for
+    /// none).
+    fn di_file_line(&mut self, p: &mut +Program, span: Span): (MetadataRef, u32) {
+        return match self.di_place(p, span) {
+            Some(pl) => {
+                let (fi, line, _) = pl;
+                (self.di_file(p, fi), line)
+            }
+            None => (self.di_cu_file, 0),
+        };
+    }
+
+    // ===================================================================== locations
+
+    /// Make `span` the location of what is emitted next (unless it has no
+    /// place, or no function is being described).
+    pub fn di_set(&mut self, p: &mut +Program, span: Span) {
+        if is_null(self.di_sp) {
+            return;
+        }
+        let Some(pl) = self.di_place(p, span) else {
+            // Code with no place of its own is where the code before it
+            // is, or at the function's name if nothing was before it.
+            if self.di_bare {
+                self.di_use(self.di_loc, self.di_line);
+            }
+            return;
+        };
+        let (fi, line, col) = pl;
+        let file = self.di_file(p, fi);
+        let mut scope = self.di_scope;
+        if (file as usize) != (self.di_scope_file as usize) {
+            scope = unsafe { LLVMDIBuilderCreateLexicalBlockFile(self.di, self.di_scope, file, 0) };
+        }
+        let loc = unsafe { LLVMDIBuilderCreateDebugLocation(self.ctx, line, col, scope, null()) };
+        self.di_use(loc, line);
+    }
+
+    /// Make the closing brace of a block spanning `span` the location.
+    pub fn di_set_end(&mut self, p: &mut +Program, span: Span) {
+        if is_null(self.di_sp) {
+            return;
+        }
+        if is_dummy(span) || span.hi == 0 {
+            self.di_set(p, span);
+            return;
+        }
+        self.di_set(p, Span::new(span.hi - 1, span.hi));
+    }
+
+    fn di_use(&mut self, loc: MetadataRef, line: u32) {
+        self.di_bare = false;
+        self.di_loc = loc;
+        self.di_line = line;
+        unsafe { LLVMSetCurrentDebugLocation2(self.b, loc) };
+    }
+
+    /// The current location, to go back to with `di_back`.
+    pub fn di_mark(&self): (MetadataRef, u32) {
+        return (self.di_loc, self.di_line);
+    }
+
+    pub fn di_back(&mut self, m: (MetadataRef, u32)) {
+        if is_null(self.di_sp) {
+            return;
+        }
+        let (loc, line) = m;
+        if !is_null(loc) {
+            self.di_use(loc, line);
+        }
+    }
+
+    // ===================================================================== scopes
+
+    /// The innermost scope, to go back to with `di_scope_back`.
+    pub fn di_scope_mark(&self): (MetadataRef, MetadataRef) {
+        return (self.di_scope, self.di_scope_file);
+    }
+
+    pub fn di_scope_back(&mut self, m: (MetadataRef, MetadataRef)) {
+        let (scope, file) = m;
+        self.di_scope = scope;
+        self.di_scope_file = file;
+    }
+
+    /// A lexical block from `span` on, inside the innermost scope.
+    fn di_open(&mut self, p: &mut +Program, span: Span) {
+        let Some(pl) = self.di_place(p, span) else {
+            return;
+        };
+        let (fi, line, col) = pl;
+        let file = self.di_file(p, fi);
+        self.di_scope = unsafe { LLVMDIBuilderCreateLexicalBlock(self.di, self.di_scope, file, line, col) };
+        self.di_scope_file = file;
+    }
+
+    /// After pattern `pat` bound its variables (at `span`): a lexical block
+    /// from there on, describing them. The caller restores the scope
+    /// (`di_scope_mark`) where they go out of scope.
+    pub fn di_bind(&mut self, p: &mut +Program, pat: Id::<Pat>, span: Span) {
+        if !self.dbg_full() || is_null(self.di_sp) {
+            return;
+        }
+        let mut ls: [LocalId; ..+] = [];
+        bindings(&p.thir, pat, &mut ls);
+        if ls.len() == 0 {
+            return;
+        }
+        self.di_open(p, span);
+        for l in ls {
+            self.di_local(p, l);
+        }
+    }
+
+    /// `di_bind` for the variable of a `for` loop over a range.
+    pub fn di_bind_local(&mut self, p: &mut +Program, l: LocalId, span: Span) {
+        if !self.dbg_full() || is_null(self.di_sp) {
+            return;
+        }
+        self.di_open(p, span);
+        self.di_local(p, l);
+    }
+
+    // ===================================================================== functions
+
+    /// Describe `f`, the instance of `body.def` with arguments `self.args`,
+    /// and make its name the location of its prologue.
+    pub fn di_begin_fn(&mut self, p: &mut +Program, f: ValueRef, body: Body) {
+        if !self.dbg_on() {
+            return;
+        }
+        let def = body.def;
+        let mut mangled = String::from("_ZN");
+        let (scope, name) = self.di_fn_name(p, def, self.args, &mut mangled);
+        mangled.push('E');
+        let (file, line) = self.di_file_line(p, p.def(def).span);
+        let scope_line = match self.di_place(p, body.span) {
+            Some(pl) => {
+                let (_, l, _) = pl;
+                l
+            }
+            None => line,
+        };
+        let mut tys: [MetadataRef; ..+] = [];
+        if self.dbg_full() {
+            let r = p.fn_data(def).sig.ret;
+            let ret = self.t(p, r);
+            if Cg::is_void(p, ret) {
+                tys.push(null());
+            } else {
+                tys.push(self.di_type(p, ret));
+            }
+            for i in 0..body.params.len() {
+                let l = p.thir.local_ids.list(body.params)[i];
+                let lt = p.thir.local(body, l).ty;
+                let t = self.t(p, lt);
+                let st = p.types.strip_grow(t);
+                tys.push(self.di_type(p, st));
+            }
+        }
+        let sty = unsafe { LLVMDIBuilderCreateSubroutineType(self.di, file, tys[..].as_ptr(), tys.len() as u32, DI_FLAG_ZERO) };
+        let (sym, sym_len) = self.linkage_name(f);
+        let mut link = sym;
+        let mut len = sym_len;
+        if !self.di_cv {
+            let m = mangled.as_str();
+            link = m.as_bytes().as_ptr();
+            len = m.len();
+        }
+        let n = name.as_str();
+        let optimized = (self.opts.opt_level > 0) as i32;
+        let sp = unsafe { LLVMDIBuilderCreateFunction(self.di, scope, n.as_bytes().as_ptr(), n.len(), link, len, file, line, sty, 1, 1, scope_line, DI_FLAG_PROTOTYPED, optimized) };
+        unsafe { LLVMSetSubprogram(f, sp) };
+        self.di_sp = sp;
+        self.di_scope = sp;
+        self.di_scope_file = file;
+        // The prologue (storing the parameters into their slots) has no
+        // location, as with clang: a breakpoint on the function then stops
+        // after it, where the parameters can be read.
+        self.di_loc = unsafe { LLVMDIBuilderCreateDebugLocation(self.ctx, line, 1, sp, null()) };
+        self.di_line = line;
+        self.di_bare = true;
+        unsafe { LLVMSetCurrentDebugLocation2(self.b, null()) };
+        self.di_declared.clear();
+        for _ in 0..body.locals.len() {
+            self.di_declared.push(false);
+        }
+    }
+
+    /// The function is done: describe the variables no binding described
+    /// (in the function's scope), and stop describing.
+    pub fn di_end_fn(&mut self, p: &mut +Program) {
+        if is_null(self.di_sp) {
+            return;
+        }
+        self.di_scope = self.di_sp;
+        for i in 0..self.di_declared.len() {
+            if !self.di_declared[i] {
+                self.di_local(p, LocalId::new(i));
+            }
+        }
+        self.di_sp = null();
+        self.di_scope = null();
+        self.di_loc = null();
+        unsafe { LLVMSetCurrentDebugLocation2(self.b, null()) };
+    }
+
+    /// Make `f` (drop glue or a format thunk, generated in the middle of
+    /// another function) the function being described: an artificial one
+    /// named `name`, at `line` of the current file. The state to give back
+    /// with `di_restore`.
+    pub fn di_enter(&mut self, f: ValueRef, name: str, line: u32): DiSaved {
+        let saved = DiSaved { sp: self.di_sp, scope: self.di_scope, file: self.di_scope_file, loc: self.di_loc, line: self.di_line };
+        if !self.dbg_on() {
+            return saved;
+        }
+        let file = if is_null(self.di_scope_file) { self.di_cu_file } else { self.di_scope_file };
+        self.di_artificial(f, name, file, line);
+        return saved;
+    }
+
+    /// Describe `f` as an artificial function `name` at `line` of `file`,
+    /// and make that the location.
+    pub fn di_artificial(&mut self, f: ValueRef, name: str, file: MetadataRef, line: u32) {
+        let none: [MetadataRef; 0] = [];
+        let sty = unsafe { LLVMDIBuilderCreateSubroutineType(self.di, file, none[..].as_ptr(), 0, DI_FLAG_ZERO) };
+        let (link, len) = self.linkage_name(f);
+        let optimized = (self.opts.opt_level > 0) as i32;
+        let sp = unsafe { LLVMDIBuilderCreateFunction(self.di, null(), name.as_bytes().as_ptr(), name.len(), link, len, file, line, sty, 1, 1, line, DI_FLAG_ARTIFICIAL + DI_FLAG_PROTOTYPED, optimized) };
+        unsafe { LLVMSetSubprogram(f, sp) };
+        self.di_sp = sp;
+        self.di_scope = sp;
+        self.di_scope_file = file;
+        let loc = unsafe { LLVMDIBuilderCreateDebugLocation(self.ctx, line, 0, sp, null()) };
+        self.di_use(loc, line);
+    }
+
+    /// The linkage name to record for `f`: its symbol in CodeView. Not in
+    /// DWARF, where debuggers show a function by its linkage name
+    /// demangled and match qualified names (`b demo::main`) against that,
+    /// which Lunar's symbols cannot be: functions get their qualified name
+    /// in the Itanium scheme instead (`_ZN4demo4mainE`; see `di_fn_name`),
+    /// artificial ones none.
+    fn linkage_name(&self, f: ValueRef): (*u8, usize) {
+        let mut len: usize = 0;
+        let link = unsafe { LLVMGetValueName2(f, addr_of_mut(&mut len)) };
+        if !self.di_cv {
+            return (link, 0);
+        }
+        return (link, len);
+    }
+
+    /// Describe the C `main` (at the line of the program's `main`).
+    pub fn di_main(&mut self, p: &mut +Program, f: ValueRef) {
+        if !self.dbg_on() {
+            return;
+        }
+        let (file, line) = match p.main {
+            Some(m) => self.di_file_line(p, p.def(m).span),
+            None => (self.di_cu_file, 0),
+        };
+        self.di_artificial(f, "main", file, line);
+    }
+
+    /// Stop describing the C `main`.
+    pub fn di_main_done(&mut self) {
+        if !is_null(self.di_sp) {
+            self.di_sp = null();
+            unsafe { LLVMSetCurrentDebugLocation2(self.b, null()) };
+        }
+    }
+
+    pub fn di_restore(&mut self, s: DiSaved) {
+        if !self.dbg_on() {
+            return;
+        }
+        self.di_sp = s.sp;
+        self.di_scope = s.scope;
+        self.di_scope_file = s.file;
+        self.di_loc = s.loc;
+        self.di_line = s.line;
+        unsafe { LLVMSetCurrentDebugLocation2(self.b, s.loc) };
+    }
+
+    /// The current line (for artificial functions made for it).
+    pub fn di_cur_line(&self): u32 {
+        return self.di_line;
+    }
+
+    /// The scope (namespaces) and name of function `def` instantiated with
+    /// `args`: `max::<i32>` in `demo`, `norm` in `demo::Point`,
+    /// `{closure#0}` in `demo::main`. Each part of the qualified name is
+    /// appended to `mangled` as an Itanium source name (`4demo4norm`),
+    /// whatever its characters: demanglers take them as they are.
+    fn di_fn_name(&mut self, p: &mut +Program, def: DefId, args: TyList, mangled: &mut +String): (MetadataRef, String) {
+        let mut name = String::new();
+        if let Some(c) = p.closures.get(def) {
+            let (pscope, pname) = self.di_fn_name(p, c.parent, args, mangled);
+            let mut key = String::new();
+            key.write("fn#{c.parent.index()}#{pname}");
+            let scope = self.di_ns(p, pscope, pname.as_str(), key.as_str());
+            let n = self.closure_ordinal(p, def);
+            name.push_str("{closure#");
+            name.write("{n}");
+            name.push('}');
+            source_name(mangled, name.as_str());
+            return (scope, name);
+        }
+        let d = p.def(def);
+        let module = p.path_of(d.module);
+        let mut scope = self.di_module_ns(p, module.as_str(), mangled);
+        let fd = p.fn_data(def);
+        if let Some(o) = fd.owner {
+            // Methods are in a namespace for their type (the `Self` type of
+            // a trait's default method).
+            let mut self_ty: Option::<Ty> = None;
+            if p.def(o).kind == DefKind::Impl {
+                let st = p.impl_data(o).self_ty;
+                self_ty = Some(p.types.subst(st, args));
+            } else if args.len() > 0 {
+                self_ty = Some(p.types.at(args, 0));
+            }
+            let mut tn = String::new();
+            match self_ty {
+                Some(t) => self.di_ty_name(p, t, &mut tn),
+                None => tn.push_str(p.name(o)),
+            }
+            let mut key = String::new();
+            key.write("{module}::<impl {tn}>");
+            scope = self.di_ns(p, scope, tn.as_str(), key.as_str());
+            source_name(mangled, tn.as_str());
+        }
+        name.push_str(p.text(d.name));
+        let own = fd.generics.parent_count as usize;
+        if args.len() > own {
+            name.push_str("::<");
+            for i in own..args.len() {
+                if i > own {
+                    name.push_str(", ");
+                }
+                self.di_ty_name(p, p.types.at(args, i), &mut name);
+            }
+            name.push('>');
+        }
+        source_name(mangled, name.as_str());
+        return (scope, name);
+    }
+
+    /// The position of closure `def` among its function's closures.
+    fn closure_ordinal(&mut self, p: &mut +Program, def: DefId): u32 {
+        if !self.di_ords_built {
+            self.di_ords_built = true;
+            let mut counts: HashMap::<DefId, u32> = HashMap::new();
+            for i in 0..p.defs.len() {
+                let d = DefId::new(i);
+                if let Some(c) = p.closures.get(d) {
+                    let n = match counts.get(c.parent) {
+                        Some(n) => n,
+                        None => 0,
+                    };
+                    self.di_ords.insert(d, n);
+                    counts.insert(c.parent, n + 1);
+                }
+            }
+        }
+        return match self.di_ords.get(def) {
+            Some(n) => n,
+            None => 0,
+        };
+    }
+
+    /// The namespace `name` in `parent` (null: the top level), made once
+    /// per `key`.
+    fn di_ns(&mut self, p: &mut +Program, parent: MetadataRef, name: str, key: str): MetadataRef {
+        let k = p.sym(key);
+        if let Some(ns) = self.di_nss.get(k) {
+            return ns;
+        }
+        let ns = unsafe { LLVMDIBuilderCreateNameSpace(self.di, parent, name.as_bytes().as_ptr(), name.len(), 0) };
+        self.di_nss.insert(k, ns);
+        return ns;
+    }
+
+    /// The innermost namespace of module path `path` (`a::b::c`), whose
+    /// parts are appended to `mangled` (see `di_fn_name`).
+    fn di_module_ns(&mut self, p: &mut +Program, path: str, mangled: &mut +String): MetadataRef {
+        let mut scope = null();
+        let b = path.as_bytes();
+        let mut start: usize = 0;
+        let mut i: usize = 0;
+        while i <= b.len() {
+            let end = i == b.len();
+            if end || (i + 1 < b.len() && b[i] == b':' && b[i + 1] == b':') {
+                let seg = path[start..i];
+                if seg.len() > 0 {
+                    scope = self.di_ns(p, scope, seg, path[..i]);
+                    source_name(mangled, seg);
+                }
+                if end {
+                    break;
+                }
+                i += 2;
+                start = i;
+                continue;
+            }
+            i += 1;
+        }
+        return scope;
+    }
+
+    // ===================================================================== variables
+
+    /// Describe local `l`, at its slot, as a variable of the innermost
+    /// scope (once; not compiler temporaries).
+    pub fn di_local(&mut self, p: &mut +Program, l: LocalId) {
+        if !self.dbg_full() || is_null(self.di_sp) {
+            return;
+        }
+        let i = l.index();
+        if i >= self.di_declared.len() || self.di_declared[i] {
+            return;
+        }
+        self.di_declared[i] = true;
+        let local = p.thir.local(self.body, l);
+        match local.kind {
+            LocalKind::Let => {}
+            _ => return,
+        }
+        let slot = self.locals[i];
+        if is_null(slot) {
+            return;
+        }
+        let lt = self.t(p, local.ty);
+        let t = p.types.strip_grow(lt);
+        let ty = self.di_type(p, t);
+        let name = String::from(p.text(local.name));
+        let n = name.as_str();
+        let (file, line) = self.di_file_line(p, local.span);
+        let var = unsafe { LLVMDIBuilderCreateAutoVariable(self.di, self.di_scope, n.as_bytes().as_ptr(), n.len(), file, line, ty, 1, DI_FLAG_ZERO, 0) };
+        self.di_declare(slot, var, false, line);
+    }
+
+    /// Describe parameter `l` (argument `arg_no`, from 1) at `storage`: its
+    /// slot, or with `indirect`, a slot holding its address.
+    pub fn di_param(&mut self, p: &mut +Program, l: LocalId, arg_no: u32, storage: ValueRef, indirect: bool) {
+        if !self.dbg_full() || is_null(self.di_sp) {
+            return;
+        }
+        let i = l.index();
+        if i < self.di_declared.len() {
+            self.di_declared[i] = true;
+        }
+        let local = p.thir.local(self.body, l);
+        let lt = self.t(p, local.ty);
+        let t = p.types.strip_grow(lt);
+        let ty = self.di_type(p, t);
+        let name = String::from(p.text(local.name));
+        let n = name.as_str();
+        let fl = self.di_file_line(p, local.span);
+        let (mut file, mut line) = (self.di_scope_file, self.di_line);
+        let (f, l) = fl;
+        if l != 0 {
+            file = f;
+            line = l;
+        }
+        let var = unsafe { LLVMDIBuilderCreateParameterVariable(self.di, self.di_sp, n.as_bytes().as_ptr(), n.len(), arg_no, file, line, ty, 1, DI_FLAG_ZERO) };
+        self.di_declare(storage, var, indirect, line);
+    }
+
+    /// Declare that variable `var` lives at `storage` (an entry block
+    /// alloca), or with `indirect`, at the address held there.
+    fn di_declare(&mut self, storage: ValueRef, var: MetadataRef, indirect: bool, line: u32) {
+        let deref = [DW_OP_DEREF];
+        let n: usize = if indirect { 1 } else { 0 };
+        let expr = unsafe { LLVMDIBuilderCreateExpression(self.di, deref[..].as_ptr(), n) };
+        let loc = unsafe { LLVMDIBuilderCreateDebugLocation(self.ctx, line, 0, self.di_scope, null()) };
+        let next = unsafe { LLVMGetNextInstruction(storage) };
+        if is_null(next) {
+            unsafe { LLVMDIBuilderInsertDeclareRecordAtEnd(self.di, storage, var, expr, loc, LLVMGetInstructionParent(storage)) };
+        } else {
+            unsafe { LLVMDIBuilderInsertDeclareRecordBefore(self.di, storage, var, expr, loc, next) };
+        }
+    }
+
+    // ===================================================================== types
+
+    /// The debug type of values of type `t` (made once). A type met again
+    /// while it is being made (through a pointer) is a declaration of it,
+    /// which debuggers resolve by name.
+    pub fn di_type(&mut self, p: &mut +Program, t: Ty): MetadataRef {
+        if let Some(d) = self.di_types.get(t) {
+            return d;
+        }
+        if let Some(f) = self.di_fwd.get(t) {
+            return f;
+        }
+        let d = self.di_make_type(p, t);
+        self.di_types.insert(t, d);
+        return d;
+    }
+
+    fn di_make_type(&mut self, p: &mut +Program, t: Ty): MetadataRef {
+        let lt = self.llty(p, t);
+        let bits = unsafe { LLVMABISizeOfType(self.td, lt) } * 8;
+        let align = unsafe { LLVMABIAlignmentOfType(self.td, lt) } * 8;
+        let mut name = String::new();
+        self.di_ty_name(p, t, &mut name);
+        let file = self.di_cu_file;
+        return match p.types.kind(t) {
+            TyKind::Int(i) => self.di_basic(name.as_str(), bits, if i.signed() { DW_ATE_SIGNED } else { DW_ATE_UNSIGNED }),
+            TyKind::Float(_) => self.di_basic(name.as_str(), bits, DW_ATE_FLOAT),
+            TyKind::Bool => self.di_basic("bool", 8, DW_ATE_BOOLEAN),
+            TyKind::Char => self.di_basic("char", 32, DW_ATE_UTF),
+            TyKind::Str => {
+                let u8t = p.types.int(IntTy::U8);
+                self.di_handle(p, name.as_str(), u8t, false, lt, bits, align)
+            }
+            TyKind::String => {
+                let u8t = p.types.int(IntTy::U8);
+                self.di_handle(p, name.as_str(), u8t, true, lt, bits, align)
+            }
+            TyKind::FmtArgs => {
+                let u8t = p.types.int(IntTy::U8);
+                let env = p.types.ptr(u8t, false);
+                let thunk = p.types.int(IntTy::Usize);
+                let mut ms: [MetadataRef; ..+] = [];
+                ms.push(self.di_field(p, null(), "env", env, self.offset(lt, 0), file, 0));
+                ms.push(self.di_field(p, null(), "thunk", thunk, self.offset(lt, 1), file, 0));
+                self.di_struct(null(), name.as_str(), "", file, 0, bits, align, ms[..])
+            }
+            TyKind::Tuple(ts) => {
+                let mut ms: [MetadataRef; ..+] = [];
+                for i in 0..ts.len() {
+                    let mut fname = String::new();
+                    fname.write("__{i}");
+                    let ft = p.types.at(ts, i);
+                    ms.push(self.di_field(p, null(), fname.as_str(), ft, self.offset(lt, i as u32), file, 0));
+                }
+                self.di_struct(null(), name.as_str(), "", file, 0, bits, align, ms[..])
+            }
+            TyKind::Adt(d, args) => self.di_adt(p, t, d, args, name.as_str(), lt, bits, align),
+            TyKind::Array(e, k) => match k {
+                ArrKind::Fixed(n) => self.di_array(p, e, n, bits, align),
+                ArrKind::FixedVar(_) => self.di_array(p, e, 0, bits, align),
+                ArrKind::Slice | ArrKind::SliceMut => self.di_handle(p, name.as_str(), e, false, lt, bits, align),
+                ArrKind::Dyn | ArrKind::Grow | ArrKind::Shrink => self.di_handle(p, name.as_str(), e, true, lt, bits, align),
+            },
+            TyKind::Grow(inner) => self.di_type(p, inner),
+            TyKind::Ptr(e, _) => {
+                let pointee = self.di_type(p, e);
+                self.di_pointer(pointee)
+            }
+            TyKind::FnPtr(ps, _, r) => {
+                let mut tys: [MetadataRef; ..+] = [];
+                if Cg::is_void(p, r) {
+                    tys.push(null());
+                } else {
+                    tys.push(self.di_type(p, r));
+                }
+                for i in 0..ps.len() {
+                    tys.push(self.di_type(p, p.types.at(ps, i)));
+                }
+                let sty = unsafe { LLVMDIBuilderCreateSubroutineType(self.di, file, tys[..].as_ptr(), tys.len() as u32, DI_FLAG_ZERO) };
+                self.di_pointer(sty)
+            }
+            TyKind::Closure(def, args) => self.di_closure(p, t, def, args, name.as_str(), lt, bits, align),
+            TyKind::Opaque(..) => {
+                let r = p.reveal(t);
+                self.di_type(p, r)
+            }
+            TyKind::Never | TyKind::Error | TyKind::Param(..) | TyKind::Infer(_) => {
+                let none: [MetadataRef; 0] = [];
+                self.di_struct(null(), name.as_str(), "", file, 0, 0, 8, none[..])
+            }
+        };
+    }
+
+    /// The offset in bits of field `i` of LLVM struct `st`.
+    fn offset(&self, st: TypeRef, i: u32): u64 {
+        return unsafe { LLVMOffsetOfElement(self.td, st, i) } * 8;
+    }
+
+    fn di_basic(&mut self, name: str, bits: u64, encoding: u32): MetadataRef {
+        return unsafe { LLVMDIBuilderCreateBasicType(self.di, name.as_bytes().as_ptr(), name.len(), bits, encoding, DI_FLAG_ZERO) };
+    }
+
+    fn di_pointer(&mut self, pointee: MetadataRef): MetadataRef {
+        let none = "";
+        return unsafe { LLVMDIBuilderCreatePointerType(self.di, pointee, 64, 0, 0, none.as_bytes().as_ptr(), 0) };
+    }
+
+    /// A member `name` of type `t` at `offset` bits.
+    fn di_field(&mut self, p: &mut +Program, scope: MetadataRef, name: str, t: Ty, offset: u64, file: MetadataRef, line: u32): MetadataRef {
+        let ty = self.di_type(p, t);
+        let lt = self.llty(p, t);
+        let bits = unsafe { LLVMABISizeOfType(self.td, lt) } * 8;
+        let align = unsafe { LLVMABIAlignmentOfType(self.td, lt) } * 8;
+        return unsafe { LLVMDIBuilderCreateMemberType(self.di, scope, name.as_bytes().as_ptr(), name.len(), file, line, bits, align, offset, DI_FLAG_ZERO, ty) };
+    }
+
+    fn di_struct(&mut self, scope: MetadataRef, name: str, uid: str, file: MetadataRef, line: u32, bits: u64, align: u32, ms: [MetadataRef; &]): MetadataRef {
+        return unsafe { LLVMDIBuilderCreateStructType(self.di, scope, name.as_bytes().as_ptr(), name.len(), file, line, bits, align, DI_FLAG_ZERO, null(), ms.as_ptr(), ms.len() as u32, 0, null(), uid.as_bytes().as_ptr(), uid.len()) };
+    }
+
+    /// `[T; N]`.
+    fn di_array(&mut self, p: &mut +Program, e: Ty, n: u64, bits: u64, align: u32): MetadataRef {
+        let et = self.di_type(p, e);
+        let sub = [unsafe { LLVMDIBuilderGetOrCreateSubrange(self.di, 0, n as i64) }];
+        return unsafe { LLVMDIBuilderCreateArrayType(self.di, bits, align, et, sub[..].as_ptr(), 1) };
+    }
+
+    /// `str`, `String`, a slice or an owning array: `data_ptr` to the
+    /// elements of type `elem`, `length`, and with `cap`, `capacity`.
+    fn di_handle(&mut self, p: &mut +Program, name: str, elem: Ty, cap: bool, lt: TypeRef, bits: u64, align: u32): MetadataRef {
+        let usize_t = p.types.int(IntTy::Usize);
+        let ptr = p.types.ptr(elem, false);
+        let file = self.di_cu_file;
+        let mut ms: [MetadataRef; ..+] = [];
+        ms.push(self.di_field(p, null(), "data_ptr", ptr, self.offset(lt, 0), file, 0));
+        ms.push(self.di_field(p, null(), "length", usize_t, self.offset(lt, 1), file, 0));
+        if cap {
+            ms.push(self.di_field(p, null(), "capacity", usize_t, self.offset(lt, 2), file, 0));
+        }
+        return self.di_struct(null(), name, "", file, 0, bits, align, ms[..]);
+    }
+
+    /// The name of field `i` named `name`: `__i` for tuple fields.
+    fn field_name(&mut self, p: &mut +Program, ctor: CtorKind, name: Symbol, i: usize, out: &mut +String) {
+        if ctor == CtorKind::Tuple {
+            out.write("__{i}");
+        } else {
+            out.push_str(p.text(name));
+        }
+    }
+
+    /// A struct (a union for an enum) instance `t` of `d<args>`.
+    fn di_adt(&mut self, p: &mut +Program, t: Ty, d: DefId, args: TyList, name: str, lt: TypeRef, bits: u64, align: u32): MetadataRef {
+        let info = p.def(d);
+        let module = p.path_of(info.module);
+        let mut unused = String::new();
+        let scope = self.di_module_ns(p, module.as_str(), &mut unused);
+        let (file, line) = self.di_file_line(p, info.span);
+        let mut uid = String::new();
+        uid.write("{module}::{name}");
+        let adt = p.adt(d);
+        let tag = if adt.is_enum { DW_TAG_UNION_TYPE } else { DW_TAG_STRUCTURE_TYPE };
+        let us = uid.as_str();
+        let fwd = unsafe { LLVMDIBuilderCreateForwardDecl(self.di, tag, name.as_bytes().as_ptr(), name.len(), scope, file, line, 0, bits, align, us.as_bytes().as_ptr(), us.len()) };
+        self.di_fwd.insert(t, fwd);
+        let mut ms: [MetadataRef; ..+] = [];
+        if !adt.is_enum {
+            let v = p.variants.list(adt.variants)[0];
+            for i in 0..v.fields.len() {
+                let fd = p.fields.list(v.fields)[i];
+                let ft = p.types.subst(fd.ty, args);
+                let mut fname = String::new();
+                self.field_name(p, v.ctor, fd.name, i, &mut fname);
+                let (_, fline) = self.di_file_line(p, fd.span);
+                ms.push(self.di_field(p, fwd, fname.as_str(), ft, self.offset(lt, i as u32), file, fline));
+            }
+            return self.di_struct(scope, name, us, file, line, bits, align, ms[..]);
+        }
+        // An enum: a union of the tag and a struct for each variant, whose
+        // fields are at their offsets in the payload.
+        let payload = self.offset(lt, 1);
+        let u32t = p.types.int(IntTy::U32);
+        let base = self.di_type(p, u32t);
+        let mut enumerators: [MetadataRef; ..+] = [];
+        for vi in 0..adt.variants.len() {
+            let v = p.variants.list(adt.variants)[vi];
+            let vn = String::from(p.text(v.name));
+            let s = vn.as_str();
+            enumerators.push(unsafe { LLVMDIBuilderCreateEnumerator(self.di, s.as_bytes().as_ptr(), s.len(), vi as i64, 1) });
+        }
+        let mut tag_name = String::from(name);
+        tag_name.push_str("::{tag}");
+        let tn = tag_name.as_str();
+        let tag_ty = unsafe { LLVMDIBuilderCreateEnumerationType(self.di, scope, tn.as_bytes().as_ptr(), tn.len(), file, line, 32, 32, enumerators[..].as_ptr(), enumerators.len() as u32, base) };
+        let tag_field = "tag";
+        ms.push(unsafe { LLVMDIBuilderCreateMemberType(self.di, fwd, tag_field.as_bytes().as_ptr(), tag_field.len(), file, line, 32, 32, 0, DI_FLAG_ZERO, tag_ty) });
+        for vi in 0..adt.variants.len() {
+            let v = p.variants.list(adt.variants)[vi];
+            let vs = self.variant_struct(p, t, vi);
+            let (_, vline) = self.di_file_line(p, v.span);
+            let mut fs: [MetadataRef; ..+] = [];
+            for i in 0..v.fields.len() {
+                let fd = p.fields.list(v.fields)[i];
+                let ft = p.types.subst(fd.ty, args);
+                let mut fname = String::new();
+                self.field_name(p, v.ctor, fd.name, i, &mut fname);
+                let (_, fline) = self.di_file_line(p, fd.span);
+                fs.push(self.di_field(p, null(), fname.as_str(), ft, payload + self.offset(vs, i as u32), file, fline));
+            }
+            let vn = String::from(p.text(v.name));
+            let mut vname = String::new();
+            vname.write("{name}::{vn}");
+            let mut vuid = String::new();
+            vuid.write("{us}::{vn}");
+            let vty = self.di_struct(scope, vname.as_str(), vuid.as_str(), file, vline, bits, align, fs[..]);
+            let vns = vn.as_str();
+            ms.push(unsafe { LLVMDIBuilderCreateMemberType(self.di, fwd, vns.as_bytes().as_ptr(), vns.len(), file, vline, bits, align, 0, DI_FLAG_ZERO, vty) });
+        }
+        return unsafe { LLVMDIBuilderCreateUnionType(self.di, scope, name.as_bytes().as_ptr(), name.len(), file, line, bits, align, DI_FLAG_ZERO, ms[..].as_ptr(), ms.len() as u32, 0, us.as_bytes().as_ptr(), us.len()) };
+    }
+
+    /// A closure's captures: a struct with a member per capture, named
+    /// after the variable (a pointer to it, for one it borrows).
+    fn di_closure(&mut self, p: &mut +Program, t: Ty, def: DefId, args: TyList, name: str, lt: TypeRef, bits: u64, align: u32): MetadataRef {
+        let mut unused = String::new();
+        let (scope, fname) = self.di_fn_name(p, def, args, &mut unused);
+        let _ = fname;
+        let (file, line) = self.di_file_line(p, p.def(def).span);
+        let mut uid = String::new();
+        uid.write("{name}@{def.index()}");
+        let us = uid.as_str();
+        let fwd = unsafe { LLVMDIBuilderCreateForwardDecl(self.di, DW_TAG_STRUCTURE_TYPE, name.as_bytes().as_ptr(), name.len(), scope, file, line, 0, bits, align, us.as_bytes().as_ptr(), us.len()) };
+        self.di_fwd.insert(t, fwd);
+        let fields = p.closure_fields(def, args);
+        let Some(info) = p.closures.get(def) else {
+            let none: [MetadataRef; 0] = [];
+            return self.di_struct(scope, name, us, file, line, bits, align, none[..]);
+        };
+        let mut ms: [MetadataRef; ..+] = [];
+        for i in 0..fields.len() {
+            let cap = p.captures.list(info.captures)[i];
+            let cn = String::from(p.text(cap.name));
+            let ft = p.types.at(fields, i);
+            ms.push(self.di_field(p, fwd, cn.as_str(), ft, self.offset(lt, i as u32), file, line));
+        }
+        return self.di_struct(scope, name, us, file, line, bits, align, ms[..]);
+    }
+
+    /// The name of type `t` in the debug information: as Lunar writes it,
+    /// except owning arrays and slices in CodeView, where natvis patterns
+    /// can only match `name<...>` templates: `array$<T>`, `slice$<T>`.
+    pub fn di_ty_name(&mut self, p: &mut +Program, t: Ty, out: &mut +String) {
+        match p.types.kind(t) {
+            TyKind::Adt(d, args) => {
+                out.push_str(p.name(d));
+                if args.len() > 0 {
+                    out.push_str("::<");
+                    self.di_ty_names(p, args, out);
+                    out.push('>');
+                }
+            }
+            TyKind::Tuple(ts) => {
+                out.push('(');
+                self.di_ty_names(p, ts, out);
+                if ts.len() == 1 {
+                    out.push(',');
+                }
+                out.push(')');
+            }
+            TyKind::Array(e, k) => {
+                let fixed = match k {
+                    ArrKind::Fixed(_) | ArrKind::FixedVar(_) => true,
+                    _ => false,
+                };
+                if self.di_cv && !fixed {
+                    out.push_str(if k.is_slice() { "slice$<" } else { "array$<" });
+                    self.di_ty_name(p, e, out);
+                    out.push('>');
+                    return;
+                }
+                out.push('[');
+                self.di_ty_name(p, e, out);
+                match k {
+                    ArrKind::Fixed(n) => out.write("; {n}]"),
+                    ArrKind::FixedVar(_) => out.push_str("; _]"),
+                    ArrKind::Dyn => out.push(']'),
+                    ArrKind::Grow => out.push_str("; ..+]"),
+                    ArrKind::Shrink => out.push_str("; -..+]"),
+                    ArrKind::Slice => out.push_str("; &]"),
+                    ArrKind::SliceMut => out.push_str("; &mut]"),
+                }
+            }
+            TyKind::Grow(e) => self.di_ty_name(p, e, out),
+            TyKind::Ptr(e, m) => {
+                out.push_str(if m { "*mut " } else { "*" });
+                self.di_ty_name(p, e, out);
+            }
+            TyKind::Closure(def, _) => {
+                let n = self.closure_ordinal(p, def);
+                out.push_str("{closure_env#");
+                out.write("{n}");
+                out.push('}');
+            }
+            TyKind::Opaque(..) => {
+                let r = p.reveal(t);
+                self.di_ty_name(p, r, out);
+            }
+            _ => p.write_ty(out, t),
+        }
+    }
+
+    fn di_ty_names(&mut self, p: &mut +Program, l: TyList, out: &mut +String) {
+        for i in 0..l.len() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            self.di_ty_name(p, p.types.at(l, i), out);
+        }
+    }
+}

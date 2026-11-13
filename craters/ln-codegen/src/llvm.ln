@@ -18,6 +18,9 @@ pub type PassBuilderOptionsRef = *mut u8;
 pub type ErrorRef = *mut u8;
 pub type AttributeRef = *mut u8;
 pub type UseRef = *mut u8;
+pub type MetadataRef = *mut u8;
+pub type DIBuilderRef = *mut u8;
+pub type DbgRecordRef = *mut u8;
 
 // ----- LLVMLinkage -----
 pub const EXTERNAL_LINKAGE: u32 = 0;
@@ -70,6 +73,32 @@ pub const GLOBAL_UNNAMED_ADDR: u32 = 2;
 
 /// `LLVMAttributeFunctionIndex` (`~0U`).
 pub const ATTRIBUTE_FUNCTION_INDEX: u32 = 4294967295;
+
+// ----- debug information (llvm-c/DebugInfo.h) -----
+/// `LLVMModuleFlagBehaviorWarning`.
+pub const MODULE_FLAG_WARNING: u32 = 1;
+/// `LLVMDWARFSourceLanguageC_plus_plus` (the C API's numbering, which
+/// is `DW_LANG_*` minus one): debuggers then use their C++ support for
+/// namespaces, `::` paths and expressions.
+pub const DWARF_LANG_CPP: u32 = 3;
+/// `LLVMDWARFEmissionKind`.
+pub const EMISSION_FULL: u32 = 1;
+pub const EMISSION_LINE_TABLES_ONLY: u32 = 2;
+/// `LLVMDIFlags`.
+pub const DI_FLAG_ZERO: u32 = 0;
+pub const DI_FLAG_ARTIFICIAL: u32 = 64;
+pub const DI_FLAG_PROTOTYPED: u32 = 256;
+/// `DW_ATE_*` base type encodings.
+pub const DW_ATE_BOOLEAN: u32 = 2;
+pub const DW_ATE_FLOAT: u32 = 4;
+pub const DW_ATE_SIGNED: u32 = 5;
+pub const DW_ATE_UNSIGNED: u32 = 7;
+pub const DW_ATE_UTF: u32 = 16;
+/// `DW_TAG_structure_type`, `DW_TAG_union_type`.
+pub const DW_TAG_STRUCTURE_TYPE: u32 = 19;
+pub const DW_TAG_UNION_TYPE: u32 = 23;
+/// `DW_OP_deref`.
+pub const DW_OP_DEREF: u64 = 6;
 
 // The C API is its own library on Windows (`LLVM-C.dll`) and part of
 // `libLLVM` elsewhere. The directory it is in goes in `$LUNAR_LIB_PATH`.
@@ -249,6 +278,43 @@ extern "C" {
     pub fn LLVMBuildPhi(b: BuilderRef, t: TypeRef, name: *u8): ValueRef;
     pub fn LLVMAddIncoming(phi: ValueRef, vals: *ValueRef, blocks: *BasicBlockRef, n: u32);
     pub fn LLVMBuildCall2(b: BuilderRef, fn_ty: TypeRef, f: ValueRef, args: *ValueRef, n: u32, name: *u8): ValueRef;
+
+    // ----- layout -----
+    pub fn LLVMOffsetOfElement(td: TargetDataRef, st: TypeRef, i: u32): u64;
+
+    // ----- debug information -----
+    pub fn LLVMValueAsMetadata(v: ValueRef): MetadataRef;
+    pub fn LLVMAddModuleFlag(m: ModuleRef, behavior: u32, key: *u8, key_len: usize, val: MetadataRef);
+    pub fn LLVMSetSubprogram(f: ValueRef, sp: MetadataRef);
+    pub fn LLVMSetCurrentDebugLocation2(b: BuilderRef, loc: MetadataRef);
+    pub fn LLVMCreateDIBuilder(m: ModuleRef): DIBuilderRef;
+    pub fn LLVMDisposeDIBuilder(d: DIBuilderRef);
+    pub fn LLVMDIBuilderFinalize(d: DIBuilderRef);
+    pub fn LLVMDIBuilderCreateCompileUnit(d: DIBuilderRef, lang: u32, file: MetadataRef, producer: *u8, producer_len: usize, optimized: i32, flags: *u8, flags_len: usize, runtime_ver: u32, split_name: *u8, split_name_len: usize, kind: u32, dwo_id: u32, split_debug_inlining: i32, debug_info_for_profiling: i32, sysroot: *u8, sysroot_len: usize, sdk: *u8, sdk_len: usize): MetadataRef;
+    pub fn LLVMDIBuilderCreateFile(d: DIBuilderRef, name: *u8, name_len: usize, dir: *u8, dir_len: usize): MetadataRef;
+    pub fn LLVMDIBuilderCreateNameSpace(d: DIBuilderRef, parent: MetadataRef, name: *u8, name_len: usize, export_symbols: i32): MetadataRef;
+    pub fn LLVMDIBuilderCreateFunction(d: DIBuilderRef, scope: MetadataRef, name: *u8, name_len: usize, linkage: *u8, linkage_len: usize, file: MetadataRef, line: u32, ty: MetadataRef, local_to_unit: i32, definition: i32, scope_line: u32, flags: u32, optimized: i32): MetadataRef;
+    pub fn LLVMDIBuilderCreateLexicalBlock(d: DIBuilderRef, scope: MetadataRef, file: MetadataRef, line: u32, col: u32): MetadataRef;
+    pub fn LLVMDIBuilderCreateDebugLocation(c: ContextRef, line: u32, col: u32, scope: MetadataRef, inlined_at: MetadataRef): MetadataRef;
+    pub fn LLVMDIBuilderCreateSubroutineType(d: DIBuilderRef, file: MetadataRef, tys: *MetadataRef, n: u32, flags: u32): MetadataRef;
+    pub fn LLVMDIBuilderCreateBasicType(d: DIBuilderRef, name: *u8, name_len: usize, bits: u64, encoding: u32, flags: u32): MetadataRef;
+    pub fn LLVMDIBuilderCreatePointerType(d: DIBuilderRef, pointee: MetadataRef, bits: u64, align: u32, address_space: u32, name: *u8, name_len: usize): MetadataRef;
+    pub fn LLVMDIBuilderCreateStructType(d: DIBuilderRef, scope: MetadataRef, name: *u8, name_len: usize, file: MetadataRef, line: u32, bits: u64, align: u32, flags: u32, derived_from: MetadataRef, elems: *MetadataRef, n: u32, runtime_lang: u32, vtable_holder: MetadataRef, unique_id: *u8, unique_id_len: usize): MetadataRef;
+    pub fn LLVMDIBuilderCreateUnionType(d: DIBuilderRef, scope: MetadataRef, name: *u8, name_len: usize, file: MetadataRef, line: u32, bits: u64, align: u32, flags: u32, elems: *MetadataRef, n: u32, runtime_lang: u32, unique_id: *u8, unique_id_len: usize): MetadataRef;
+    pub fn LLVMDIBuilderCreateMemberType(d: DIBuilderRef, scope: MetadataRef, name: *u8, name_len: usize, file: MetadataRef, line: u32, bits: u64, align: u32, offset: u64, flags: u32, ty: MetadataRef): MetadataRef;
+    pub fn LLVMDIBuilderCreateEnumerator(d: DIBuilderRef, name: *u8, name_len: usize, value: i64, unsigned: i32): MetadataRef;
+    pub fn LLVMDIBuilderCreateEnumerationType(d: DIBuilderRef, scope: MetadataRef, name: *u8, name_len: usize, file: MetadataRef, line: u32, bits: u64, align: u32, elems: *MetadataRef, n: u32, class_ty: MetadataRef): MetadataRef;
+    pub fn LLVMDIBuilderCreateArrayType(d: DIBuilderRef, bits: u64, align: u32, elem: MetadataRef, subscripts: *MetadataRef, n: u32): MetadataRef;
+    pub fn LLVMDIBuilderGetOrCreateSubrange(d: DIBuilderRef, lower: i64, count: i64): MetadataRef;
+    pub fn LLVMDIBuilderCreateForwardDecl(d: DIBuilderRef, tag: u32, name: *u8, name_len: usize, scope: MetadataRef, file: MetadataRef, line: u32, runtime_lang: u32, bits: u64, align: u32, unique_id: *u8, unique_id_len: usize): MetadataRef;
+    pub fn LLVMDIBuilderCreateLexicalBlockFile(d: DIBuilderRef, scope: MetadataRef, file: MetadataRef, discriminator: u32): MetadataRef;
+    pub fn LLVMGetValueName2(v: ValueRef, len: *mut usize): *u8;
+    pub fn LLVMGetInstructionParent(i: ValueRef): BasicBlockRef;
+    pub fn LLVMDIBuilderCreateExpression(d: DIBuilderRef, ops: *u64, n: usize): MetadataRef;
+    pub fn LLVMDIBuilderCreateAutoVariable(d: DIBuilderRef, scope: MetadataRef, name: *u8, name_len: usize, file: MetadataRef, line: u32, ty: MetadataRef, always_preserve: i32, flags: u32, align: u32): MetadataRef;
+    pub fn LLVMDIBuilderCreateParameterVariable(d: DIBuilderRef, scope: MetadataRef, name: *u8, name_len: usize, arg_no: u32, file: MetadataRef, line: u32, ty: MetadataRef, always_preserve: i32, flags: u32): MetadataRef;
+    pub fn LLVMDIBuilderInsertDeclareRecordBefore(d: DIBuilderRef, storage: ValueRef, var: MetadataRef, expr: MetadataRef, loc: MetadataRef, before: ValueRef): DbgRecordRef;
+    pub fn LLVMDIBuilderInsertDeclareRecordAtEnd(d: DIBuilderRef, storage: ValueRef, var: MetadataRef, expr: MetadataRef, loc: MetadataRef, bb: BasicBlockRef): DbgRecordRef;
 }
 
 /// The NUL-terminated literal `s` (which must end in `\0`) for C.
