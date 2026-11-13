@@ -61,6 +61,8 @@ pub struct AnalyzeOptions<'a> {
     pub overlay: Option<&'a HashMap<PathBuf, String>>,
     /// Read the standard library from this directory.
     pub std_dir: Option<&'a Path>,
+    /// The name and version of the package being built.
+    pub package: Option<(&'a str, &'a str)>,
 }
 
 /// Disk files, with some replaced by in-memory contents.
@@ -147,6 +149,10 @@ pub fn analyze_craters(craters: &[CraterSpec], o: &AnalyzeOptions) -> Analysis {
     }
     let mut opts = ln_sema::Options::host(o.test);
     opts.keep_going = o.keep_going;
+    if let Some((name, version)) = o.package {
+        opts.pkg_name = name.to_string();
+        opts.pkg_version = version.to_string();
+    }
     if let Some(os) = o.target_os {
         opts.target_os = os.to_string();
         opts.target_family = if os == "windows" { "windows" } else { "unix" }.to_string();
@@ -179,7 +185,7 @@ pub fn std_tree_of(path: &Path) -> Option<PathBuf> {
 /// Analyze the standard library tree at `dir` on its own (from disk, with
 /// `o.overlay` for unsaved buffers), for editors working on std itself.
 pub fn analyze_std_tree(dir: &Path, o: &AnalyzeOptions) -> Analysis {
-    let o = AnalyzeOptions { std_dir: Some(dir), test: o.test, target_os: o.target_os, keep_going: o.keep_going, overlay: o.overlay };
+    let o = AnalyzeOptions { std_dir: Some(dir), test: o.test, target_os: o.target_os, keep_going: o.keep_going, overlay: o.overlay, package: o.package };
     analyze_craters(&[], &o)
 }
 

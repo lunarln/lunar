@@ -469,6 +469,8 @@ struct Transcriber<'b> {
     out: &'b mut Vec<Tt>,
     /// The index of each enclosing repetition, innermost last.
     indices: Vec<usize>,
+    /// For `${env(..)}`.
+    opts: &'b crate::Options,
 }
 
 impl Transcriber<'_> {
@@ -537,10 +539,24 @@ impl Transcriber<'_> {
             }
             "stringify" => {
                 let mut toks = Vec::new();
-                Transcriber { mark, call, out: &mut toks, indices: self.indices.clone() }.body(args, b)?;
+                Transcriber { mark, call, out: &mut toks, indices: self.indices.clone(), opts: self.opts }.body(args, b)?;
                 let trees: Vec<TokenTree> = toks.into_iter().map(TokenTree::Token).collect();
                 let text = ast::pretty::tokens(&trees);
                 self.out.push(made(T::Str, &format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\"")), call, mark));
+            }
+            "env" => {
+                let mut i = 0;
+                let var = if args.is_empty() { String::new() } else { self.concat_part(args, &mut i, b)? };
+                if var.is_empty() || i != args.len() {
+                    return Err((mc::BAD_MATCHER, name.span, "write `${env(\"NAME\")}` or `${env($name)}`".into()));
+                }
+                let value = match self.opts.compile_time_var(&var) {
+                    Some(v) => v,
+                    // Editors analyze files outside any build: no error.
+                    None if self.opts.keep_going => String::new(),
+                    None => return Err((mc::ERROR, call, format!("environment variable `{var}` is not defined at compile time"))),
+                };
+                self.out.push(made(T::Str, &format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")), call, mark));
             }
             "error" => {
                 let msg = match args.as_slice() {
@@ -550,7 +566,7 @@ impl Transcriber<'_> {
                 return Err((mc::ERROR, call, msg));
             }
             other => {
-                return Err((mc::BAD_MATCHER, name.span, format!("unknown metavariable expression `{other}`; use index, ignore, concat, stringify or error")));
+                return Err((mc::BAD_MATCHER, name.span, format!("unknown metavariable expression `{other}`; use index, ignore, concat, stringify, env or error")));
             }
         }
         Ok(())
@@ -598,7 +614,7 @@ impl Transcriber<'_> {
                                 };
                                 i += 3;
                                 let mut bound = Vec::new();
-                                Transcriber { mark: self.mark, call: self.call, out: &mut bound, indices: self.indices.clone() }.body(trees, b)?;
+                                Transcriber { mark: self.mark, call: self.call, out: &mut bound, indices: self.indices.clone(), opts: self.opts }.body(trees, b)?;
                                 self.generics(frag, Some(bound));
                             }
                             _ => self.fragment(frag),
@@ -843,7 +859,7 @@ impl<'a> Sema<'a> {
         if kind == ExpansionKind::Expr {
             toks.push(made(T::LBrace, "{", Span::DUMMY, mark));
         }
-        if let Err((code, span, msg)) = (Transcriber { mark, call, out: &mut toks, indices: Vec::new() }).body(body, &bindings) {
+        if let Err((code, span, msg)) = (Transcriber { mark, call, out: &mut toks, indices: Vec::new(), opts: &self.opts }).body(body, &bindings) {
             let d = Diagnostic::error(code, span, msg);
             // A macro's own `${error(..)}` is already reported at the call.
             self.err(if span == call { d } else { d.with_secondary(call, format!("in this expansion of `{name}!`")) });

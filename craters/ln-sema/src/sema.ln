@@ -39,12 +39,16 @@ pub struct Options {
     /// Type-check function bodies even after errors in item signatures, and
     /// return the (partial) program despite errors. For editor tooling.
     pub keep_going: bool,
+    /// The package being built (empty for a single file): what
+    /// `env!("LUNAR_PKG_NAME")` and `env!("LUNAR_PKG_VERSION")` expand to.
+    pub pkg_name: String,
+    pub pkg_version: String,
 }
 
 impl Options {
     pub fn host(test: bool): Options {
         let family = if host_os() == "windows" { "windows" } else { "unix" };
-        return Options { target_os: String::from(host_os()), target_family: String::from(family), target_arch: String::from(host_arch()), test, keep_going: false };
+        return Options { target_os: String::from(host_os()), target_family: String::from(family), target_arch: String::from(host_arch()), test, keep_going: false, pkg_name: String::new(), pkg_version: String::new() };
     }
 }
 

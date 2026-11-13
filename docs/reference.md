@@ -580,13 +580,18 @@ alone lists every code. The explanations are the files in
   `std::test::{assert, assert_eq, assert_ne}` (functions taking `&T`, and
   the macros `assert!(c)`, `assert_eq!(a, b)`, `assert_ne!(a, b)`, which
   lend their arguments and describe the assertion),
-  `std::process::{exit, abort, panic}`, `std::env::{arg_count, arg}`.
+  `std::process::{exit, abort, panic}`, `std::env::{arg_count, arg}`, and
+  the macro `std::env::env!("NAME")`: a `str` literal with the value the
+  variable had when the program was compiled. `LUNAR_PKG_NAME` and
+  `LUNAR_PKG_VERSION` are the name and version of the package being built
+  (from `lunar.toml`); other names come from the compiler's environment.
+  An undefined variable is `err(macro::error)`.
 * The prelude provides `Dull`, `Option`/`Some`/`None`, `Result`/`Ok`/`Err`,
   `Eq`, `Ord`, `Ordering`, `Clone`, `Default`, `Display`, `Debug`, `Hash`,
   `Iterator`, `Fn`, `FnMut`, `FnOnce`, `print`, `println`, `eprint`,
   `eprintln`, `panic`, `assert`,
   `assert_eq` and `assert_ne`, with the derives and macros of the same
-  names.
+  names, and the macro `env!`.
 * Format strings: `{x}` uses `Display`, `{x:?}` uses `Debug` (strings and
   characters quoted and escaped, arrays as `[1, 2]`, derived types as
   `Point { x: 1, y: 2 }`).

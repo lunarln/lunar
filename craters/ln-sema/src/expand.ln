@@ -916,6 +916,24 @@ impl Sema {
             let pretty = self.pretty_tokens(toks[..]);
             let lit = quote(pretty.as_str());
             out.push(self.made(T::Str, lit.as_str(), call, mark));
+        } else if text == "env" {
+            let mut i: usize = 0;
+            let var = if args.len() > 0 { self.concat_part(tx, args, &mut i, b)? } else { String::new() };
+            if var.is_empty() || i != args.len() {
+                return Err(merr(MCode::BadMatcher, name.span, core::fmt::format("write `${{env(\"NAME\")}}` or `${{env($name)}}`")));
+            }
+            let value = match self.compile_time_var(var.as_str()) {
+                Some(v) => v,
+                None => {
+                    if !self.opts.keep_going {
+                        return Err(merr(MCode::Error, call, core::fmt::format("environment variable `{var}` is not defined at compile time")));
+                    }
+                    // Editors analyze files outside any build: no error.
+                    String::new()
+                }
+            };
+            let lit = quote(value.as_str());
+            out.push(self.made(T::Str, lit.as_str(), call, mark));
         } else if text == "error" {
             let mut msg: Option::<String> = None;
             if args.len() == 1 {
@@ -948,9 +966,22 @@ impl Sema {
                 None => Err(merr(MCode::BadMatcher,name.span, core::fmt::format("write `${{error(\"message\")}}`"))),
             };
         } else {
-            return Err(merr(MCode::BadMatcher,name.span, core::fmt::format("unknown metavariable expression `{text}`; use index, ignore, concat, stringify or error")));
+            return Err(merr(MCode::BadMatcher,name.span, core::fmt::format("unknown metavariable expression `{text}`; use index, ignore, concat, stringify, env or error")));
         }
         return Ok(());
+    }
+
+    /// The value of `${env(name)}`: the package being built for
+    /// `LUNAR_PKG_NAME` and `LUNAR_PKG_VERSION`, else the compiler's
+    /// environment.
+    fn compile_time_var(&self, name: str): Option::<String> {
+        if name == "LUNAR_PKG_NAME" && !self.opts.pkg_name.is_empty() {
+            return Some(String::from(self.opts.pkg_name.as_str()));
+        }
+        if name == "LUNAR_PKG_VERSION" && !self.opts.pkg_version.is_empty() {
+            return Some(String::from(self.opts.pkg_version.as_str()));
+        }
+        return std::env::var(name);
     }
 
     /// Tokens as text, as `ln_ast::pretty::tokens` prints them.

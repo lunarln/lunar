@@ -336,7 +336,9 @@ fn add(name: &str, mut spec: DepSpecArgs, color: bool) -> Result<(), ()> {
 /// Analyze one target of a member package.
 fn analyze_target(graph: &Graph, pkg: usize, target: &Target, test: bool, target_os: Option<&str>) -> Result<Analysis, ProjectError> {
     let craters = project::craters(graph, pkg, target)?;
-    Ok(analyze_craters(&craters, &AnalyzeOptions { test, target_os, ..Default::default() }))
+    let m = &graph.packages[pkg].manifest;
+    let version = m.version.to_string();
+    Ok(analyze_craters(&craters, &AnalyzeOptions { test, target_os, package: Some((&m.name, &version)), ..Default::default() }))
 }
 
 fn check_project(package: Option<&str>, target_os: Option<&str>, color: bool) -> Result<(), ()> {

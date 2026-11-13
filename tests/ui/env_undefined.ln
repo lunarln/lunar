@@ -1,0 +1,8 @@
+// error: macro::error
+// `env!` reads a variable when the program is compiled: the package's name
+// and version (`LUNAR_PKG_NAME`, `LUNAR_PKG_VERSION`) or the compiler's
+// environment. An undefined variable is an error.
+fn main() {
+    let v = env!("LUNAR_TEST_SURELY_UNDEFINED");
+    println("{v}");
+}
