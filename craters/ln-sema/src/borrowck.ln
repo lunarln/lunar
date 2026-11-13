@@ -1044,6 +1044,37 @@ impl Cx {
         };
     }
 
+    /// Whether values of `t` may hold views other than `dyn`s (which point
+    /// at variables, not into their storage).
+    fn has_non_dyn_view(&self, p: &mut +Program, t: Ty, depth: u32): bool {
+        if depth > 32 {
+            return true;
+        }
+        return match p.types.kind(t) {
+            TyKind::Dyn(..) => false,
+            TyKind::Array(e, k) => k.is_slice() || self.has_non_dyn_view(p, e, depth + 1),
+            TyKind::Tuple(ts) => {
+                for i in 0..ts.len() {
+                    if self.has_non_dyn_view(p, p.types.at(ts, i), depth + 1) {
+                        return true;
+                    }
+                }
+                false
+            }
+            TyKind::Adt(d, args) => {
+                let fs = p.adt_field_tys(d, args);
+                for i in 0..fs.len() {
+                    if self.has_non_dyn_view(p, p.types.at(fs, i), depth + 1) {
+                        return true;
+                    }
+                }
+                false
+            }
+            TyKind::Grow(e) => self.has_non_dyn_view(p, e, depth + 1),
+            _ => self.has_view(p, t),
+        };
+    }
+
     fn any_dyn_mut(&self, p: &mut +Program, l: TyList, depth: u32): bool {
         for i in 0..l.len() {
             if self.may_hold_dyn_mut(p, p.types.at(l, i), depth) {
@@ -1215,7 +1246,8 @@ impl Cx {
                         closures = true;
                     }
                 }
-                if closures && !views_args && !self.may_hold_closure(p, ex.ty, 0) {
+                let into = !views_args || self.has_non_dyn_view(p, ex.ty, 0);
+                if closures && into && !self.may_hold_closure(p, ex.ty, 0) {
                     let mut slots: [LocalId; ..+] = [];
                     for x in r[..] {
                         if let Root::Slot(l) = x {
