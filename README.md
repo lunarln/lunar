@@ -56,6 +56,57 @@ fn main() {
 
 See [docs/reference.md](docs/reference.md) for the full language reference.
 
+## Installing
+
+Prebuilt compilers for Linux (x86_64), macOS (Apple silicon) and Windows
+(x64) are on the [releases page](https://github.com/lunarln/lunar/releases).
+The install scripts download the latest one for your platform, check its
+SHA-256 checksum and unpack it into `~/.lunar`:
+
+```sh
+# Linux, macOS
+curl -fsSL https://raw.githubusercontent.com/lunarln/lunar/main/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/lunarln/lunar/main/install.ps1 | iex
+```
+
+Then add `~/.lunar/bin` to your `PATH` (the scripts print how). Pick
+another directory with `--prefix DIR` (`-Prefix DIR`) or `LUNAR_PREFIX`,
+and a version with `--version 0.1.0` (`-Version 0.1.0`) or
+`LUNAR_VERSION`.
+
+A release archive (`lunar-<version>-<target>.tar.gz`, or `.zip` on Windows)
+can also be unpacked anywhere by hand. It holds:
+
+```
+bin/lunar(.exe)              the compiler, package manager and language server
+bin/LLVM-C.dll               (Windows) LLVM, found next to the executable
+lib/libLLVM.*                (Linux, macOS) LLVM and the libraries it needs,
+                             found through the executable's run path
+lib/lunar/std/               the standard library
+lib/lunar/docs/errors/       the explanations shown by `lunar explain`
+LICENSE-*, licenses/         Lunar's licenses, LLVM's and the bundled libraries'
+```
+
+LLVM comes with the compiler, so nothing else is needed to run it. To
+build programs it needs a linker, which you install yourself:
+
+* **Linux**: a C toolchain that provides `cc` (gcc or clang; on Debian and
+  Ubuntu, `build-essential`). The prebuilt compiler needs glibc 2.35 or
+  newer (Ubuntu 22.04, Debian 12, Fedora 36 and later).
+* **macOS**: the Xcode command line tools (`xcode-select --install`).
+* **Windows**: the
+  [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+  with the C++ workload (for the C runtime and the Windows SDK), and either
+  LLVM `clang` on `PATH` (it finds the Build Tools by itself) or a
+  Developer PowerShell for Visual Studio, which puts `link.exe` on `PATH`.
+
+`LUNAR_CC` overrides the linker everywhere. Without one, `lunar build`
+fails with `err(build::link)` and says what to install.
+
 ## Building
 
 Requirements:
@@ -191,9 +242,24 @@ code --install-extension lunar-0.1.0.vsix
 Set `LUNAR_STD_DIR=std` to make the compiler read the standard library from
 disk instead of the copy embedded at build time.
 
-## Distribution
+## Releases
 
-The `lunar` binary links LLVM dynamically, so it needs LLVM 20 at run time,
-just as it does at build time. Release builds are meant to ship the LLVM
-shared library next to the binary, the way Rust's toolchain bundles its
-LLVM.
+`lunar --version` prints the version in `craters/lunar/lunar.toml`
+(through `env!("LUNAR_PKG_VERSION")`). Pushing a tag `v<that version>` runs
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which on
+each platform:
+
+1. bootstraps the compiler (`tools/bootstrap.sh`): stage 1 is `craters/`
+   built by the stage 0 compiler, stage 2 is built by stage 1, stage 3 by
+   stage 2, and stages 2 and 3 must be identical;
+2. packages stage 2 with the standard library, the error explanations and
+   LLVM's shared library (`tools/package.sh`), rewriting the executable's
+   run path on Linux (`$ORIGIN/../lib`) and macOS
+   (`@executable_path/../lib`) so that it loads the bundled LLVM, and tries
+   the package out;
+3. unpacks each archive on a clean machine and builds programs with it;
+4. publishes the archives and their `.sha256` checksums as a GitHub
+   release.
+
+Run by hand, or on a pull request that changes the release tooling, it
+does everything but publish.
