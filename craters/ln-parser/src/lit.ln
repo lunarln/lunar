@@ -387,16 +387,10 @@ pub fn unescape_byte_help(raw: str): Option::<String> {
     };
 }
 
-/// A format hole's expression length and spec.
-struct SpecSplit {
-    len: usize,
-    spec: FmtSpec,
-}
-
-/// Split a format hole into its expression and format spec: `p:?` is `p`
-/// with `Debug`. The spec starts at the first `:` outside brackets, strings
-/// and character literals that is not part of `::`.
-fn split_spec(inner: str): Result::<SpecSplit, String> {
+/// Where a format hole's spec starts: the index of its `:`, the first one
+/// outside brackets, strings and character literals that is not part of
+/// `::` (`p:?` is `p` with `Debug`); `None` if it has no spec.
+fn spec_colon(inner: str): Option::<usize> {
     let b = inner.as_bytes();
     let mut depth: i32 = 0;
     let mut i: usize = 0;
@@ -412,25 +406,107 @@ fn split_spec(inner: str): Result::<SpecSplit, String> {
             while i < b.len() && b[i] != c {
                 i += if b[i] == b'\\' { 2 } else { 1 };
             }
-        } else if c == b':' && depth == 0 {
+        } else if c == b':' {
             if i + 1 < b.len() && b[i + 1] == b':' {
                 i += 2;
                 continue;
             }
-            let spec = inner[i + 1..].trim();
-            if spec == "?" {
-                return Ok(SpecSplit { len: i, spec: FmtSpec::Debugged });
+            if depth == 0 {
+                return Some(i);
             }
-            if spec.len() == 0 {
-                return Err(String::from("empty format spec after `:`; write `{x:?}` for `Debug`, or `{x}` for `Display`"));
-            }
-            let mut m = String::new();
-            m.write("unknown format spec `{spec}`; the only one is `?` (`{{x:?}}` uses `Debug`)");
-            return Err(m);
         }
         i += 1;
     }
-    return Ok(SpecSplit { len: b.len(), spec: FmtSpec::Show });
+    return None;
+}
+
+fn is_align(c: u8): bool {
+    return c == b'<' || c == b'^' || c == b'>';
+}
+
+/// The first character of spec `s` (not empty) and its length in `s`,
+/// with the escapes a fill may be written with (`\"`, `\\`, `\'`, `\n`,
+/// `\t`, `\r`, `\0`, `\x41`); length 0 for another escape.
+fn spec_fill(s: str): (char, usize) {
+    let b = s.as_bytes();
+    if b[0] != b'\\' {
+        return match s.chars().next() {
+            Some(c) => (c, c.len_utf8()),
+            None => (' ', 0),
+        };
+    }
+    if b.len() < 2 {
+        return (' ', 0);
+    }
+    let e = b[1];
+    if e == b'x' && b.len() >= 4 && b[2] < 0x80 && b[3] < 0x80 {
+        return match unescape(s[..4]) {
+            Ok(u) => match u.as_str().chars().next() {
+                Some(c) => (c, 4),
+                None => (' ', 0),
+            },
+            Err(_) => (' ', 0),
+        };
+    }
+    let c = if e == b'n' {
+        '\n'
+    } else if e == b't' {
+        '\t'
+    } else if e == b'r' {
+        '\r'
+    } else if e == b'0' {
+        '\0'
+    } else if e == b'\\' || e == b'\'' || e == b'"' {
+        e as char
+    } else {
+        return (' ', 0);
+    };
+    return (c, 2);
+}
+
+fn align_of(c: u8): FmtAlign {
+    return if c == b'<' { FmtAlign::Left } else if c == b'^' { FmtAlign::Center } else { FmtAlign::Right };
+}
+
+fn is_spec_ident_start(c: u8): bool {
+    return (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || c == b'_' || c >= 0x80;
+}
+
+fn is_spec_ident(c: u8): bool {
+    return is_spec_ident_start(c) || (c >= b'0' && c <= b'9');
+}
+
+/// The format type `t` names, if any.
+fn fmt_kind(t: str): Option::<FmtKind> {
+    return if t == "" {
+        Some(FmtKind::Display)
+    } else if t == "?" {
+        Some(FmtKind::Debug)
+    } else if t == "x" {
+        Some(FmtKind::LowerHex)
+    } else if t == "X" {
+        Some(FmtKind::UpperHex)
+    } else if t == "o" {
+        Some(FmtKind::Octal)
+    } else if t == "b" {
+        Some(FmtKind::Binary)
+    } else if t == "e" {
+        Some(FmtKind::LowerExp)
+    } else if t == "E" {
+        Some(FmtKind::UpperExp)
+    } else {
+        None
+    };
+}
+
+/// The largest width or precision written as a number (as in Rust).
+const MAX_SPEC_COUNT: u64 = 65535;
+
+/// A width or precision in a spec: `5` or `name$`, at `b[i..]`.
+struct SpecCount {
+    count: FmtCount,
+    /// Just after it (`i` if there is none).
+    end: usize,
 }
 
 impl Parser {
@@ -452,6 +528,175 @@ impl Parser {
     fn fmt_error(&mut self, message: str, lo: u32, hi: u32): FmtString {
         let m = self.intern(message);
         return FmtString::Invalid(m, Span::new(lo, hi));
+    }
+
+    /// Parse the format spec `spec` (the text after a hole's `:`, at `lo`
+    /// in the file): `[[fill]align][sign]['#']['0'][width]['.' precision]
+    /// [type]`, as in Rust. On an error, the format string's error, at the
+    /// part of the spec that is wrong.
+    fn parse_spec(&mut self, spec: str, lo: u32): Result::<FmtSpec, FmtString> {
+        let trimmed = spec.trim();
+        if trimmed.len() == 0 {
+            return Ok(FmtSpec::Show);
+        }
+        if trimmed == "?" {
+            return Ok(FmtSpec::Debugged);
+        }
+        // Trailing spaces are not part of the spec; a leading one may be
+        // the fill.
+        let sb = spec.as_bytes();
+        let mut n = sb.len();
+        while n > 0 && (sb[n - 1] == b' ' || sb[n - 1] == b'\t') {
+            n -= 1;
+        }
+        let s = spec[..n];
+        let b = s.as_bytes();
+        let end = lo + n as u32;
+        let none = Span::new(end, end);
+        let mut f = FmtFormat {
+            kind: FmtKind::Display,
+            fill: ' ',
+            align: FmtAlign::Auto,
+            plus: false,
+            alt: false,
+            zero: false,
+            width: FmtCount::None,
+            precision: FmtCount::None,
+            span: Span::new(lo, end),
+            kind_span: none,
+            prec_span: none,
+            plus_span: none,
+            zero_span: none,
+        };
+        let mut i: usize = 0;
+        // [[fill]align]: the fill is any character before `<`, `^` or `>`,
+        // perhaps escaped (`\"`).
+        let (c, cl) = spec_fill(s);
+        if cl > 0 && cl < b.len() && is_align(b[cl]) {
+            f.fill = c;
+            f.align = align_of(b[cl]);
+            i = cl + 1;
+        } else if b[0] == b'\\' {
+            return Err(self.fmt_error("an escape in a format spec can only be the fill, before `<`, `^` or `>`", lo, lo + 1));
+        } else if is_align(b[0]) {
+            f.align = align_of(b[0]);
+            i = 1;
+        }
+        // [sign]: `-` is accepted and means nothing, as in Rust.
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            if b[i] == b'+' {
+                f.plus = true;
+                f.plus_span = Span::new(lo + i as u32, lo + i as u32 + 1);
+            }
+            i += 1;
+        }
+        let mut alt_at: usize = 0;
+        if i < b.len() && b[i] == b'#' {
+            f.alt = true;
+            alt_at = i;
+            i += 1;
+        }
+        // `0` is the flag unless it is the positional width `0$`.
+        if i < b.len() && b[i] == b'0' && !(i + 1 < b.len() && b[i + 1] == b'$') {
+            f.zero = true;
+            f.zero_span = Span::new(lo + i as u32, lo + i as u32 + 1);
+            i += 1;
+        }
+        let w = self.spec_count(s, lo, i, "width")?;
+        f.width = w.count;
+        i = w.end;
+        if i < b.len() && b[i] == b'.' {
+            let dot = i;
+            if i + 1 < b.len() && b[i + 1] == b'*' {
+                return Err(self.fmt_error("`.*` takes the precision from a positional argument, and format strings have none; write `.name$` with a `usize` variable `name`", lo + dot as u32, lo + dot as u32 + 2));
+            }
+            let p = self.spec_count(s, lo, i + 1, "precision")?;
+            if p.count.is_none() {
+                return Err(self.fmt_error("expected a precision after `.`: a number, or `name$` for a `usize` variable `name`", lo + dot as u32, lo + dot as u32 + 1));
+            }
+            f.precision = p.count;
+            f.prec_span = Span::new(lo + dot as u32, lo + p.end as u32);
+            i = p.end;
+        }
+        let rest = s[i..];
+        f.kind_span = Span::new(lo + i as u32, end);
+        f.kind = match fmt_kind(rest) {
+            Some(k) => k,
+            None => {
+                let mut m = String::new();
+                if rest == "x?" || rest == "X?" {
+                    m.write("`{rest}` (`Debug` with hexadecimal integers) is not supported; format the integer itself with `x` or `X`");
+                } else if is_spec_ident_start(b[i]) {
+                    m.write("unknown format type `{rest}`: expected `?`, `x`, `X`, `o`, `b`, `e` or `E`, or none for `Display`");
+                } else {
+                    m.write("unexpected `{rest}` in format spec; a spec is `[[fill]align][sign]['#']['0'][width]['.' precision][type]`");
+                }
+                return Err(self.fmt_error(m.as_str(), lo + i as u32, end));
+            }
+        };
+        if f.alt && f.kind.radix() == 0 {
+            let m = if f.kind == FmtKind::Debug {
+                "`#?` (pretty-printed `Debug`) is not supported: `Debug` writes one line"
+            } else {
+                "`#` only applies to `x`, `X`, `o` and `b`, where it adds the `0x`, `0o` or `0b` prefix"
+            };
+            return Err(self.fmt_error(m, lo + alt_at as u32, lo + alt_at as u32 + 1));
+        }
+        // A fill and alignment without a width do nothing: a spec that
+        // only picks the trait is a plain hole.
+        if !f.plus && !f.zero && f.width.is_none() && f.precision.is_none() {
+            if f.kind == FmtKind::Display {
+                return Ok(FmtSpec::Show);
+            }
+            if f.kind == FmtKind::Debug {
+                return Ok(FmtSpec::Debugged);
+            }
+        }
+        return Ok(FmtSpec::Full(self.ast.fmt_formats.add(f)));
+    }
+
+    /// The width or precision at `s[i..]` (`s` is a spec at `lo` in the
+    /// file): a number, `name$`, or none.
+    fn spec_count(&mut self, s: str, lo: u32, i: usize, what: str): Result::<SpecCount, FmtString> {
+        let b = s.as_bytes();
+        let mut j = i;
+        if j < b.len() && b[j] >= b'0' && b[j] <= b'9' {
+            let mut v: u64 = 0;
+            while j < b.len() && b[j] >= b'0' && b[j] <= b'9' {
+                if v <= MAX_SPEC_COUNT {
+                    v = v * 10 + (b[j] - b'0') as u64;
+                }
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'$' {
+                let mut m = String::new();
+                m.write("`{s[i..j + 1]}` takes the {what} from a positional argument, and format strings have none; write `name$` with a `usize` variable `name`");
+                return Err(self.fmt_error(m.as_str(), lo + i as u32, lo + j as u32 + 1));
+            }
+            if v > MAX_SPEC_COUNT {
+                let mut m = String::new();
+                m.write("the {what} `{s[i..j]}` is too large: it is at most {MAX_SPEC_COUNT}");
+                return Err(self.fmt_error(m.as_str(), lo + i as u32, lo + j as u32));
+            }
+            return Ok(SpecCount { count: FmtCount::Lit(v), end: j });
+        }
+        if j < b.len() && is_spec_ident_start(b[j]) {
+            while j < b.len() && is_spec_ident(b[j]) {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'$' {
+                let name = s[i..j];
+                return match self.parse_hole(name, lo + i as u32) {
+                    Ok(e) => Ok(SpecCount { count: FmtCount::Arg(e), end: j + 1 }),
+                    Err(_) => {
+                        let mut m = String::new();
+                        m.write("expected a variable before `$` in the {what}, found `{name}`");
+                        Err(self.fmt_error(m.as_str(), lo + i as u32, lo + j as u32))
+                    }
+                };
+            }
+        }
+        return Ok(SpecCount { count: FmtCount::None, end: i });
     }
 
     /// Interpret a string literal body (`raw`, between the quotes, starting
@@ -496,19 +741,31 @@ impl Parser {
                 if inner.trim().len() == 0 {
                     return self.fmt_error("empty `{}` in format string: put an expression inside, e.g. `{x}`", offset + open as u32, offset + j as u32);
                 }
-                let split = match split_spec(inner) {
-                    Ok(s) => s,
-                    Err(m) => return self.fmt_error(m.as_str(), offset + open as u32, offset + j as u32),
+                let colon = spec_colon(inner);
+                let len = match colon {
+                    Some(c) => c,
+                    None => inner.len(),
                 };
+                if inner[..len].trim().len() == 0 {
+                    return self.fmt_error("missing value before `:` in format string: a hole names what it shows, as in `{x:>8}`", offset + open as u32, offset + j as u32);
+                }
                 let lo = offset + open as u32 + 1;
-                match self.parse_hole(raw[open + 1..open + 1 + split.len], lo) {
-                    Ok(e) => pieces.push(FmtPiece::Hole(e, split.spec)),
+                let e = match self.parse_hole(raw[open + 1..open + 1 + len], lo) {
+                    Ok(e) => e,
                     Err(msg) => {
                         let mut m = String::new();
                         m.write("invalid expression in format string: {self.ast.text(msg)}");
                         return self.fmt_error(m.as_str(), offset + open as u32, offset + j as u32);
                     }
-                }
+                };
+                let spec = match colon {
+                    Some(c) => match self.parse_spec(inner[c + 1..], lo + c as u32 + 1) {
+                        Ok(s) => s,
+                        Err(err) => return err,
+                    },
+                    None => FmtSpec::Show,
+                };
+                pieces.push(FmtPiece::Hole(e, spec));
                 i = j;
                 text_start = i;
             } else {

@@ -4,13 +4,13 @@
 
 use core::arena::{Id, List};
 use core::ffi::c_string;
-use ln_ast::{BinOp, FmtSpec, ParamMode, Span, UnOp};
+use ln_ast::{BinOp, FmtAlign, FmtCount, FmtFormat, FmtKind, FmtSpec, ParamMode, Span, UnOp};
 use ln_sema::defs::DefId;
 use ln_sema::diag::dummy_span;
 use ln_sema::program::Program;
 use ln_sema::thir::*;
 use ln_sema::traits::MethodImpl;
-use ln_sema::ty::{ArrKind, IntTy, Modes, TraitRef, Ty, TyKind, TyList};
+use ln_sema::ty::{ArrKind, FloatTy, IntTy, Modes, TraitRef, Ty, TyKind, TyList};
 use crater::Cg;
 use crater::llvm::*;
 
@@ -655,6 +655,18 @@ impl Cg {
 
     fn builtin(&mut self, p: &mut +Program, lang: str, method: str, vals: [ValueRef; &], self_ty: Ty, ret: Ty, span: Span): ValueRef {
         let op = method_op(method);
+        if lang == "debug" {
+            // A fixed array, shown through its slice.
+            match self.array_debug_fn(p, self_ty) {
+                Ok(g) => {
+                    let tmp = self.spill(p, vals[0], self_ty, z("array\0"));
+                    let args = [tmp, vals[1]];
+                    self.call(g, args[..]);
+                }
+                Err(e) => self.ice(p, e.as_str()),
+            }
+            return self.unit();
+        }
         if lang == "neg" {
             return self.unary(p, UnOp::Neg, vals[0], self_ty, span);
         }
@@ -1032,6 +1044,9 @@ impl Cg {
         let env = unsafe { LLVMGetParam(f, 0) };
         let out = unsafe { LLVMGetParam(f, 1) };
         let mut ai: usize = 0;
+        // The `name$` widths and precisions (their fields of the
+        // environment) of the next value with a spec.
+        let mut counts: [usize; -..+] = [];
         for i in 0..pieces.len() {
             let piece = p.thir.fmt_pieces.list(pieces)[i];
             match piece {
@@ -1040,51 +1055,20 @@ impl Cg {
                     self.thunk_extend(p, f, out, sv)?;
                 }
                 FmtPiece::Arg(_, spec) => {
-                    let (lang, method, tname) = match spec {
-                        FmtSpec::Show => ("display", "fmt", "Display"),
-                        FmtSpec::Debugged => ("debug", "debug", "Debug"),
-                    };
-                    let Some(trait_id) = p.lang_item(lang) else {
-                        let mut e = String::new();
-                        e.write("missing lang item `{lang}`");
-                        return Err(e);
-                    };
+                    if let FmtSpec::Count = spec {
+                        counts.push(ai);
+                        ai += 1;
+                        continue;
+                    }
                     let t = arg_tys[ai];
                     let fp = self.struct_gep(env_ty, env, ai as u32, noname());
-                    let tr = TraitRef { trait_id, args: List::empty() };
-                    let msym = p.sym(method);
-                    match p.resolve_method(tr, t, msym, List::empty()) {
-                        Some(MethodImpl::Fn { def, args }) => {
-                            let callee = self.instance(p, def, args);
-                            // `fmt(&self, ..)` takes the value's address; a
-                            // value that lives in memory is passed as a
-                            // pointer to a copy.
-                            let mut recv = fp;
-                            if !p.param_by_ref(def, 0) {
-                                let lt = self.llty(p, t);
-                                if self.in_memory(p, t) {
-                                    recv = self.entry_alloca(f, lt, z("copy\0"));
-                                    self.copy_mem(p, recv, fp, t);
-                                } else {
-                                    recv = self.load_ty(lt, fp, noname());
-                                }
-                            }
-                            let call_args = [recv, out];
-                            self.call(callee, call_args[..]);
+                    match spec {
+                        FmtSpec::Full(id) => {
+                            self.fmt_spec_value(p, f, env_ty, env, out, fp, t, id, counts[..])?;
+                            counts.clear();
                         }
-                        Some(MethodImpl::Virtual { index }) => {
-                            let Some(fty) = self.virtual_fn_ty(p, tr, t, msym, List::empty()) else {
-                                return Err(String::from("a virtual call of an unknown method"));
-                            };
-                            let rest = [out];
-                            self.call_virtual(fp, index, fty, rest[..], null());
-                        }
-                        _ => {
-                            let ts = p.ty_str(t);
-                            let mut e = String::new();
-                            e.write("no `{tname}` implementation for `{ts}`");
-                            return Err(e);
-                        }
+                        FmtSpec::Debugged => self.fmt_value(p, f, out, fp, t, true)?,
+                        _ => self.fmt_value(p, f, out, fp, t, false)?,
                     }
                     ai += 1;
                 }
@@ -1096,6 +1080,249 @@ impl Cg {
             self.position(saved);
         }
         return Ok(f);
+    }
+
+    /// Write the value of type `t` at `fp` to the `String` at `out` (in the
+    /// thunk `f`) with `Display::fmt`, or `Debug::debug` if `debug`.
+    fn fmt_value(&mut self, p: &mut +Program, f: ValueRef, out: ValueRef, fp: ValueRef, t: Ty, with_debug: bool): Result::<(), String> {
+        let (lang, method, tname) = if with_debug { ("debug", "debug", "Debug") } else { ("display", "fmt", "Display") };
+        let Some(trait_id) = p.lang_item(lang) else {
+            let mut e = String::new();
+            e.write("missing lang item `{lang}`");
+            return Err(e);
+        };
+        let tr = TraitRef { trait_id, args: List::empty() };
+        let msym = p.sym(method);
+        match p.resolve_method(tr, t, msym, List::empty()) {
+            Some(MethodImpl::Fn { def, args }) => {
+                let callee = self.instance(p, def, args);
+                // `fmt(&self, ..)` takes the value's address; a value that
+                // lives in memory is passed as a pointer to a copy.
+                let mut recv = fp;
+                if !p.param_by_ref(def, 0) {
+                    let lt = self.llty(p, t);
+                    if self.in_memory(p, t) {
+                        recv = self.entry_alloca(f, lt, z("copy\0"));
+                        self.copy_mem(p, recv, fp, t);
+                    } else {
+                        recv = self.load_ty(lt, fp, noname());
+                    }
+                }
+                let call_args = [recv, out];
+                self.call(callee, call_args[..]);
+            }
+            Some(MethodImpl::Virtual { index }) => {
+                let Some(fty) = self.virtual_fn_ty(p, tr, t, msym, List::empty()) else {
+                    return Err(String::from("a virtual call of an unknown method"));
+                };
+                let rest = [out];
+                self.call_virtual(fp, index, fty, rest[..], null());
+            }
+            // `Debug` of a fixed array.
+            Some(MethodImpl::Builtin { .. }) if with_debug => {
+                let g = self.array_debug_fn(p, t)?;
+                let call_args = [fp, out];
+                self.call(g, call_args[..]);
+            }
+            _ => {
+                let ts = p.ty_str(t);
+                let mut e = String::new();
+                e.write("no `{tname}` implementation for `{ts}`");
+                return Err(e);
+            }
+        }
+        return Ok(());
+    }
+
+    /// Write the value of type `t` at `fp` as its spec `id` says (in the
+    /// thunk `f`, whose environment `env` holds the `name$` widths and
+    /// precisions in its fields `counts`, width first): remember where it
+    /// starts, write it (with `Display`, `Debug`, or `fmt_radix` and
+    /// `fmt_float` for the radix and exponent types and the precision of
+    /// floats), then let `fmt_pad` cut, sign and pad it in place.
+    fn fmt_spec_value(&mut self, p: &mut +Program, f: ValueRef, env_ty: TypeRef, env: ValueRef, out: ValueRef, fp: ValueRef, t: Ty, id: Id::<FmtFormat>, counts: [usize; &]): Result::<(), String> {
+        let fs = p.ast.fmt_formats.get(id);
+        let st = p.types.strip_grow(t);
+        let (is_int, is_float, is_text) = match p.types.kind(st) {
+            TyKind::Int(_) => (true, false, false),
+            TyKind::Float(_) => (false, true, false),
+            TyKind::Str | TyKind::String | TyKind::Char | TyKind::Bool => (false, false, true),
+            _ => (false, false, false),
+        };
+        let single = match p.types.kind(st) {
+            TyKind::Float(FloatTy::F32) => true,
+            _ => false,
+        };
+        let numeric = is_int || is_float;
+        let ut = self.usize_ty();
+        let mut ci: usize = 0;
+        let mut width: Option::<ValueRef> = None;
+        match fs.width {
+            FmtCount::None => {}
+            FmtCount::Lit(n) => width = Some(self.usize(n)),
+            FmtCount::Arg(_) => {
+                let cp = self.struct_gep(env_ty, env, counts[ci] as u32, noname());
+                width = Some(self.load_ty(ut, cp, z("width\0")));
+                ci += 1;
+            }
+        }
+        let mut precision: Option::<ValueRef> = None;
+        match fs.precision {
+            FmtCount::None => {}
+            FmtCount::Lit(n) => precision = Some(self.usize(n)),
+            FmtCount::Arg(_) => {
+                let cp = self.struct_gep(env_ty, env, counts[ci] as u32, noname());
+                precision = Some(self.load_ty(ut, cp, z("precision\0")));
+            }
+        }
+        let radix = fs.kind.radix();
+        let truncate = precision.is_some() && is_text && fs.kind == FmtKind::Display;
+        let finish = width.is_some() || fs.plus || truncate;
+        let ht = self.handle_ty();
+        let mut start = self.usize(0);
+        if finish {
+            let lp = self.struct_gep(ht, out, 1, noname());
+            start = self.load_ty(ut, lp, z("start\0"));
+        }
+        let i32t = self.i32_ty();
+        if radix != 0 && is_int {
+            // The bits, zero-extended: two's complement of the value's own
+            // width, as in Rust (`-1i8` is `ff`).
+            let lt = self.llty(p, st);
+            let v = self.load_ty(lt, fp, noname());
+            let bits = unsafe { LLVMBuildIntCast2(self.b, v, ut, 0, noname()) };
+            let mut flags: u64 = 0;
+            if fs.kind == FmtKind::UpperHex {
+                flags += 1;
+            }
+            if fs.alt {
+                flags += 2;
+            }
+            let g = self.lang_fn(p, "fmt_radix")?;
+            let args = [out, bits, self.usize(radix), self.const_int(i32t, flags)];
+            self.call(g, args[..]);
+        } else if is_float && (fs.kind.is_exp() || precision.is_some()) {
+            let lt = self.llty(p, st);
+            let v = self.load_ty(lt, fp, noname());
+            let d = unsafe { LLVMBuildFPCast(self.b, v, self.float_ty(FloatTy::F64), noname()) };
+            let mut flags: u64 = 0;
+            if precision.is_some() {
+                flags += 1;
+            }
+            if fs.kind.is_exp() {
+                flags += 2;
+            }
+            if fs.kind == FmtKind::UpperExp {
+                flags += 4;
+            }
+            if single {
+                flags += 8;
+            }
+            let prec = match precision {
+                Some(v) => v,
+                None => self.usize(0),
+            };
+            let g = self.lang_fn(p, "fmt_float")?;
+            let args = [out, d, prec, self.const_int(i32t, flags)];
+            self.call(g, args[..]);
+        } else {
+            self.fmt_value(p, f, out, fp, t, fs.kind == FmtKind::Debug)?;
+        }
+        if !finish {
+            return Ok(());
+        }
+        let mut flags: u64 = 0;
+        if width.is_some() {
+            flags += 1;
+        }
+        if fs.plus {
+            flags += 2;
+        }
+        if fs.zero && numeric {
+            flags += 4;
+        }
+        if fs.alt && radix != 0 {
+            flags += 8;
+        }
+        if truncate {
+            flags += 16;
+        }
+        flags += match fs.align {
+            FmtAlign::Center => 32,
+            FmtAlign::Right => 64,
+            FmtAlign::Left => 0,
+            FmtAlign::Auto => if numeric { 64 } else { 0 },
+        };
+        let w = match width {
+            Some(v) => v,
+            None => self.usize(0),
+        };
+        let prec = match precision {
+            Some(v) => v,
+            None => self.usize(0),
+        };
+        let g = self.lang_fn(p, "fmt_pad")?;
+        let args = [out, start, w, prec, self.const_int(i32t, (fs.fill as u32) as u64), self.const_int(i32t, flags)];
+        self.call(g, args[..]);
+        return Ok(());
+    }
+
+    /// `void(ptr self, ptr out)`: `Debug` for the fixed array type `t` at
+    /// `self`, through its slice's impl (std has no impl for each length).
+    /// For format holes, method calls and vtables.
+    pub fn array_debug_fn(&mut self, p: &mut +Program, t: Ty): Result::<ValueRef, String> {
+        if let Some(g) = self.array_debug.get(t) {
+            return Ok(g);
+        }
+        let TyKind::Array(elem, ArrKind::Fixed(n)) = p.types.kind(t) else {
+            let ts = p.ty_str(t);
+            let mut e = String::new();
+            e.write("no `Debug` implementation for `{ts}`");
+            return Err(e);
+        };
+        let Some(trait_id) = p.lang_item("debug") else {
+            return Err(String::from("missing lang item `debug`"));
+        };
+        let tr = TraitRef { trait_id, args: List::empty() };
+        let slice_t = p.types.array(elem, ArrKind::Slice);
+        let msym = p.sym("debug");
+        let Some(MethodImpl::Fn { def, args }) = p.resolve_method(tr, slice_t, msym, List::empty()) else {
+            let ts = p.ty_str(slice_t);
+            let mut e = String::new();
+            e.write("no `Debug` implementation for `{ts}`");
+            return Err(e);
+        };
+        let ptr = self.ptr_ty();
+        let ps = [ptr, ptr];
+        let fty = unsafe { LLVMFunctionType(self.void_ty(), ps[..].as_ptr(), 2, 0) };
+        self.counter += 1;
+        let mut name = String::new();
+        name.write("_LN_debug_array{self.counter}");
+        let cname = c_string(name.as_str());
+        let g = unsafe { LLVMAddFunction(self.module, cname.as_ptr(), fty) };
+        unsafe { LLVMSetLinkage(g, INTERNAL_LINKAGE) };
+        self.array_debug.insert(t, g);
+        let saved = self.insert_block();
+        let entry = self.append_block(g, z("entry\0"));
+        self.position(entry);
+        let di = self.di_enter(g, "<array as Debug>::debug", self.di_cur_line());
+        let data = unsafe { LLVMGetParam(g, 0) };
+        let out = unsafe { LLVMGetParam(g, 1) };
+        let slice = self.make_slice(data, self.usize(n));
+        let callee = self.instance(p, def, args);
+        let mut recv = slice;
+        if p.param_by_ref(def, 0) || self.in_memory(p, slice_t) {
+            recv = self.entry_alloca(g, self.slice_ty(), z("slice\0"));
+            self.store(slice, recv);
+        }
+        let call_args = [recv, out];
+        self.call(callee, call_args[..]);
+        self.ret_void();
+        self.di_restore(di);
+        if !is_null(saved) {
+            self.position(saved);
+        }
+        return Ok(g);
     }
 
     /// Append the `str` value `s` to the `String` behind `out` (inside the
