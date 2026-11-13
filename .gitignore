@@ -1,6 +1,11 @@
+# The bootstrap's stages and the release packages (tools/bootstrap.sh and
+# tools/package.sh as CI runs them).
 /target
+# What `lunar build FILE` leaves next to a program.
 *.obj
 *.o
 *.exe
 *.pdb
+*.ilk
+*.dSYM/
 /out

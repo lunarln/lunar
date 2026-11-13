@@ -1,9 +1,9 @@
-# The Lunar compiler, in Lunar
+# The Lunar compiler
 
-The Rust compiler (`crates/`) ported to Lunar. It is a Lunar workspace,
-built with `lunar build` from this directory, and it is self-hosted: the
-compiler built from it by the Rust `lunar` compiles it again into a
-compiler that compiles it into the very same executable.
+The compiler, package manager and language server, written in Lunar. It
+is a Lunar workspace, built with `lunar build` from this directory, and it
+is self-hosted: a released compiler builds it, and the compiler that makes
+builds it again into the very same executable.
 
 ## Building and bootstrapping
 
@@ -15,75 +15,84 @@ time.
 ```sh
 cd craters
 export LUNAR_LIB_PATH="C:/Program Files/LLVM/lib"   # or `llvm-config --libdir`
-lunar build --release                                # stage 1, by the Rust compiler
-mkdir stage2 stage3
-target/release/lunar build -p lunar -o stage2/lunar  # stage 2, by stage 1
-stage2/lunar build -p lunar -o stage3/lunar          # stage 3, by stage 2
-cmp stage2/lunar stage3/lunar                        # identical
+lunar build --release                                # with a released lunar
+target/release/lunar --version
 ```
 
-(Both stages get the same file name because on macOS the linker's ad hoc
-code signature records it.)
-
-Stages 2 and 3 are debug builds, so they carry full debug information
-(`--debug-info none` leaves it out) and are still the same bytes: the
-metadata has no timestamps or addresses, source paths are recorded relative
-to `craters/` (std's under its own directory), and on Windows the
-executable names its PDB without a directory (`/PDBALTPATH:%_PDB%`) and is
-linked with `/Brepro`, so where the stages are built does not matter.
-
-The executable, `target/release/lunar`, is a drop-in replacement for the
-Rust `lunar`: the same commands (`new`, `init`, `check`, `build`, `run`,
-`test`, `add`, `remove`, `update`, `clean`, `emit-llvm`, `explain`, `lsp`), options, help and error texts, status lines, exit codes
-and diagnostics. Diagnostics are drawn by `ln-ariadne` exactly as the Rust
-compiler draws them with ariadne (`ln-sema/src/render.ln` is the glue).
-When stderr is a terminal and `NO_COLOR` is not set they are in color, and
-the quoted code is syntax highlighted from `ln-lexer`'s tokens
-(`ln-sema/src/highlight.ln`).
-
-The Rust integration tests run against it with `LUNAR_BIN`:
+The released compiler is the one in [stage0.txt](stage0.txt) (or a newer
+one). [`tools/bootstrap.sh`](../tools/bootstrap.sh) does the whole
+bootstrap, as CI and releases do:
 
 ```sh
-LUNAR_BIN=$PWD/target/release/lunar cargo test -p ln-driver --test lang --test project --test hover --test lsp_session
+tools/bootstrap.sh path/to/stage0/bin/lunar out
+# stage 1: craters/ built by stage 0, with stage 0's own std
+# stage 2: built by stage 1, with the repository's std/
+# stage 3: built by stage 2; stages 2 and 3 must be identical
 ```
+
+Each stage is linked to a file of the same name in its own directory,
+because on macOS the linker's ad hoc code signature records it. The
+stages are the same bytes whatever they are built with: the debug
+information has no timestamps or addresses, source paths are recorded
+relative to `craters/` (std's under its own directory), and on Windows the
+executable names its PDB without a directory (`/PDBALTPATH:%_PDB%`) and is
+linked with `/Brepro`.
+
+What `craters/` may use (only what stage 0 supports) and how to move
+stage 0 forward is in [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+The executable has the commands `new`, `init`, `check`, `build`, `run`,
+`test`, `add`, `remove`, `update`, `clean`, `emit-llvm`, `explain` and
+`lsp`. Diagnostics are drawn by `ln-ariadne` (`ln-sema/src/render.ln` is
+the glue). When stderr is a terminal and `NO_COLOR` is not set they are in
+color, and the quoted code is syntax highlighted from `ln-lexer`'s tokens
+(`ln-sema/src/highlight.ln`).
+
+### Tests
+
+* `lunar test -p lunar`: the compiler's own tests, among them the
+  language server sessions in `tests/lsp/` replayed in process
+  (`lunar/src/ide_tests.ln`) and the debug information
+  (`lunar/src/debuginfo_tests.ln`: the IR, a scripted lldb session when
+  lldb starts, and the PDB through `llvm-pdbutil`). The other packages
+  have unit tests too (`lunar test -p ln-json`, ...).
+* `LUNAR_BIN=$PWD/target/release/lunar lunar test -p lunar-tests`:
+  [lunar-tests](lunar-tests/src/lib.ln) runs the executable through its
+  command line and language server, on `tests/ui`, `tests/run`,
+  `tests/fatal`, `examples`, `docs/errors`, projects and workspaces,
+  `tests/lsp` over `lunar lsp`, and broken programs. It uses
+  `std::process::Command` to start `lunar` and talk to it.
 
 ### Where it finds the standard library
 
-The Rust compiler embeds `std/` and `docs/errors/`; this one reads them at
-run time, from the first of:
+The standard library and the explanations of the diagnostic codes are not
+embedded: they are read at run time, from the first of:
 
 1. `$LUNAR_STD_DIR` (the standard library only: `core/` and `std/`);
 2. an installation: `<prefix>/lib/lunar/std` and
    `<prefix>/lib/lunar/docs/errors`, for the executable
-   `<prefix>/bin/lunar`;
+   `<prefix>/bin/lunar` (the layout of the release archives);
 3. a source checkout: the nearest directory above the executable with
    `std/core/lib.ln`, and its `std/` and `docs/errors/`. So
    `craters/target/release/lunar` uses the repository's.
-
-To install it, copy the files into that layout:
-
-```
-<prefix>/bin/lunar(.exe)
-<prefix>/lib/lunar/std/{core,std}/...       # this repository's std/
-<prefix>/lib/lunar/docs/errors/<scope>/<name>.md
-```
 
 Without a standard library `lunar` reports `err(build::io): could not find
 the standard library`; without `docs/errors`, `lunar explain` says so and
 failed builds show no `lunar explain` hint.
 
-| Crater       | Port of            | State |
-|--------------|--------------------|-------|
-| `ln-lexer`   | `crates/ln-lexer`  | complete |
-| `ln-ast`     | `crates/ln-ast`    | the syntax tree, in arenas (`core::arena`): every `Box` is an `Id`, every `Vec` a `List`, names and strings are interned |
-| `ln-parser`  | `crates/ln-parser` and `crates/ln-parse-kit` | complete: source files (`parse_file`, and `parse_file_into` a shared `Ast` with global offsets), macro expansions (`parse_expansion`, `parse_fragment`), hygiene contexts on identifiers and tokens |
-| `ln-ariadne` | the `ariadne` crate (0.6) | complete: sources, labels (color, order, priority), reports with notes and helps, the whole `Config` and the layout algorithm, both character sets; ariadne's tests. Beyond ariadne: a `Theme` for every part of a report, and per-byte source styles (`Sources::add_styled`, `add_highlighted` with a `Highlighter`). Character widths approximate `unicode-width` (common wide and zero-width ranges) |
-| `ln-sema`    | `crates/ln-sema` and `crates/ln-diag` | complete (see below) |
-| `ln-codegen` | `crates/ln-codegen` | complete (LLVM through its C API, `llvm.ln`) |
-| `ln-toml`    | the `toml` and `toml_edit` crates | what manifests and lockfiles need: the whole TOML syntax, every key and value with its place in the text; `edit` sets and removes keys in place, keeping comments and layout as `toml_edit` does |
-| `ln-semver`  | the `semver` crate (1.0) | versions, requirements (`^`, `~`, `=`, `<`, `>`, wildcards, several comparators), matching with its pre-release rules, its display and error messages |
-| `ln-json`    | what the language server gets from `serde_json` | JSON documents as arenas of linked nodes: strict parsing (escapes, `\u` surrogate pairs, numbers kept as written), building, compact writing with serde_json's escapes; tests in `src/tests.ln` |
-| `lunar`      | `crates/ln-driver` | the `lunar` command (above): `cli.ln` (clap's parsing, help and errors), `commands.ln` (`main.rs`), `project.ln` and `git.ln` (`project.rs`), `compile.ln` (`lib.rs`), `explain.ln`, `link.ln`, `testing.ln`, `sysroot.ln`, and the language server, `lsp.ln`, `ide.ln`, `complete.ln`, `refs.ln` and `symbols.ln` (below). Hidden modes for `selfhost.rs`: `--lex FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--render [--color] FILE...` the diagnostics drawn as `lunar check` draws them, `--craters DIR` the craters a package build loads |
+| Crater       | Contents |
+|--------------|----------|
+| `ln-lexer`   | tokens and lexical errors, conflict markers |
+| `ln-ast`     | the syntax tree, in arenas (`core::arena`): nodes are `Id`s, lists `List`s, names and strings are interned; `pretty` prints declarations |
+| `ln-parser`  | source files (`parse_file`, and `parse_file_into` a shared `Ast` with global offsets), macro expansions (`parse_expansion`, `parse_fragment`), hygiene contexts on identifiers and tokens |
+| `ln-ariadne` | a port of the `ariadne` crate (0.6): sources, labels (color, order, priority), reports with notes and helps, the whole `Config` and the layout algorithm, both character sets. Beyond ariadne: a `Theme` for every part of a report, and per-byte source styles (`Sources::add_styled`, `add_highlighted` with a `Highlighter`). Character widths approximate `unicode-width` (common wide and zero-width ranges) |
+| `ln-sema`    | semantic analysis and diagnostics (see below) |
+| `ln-codegen` | LLVM code generation through LLVM's C API (`llvm.ln`), and debug information (`debug.ln`) |
+| `ln-toml`    | what manifests and lockfiles need: the whole TOML syntax, every key and value with its place in the text; `edit` sets and removes keys in place, keeping comments and layout |
+| `ln-semver`  | versions and requirements (`^`, `~`, `=`, `<`, `>`, wildcards, several comparators), matching with Cargo's pre-release rules |
+| `ln-json`    | JSON documents as arenas of linked nodes: strict parsing (escapes, `\u` surrogate pairs, numbers kept as written), building, compact writing |
+| `lunar`      | the `lunar` command: `cli.ln` (parsing, help and errors), `commands.ln`, `project.ln` and `git.ln` (packages), `compile.ln`, `explain.ln`, `link.ln`, `testing.ln`, `sysroot.ln`, and the language server, `lsp.ln`, `ide.ln`, `complete.ln`, `refs.ln` and `symbols.ln` (below). Hidden modes, for looking at one stage of the front end: `--lex FILE...` prints tokens, `--parse FILE...` the syntax tree and syntax errors, `--check FILE` the diagnostics one per line (`LN_EXPANSIONS=1` also prints every macro expansion), `--render [--color] FILE...` the diagnostics drawn as `lunar check` draws them, `--craters DIR` the craters a package build loads |
+| `lunar-tests` | the tests of the executable (above) |
 
 ### The language server
 
@@ -95,7 +104,7 @@ declarations; `ln_sema::query` for the methods of a type):
 * diagnostics as you type (for std itself too, when a file of a std source
   tree is open), with quick fixes (`textDocument/codeAction`) from the exact
   suggestions diagnostics carry (`Diags::suggest`);
-* hover with the Rust server's text, and go to definition;
+* hover, and go to definition;
 * completion (`.` and `:` trigger it): locals in scope, items in scope and
   through paths, fields and methods by the receiver's type (inherent and
   trait methods, autoslicing), struct literal fields, `use` paths, keywords
@@ -121,23 +130,21 @@ comes from the sysroot, so definitions in it are `file:` locations;
 of the four crates used last and analyzes others again when asked about
 them; after changes it waits for a moment without input before analyzing
 again. The session scripts in `tests/lsp/` (at the root of the repository)
-test every feature: `lunar test -p lunar` replays them in process. The LSP
-tests in `crates/ln-driver/tests` (`lang`, `project`, `hover`,
-`lsp_session`) run against it with `LUNAR_BIN`; `lsp_session` compares its
-answers with the Rust server's.
+test every feature, in process (`lunar test -p lunar`) and over `lunar lsp`
+(`lunar test -p lunar-tests`).
 
 ## The passes
 
-| Part | Rust source | Lunar file(s) | State |
-|------|-------------|---------------|-------|
-| front end | `loader.rs`, `expand.rs`, `collect.rs`, `resolve.rs`, `lower.rs`, parser expansion parsing | `ln-sema/src/{sema,loader,expand,collect,resolve,lower}.ln` | done; same diagnostics as Rust on tests/ui, tests/run, examples |
-| traits, layout | `traits.rs`, `layout.rs` | `ln-sema/src/{traits,layout}.ln` | done (unit checks in `tests.ln`) |
-| borrow checker | `borrowck.rs` | `ln-sema/src/borrowck.ln` | done (unit checks on hand-built THIR in `tests.ln`) |
-| type checker | `typeck/*.rs` | `ln-sema/src/typeck/{mod,expr,call,pat,closure}.ln` | done; Rust's `FnCtx` is the `Sema::fcx` field |
-| code generation | `crates/ln-codegen` | `ln-codegen/src/{lib,func,ops,init,llvm}.ln` | done; the state of the function being lowered (Rust's `FnCg`) lives in `Cg` |
-| debug information | (none in Rust) | `ln-codegen/src/debug.ln` | CodeView / DWARF through LLVM's DIBuilder: functions, lines, variables in lexical blocks, types |
-| driver | `crates/ln-driver` (all but `lsp.rs`, `ide.rs`) | `lunar/src/*.ln` | done; std and `docs/errors` are read from the sysroot, not embedded |
-| language server | `lsp.rs`, `ide.rs`, `ln-ast/src/pretty.rs` | `lunar/src/{lsp,ide,complete,refs,symbols}.ln`, `ln-ast/src/pretty.ln`, `ln-sema/src/query.ln` | done, and beyond the Rust server: the same answers where both answer (`tests/lsp_session.rs`); completion, signature help, references, rename, semantic tokens, symbols, inlay hints and quick fixes (`tests/lsp/`) |
+| Part | File(s) |
+|------|---------|
+| front end: loading, macro expansion, collection, name resolution, lowering | `ln-sema/src/{sema,loader,expand,collect,resolve,lower}.ln` |
+| traits, layout | `ln-sema/src/{traits,layout}.ln` (unit checks in `tests.ln`) |
+| borrow checker | `ln-sema/src/borrowck.ln` (unit checks on hand-built THIR in `tests.ln`) |
+| type checker | `ln-sema/src/typeck/{mod,expr,call,pat,closure}.ln`; the state of the function being checked is the `Sema::fcx` field |
+| code generation | `ln-codegen/src/{lib,func,ops,init,llvm}.ln`; the state of the function being lowered lives in `Cg` |
+| debug information | `ln-codegen/src/debug.ln`: CodeView / DWARF through LLVM's DIBuilder: functions, lines, variables in lexical blocks, types |
+| driver | `lunar/src/*.ln` |
+| language server | `lunar/src/{lsp,ide,complete,refs,symbols}.ln`, `ln-ast/src/pretty.ln`, `ln-sema/src/query.ln` |
 
 ### Data model
 
@@ -160,9 +167,11 @@ answers with the Rust server's.
   `borrowck::lint(p, body, &mut lints)` writes warnings into a separate
   `Diags` (copy them over with `Diags::push_from`).
 
-### Writing Lunar for the port
+### Writing the compiler in Lunar
 
-* Structs cannot hold references: state a Rust struct borrows is passed to
+* Use only what the stage 0 release supports (language and std):
+  [CONTRIBUTING.md](../CONTRIBUTING.md).
+* Structs cannot hold references: state a struct would borrow is passed to
   methods as parameters, or owned.
 * Array items, map keys and values must be Light (own no array or string).
 * What a returned value's views point into is part of the signature
@@ -185,55 +194,15 @@ answers with the Rust server's.
   `&mut +self` methods only grow. Parameters whose views a function stores
   into an in-out argument are `kept`.
 
-## Checked against the Rust compiler
+## Notes
 
-`crates/ln-driver/tests/selfhost.rs` builds this workspace and runs it over
-every `.ln` file in the repository:
-
-* `lexer_matches_rust_lexer`: the same tokens, lexical errors and conflict
-  markers;
-* `parser_matches_rust_parser`: the same syntax tree (`ln_ast::dump`, the
-  same text as `crates/ln-ast/src/dump.rs`) and the same syntax errors (code,
-  span and message);
-* `parser_matches_rust_parser_on_broken_programs`: the same, for every
-  program cut off a third and two thirds of the way through, which
-  exercises error recovery;
-* `diagnostics_render_as_rust_renders_them`: on every file in `tests/ui`,
-  `--render` prints byte for byte what `lunar check` prints without color
-  (before its summary line): the same diagnostics, drawn the same;
-* `compiler_builds_itself`: the bootstrap above; stages 2 and 3 must have
-  the same LLVM IR and the same bytes (on Windows the link is reproducible
-  through `/Brepro`; on macOS the linker's ad hoc code signature names the
-  executable, so both stages are linked to files of the same name).
-
-Programs compiled by the Lunar compiler pass every run test
-(`tests/run`, `examples`), and `--check` reports the Rust compiler's
-codes at the same positions on `tests/ui`. With `LUNAR_BIN` set to it,
-the command-line and language server tests (`tests/lang.rs`,
-`tests/project.rs`, `tests/hover.rs`, `tests/lsp_session.rs`) pass.
-
-## Differences from the Rust driver
-
-* `std/` and `docs/errors/` come from the sysroot (above), not from the
-  executable.
-* Programs get debug information (`ln-codegen/src/debug.ln`; see
-  [Debugging](../README.md#debugging)): `build`, `run`, `test` and
-  `emit-llvm` also take `--debug-info none|lines|full` and
-  `--remap-path-prefix FROM=TO`. Tests: `lunar test -p lunar` in
-  `craters/` (`lunar/src/debuginfo_tests.ln`: the IR, a scripted lldb
-  session when lldb starts, and on Windows the PDB through
-  `llvm-pdbutil`).
-* On Windows, linking falls back from `clang` to a `link.exe` on `PATH`;
-  the Rust driver also finds an installed MSVC through the registry.
+* On Windows, linking falls back from `clang` to a `link.exe` on `PATH`
+  (as in a Developer PowerShell); it does not look for an installed MSVC
+  through the registry.
 * I/O errors are worded by `std` (`not found (os error 2)`), not by the
   operating system.
-* Manifest errors that Rust's serde reports with its own spans (an unknown
-  key, a value of the wrong type) point at the key or value instead.
-
-## Differences from the Rust parser
-
-* The cursor's arrays only grow. A format string's holes are lexed onto the
+* The parser's arrays only grow. A format string's holes are lexed onto the
   end of the token array and parsed with the cursor's limit moved there;
   their errors are marked dead rather than removed.
-* Float literals keep their text (the span) rather than a parsed value.
-* Integer literals hold up to 128 bits in two `u64` words.
+* Float literals keep their text (the span) rather than a parsed value;
+  integer literals hold up to 128 bits in two `u64` words.
