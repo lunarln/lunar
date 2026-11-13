@@ -15,6 +15,49 @@ use crater::paths::{obj_extension, with_extension};
 use crater::project::Project;
 use crater::sysroot;
 use crater::ui::use_color;
+use ln_codegen::DebugInfo;
+
+/// How a build compiles: optimized or not, and its debug information.
+pub struct Profile {
+    pub release: bool,
+    pub debug: DebugInfo,
+    /// `--remap-path-prefix FROM=TO`, if given.
+    pub remap: Option::<str>,
+    /// DWARF instead of CodeView on Windows (`LUNAR_DEBUG_FORMAT=dwarf`),
+    /// for lldb: in the executable, linked by `lld`.
+    pub dwarf: bool,
+}
+
+impl Profile {
+    /// The debug profile, or with `release`, the release one. As with
+    /// cargo, the debug profile has full debug information and release
+    /// none, unless `debug_info` (`--debug-info`: `none`, `lines` or
+    /// `full`) says otherwise.
+    pub fn new(release: bool, debug_info: Option::<str>, remap: Option::<str>): Profile {
+        let debug = match debug_info {
+            Some(d) => {
+                if d == "none" {
+                    DebugInfo::None
+                } else if d == "lines" {
+                    DebugInfo::Lines
+                } else {
+                    DebugInfo::Full
+                }
+            }
+            None => if release { DebugInfo::None } else { DebugInfo::Full },
+        };
+        let dwarf = match std::env::var("LUNAR_DEBUG_FORMAT") {
+            Some(f) => f.as_str() == "dwarf",
+            None => false,
+        };
+        return Profile { release, debug, remap, dwarf };
+    }
+
+    /// The profile's name: `target/<name>/`.
+    pub fn name(&self): str {
+        return if self.release { "release" } else { "debug" };
+    }
+}
 
 /// Load the craters `proj.specs` (the first is the one built), then `core`
 /// and `std`, and analyze them for the host (or `target_os`). If a file
@@ -194,19 +237,34 @@ fn trim_end(s: str): str {
     return s[..end];
 }
 
-fn codegen_options(release: bool, test: bool, emit_llvm: Option::<str>): ln_codegen::Options {
+fn codegen_options(prof: Profile, test: bool, emit_llvm: Option::<str>): ln_codegen::Options {
     let ir = match emit_llvm {
         Some(e) => Some(String::from(e)),
         None => None,
     };
-    return ln_codegen::Options { opt_level: if release { 2 } else { 0 }, test, overflow_checks: !release, emit_llvm: ir };
+    let mut opts = ln_codegen::Options::new(if prof.release { 2 } else { 0 }, test, !prof.release);
+    opts.emit_llvm = ir;
+    opts.debug_info = prof.debug;
+    opts.dwarf = prof.dwarf;
+    // Source paths are recorded relative to the directory the build runs
+    // in (and remapped as asked).
+    if let Ok(d) = std::env::current_dir() {
+        opts.debug_dir = d;
+    }
+    if let Some(r) = prof.remap {
+        if let Some(i) = r.find("=") {
+            opts.remap_from = String::from(r[..i]);
+            opts.remap_to = String::from(r[i + 1..]);
+        }
+    }
+    return opts;
 }
 
 /// Generate code for an analyzed program and link it into the executable
 /// `out`; false after reporting a failure.
-pub fn build_exe(s: &mut Sema, out: str, release: bool, test: bool, emit_llvm: Option::<str>): bool {
+pub fn build_exe(s: &mut Sema, out: str, prof: Profile, test: bool, emit_llvm: Option::<str>): bool {
     let obj = with_extension(out, obj_extension());
-    match ln_codegen::compile(&mut s.p, codegen_options(release, test, emit_llvm), obj.as_str()) {
+    match ln_codegen::compile(&mut s.p, codegen_options(prof, test, emit_llvm), obj.as_str()) {
         Ok(()) => {}
         Err(e) => {
             codegen_error(e.as_str());
@@ -217,7 +275,8 @@ pub fn build_exe(s: &mut Sema, out: str, release: bool, test: bool, emit_llvm: O
     for l in s.p.link_libs {
         libs.push(s.p.text(l));
     }
-    let linked = link::link(obj.as_str(), out, libs[..]);
+    let debug = prof.debug != DebugInfo::None;
+    let linked = link::link(obj.as_str(), out, libs[..], debug, prof.dwarf);
     let _ = fs::remove_file(obj.as_str());
     return match linked {
         Ok(()) => true,
@@ -230,8 +289,8 @@ pub fn build_exe(s: &mut Sema, out: str, release: bool, test: bool, emit_llvm: O
 
 /// The optimized LLVM IR of an analyzed program, or `None` after
 /// reporting a failure.
-pub fn emit_ir(s: &mut Sema, release: bool, test: bool): Option::<String> {
-    return match ln_codegen::emit_ir(&mut s.p, codegen_options(release, test, None)) {
+pub fn emit_ir(s: &mut Sema, prof: Profile, test: bool): Option::<String> {
+    return match ln_codegen::emit_ir(&mut s.p, codegen_options(prof, test, None)) {
         Ok(ir) => Some(ir),
         Err(e) => {
             codegen_error(e.as_str());

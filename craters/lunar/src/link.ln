@@ -11,10 +11,24 @@
 // `#[link(name = "...")]` are passed on as `-lname` (`name.lib` for
 // `link.exe`), searched for in the directories in `$LUNAR_LIB_PATH`
 // (separated like `PATH`) as well as the linker's defaults.
+//
+// With debug information, the debugger's files are made too:
+//
+// * Windows: the linker writes `<out>.pdb` (`/DEBUG`) next to the
+//   executable, which names it without its directory (`/PDBALTPATH`), so
+//   the executable is the same wherever it is built; the standard
+//   library's `debugger/lunar.natvis` goes into the PDB (`/NATVIS`). With
+//   `LUNAR_DEBUG_FORMAT=dwarf`, `lld` keeps DWARF in the executable
+//   instead, for lldb.
+// * macOS: the DWARF stays in the object file, which is deleted after
+//   linking, so `dsymutil` first collects it into `<out>.dSYM`.
+// * Linux: the DWARF is in the executable.
 
 use std::env;
 use std::fs;
 use std::process;
+use crater::paths::with_extension;
+use crater::sysroot;
 
 /// A failed link, as a `build::link` diagnostic: its message, a note
 /// (the linker's output) and a help, each possibly empty.
@@ -24,22 +38,28 @@ pub struct LinkError {
     pub help: String,
 }
 
-/// Link `obj` and the native libraries `libs` into the executable `out`.
-pub fn link(obj: str, out: str, libs: [str; &]): Result::<(), LinkError> {
+/// Link `obj` and the native libraries `libs` into the executable `out`,
+/// with its debug information if `debug` (on Windows, DWARF rather than a
+/// PDB with `dwarf`).
+pub fn link(obj: str, out: str, libs: [str; &], debug: bool, dwarf: bool): Result::<(), LinkError> {
     let search = lib_path();
     let mut b = Args::new();
     if let Some(cc) = env::var("LUNAR_CC") {
         b.add(obj);
         b.add("-o");
         b.add(out);
+        if debug {
+            b.add("-g");
+        }
         gnu_args(&mut b, search.as_str(), libs, false);
         for l in system_libs() {
             b.add(l);
         }
-        return run(cc.as_str(), &b);
+        run(cc.as_str(), &b)?;
+        return collect_debug(out, debug);
     }
     if is_windows() {
-        return link_windows(obj, out, libs, search.as_str());
+        return link_windows(obj, out, libs, search.as_str(), debug, dwarf);
     }
     b.add(obj);
     b.add("-o");
@@ -48,7 +68,55 @@ pub fn link(obj: str, out: str, libs: [str; &]): Result::<(), LinkError> {
     for l in system_libs() {
         b.add(l);
     }
-    return run("cc", &b);
+    run("cc", &b)?;
+    return collect_debug(out, debug);
+}
+
+/// The files besides executable `exe` that hold its debug information
+/// (`.pdb`, `.dSYM`), which go with it.
+pub fn remove_debug_files(exe: str) {
+    if is_windows() {
+        let _ = fs::remove_file(with_extension(exe, "pdb").as_str());
+    } else if is_macos() {
+        let mut d = String::from(exe);
+        d.push_str(".dSYM");
+        if fs::is_dir(d.as_str()) {
+            let _ = fs::remove_dir_all(d.as_str());
+        }
+    }
+}
+
+/// On macOS, collect the debug information of `out` from its object file
+/// into `out.dSYM` (before the object is deleted).
+fn collect_debug(out: str, debug: bool): Result::<(), LinkError> {
+    if !debug || !is_macos() {
+        return Ok(());
+    }
+    let mut b = Args::new();
+    b.add(out);
+    return run("dsymutil", &b);
+}
+
+/// The arguments that make `link.exe` (directly, or through `clang` with
+/// `-Wl,`) write the PDB: reproducibly, named without its directory, with
+/// the standard library's natvis.
+fn pdb_args(b: &mut +Args, prefix: str) {
+    // (`/DEBUG` keeps unreferenced functions unless told otherwise.)
+    for a in ["/DEBUG", "/INCREMENTAL:NO", "/OPT:REF", "/PDBALTPATH:%_PDB%"] {
+        let mut s = String::from(prefix);
+        s.push_str(a);
+        b.add(s.as_str());
+    }
+    if let Some(std_dir) = sysroot::std_dir() {
+        let mut natvis = String::from(std_dir.as_str());
+        natvis.push_str("/debugger/lunar.natvis");
+        if fs::is_file(natvis.as_str()) {
+            let mut s = String::from(prefix);
+            s.push_str("/NATVIS:");
+            s.push_str(natvis.as_str());
+            b.add(s.as_str());
+        }
+    }
 }
 
 /// The main thread's stack on Windows, in bytes (reserved, used as
@@ -57,9 +125,14 @@ pub fn link(obj: str, out: str, libs: [str; &]): Result::<(), LinkError> {
 /// 128 deep); Linux gives 8 MiB by default.
 const MAIN_STACK: usize = 8388608;
 
-fn link_windows(obj: str, out: str, libs: [str; &], search: str): Result::<(), LinkError> {
+fn link_windows(obj: str, out: str, libs: [str; &], search: str, debug: bool, dwarf: bool): Result::<(), LinkError> {
     let mut b = Args::new();
     if which("clang") {
+        if debug && dwarf {
+            // `link.exe` truncates the names of DWARF sections; `lld`
+            // keeps them in the executable.
+            b.add("-fuse-ld=lld");
+        }
         b.add(obj);
         b.add("-o");
         b.add(out);
@@ -72,6 +145,13 @@ fn link_windows(obj: str, out: str, libs: [str; &], search: str): Result::<(), L
         let mut stack = String::new();
         stack.write("-Wl,/STACK:{MAIN_STACK}");
         b.add(stack.as_str());
+        if debug && dwarf {
+            b.add("-Wl,/DEBUG:DWARF");
+            b.add("-Wl,/INCREMENTAL:NO");
+            b.add("-Wl,/OPT:REF");
+        } else if debug {
+            pdb_args(&mut b, "-Wl,");
+        }
         return run("clang", &b);
     }
     if !which("link") {
@@ -90,6 +170,9 @@ fn link_windows(obj: str, out: str, libs: [str; &], search: str): Result::<(), L
     let mut stack = String::new();
     stack.write("/STACK:{MAIN_STACK}");
     b.add(stack.as_str());
+    if debug {
+        pdb_args(&mut b, "");
+    }
     for d in search.split(path_sep()) {
         if d.len() > 0 {
             let mut a = String::from("/LIBPATH:");
@@ -236,6 +319,16 @@ fn is_windows(): bool {
 
 #[cfg(unix)]
 fn is_windows(): bool {
+    return false;
+}
+
+#[cfg(target_os = "macos")]
+fn is_macos(): bool {
+    return true;
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_macos(): bool {
     return false;
 }
 

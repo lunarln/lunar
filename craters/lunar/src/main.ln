@@ -46,7 +46,7 @@ use std::fs;
 use ln_sema::diag::{Severity, is_dummy};
 use ln_sema::program::Program;
 use ln_sema::render::{plain_message, render_all};
-use crater::compile::analyze_file;
+use crater::compile::{Profile, analyze_file};
 use crater::project::{DepSpec, Project, Target};
 
 fn main() {
@@ -77,6 +77,7 @@ fn main() {
 fn run(c: &cli::Cli): i32 {
     let cmd = c.command;
     let file: Option::<str> = if c.positionals.len() > 0 { Some(c.positionals[0]) } else { None };
+    let prof = Profile::new(c.release, c.debug_info, c.remap);
     if cmd == "new" {
         return commands::new_package(c.positionals[0], c.lib);
     }
@@ -91,18 +92,18 @@ fn run(c: &cli::Cli): i32 {
     }
     if cmd == "build" {
         return match file {
-            Some(f) => commands::build_file(f, c.output, c.release, c.emit_llvm),
-            None => commands::build_project(c.package, c.output, c.release, c.emit_llvm),
+            Some(f) => commands::build_file(f, c.output, prof, c.emit_llvm),
+            None => commands::build_project(c.package, c.output, prof, c.emit_llvm),
         };
     }
     if cmd == "run" {
         return match file {
-            Some(f) => commands::run_file(f, c.release, c.rest[..]),
-            None => commands::run_project(c.package, c.release, c.rest[..]),
+            Some(f) => commands::run_file(f, prof, c.rest[..]),
+            None => commands::run_project(c.package, prof, c.rest[..]),
         };
     }
     if cmd == "test" {
-        return commands::test(c.positionals[..], c.package, c.release);
+        return commands::test(c.positionals[..], c.package, prof);
     }
     if cmd == "add" {
         let spec = DepSpec { version: None, path: c.path, git: c.git, tag: c.tag, branch: c.branch, rev: c.rev, package: c.package };
@@ -118,7 +119,7 @@ fn run(c: &cli::Cli): i32 {
         return commands::clean();
     }
     if cmd == "emit-llvm" {
-        return commands::emit_llvm(c.positionals[0], c.output, c.release, c.test);
+        return commands::emit_llvm(c.positionals[0], c.output, prof, c.test);
     }
     if cmd == "lsp" {
         return lsp::serve();
