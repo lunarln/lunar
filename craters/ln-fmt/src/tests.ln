@@ -361,6 +361,18 @@ fn operators() {
 }
 ",
     );
+    // A condition and its `{` break together.
+    check(
+        "fn f() { if v.kind == Kind::Table && (v.table == TableKind::Header || v.table == TableKind::Implicit123) { x(); } }",
+        "fn f() {
+    if v.kind == Kind::Table
+        && (v.table == TableKind::Header || v.table == TableKind::Implicit123)
+    {
+        x();
+    }
+}
+",
+    );
     // What follows `=` goes on the next line if it fits there...
     check(
         "fn f() { let total = first_value_with_long_name + second_value_with_long_name + third_value_name * 200000; }",

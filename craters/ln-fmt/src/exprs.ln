@@ -273,7 +273,7 @@ impl Printer {
                 self.open();
                 self.tok(lo, "while");
                 self.text(" ");
-                self.expr(cond);
+                self.header_expr(cond);
                 self.line();
                 self.header_end();
                 self.block(body, false);
@@ -356,6 +356,21 @@ impl Printer {
     /// A chain of binary operators of one precedence, broken before the
     /// operators.
     fn binary(&mut self, id: Id::<Expr>) {
+        self.binary_in(id, true);
+    }
+
+    /// The expression of a control flow header (`if c`, `while c`, ...):
+    /// a chain of operators breaks with the header (and its `{`).
+    fn header_expr(&mut self, id: Id::<Expr>) {
+        match self.ast.exprs.get(id).kind {
+            ExprKind::Binary(_, _, _) => self.binary_in(id, false),
+            _ => self.expr(id),
+        }
+    }
+
+    /// A chain of operators, in a group of its own (`grouped`) or in the
+    /// enclosing one.
+    fn binary_in(&mut self, id: Id::<Expr>, grouped: bool) {
         let p = match self.ast.exprs.get(id).kind {
             ExprKind::Binary(op, _, _) => prec(op),
             _ => 0,
@@ -396,8 +411,12 @@ impl Printer {
         let ind = self.d.indent(rest);
         self.emit(ind);
         let c = self.close();
-        let g = self.d.group(c, 0);
-        self.emit(g);
+        if grouped {
+            let g = self.d.group(c, 0);
+            self.emit(g);
+        } else {
+            self.emit(c);
+        }
     }
 
     // ===================================================================== calls and chains
@@ -888,7 +907,7 @@ impl Printer {
         self.text(" ");
         let (then, else_) = match e.kind {
             ExprKind::If { cond, then, else_ } => {
-                self.expr(cond);
+                self.header_expr(cond);
                 (then, else_)
             }
             ExprKind::IfLet { pat, scrut, then, else_ } => {
