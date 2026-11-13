@@ -21,6 +21,8 @@ Language support for [Lunar](https://github.com/lunarln/lunar):
   highlights and rename (across the files of a package).
 * An outline of each file, workspace symbol search, and inlay hints (the
   types of `let`s, parameter names at calls).
+* Format Document, in `lunar fmt`'s style (`docs/style.md`). A file with
+  syntax errors is left as it is.
 
 The language features come from `lunar lsp`. Install Lunar with its
 install script (see [Installing](https://github.com/lunarln/lunar#installing));
