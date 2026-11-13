@@ -1,0 +1,4 @@
+sum of 1..=10000: 50005000
+hits: 4000
+words: 9
+the thread panicked: index out of bounds: the length is 2 but the index is 3

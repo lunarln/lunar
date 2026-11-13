@@ -371,6 +371,14 @@ fn traits_and_impls() {
     );
     check("impl !Send for P {}", "impl !Send for P {}\n");
     check(
+        "unsafe  impl::<T:Send> Sync for M::<T>{}",
+        "unsafe impl::<T: Send> Sync for M::<T> {}\n",
+    );
+    check(
+        "pub  const  fn new(v:u64):A{return A{v};}",
+        "pub const fn new(v: u64): A {\n    return A { v };\n}\n",
+    );
+    check(
         "impl Point{fn new():Point{Point{x:0,y:0}}}",
         "impl Point {\n    fn new(): Point {\n        Point { x: 0, y: 0 }\n    }\n}\n",
     );
