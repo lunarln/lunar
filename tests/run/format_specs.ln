@@ -46,6 +46,8 @@ fn main() {
     // fill and alignment.
     println("[{n:08}] [{m:08}] [{n:+08}] [{z:+05}] [{n:#010x}] [{n:#010b}] [{m:#010x}] [{n:#06o}]");
     println("[{n:^08}] [{m:<05}] [{n:*>08}] [{n:#04x}] [{n:#03x}]");
+    let ff = 255;
+    println("[{n:>+#010x}] [{n:+#010x}] [{ff:#010X}] [{ff:+010o}]");
 
     // Width and precision from variables.
     let w: usize = 10;
@@ -153,4 +155,11 @@ fn main() {
 
     // Holes are expressions, specs included.
     println("[{n * 2:>6}] [{s.len():03}] [{pi * 2.0:.3}] [{[n, m]:?}] [{if n > 0 { "pos" } else { "neg" }:^7}]");
+
+    // A closure captures what its specs name.
+    let cols: usize = 7;
+    let digits: usize = 1;
+    let row = |x: f64| core::fmt::format("|{x:>cols$.digits$}|");
+    let later = move || core::fmt::format("|{n:^cols$}|");
+    println("{row(2.25)} {row(-0.05)} {later()}");
 }

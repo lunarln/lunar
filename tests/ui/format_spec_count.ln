@@ -1,0 +1,11 @@
+// error: type::mismatch
+// error: name::unresolved
+// A `name$` width or precision names a `usize` variable in scope.
+fn main() {
+    let x = 2.5;
+    let w: i32 = 8;
+    let p: usize = 2;
+    println("[{x:w$.p$}]");
+    println("[{x:>width$}]");
+    println("[{x:.prec$}]");
+}

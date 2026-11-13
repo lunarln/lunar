@@ -6,8 +6,17 @@ A string literal passed to a `FmtArgs` parameter (as in `println`, `print`,
 
 * has a `{` without a matching `}`;
 * has a `}` that does not close a `{`;
-* has an empty `{}`, with no expression inside;
-* has a `{...}` whose contents are not a valid expression.
+* has an empty `{}`, with no expression inside, or a spec with nothing
+  before its `:` (`{:x}`; a hole names its value, as in `{n:x}`);
+* has a `{...}` whose contents are not a valid expression;
+* has a malformed format spec after the `:`. A spec is written as in Rust,
+  `[[fill]align][sign]['#']['0'][width]['.' precision][type]`, where the type
+  is one of `?`, `x`, `X`, `o`, `b`, `e` and `E` (or none, for `Display`),
+  and a width or precision is a number or `name$`, naming a `usize`
+  variable. The error points at the part of the spec that is wrong: an
+  unknown type, a `.` without a precision, a `#` with a type that has no
+  prefix (`{x:#?}`, pretty `Debug`, is not supported), or a positional
+  argument (`1$`, `.*`), which format strings do not have.
 
 To write a literal brace, double it: `{{` and `}}`. String literals that are
 not passed to a `FmtArgs` parameter are plain `str` values and are never
@@ -15,6 +24,8 @@ interpolated, so braces in them need no escaping.
 
 A well-formed hole whose value cannot be formatted, because its type does
 not implement `Display`, is a different error: `type::unsatisfied_bound`.
+A well-formed spec that does not suit the value's type (`x` on a float) is
+`type::bad_format_spec`.
 
 ## Erroneous example
 

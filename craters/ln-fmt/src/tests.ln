@@ -701,6 +701,10 @@ fn literals() {
     keep(
         "fn f() {\n    let x = 0xff_u8 + 1_000 + 1.5e3;\n    println(\"{x}  {m.get(\"k\")}{{\");\n    let c = '\\n';\n    let b = b'a';\n}\n",
     );
+    // Format specs too, spaces, fills and `name$` included.
+    keep(
+        "fn f() {\n    println(\"[{x:>8}] [{x: <8}] [{x:*^+#010.3x}] [{y:'^w$.p$}]\");\n    println(\"[{z:\\\"<4?}] [{a :?}] [{b:}] {{c:>2}}\");\n    let s = \"{a:  >2}\";\n}\n",
+    );
 }
 
 #[test]

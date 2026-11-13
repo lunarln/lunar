@@ -87,6 +87,32 @@ fn similar_name_suggestion_is_deterministic() {
     }
 }
 
+/// A format spec's errors point at the part of the spec that is wrong,
+/// inside the string literal (`file:line:column` of each, in the order of
+/// the `println`s of the tests/ui files).
+#[test]
+fn format_spec_errors_point_into_the_spec() {
+    let cases = [
+        ("format_spec_syntax", "7:17 8:19 9:17 10:17 11:17 12:17 13:17 14:20 15:17 16:17 17:14 18:17"),
+        ("format_spec_type", "16:17 17:17 25:17 26:18 27:17 28:17 29:17 30:17 31:17"),
+        ("format_spec_count", "8:18 9:19 10:19"),
+    ];
+    let mut f = Failures::new();
+    for c in cases {
+        let (name, spots) = c;
+        let file = core::fmt::format("tests/ui/{name}.ln");
+        let o = lunar(["check", file.as_str()][..]);
+        let stderr = clean(o.stderr.as_str());
+        for spot in spots.split(" ") {
+            let want = core::fmt::format("{name}.ln:{spot} ]");
+            if !stderr.as_str().contains(want.as_str()) {
+                f.add("{file}: no error at {spot}:\n{stderr}");
+            }
+        }
+    }
+    f.check();
+}
+
 /// Build and run every program in `dir`, and `lunar test` those with
 /// tests.
 fn run_dir(dir: str) {
