@@ -7,7 +7,7 @@
 // lldb (as LLVM's Windows release builds it) reads no PDBs, so on Windows
 // the session uses a DWARF build (`Profile::dwarf`). The tests that need a
 // tool say so and pass when it is missing or cannot start (lldb on Windows
-// needs Python 3.10 on `PATH`).
+// needs a Python 3 on `PATH`).
 
 use std::env;
 use std::fs;
@@ -243,7 +243,7 @@ fn runs(program: str): bool {
 #[test]
 fn lldb_session() {
     if !runs("lldb") {
-        println("skipped: no lldb that starts (on Windows it needs Python 3.10 on PATH)");
+        println("skipped: no lldb that starts (on Windows it needs a Python 3 on PATH)");
         return;
     }
     let file = setup("lldb");
