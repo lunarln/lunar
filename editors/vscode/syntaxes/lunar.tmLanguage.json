@@ -180,7 +180,7 @@
         },
         {
           "name": "keyword.other.lunar",
-          "match": "\\b(fn|let|struct|enum|impl|trait|type|mod|use|as|macro)\\b"
+          "match": "\\b(fn|let|struct|enum|impl|trait|type|mod|use|as|macro|dyn)\\b"
         },
         {
           "comment": "A macro invocation: `vec!(`, `tokens! {`",
