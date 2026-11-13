@@ -1,0 +1,31 @@
+{
+  "about": "Trait objects: hover on a `dyn` variable and on a method called through it, completion of the trait's methods on a `dyn` receiver, and `dyn` as a keyword in semantic tokens.",
+  "steps": [
+    { "open": "main.ln" },
+    { "request": "textDocument/hover",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "view =", 0, 1] },
+      "expect": ["let view: dyn mut Shape", "size = 16 (0x10), align = 0x8"] },
+    { "request": "textDocument/hover",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "area();", 0, 1] },
+      "expect": ["fn area(&self): f64", "The area."] },
+    { "request": "textDocument/definition",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "grow(1.0)", 0, 1] },
+      "ranges": [["main.ln", "grow(&mut self, by: f64);", 0, 0, 4]] },
+    { "request": "textDocument/semanticTokens/full",
+      "params": { "textDocument": { "uri": "$uri:main.ln" } },
+      "tokens": [
+        ["main.ln", "dyn Shape;", 0, 0, "keyword"],
+        ["main.ln", "Shape;", 0, 0, "interface"],
+        ["main.ln", "dyn mut", 0, 0, "keyword"]
+      ] },
+    { "change": "main.ln", "replace": ["    // here", "    shared./*C*/"] },
+    { "request": "textDocument/completion",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "/*C*/", 0, 0] },
+      "expect": ["\"label\":\"area\"", "\"label\":\"grow\"", "\"detail\":\"fn area(&self): f64\""],
+      "absent": ["\"label\":\"side\""] },
+    { "change": "main.ln", "replace": ["    shared./*C*/", "    let x: d/*C*/"] },
+    { "request": "textDocument/completion",
+      "params": { "textDocument": { "uri": "$uri:main.ln" }, "position": ["$pos", "main.ln", "/*C*/", 0, 0] },
+      "expect": ["\"label\":\"dyn\""] }
+  ]
+}
