@@ -1,9 +1,12 @@
-// Hash maps. Keys and values are Light, like array items. `HashMap` is
-// unordered; `OrderedHashMap` iterates in insertion order (for
-// deterministic output). Changing a value in place goes through a closure:
-// `m.update(k, |v| v + 1)`.
+// Collections of Light items (like array items: no `String`s or arrays
+// inside). `HashMap` is unordered; `OrderedHashMap` iterates in insertion
+// order (for deterministic output); `HashSet` is a `HashMap` without
+// values; `SortedMap` keeps its keys in order; `Deque` is a ring buffer
+// and `BinaryHeap` a priority queue. Reads return copies, and changing a
+// value in place goes through a closure: `m.update(k, |v| v + 1)`.
 
 use crater::hash::{Hash, Hasher, hash_of};
+use crater::cmp::Ordering;
 
 /// One slot of a table: empty, or a key with its value and hash.
 enum Slot::<K: Light, V: Light> {
@@ -36,6 +39,12 @@ impl::<K: Light + Hash + Eq, V: Light> HashMap::<K, V> {
 
     pub fn is_empty(&self): bool {
         return self.len == 0;
+    }
+
+    /// Remove everything.
+    pub fn clear(&mut self) {
+        self.slots = [];
+        self.len = 0;
     }
 
     /// The slot holding `k`, or the empty slot where it would go. The
@@ -464,6 +473,681 @@ struct OrderedValues::<K: Light, V: Light> {
 }
 
 impl::<K: Light, V: Light> Iterator::<V> for OrderedValues::<K, V> {
+    fn next(&mut self): Option::<V> {
+        if self.i == self.entries.len() {
+            return None;
+        }
+        let e = self.entries[self.i];
+        self.i += 1;
+        return Some(e.value);
+    }
+}
+
+// ===================================================================== HashSet
+
+/// An unordered set of `T`s: a `HashMap` from `T` to nothing.
+pub struct HashSet::<T: Light + Hash + Eq> {
+    map: HashMap::<T, ()>,
+}
+
+impl::<T: Light + Hash + Eq> HashSet::<T> {
+    pub fn new(): HashSet::<T> {
+        return HashSet { map: HashMap::new() };
+    }
+
+    /// A set of the items of `items`.
+    pub fn from_slice(kept items: [T; &]): HashSet::<T> {
+        let mut s = HashSet::new();
+        s.extend(items);
+        return s;
+    }
+
+    pub fn len(&self): usize {
+        return self.map.len();
+    }
+
+    pub fn is_empty(&self): bool {
+        return self.map.len() == 0;
+    }
+
+    /// Add `v`; false if it was already there.
+    pub fn insert(&mut self, kept v: T): bool {
+        return self.map.insert(v, ()).is_none();
+    }
+
+    /// Add every item of `items`.
+    pub fn extend(&mut self, kept items: [T; &]) {
+        for v in items {
+            self.map.insert(v, ());
+        }
+    }
+
+    pub fn contains(&self, v: T): bool {
+        return self.map.contains(v);
+    }
+
+    /// Remove `v`; false if it was not there.
+    pub fn remove(&mut self, v: T): bool {
+        return self.map.remove(v).is_some();
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
+    /// Every item, in no particular order.
+    pub fn iter(&self): impl Iterator::<T> {
+        return self.map.keys();
+    }
+
+    /// Whether every item of this set is in `other`.
+    pub fn is_subset(&self, other: &HashSet::<T>): bool {
+        for v in self.map.keys() {
+            if !other.contains(v) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Whether the sets have no item in common.
+    pub fn is_disjoint(&self, other: &HashSet::<T>): bool {
+        for v in self.map.keys() {
+            if other.contains(v) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// The items in either set.
+    pub fn union(&self, other: &HashSet::<T>): HashSet::<T> from self, other {
+        let mut out = HashSet::new();
+        for v in self.map.keys() {
+            out.insert(v);
+        }
+        for v in other.map.keys() {
+            out.insert(v);
+        }
+        return out;
+    }
+
+    /// The items in both sets.
+    pub fn intersection(&self, other: &HashSet::<T>): HashSet::<T> from self {
+        let mut out = HashSet::new();
+        for v in self.map.keys() {
+            if other.contains(v) {
+                out.insert(v);
+            }
+        }
+        return out;
+    }
+
+    /// The items of this set that are not in `other`.
+    pub fn difference(&self, other: &HashSet::<T>): HashSet::<T> from self {
+        let mut out = HashSet::new();
+        for v in self.map.keys() {
+            if !other.contains(v) {
+                out.insert(v);
+            }
+        }
+        return out;
+    }
+}
+
+impl::<T: Light + Hash + Eq + Debug> Debug for HashSet::<T> {
+    /// `{1, 2, 3}`.
+    fn debug(&self, out: &mut +String) {
+        debug_items(self.iter(), out, '{', '}');
+    }
+}
+
+/// `(a, b, ...)` between `open` and `close`.
+fn debug_items::<T: Light + Debug, I: Iterator::<T>>(it: I, out: &mut +String, open: char, close: char) {
+    out.push(open);
+    let mut first = true;
+    for v in it {
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        v.debug(out);
+    }
+    out.push(close);
+}
+
+// ===================================================================== Deque
+
+/// A double-ended queue: a ring buffer that grows, with pushes and pops
+/// at both ends in constant time. `get(0)` is the front.
+pub struct Deque::<T: Light> {
+    /// The ring: its length is the capacity; the items are the `len`
+    /// starting at `head`, wrapping around. Other places hold stale
+    /// copies (items are Light, so nothing needs freeing).
+    buf: [T; -..+],
+    head: usize,
+    len: usize,
+}
+
+impl::<T: Light> Deque::<T> {
+    pub fn new(): Deque::<T> {
+        return Deque { buf: [], head: 0, len: 0 };
+    }
+
+    pub fn len(&self): usize {
+        return self.len;
+    }
+
+    pub fn is_empty(&self): bool {
+        return self.len == 0;
+    }
+
+    /// Make room for one more: copy the items, in order, into a ring
+    /// twice the size, filling the rest with copies of `filler`.
+    fn grow(&mut self, kept filler: T) {
+        let cap = self.buf.len();
+        let new_cap = if cap < 4 { 8 } else { cap * 2 };
+        let mut ring: [T; -..+] = [];
+        for i in 0..self.len {
+            ring.push(self.buf[(self.head + i) % cap]);
+        }
+        while ring.len() < new_cap {
+            ring.push(filler);
+        }
+        self.buf = ring;
+        self.head = 0;
+    }
+
+    /// Add `v` at the back.
+    pub fn push_back(&mut self, kept v: T) {
+        if self.len == self.buf.len() {
+            self.grow(v);
+        }
+        let cap = self.buf.len();
+        self.buf[(self.head + self.len) % cap] = v;
+        self.len += 1;
+    }
+
+    /// Add `v` at the front.
+    pub fn push_front(&mut self, kept v: T) {
+        if self.len == self.buf.len() {
+            self.grow(v);
+        }
+        let cap = self.buf.len();
+        self.head = (self.head + cap - 1) % cap;
+        self.buf[self.head] = v;
+        self.len += 1;
+    }
+
+    /// Remove and return the front item.
+    pub fn pop_front(&mut self): Option::<T> {
+        if self.len == 0 {
+            return None;
+        }
+        let v = self.buf[self.head];
+        self.head = (self.head + 1) % self.buf.len();
+        self.len -= 1;
+        return Some(v);
+    }
+
+    /// Remove and return the back item.
+    pub fn pop_back(&mut self): Option::<T> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        return Some(self.buf[(self.head + self.len) % self.buf.len()]);
+    }
+
+    /// A copy of item `i` (0 is the front).
+    pub fn get(&self, i: usize): Option::<T> {
+        if i >= self.len {
+            return None;
+        }
+        return Some(self.buf[(self.head + i) % self.buf.len()]);
+    }
+
+    pub fn front(&self): Option::<T> {
+        return self.get(0);
+    }
+
+    pub fn back(&self): Option::<T> {
+        if self.len == 0 {
+            return None;
+        }
+        return self.get(self.len - 1);
+    }
+
+    /// Replace item `i`; panics if there is none.
+    pub fn set(&mut self, i: usize, kept v: T) {
+        if i >= self.len {
+            panic("Deque::set: index {i} out of bounds for length {self.len}");
+        }
+        let cap = self.buf.len();
+        self.buf[(self.head + i) % cap] = v;
+    }
+
+    /// Replace item `i` with what `f` makes of it; false (without calling
+    /// `f`) if there is none.
+    pub fn update::<F: FnOnce(T): T>(&mut self, i: usize, kept f: F): bool {
+        if i >= self.len {
+            return false;
+        }
+        let cap = self.buf.len();
+        let at = (self.head + i) % cap;
+        self.buf[at] = f(self.buf[at]);
+        return true;
+    }
+
+    /// Remove everything (keeping the room).
+    pub fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    /// Every item, front to back.
+    pub fn iter(&self): impl Iterator::<T> {
+        return DequeIter { buf: self.buf[..], head: self.head, len: self.len, i: 0 };
+    }
+}
+
+impl::<T: Light + Eq> Deque::<T> {
+    pub fn contains(&self, v: T): bool {
+        for i in 0..self.len {
+            if self.buf[(self.head + i) % self.buf.len()] == v {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+impl::<T: Light + Debug> Debug for Deque::<T> {
+    /// `[1, 2, 3]`, front to back.
+    fn debug(&self, out: &mut +String) {
+        debug_items(self.iter(), out, '[', ']');
+    }
+}
+
+struct DequeIter::<T: Light> {
+    buf: [T; &],
+    head: usize,
+    len: usize,
+    i: usize,
+}
+
+impl::<T: Light> Iterator::<T> for DequeIter::<T> {
+    fn next(&mut self): Option::<T> {
+        if self.i == self.len {
+            return None;
+        }
+        let v = self.buf[(self.head + self.i) % self.buf.len()];
+        self.i += 1;
+        return Some(v);
+    }
+}
+
+// ===================================================================== BinaryHeap
+
+/// A priority queue: `pop` takes the greatest item. For the smallest
+/// first, push `cmp::Reverse(x)`, or give the items an `Ord` that orders
+/// them as wanted.
+pub struct BinaryHeap::<T: Light + Ord> {
+    /// A max-heap: each item is at least as great as its children
+    /// (`2i + 1` and `2i + 2`).
+    items: [T; -..+],
+}
+
+impl::<T: Light + Ord> BinaryHeap::<T> {
+    pub fn new(): BinaryHeap::<T> {
+        return BinaryHeap { items: [] };
+    }
+
+    /// A heap of the items of `items` (built in linear time).
+    pub fn from_slice(kept items: [T; &]): BinaryHeap::<T> {
+        let mut h = BinaryHeap { items: [] };
+        h.items.extend(items);
+        let mut i = h.items.len() / 2;
+        while i > 0 {
+            i -= 1;
+            h.sift_down(i);
+        }
+        return h;
+    }
+
+    pub fn len(&self): usize {
+        return self.items.len();
+    }
+
+    pub fn is_empty(&self): bool {
+        return self.items.len() == 0;
+    }
+
+    /// Add `v`.
+    pub fn push(&mut self, kept v: T) {
+        self.items.push(v);
+        let mut i = self.items.len() - 1;
+        while i > 0 {
+            let parent = (i - 1) / 2;
+            if !(self.items[parent] < self.items[i]) {
+                break;
+            }
+            let t = self.items[parent];
+            self.items[parent] = self.items[i];
+            self.items[i] = t;
+            i = parent;
+        }
+    }
+
+    /// A copy of the greatest item.
+    pub fn peek(&self): Option::<T> {
+        return self.items.first();
+    }
+
+    /// Remove and return the greatest item.
+    pub fn pop(&mut self): Option::<T> {
+        let n = self.items.len();
+        if n == 0 {
+            return None;
+        }
+        let top = self.items[0];
+        let last = self.items[n - 1];
+        self.items.truncate(n - 1);
+        if n > 1 {
+            self.items[0] = last;
+            self.sift_down(0);
+        }
+        return Some(top);
+    }
+
+    fn sift_down(&mut self, start: usize) {
+        let n = self.items.len();
+        let mut i = start;
+        loop {
+            let l = 2 * i + 1;
+            if l >= n {
+                return;
+            }
+            let mut big = l;
+            if l + 1 < n && self.items[l] < self.items[l + 1] {
+                big = l + 1;
+            }
+            if !(self.items[i] < self.items[big]) {
+                return;
+            }
+            let t = self.items[i];
+            self.items[i] = self.items[big];
+            self.items[big] = t;
+            i = big;
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    /// Every item, in no particular order.
+    pub fn iter(&self): impl Iterator::<T> {
+        return SliceIter { items: self.items[..], i: 0 };
+    }
+
+    /// The items, smallest first.
+    pub fn into_sorted(self): [T; -..+] {
+        let mut v = self.items;
+        sort_items(v[..]);
+        return v;
+    }
+}
+
+fn sort_items::<T: Light + Ord>(s: [T; &mut]) {
+    s.sort();
+}
+
+impl::<T: Light + Ord + Debug> Debug for BinaryHeap::<T> {
+    fn debug(&self, out: &mut +String) {
+        debug_items(self.iter(), out, '[', ']');
+    }
+}
+
+struct SliceIter::<T: Light> {
+    items: [T; &],
+    i: usize,
+}
+
+impl::<T: Light> Iterator::<T> for SliceIter::<T> {
+    fn next(&mut self): Option::<T> {
+        if self.i == self.items.len() {
+            return None;
+        }
+        let v = self.items[self.i];
+        self.i += 1;
+        return Some(v);
+    }
+}
+
+// ===================================================================== SortedMap
+
+/// One entry of a `SortedMap`.
+struct SortedEntry::<K: Light, V: Light> {
+    key: K,
+    value: V,
+}
+
+/// A map that keeps its keys in order: a sorted array of entries.
+/// Lookups are binary searches; iteration is in key order, and `range`,
+/// `first` and `last` use the order. Inserting or removing moves the
+/// entries after it, so it suits maps that are read more than changed
+/// (or built in order); it is one array, with no per-entry allocation.
+pub struct SortedMap::<K: Light + Ord, V: Light> {
+    entries: [SortedEntry::<K, V>; -..+],
+}
+
+impl::<K: Light + Ord, V: Light> SortedMap::<K, V> {
+    pub fn new(): SortedMap::<K, V> {
+        return SortedMap { entries: [] };
+    }
+
+    pub fn len(&self): usize {
+        return self.entries.len();
+    }
+
+    pub fn is_empty(&self): bool {
+        return self.entries.len() == 0;
+    }
+
+    /// Where `k` is (`Ok`) or would go (`Err`).
+    fn search(&self, k: K): Result::<usize, usize> {
+        let mut lo: usize = 0;
+        let mut hi = self.entries.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let c = self.entries[mid].key.cmp(&k);
+            match c {
+                Ordering::Less => lo = mid + 1,
+                Ordering::Greater => hi = mid,
+                Ordering::Equal => return Ok(mid),
+            }
+        }
+        return Err(lo);
+    }
+
+    /// The position of the first key at least `k`.
+    fn lower_bound(&self, k: K): usize {
+        return match self.search(k) {
+            Ok(i) => i,
+            Err(i) => i,
+        };
+    }
+
+    /// Set the value for `k`; returns the value it replaced.
+    pub fn insert(&mut self, kept k: K, kept v: V): Option::<V> from self, k, v {
+        match self.search(k) {
+            Ok(i) => {
+                let old = self.entries[i].value;
+                self.entries[i].value = v;
+                return Some(old);
+            }
+            Err(i) => {
+                self.entries.insert(i, SortedEntry { key: k, value: v });
+                return None;
+            }
+        }
+    }
+
+    /// A copy of the value for `k`.
+    pub fn get(&self, k: K): Option::<V> {
+        return match self.search(k) {
+            Ok(i) => Some(self.entries[i].value),
+            Err(_) => None,
+        };
+    }
+
+    /// The value for `k`, or `default` if there is none.
+    pub fn get_or(&self, k: K, default: V): V from self, default {
+        return match self.get(k) {
+            Some(v) => v,
+            None => default,
+        };
+    }
+
+    pub fn contains(&self, k: K): bool {
+        return self.search(k).is_ok();
+    }
+
+    /// Replace the value for `k` with what `f` makes of it. Returns false
+    /// (and does not call `f`) if there is no value for `k`.
+    pub fn update::<F: FnOnce(V): V>(&mut self, k: K, kept f: F): bool {
+        return match self.search(k) {
+            Ok(i) => {
+                self.entries[i].value = f(self.entries[i].value);
+                true
+            }
+            Err(_) => false,
+        };
+    }
+
+    /// Remove `k`; returns its value.
+    pub fn remove(&mut self, k: K): Option::<V> {
+        return match self.search(k) {
+            Ok(i) => {
+                let old = self.entries[i];
+                self.entries.remove(i);
+                Some(old.value)
+            }
+            Err(_) => None,
+        };
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// The entry with the smallest key.
+    pub fn first(&self): Option::<(K, V)> {
+        if self.entries.len() == 0 {
+            return None;
+        }
+        let e = self.entries[0];
+        return Some((e.key, e.value));
+    }
+
+    /// The entry with the greatest key.
+    pub fn last(&self): Option::<(K, V)> {
+        let n = self.entries.len();
+        if n == 0 {
+            return None;
+        }
+        let e = self.entries[n - 1];
+        return Some((e.key, e.value));
+    }
+
+    /// Remove and return the entry with the smallest key.
+    pub fn pop_first(&mut self): Option::<(K, V)> {
+        if self.entries.len() == 0 {
+            return None;
+        }
+        let e = self.entries[0];
+        self.entries.remove(0);
+        return Some((e.key, e.value));
+    }
+
+    /// Remove and return the entry with the greatest key.
+    pub fn pop_last(&mut self): Option::<(K, V)> {
+        let e = self.entries.pop()?;
+        return Some((e.key, e.value));
+    }
+
+    /// Every key and value, in key order.
+    pub fn iter(&self): impl Iterator::<(K, V)> {
+        return SortedEntries { entries: self.entries[..], i: 0 };
+    }
+
+    /// The keys and values with keys from `lo` up to (not including)
+    /// `hi`, in key order.
+    pub fn range(&self, lo: K, hi: K): impl Iterator::<(K, V)> {
+        let start = self.lower_bound(lo);
+        let mut end = self.lower_bound(hi);
+        if end < start {
+            end = start;
+        }
+        return SortedEntries { entries: self.entries[start..end], i: 0 };
+    }
+
+    /// Every key, in order.
+    pub fn keys(&self): impl Iterator::<K> {
+        return SortedKeys { entries: self.entries[..], i: 0 };
+    }
+
+    /// Every value, in key order.
+    pub fn values(&self): impl Iterator::<V> {
+        return SortedValues { entries: self.entries[..], i: 0 };
+    }
+}
+
+impl::<K: Light + Ord + Debug, V: Light + Debug> Debug for SortedMap::<K, V> {
+    fn debug(&self, out: &mut +String) {
+        debug_entries(self.iter(), out);
+    }
+}
+
+struct SortedEntries::<K: Light, V: Light> {
+    entries: [SortedEntry::<K, V>; &],
+    i: usize,
+}
+
+impl::<K: Light, V: Light> Iterator::<(K, V)> for SortedEntries::<K, V> {
+    fn next(&mut self): Option::<(K, V)> {
+        if self.i == self.entries.len() {
+            return None;
+        }
+        let e = self.entries[self.i];
+        self.i += 1;
+        return Some((e.key, e.value));
+    }
+}
+
+struct SortedKeys::<K: Light, V: Light> {
+    entries: [SortedEntry::<K, V>; &],
+    i: usize,
+}
+
+impl::<K: Light, V: Light> Iterator::<K> for SortedKeys::<K, V> {
+    fn next(&mut self): Option::<K> {
+        if self.i == self.entries.len() {
+            return None;
+        }
+        let e = self.entries[self.i];
+        self.i += 1;
+        return Some(e.key);
+    }
+}
+
+struct SortedValues::<K: Light, V: Light> {
+    entries: [SortedEntry::<K, V>; &],
+    i: usize,
+}
+
+impl::<K: Light, V: Light> Iterator::<V> for SortedValues::<K, V> {
     fn next(&mut self): Option::<V> {
         if self.i == self.entries.len() {
             return None;

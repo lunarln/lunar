@@ -99,6 +99,31 @@ impl crater::fmt::Debug for Ordering {
     }
 }
 
+/// `x` with its order turned around: `Reverse(a) < Reverse(b)` when
+/// `a > b`. Pushing `Reverse(x)` into a `BinaryHeap` pops the smallest
+/// first; sorting `Reverse`s sorts in descending order.
+pub struct Reverse::<T>(pub T);
+
+impl::<T: Eq> Eq for Reverse::<T> {
+    fn eq(&self, other: &Reverse::<T>): bool {
+        return self.0 == other.0;
+    }
+}
+
+impl::<T: Ord> Ord for Reverse::<T> {
+    fn cmp(&self, other: &Reverse::<T>): Ordering {
+        return other.0.cmp(&self.0);
+    }
+}
+
+impl::<T: crater::fmt::Debug> crater::fmt::Debug for Reverse::<T> {
+    fn debug(&self, out: &mut +String) {
+        out.push_str("Reverse(");
+        self.0.debug(out);
+        out.push(')');
+    }
+}
+
 // ===================================================================== derives
 
 /// `#[derive(Eq)]`: equal when every field is equal; for enums, the same
