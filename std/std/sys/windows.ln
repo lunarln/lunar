@@ -834,7 +834,6 @@ extern "C" {
     fn MoveFileExW(from: *u16, to: *u16, flags: u32): i32;
     fn CreateHardLinkW(link: *u16, target: *u16, security: *mut u8): i32;
     fn CreateSymbolicLinkW(link: *u16, target: *u16, flags: u32): u8;
-    fn SetHandleInformation(h: *mut u8, mask: u32, flags: u32): i32;
 }
 
 /// `INVALID_HANDLE_VALUE` and `INVALID_SOCKET`: all bits set.
@@ -1154,11 +1153,6 @@ pub fn random_fill(buf: [u8; &mut]): bool {
         off += n;
     }
     return true;
-}
-
-extern "C" {
-    fn GetEnvironmentStringsW(): *mut u16;
-    fn FreeEnvironmentStringsW(block: *mut u16): i32;
 }
 
 /// Every environment variable as `NAME=value` and a NUL, onto `out`.
