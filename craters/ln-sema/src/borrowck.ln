@@ -970,8 +970,11 @@ impl Cx {
                 r = self.value_roots(p, inner);
                 // Slicing a temporary view (`s.as_bytes()[0..2]`) points
                 // wherever that view points; only a temporary owner or
-                // fixed array holds the data itself.
-                if !self.is_view_container(p, pe.ty) {
+                // fixed array holds the data itself. A temporary without
+                // storage of its own (an iterator holding only views, as
+                // in `s.split(" ").next()`) can only be pointed through,
+                // like such a local.
+                if !self.is_view_container(p, pe.ty) && self.has_storage(p, pe.ty, 0) {
                     roots_insert(&mut r, Root::Temp);
                 }
             }
@@ -1160,12 +1163,22 @@ impl Cx {
         let mut r: Roots = [];
         match self.place_root(p, place) {
             Some(Root::Local(l)) => return self.local_roots(l),
-            Some(Root::Temp) => match p.thir.expr(place).kind {
-                ExprKind::Temp(inner) => return self.value_roots(p, inner),
-                _ => {
-                    r.push(Root::Temp);
+            Some(Root::Temp) => {
+                // A value stored in a temporary, or in a field or item of
+                // one (`make().text`, `c.pair().0`), points wherever the
+                // temporary's views point: it is a copy, not a view into
+                // the temporary.
+                let mut x = place;
+                loop {
+                    match p.thir.expr(x).kind {
+                        ExprKind::Temp(inner) => return self.value_roots(p, inner),
+                        ExprKind::Field { base, .. } => x = base,
+                        ExprKind::Index { base, .. } => x = base,
+                        _ => break,
+                    }
                 }
-            },
+                r.push(Root::Temp);
+            }
             _ => {}
         }
         return r;
@@ -2024,7 +2037,24 @@ impl Cx {
                 self.collect_assigns_block(p, body, out);
             }
             ExprKind::ForRange { body, .. } => self.collect_assigns_block(p, body, out),
-            ExprKind::ForArray { body, .. } => self.collect_assigns_block(p, body, out),
+            ExprKind::ForArray { pat, array, body, .. } => {
+                // The bindings are copies of the items, which point
+                // wherever the array's views point.
+                if self.has_view(p, p.thir.expr(array).ty) {
+                    let r = self.value_roots_of_place(p, array);
+                    let mut binds: [LocalId; ..+] = [];
+                    pat_bindings(&p.thir, pat, &mut binds);
+                    for l in binds {
+                        if self.has_view(p, self.local(p, l).ty) {
+                            for x in r[..] {
+                                out.push(pair_key(l, x));
+                            }
+                        }
+                    }
+                }
+                self.collect_assigns(p, array, out);
+                self.collect_assigns_block(p, body, out);
+            }
             _ => {
                 let mut kids: [Id::<Expr>; ..+] = [];
                 visit_children(&p.thir, e, &mut kids);
@@ -2525,6 +2555,16 @@ impl Cx {
         };
     }
 
+    /// Remove the locals pattern `pat` binds from `live`: they are given
+    /// new values where it matches.
+    fn kill_bindings(&self, p: &Program, pat: Id::<Pat>, live: &mut LiveSet) {
+        let mut binds: [LocalId; ..+] = [];
+        pat_bindings(&p.thir, pat, &mut binds);
+        for l in binds {
+            ls_remove(live, l);
+        }
+    }
+
     /// Report views of `root` that are live after an invalidating event.
     fn invalidate(&mut self, p: &mut +Program, root: LocalId, live_after: [u64; &], span: Span, what: str) {
         let rname = p.text(self.local(p, root).name);
@@ -2621,7 +2661,54 @@ impl Cx {
                 TyKind::FnPtr(ps, _, _) => Some(ps),
                 _ => None,
             },
-            Callee::Value { .. } => None,
+            Callee::Value { callee: f, kind } => self.value_params(p, p.thir.expr(f).ty, kind),
+        };
+    }
+
+    /// The parameter types a value of type `t` is called with as `kind`
+    /// (`Fn`, `FnMut` or `FnOnce`), when known: a closure's own, or those of
+    /// the `Fn` bound of that kind on a generic parameter or `impl Trait`
+    /// (whatever is called through it implements the bound, so its body
+    /// was checked against the bound's modes, `&mut +` included).
+    fn value_params(&self, p: &mut +Program, t: Ty, kind: ClosureKind): Option::<TyList> {
+        return match p.types.kind(t) {
+            TyKind::Closure(def, args) => {
+                if !p.closures.contains(def) {
+                    return None;
+                }
+                match p.types.kind(p.closure_sig(def, args)) {
+                    TyKind::FnPtr(ps, _, _) => Some(ps),
+                    _ => None,
+                }
+            }
+            TyKind::FnPtr(ps, _, _) => Some(ps),
+            TyKind::Param(..) | TyKind::Opaque(..) => {
+                let mut preds: [Pred; ..+] = [];
+                preds.extend(self.env);
+                if let TyKind::Opaque(d, i, args) = p.types.kind(t) {
+                    p.opaque_preds(d, i, args, &mut preds);
+                }
+                for q in preds {
+                    if q.ty != t || q.trait_ref.args.len() == 0 {
+                        continue;
+                    }
+                    let same = match p.lang_name(q.trait_ref.trait_id) {
+                        Some(n) => match ClosureKind::from_lang(n) {
+                            Some(k) => k == kind,
+                            None => false,
+                        },
+                        None => false,
+                    };
+                    if !same {
+                        continue;
+                    }
+                    if let TyKind::FnPtr(ps, _, _) = p.types.kind(p.types.at(q.trait_ref.args, 0)) {
+                        return Some(ps);
+                    }
+                }
+                None
+            }
+            _ => None,
         };
     }
 
@@ -2792,6 +2879,12 @@ impl Cx {
                     if let Some(g) = a.guard {
                         x = self.live(p, g, x);
                     }
+                    // The arm's bindings get their values here, after the
+                    // scrutinee: what they held before is dead (as for
+                    // `let`). Otherwise a binding of `while let`, `for` or
+                    // `let .. else` in a loop would look live at the call
+                    // that makes its value, and around the loop.
+                    self.kill_bindings(p, a.pat, &mut x);
                     ls_union(&mut l, x[..]);
                 }
                 self.use_place(p, scrut, l)
@@ -2839,12 +2932,14 @@ impl Cx {
                 }
                 self.live(p, start, head)
             }
-            ExprKind::ForArray { array, body, id, .. } => {
+            ExprKind::ForArray { pat, array, body, id, .. } => {
                 self.set_loop_exit(id, after[..]);
                 let mut head = self.use_place(p, array, after.clone());
                 for _ in 0..8 {
                     self.set_loop_head(id, head[..]);
                     let mut b = self.live_block(p, body, head.clone());
+                    // Each pass binds the pattern afresh.
+                    self.kill_bindings(p, pat, &mut b);
                     ls_union(&mut b, after[..]);
                     let new = self.use_place(p, array, b);
                     if ls_subset(new[..], head[..]) {

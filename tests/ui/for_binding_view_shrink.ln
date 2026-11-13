@@ -1,0 +1,14 @@
+// error: borrow::shrink_while_borrowed
+// The variable of a `for` loop over an array of views points where the
+// items point, and so does what it is copied into.
+fn main() {
+    let mut text = String::from("a b");
+    let mut words: [str; ..+] = [];
+    words.push(text.as_str());
+    let mut keep = "";
+    for w in words {
+        keep = w;
+    }
+    text.clear();
+    println("{keep}");
+}

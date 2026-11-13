@@ -1,0 +1,11 @@
+// error: borrow::grow_only
+// A closure bounded by `FnMut(&mut String)` may shrink its argument, so a
+// `&mut +` parameter cannot be lent to it.
+fn apply::<F: FnMut(&mut String)>(mut f: F, s: &mut +String) {
+    f(s);
+}
+
+fn main() {
+    let mut s = String::from("hi");
+    apply(|x| x.clear(), &mut s);
+}

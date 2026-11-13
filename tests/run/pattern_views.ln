@@ -1,0 +1,219 @@
+// Views bound by patterns (`match`, `if let`, `while let`, `let .. else`,
+// `for`) from calls, temporaries, and calls through `Fn` bounds.
+struct Store {
+    names: [str; -..+],
+    nums: [i32; -..+],
+    pos: usize,
+}
+
+impl Store {
+    fn next_item(&mut self): Option::<str> {
+        if self.pos >= self.names.len() {
+            return None;
+        }
+        self.pos += 1;
+        return Some(self.names[self.pos - 1]);
+    }
+
+    fn find_mut(&mut self, k: i32): Option::<[i32; &mut]> {
+        for i in 0..self.nums.len() {
+            if self.nums[i] == k {
+                return Some(self.nums[i..i + 1]);
+            }
+        }
+        return None;
+    }
+
+    fn pair(&mut self): (str, str) {
+        return (self.names[0], self.names[1]);
+    }
+
+    fn reset(&mut self) {
+        self.pos = 0;
+        self.nums.clear();
+        self.nums.push(2);
+    }
+
+    // The binding is made after `find_mut` returns, and dead before
+    // `reset`.
+    fn set_then_reset(&mut self): i32 {
+        let Some(x) = self.find_mut(2) else {
+            return 0;
+        };
+        x[0] = 5;
+        let v = x[0];
+        self.reset();
+        return v;
+    }
+
+    // In a loop, the binding of the last pass is dead when the next pass
+    // calls `find_mut` again.
+    fn count_resets(&mut self): i32 {
+        let mut n = 0;
+        loop {
+            let Some(x) = self.find_mut(2) else {
+                break;
+            };
+            x[0] = 7;
+            n += 1;
+            if n < 3 {
+                self.reset();
+            }
+        }
+        return n;
+    }
+}
+
+struct Token {
+    text: str,
+    line: u32,
+}
+
+fn make_token(s: str): Token {
+    return Token { text: s, line: 2 };
+}
+
+// A container of views, iterated through `impl Iterator`.
+struct Names {
+    items: [str; -..+],
+}
+
+struct NamesIter {
+    items: [str; &],
+    i: usize,
+}
+
+impl Iterator for NamesIter {
+    type Item = str;
+    fn next(&mut self): Option::<str> {
+        if self.i >= self.items.len() {
+            return None;
+        }
+        self.i += 1;
+        return Some(self.items[self.i - 1]);
+    }
+}
+
+impl Names {
+    fn add(&mut +self, kept s: str) {
+        self.items.push(s);
+    }
+
+    fn drop_last(&mut self) {
+        self.items.pop();
+    }
+
+    fn iter(&self): impl Iterator::<Item = str> {
+        return NamesIter { items: self.items[..], i: 0 };
+    }
+}
+
+// Calls through `Fn` bounds whose parameter is `&mut +`: the views of the
+// caller stay valid.
+fn apply::<F: Fn(&mut +String)>(f: F, s: &mut +String) {
+    f(s);
+    f(s);
+}
+
+fn apply_mut::<F: FnMut(&mut +String)>(mut f: F, s: &mut +String) {
+    f(s);
+}
+
+fn apply_once::<F: FnOnce(&mut +String)>(f: F, s: &mut +String) {
+    f(s);
+}
+
+fn bang(s: &mut +String) {
+    s.push_str("!");
+}
+
+fn exclaim(): impl Fn(&mut +String) {
+    return move |x| x.push_str("!");
+}
+
+fn main() {
+    let text = String::from("x y z");
+    let mut c = Store { names: [text.as_str(), "b", "c"], nums: [1, 2, 3], pos: 0 };
+
+    match c.next_item() {
+        Some(v) => println("match {v}"),
+        None => {}
+    }
+    c.reset();
+    if let Some(v) = c.next_item() {
+        println("if let {v}");
+    }
+    c.reset();
+    let (a, b) = c.pair();
+    println("tuple {a}{b}");
+    c.reset();
+    // A value read out of a temporary is a copy, not a view into it.
+    let first = c.pair().0;
+    let t = make_token(text.as_str()).text;
+    println("temporary {first} {t}");
+    while let Some(v) = c.next_item() {
+        print("{v};");
+        c.nums.clear();
+    }
+    println("");
+    c.reset();
+    loop {
+        match c.next_item() {
+            Some(v) => println("loop {v}"),
+            None => break,
+        }
+        c.reset();
+        break;
+    }
+    println("{c.set_then_reset()} {c.count_resets()}");
+    c.reset();
+    let Some(v) = c.next_item() else {
+        return;
+    };
+    println("let else {v}");
+
+    // An array of views: the loop binding is dead at the shrink.
+    let mut words: [str; -..+] = [];
+    for w in text.as_str().split(" ") {
+        words.push(w);
+    }
+    words.pop();
+    for w in words {
+        print("{w};");
+        c.nums.clear();
+    }
+    println("");
+
+    // Shrunk, then grown, then iterated through `impl Iterator`.
+    let mut n = Names { items: [] };
+    n.add(text.as_str());
+    n.drop_last();
+    n.add("b");
+    let early = n.iter();
+    n.add("c");
+    for w in n.iter() {
+        print("{w};");
+    }
+    for w in early {
+        print("early {w};");
+    }
+    println("");
+    // `next` on a temporary iterator that holds only views.
+    let head = n.iter().next();
+    let word = text.as_str().split(" ").next();
+    println("{head:?} {word:?}");
+    if let Some(h) = n.iter().next() {
+        println("{h}");
+        n.drop_last();
+    }
+
+    let mut s = String::from("hi");
+    let view = s.as_str();
+    apply(|x| x.push_str("?"), &mut s);
+    apply_mut(|x| x.push_str("?"), &mut s);
+    apply_once(|x| x.push_str("?"), &mut s);
+    apply(bang, &mut s);
+    let e = exclaim();
+    e(&mut s);
+    println("{view} {s}");
+}

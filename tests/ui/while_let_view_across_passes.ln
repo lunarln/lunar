@@ -1,0 +1,31 @@
+// error: borrow::shrink_while_borrowed
+// The binding of `while let` is dead before the next pass binds it again,
+// but a copy of it kept for the next pass still points into `c`.
+struct Store {
+    names: [str; -..+],
+    pos: usize,
+}
+
+impl Store {
+    fn next_item(&mut +self): Option::<str> {
+        if self.pos >= self.names.len() {
+            return None;
+        }
+        self.pos += 1;
+        return Some(self.names[self.pos - 1]);
+    }
+
+    fn forget(&mut self) {
+        self.names.clear();
+    }
+}
+
+fn main() {
+    let mut c = Store { names: ["a", "b"], pos: 0 };
+    let mut last = "";
+    while let Some(v) = c.next_item() {
+        println("{last}");
+        last = v;
+        c.forget();
+    }
+}
