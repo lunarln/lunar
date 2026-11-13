@@ -3,7 +3,7 @@
 
 use std::process;
 use ln_sema::sema::Sema;
-use crater::compile::{build_exe, finish_front};
+use crater::compile::{Profile, build_exe, finish_front};
 
 /// The results so far.
 pub struct Tally {
@@ -22,7 +22,7 @@ impl Tally {
 
 /// Build the test harness of `s` as `out` and run the tests whose name
 /// contains `filter`. False if it did not compile.
-pub fn run_tests(s: &mut Sema, label: str, out: str, filter: Option::<str>, release: bool, tally: &mut Tally): bool {
+pub fn run_tests(s: &mut Sema, label: str, out: str, filter: Option::<str>, prof: Profile, tally: &mut Tally): bool {
     if !finish_front(s) {
         return false;
     }
@@ -32,7 +32,7 @@ pub fn run_tests(s: &mut Sema, label: str, out: str, filter: Option::<str>, rele
         names.push_str(s.p.name(t));
         ends.push(names.len());
     }
-    if !build_exe(s, out, release, true, None) {
+    if !build_exe(s, out, prof, true, None) {
         return false;
     }
     let mut selected: [usize; ..+] = [];

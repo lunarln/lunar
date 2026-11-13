@@ -24,6 +24,7 @@ pub mod llvm;
 mod init;
 mod func;
 mod ops;
+mod debug;
 #[cfg(test)]
 mod smoke;
 #[cfg(test)]
@@ -42,6 +43,16 @@ use ln_sema::thir::{Body, LoopId};
 use ln_sema::ty::{ArrKind, FloatTy, IntTy, Ty, TyKind, TyList};
 use crater::llvm::*;
 
+/// How much debug information to generate (`debug.ln`).
+#[derive(Eq)]
+pub enum DebugInfo {
+    None,
+    /// Functions and line tables, for backtraces and stepping.
+    Lines,
+    /// Also variables and types.
+    Full,
+}
+
 /// How to compile.
 pub struct Options {
     /// 0 = no optimization, 1..=3 = LLVM `default<On>`.
@@ -52,6 +63,29 @@ pub struct Options {
     pub overflow_checks: bool,
     /// Write the LLVM IR to this path as well.
     pub emit_llvm: Option::<String>,
+    pub debug_info: DebugInfo,
+    /// The compilation directory of the debug information: source paths
+    /// under it are recorded relative to it.
+    pub debug_dir: String,
+    /// `--remap-path-prefix FROM=TO` for the directories in the debug
+    /// information (`remap_from` empty: none).
+    pub remap_from: String,
+    pub remap_to: String,
+    /// DWARF even where the format is CodeView (Windows).
+    pub dwarf: bool,
+}
+
+impl Options {
+    /// Options without debug information.
+    pub fn new(opt_level: u32, test: bool, overflow_checks: bool): Options {
+        return Options { opt_level, test, overflow_checks, emit_llvm: None, debug_info: DebugInfo::None, debug_dir: String::new(), remap_from: String::new(), remap_to: String::new(), dwarf: false };
+    }
+}
+
+/// Whether debug information is CodeView (else DWARF), given
+/// `Options::dwarf`.
+pub fn codeview(dwarf: bool): bool {
+    return debug::use_codeview(dwarf);
 }
 
 /// Compile `p` to a native object file at `obj_path`.
@@ -110,8 +144,8 @@ impl Generated {
 fn generate(p: &mut +Program, opts: Options): Result::<Generated, String> {
     // The IR path is kept apart: a `String` inside an `Option` field cannot
     // be viewed without moving it out.
-    let Options { opt_level, test, overflow_checks, emit_llvm } = opts;
-    let opts = Options { opt_level, test, overflow_checks, emit_llvm: None };
+    let Options { opt_level, test, overflow_checks, emit_llvm, debug_info, debug_dir, remap_from, remap_to, dwarf } = opts;
+    let opts = Options::new(opt_level, test, overflow_checks);
     let mut emit = false;
     let mut emit_path = String::new();
     if let Some(path) = emit_llvm {
@@ -174,8 +208,33 @@ fn generate(p: &mut +Program, opts: Options): Result::<Generated, String> {
         error: String::new(),
         failed: false,
         sret: null(),
+        dbg: debug_info,
+        di_cv: codeview(dwarf),
+        di: null(),
+        di_cu: null(),
+        di_cu_file: null(),
+        di_dir: normalize_dir(debug_dir.as_str()),
+        remap_from: normalize_dir(remap_from.as_str()),
+        remap_to,
+        di_files: HashMap::new(),
+        di_nss: HashMap::new(),
+        di_types: HashMap::new(),
+        di_fwd: HashMap::new(),
+        di_ords: HashMap::new(),
+        di_ords_built: false,
+        line_starts: [],
+        file_lines: HashMap::new(),
+        di_sp: null(),
+        di_scope: null(),
+        di_scope_file: null(),
+        di_loc: null(),
+        di_line: 0,
+        di_bare: false,
+        di_declared: [],
     };
+    cg.di_init(p);
     let r = cg.run(p, tm);
+    cg.di_dispose();
     unsafe {
         LLVMDisposeBuilder(cg.b);
         LLVMDisposeBuilder(cg.ab);
@@ -262,6 +321,55 @@ pub struct Cg {
     /// Where the function writes its result, if it lives in memory (else
     /// null).
     sret: ValueRef,
+
+    // ----- debug information (`debug.ln`) -----
+    /// What to generate (with `DebugInfo::None`, the rest is unused).
+    dbg: DebugInfo,
+    /// CodeView, else DWARF.
+    di_cv: bool,
+    di: DIBuilderRef,
+    di_cu: MetadataRef,
+    di_cu_file: MetadataRef,
+    /// The compilation directory and the `--remap-path-prefix`, with `/`.
+    di_dir: String,
+    remap_from: String,
+    remap_to: String,
+    /// Files by source file index, namespaces by path, types.
+    di_files: HashMap::<u32, MetadataRef>,
+    di_nss: HashMap::<Symbol, MetadataRef>,
+    di_types: HashMap::<Ty, MetadataRef>,
+    /// Declarations of the types being made (for recursive types).
+    di_fwd: HashMap::<Ty, MetadataRef>,
+    /// Each closure's position among its function's closures.
+    di_ords: HashMap::<DefId, u32>,
+    di_ords_built: bool,
+    /// Line start offsets of the files seen so far, and each file's range
+    /// of them.
+    line_starts: [u32; ..+],
+    file_lines: HashMap::<u32, (u32, u32)>,
+    /// The function being described (null: none), its innermost scope and
+    /// that scope's file, and the current location and its line.
+    di_sp: MetadataRef,
+    di_scope: MetadataRef,
+    di_scope_file: MetadataRef,
+    di_loc: MetadataRef,
+    di_line: u32,
+    /// Whether nothing of the function has a location yet (its prologue).
+    di_bare: bool,
+    /// Whether each local of the function has been described.
+    di_declared: [bool; -..+],
+}
+
+/// `dir` with `/` for `\`, without a trailing `/`.
+fn normalize_dir(dir: str): String {
+    let mut out = String::new();
+    for c in dir.chars() {
+        out.push(if c == '\\' { '/' } else { c });
+    }
+    while out.len() > 1 && out.as_str().ends_with("/") {
+        out.truncate(out.len() - 1);
+    }
+    return out;
 }
 
 impl Cg {
@@ -272,6 +380,7 @@ impl Cg {
         while let Some(q) = self.queue.pop() {
             self.gen_fn(p, q.def, q.args, q.f)?;
         }
+        self.di_finish();
         let mut msg = null();
         let broken = unsafe { LLVMVerifyModule(self.module, RETURN_STATUS_ACTION, addr_of_mut(&mut msg)) } != 0;
         let text = take_message(msg);
@@ -826,6 +935,7 @@ impl Cg {
         unsafe { LLVMSetLinkage(main, EXTERNAL_LINKAGE) };
         let entry = self.append_block(main, z("entry\0"));
         self.position(entry);
+        self.di_main(p, main);
         let argc = unsafe { LLVMGetParam(main, 0) };
         let argv = unsafe { LLVMGetParam(main, 1) };
         let rt_init = self.lang_fn(p, "rt_init")?;
@@ -885,6 +995,7 @@ impl Cg {
             };
             self.ret(code);
         }
+        self.di_main_done();
         return Ok(());
     }
 

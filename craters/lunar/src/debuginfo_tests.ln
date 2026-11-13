@@ -1,0 +1,314 @@
+// Tests of the debug information: the IR of a small program (functions,
+// variables, types), and a debugger session on it when a debugger is
+// there to run (lldb, with the formatters in `std/debugger/`), or else the
+// PDB as `llvm-pdbutil` reads it. Run with `lunar test -p lunar` in
+// `craters/`.
+//
+// lldb (as LLVM's Windows release builds it) reads no PDBs, so on Windows
+// the session uses a DWARF build (`Profile::dwarf`). The tests that need a
+// tool say so and pass when it is missing or cannot start (lldb on Windows
+// needs Python 3.10 on `PATH`).
+
+use std::env;
+use std::fs;
+use std::process;
+use ln_codegen::DebugInfo;
+use crater::compile::{Profile, analyze_file, build_exe, check_main, emit_ir, finish_front};
+use crater::link::remove_debug_files;
+use crater::paths::exe_suffix;
+use crater::sysroot;
+
+const PROGRAM: str = "struct Point {
+    x: i32,
+    y: i32,
+}
+
+enum Shape {
+    Circle(f64),
+    Rect { w: i32, h: i32 },
+    Empty,
+}
+
+impl Point {
+    fn sum(&self): i32 {
+        return self.x + self.y;
+    }
+}
+
+fn biggest::<T: core::cmp::Ord>(a: T, b: T): T {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+fn area(s: Shape): f64 {
+    return match s {
+        Shape::Circle(r) => r * r * 3.0,
+        Shape::Rect { w, h } => (w * h) as f64,
+        Shape::Empty => 0.0,
+    };
+}
+
+fn describe(p: Point, name: str, label: &String, shape: Shape, nums: [i32; &]): i32 {
+    let total = p.sum();
+    let big = biggest(total, 7);
+    let a = area(shape);
+    let maybe: Option::<i32> = Some(big);
+    let tuple = (big, true, 'x');
+    let fixed = [1, 2, 3];
+    let add = |k: i32| k + total;
+    let r = add(nums[0]) + fixed[1];
+    println(\"{name} {label} {a} {r} {tuple.0}\");
+    if let Some(m) = maybe {
+        return m + r;
+    }
+    return r;
+}
+
+fn main() {
+    let p = Point { x: 3, y: 4 };
+    let mut label = String::from(\"hello\");
+    label.push_str(\" world\");
+    let shape = Shape::Rect { w: 2, h: 5 };
+    let nums: [i32; ..+] = [10, 20, 30];
+    let n = describe(p, \"pt\", &label, shape, nums[..]);
+    println(\"{n}\");
+}
+";
+
+/// The line of `println(\"{name} ...` in `PROGRAM`.
+const PRINT_LINE: str = "42";
+
+/// A directory of its own for `test`, with `PROGRAM` in `demo.ln`; the
+/// path of that file.
+fn setup(test: str): String {
+    let mut dir = env::temp_dir();
+    dir.write("/lunar-debuginfo-{test}-{process::id()}");
+    let _ = fs::create_dir_all(dir.as_str());
+    let mut file = String::from(dir.as_str());
+    file.push_str("/demo.ln");
+    match fs::write(file.as_str(), PROGRAM.as_bytes()) {
+        Ok(()) => {}
+        Err(e) => panic("could not write {file}: {e}"),
+    }
+    return file;
+}
+
+/// Remove the directory of `setup`'s `file`.
+fn cleanup(file: str) {
+    let _ = fs::remove_dir_all(file[..file.len() - 8]);
+}
+
+fn profile(debug: DebugInfo, release: bool, dwarf: bool): Profile {
+    return Profile { release, debug, remap: None, dwarf };
+}
+
+/// The IR of `PROGRAM` built with `prof`.
+fn ir_of(file: str, prof: Profile): String {
+    let mut s = analyze_file(file, false, None);
+    check_main(&mut s, file, false);
+    assert!(finish_front(&s));
+    return match emit_ir(&mut s, prof, false) {
+        Some(ir) => ir,
+        None => panic("emit_ir failed"),
+    };
+}
+
+/// `PROGRAM` built into `exe` with `prof`.
+fn build(file: str, exe: str, prof: Profile) {
+    let mut s = analyze_file(file, false, None);
+    check_main(&mut s, file, false);
+    assert!(finish_front(&s));
+    assert!(build_exe(&mut s, exe, prof, false, None));
+}
+
+fn expect(text: str, what: str) {
+    if !text.contains(what) {
+        panic("expected `{what}` in:\n{text}");
+    }
+}
+
+#[test]
+fn ir_describes_functions_variables_and_types() {
+    let file = setup("ir");
+    let ir = ir_of(file.as_str(), profile(DebugInfo::Full, false, false));
+    let t = ir.as_str();
+    expect(t, "!\"Debug Info Version\", i32 3}");
+    expect(t, "distinct !DICompileUnit(language: DW_LANG_C_plus_plus");
+    expect(t, "producer: \"lunar 0.1.0\"");
+    expect(t, "emissionKind: FullDebug");
+    expect(t, "!DIFile(filename: \"demo.ln\"");
+    // Functions: in their namespaces, generic instances and closures
+    // named for what they are.
+    expect(t, "distinct !DISubprogram(name: \"describe\"");
+    expect(t, "!DINamespace(name: \"demo\"");
+    expect(t, "!DINamespace(name: \"Point\"");
+    expect(t, "distinct !DISubprogram(name: \"sum\"");
+    expect(t, "distinct !DISubprogram(name: \"biggest::<i32>\"");
+    expect(t, "distinct !DISubprogram(name: \"{closure#0}\"");
+    expect(t, "distinct !DISubprogram(name: \"main\"");
+    // Variables, parameters (`label` through its address), lexical blocks.
+    expect(t, "!DILocalVariable(name: \"total\"");
+    expect(t, "!DILocalVariable(name: \"label\", arg: 3");
+    expect(t, "#dbg_declare(ptr %label, ");
+    expect(t, "!DIExpression(DW_OP_deref)");
+    expect(t, "!DILexicalBlock(");
+    // Types.
+    expect(t, "!DICompositeType(tag: DW_TAG_structure_type, name: \"Point\"");
+    expect(t, "!DIDerivedType(tag: DW_TAG_member, name: \"x\"");
+    expect(t, "!DICompositeType(tag: DW_TAG_union_type, name: \"Shape\"");
+    expect(t, "!DICompositeType(tag: DW_TAG_enumeration_type, name: \"Shape::{tag}\"");
+    expect(t, "!DIEnumerator(name: \"Rect\", value: 1, isUnsigned: true)");
+    expect(t, "!DICompositeType(tag: DW_TAG_structure_type, name: \"Shape::Rect\"");
+    expect(t, "!DICompositeType(tag: DW_TAG_union_type, name: \"Option::<i32>\"");
+    expect(t, "!DICompositeType(tag: DW_TAG_structure_type, name: \"String\"");
+    expect(t, "!DIDerivedType(tag: DW_TAG_member, name: \"data_ptr\"");
+    expect(t, "!DIDerivedType(tag: DW_TAG_member, name: \"length\"");
+    expect(t, "!DICompositeType(tag: DW_TAG_structure_type, name: \"str\"");
+    expect(t, "!DICompositeType(tag: DW_TAG_structure_type, name: \"(i32, bool, char)\"");
+    expect(t, "!DICompositeType(tag: DW_TAG_array_type");
+    expect(t, "!DICompositeType(tag: DW_TAG_structure_type, name: \"{closure_env#0}\"");
+    expect(t, "!DIBasicType(name: \"char\", size: 32, encoding: DW_ATE_UTF)");
+    // Calls have locations: line 34, `p.sum()`.
+    expect(t, "!DILocation(line: 34, column: 17,");
+    cleanup(file.as_str());
+}
+
+#[test]
+fn levels_and_profiles() {
+    let file = setup("levels");
+    let lines = ir_of(file.as_str(), profile(DebugInfo::Lines, false, false));
+    expect(lines.as_str(), "emissionKind: LineTablesOnly");
+    expect(lines.as_str(), "distinct !DISubprogram(name: \"describe\"");
+    assert!(!lines.as_str().contains("DILocalVariable"));
+    let none = ir_of(file.as_str(), profile(DebugInfo::None, true, false));
+    assert!(!none.as_str().contains("DICompileUnit"));
+    assert!(!none.as_str().contains("!dbg"));
+    // The profiles' defaults, as with cargo, and `--debug-info`.
+    assert!(Profile::new(false, None, None).debug == DebugInfo::Full);
+    assert!(Profile::new(true, None, None).debug == DebugInfo::None);
+    assert!(Profile::new(true, Some("lines"), None).debug == DebugInfo::Lines);
+    assert!(Profile::new(false, Some("none"), None).debug == DebugInfo::None);
+    // Optimized code with debug information still verifies.
+    let opt = ir_of(file.as_str(), profile(DebugInfo::Full, true, false));
+    expect(opt.as_str(), "isOptimized: true");
+    cleanup(file.as_str());
+}
+
+#[test]
+fn remapped_paths() {
+    let file = setup("remap");
+    let mut prof = profile(DebugInfo::Full, false, false);
+    let dir = env::temp_dir();
+    let mut from = String::from(dir.as_str());
+    from.push_str("=/build");
+    prof.remap = Some(from.as_str());
+    let ir = ir_of(file.as_str(), prof);
+    expect(ir.as_str(), "directory: \"/build/lunar-debuginfo-remap-");
+    cleanup(file.as_str());
+}
+
+/// Whether `program --version` runs.
+fn runs(program: str): bool {
+    let args = ["--version"];
+    return match process::output(program, args[..]) {
+        Ok(o) => o.status.success(),
+        Err(_) => false,
+    };
+}
+
+#[test]
+fn lldb_session() {
+    if !runs("lldb") {
+        println("skipped: no lldb that starts (on Windows it needs Python 3.10 on PATH)");
+        return;
+    }
+    let file = setup("lldb");
+    let mut exe = String::from(file.as_str());
+    exe.truncate(exe.len() - 3);
+    exe.push_str(exe_suffix());
+    build(file.as_str(), exe.as_str(), profile(DebugInfo::Full, false, true));
+    let mut script = match sysroot::std_dir() {
+        Some(d) => d,
+        None => panic("no standard library"),
+    };
+    script.push_str("/debugger/lunar_lldb.py");
+    let mut import = String::from("command script import ");
+    import.push_str(script.as_str());
+    let mut line = String::from("b demo.ln:");
+    line.push_str(PRINT_LINE);
+    let args = ["-b", "-o", import.as_str(), "-o", "br set -r biggest", "-o", line.as_str(), "-o", "run", "-o", "frame variable a b", "-o", "c", "-o", "frame variable", "-o", "bt", "-o", "kill", exe.as_str()];
+    let out = match process::output("lldb", args[..]) {
+        Ok(o) => o,
+        Err(e) => panic("could not run lldb: {e}"),
+    };
+    let mut all = String::from(out.stdout.as_str());
+    all.push_str(out.stderr.as_str());
+    let t = all.as_str();
+    expect(t, "demo::biggest::<i32>(a=7, b=7) at demo.ln:19");
+    expect(t, "(demo::Point) p = (x = 3, y = 4)");
+    expect(t, "(str) name = \"pt\"");
+    expect(t, "(String) label = \"hello world\"");
+    expect(t, "shape = Rect { w = 2, h = 5 }");
+    expect(t, "nums = length=3");
+    expect(t, "[1] = 20");
+    expect(t, "total = 7");
+    expect(t, "maybe = Some(7)");
+    expect(t, "fixed = ([0] = 1, [1] = 2, [2] = 3)");
+    expect(t, "demo::describe(p=(x = 3, y = 4), name=\"pt\", label=\"hello world\"");
+    expect(t, "demo::main at demo.ln:55");
+    let _ = fs::remove_file(exe.as_str());
+    remove_debug_files(exe.as_str());
+    cleanup(file.as_str());
+}
+
+/// The PDB of a CodeView build, as `llvm-pdbutil` reads it.
+#[cfg(windows)]
+#[test]
+fn pdb_contents() {
+    if !runs("llvm-pdbutil") {
+        println("skipped: no llvm-pdbutil");
+        return;
+    }
+    let file = setup("pdb");
+    let mut exe = String::from(file.as_str());
+    exe.truncate(exe.len() - 3);
+    let mut pdb = String::from(exe.as_str());
+    exe.push_str(".exe");
+    pdb.push_str(".pdb");
+    build(file.as_str(), exe.as_str(), profile(DebugInfo::Full, false, false));
+    let args = ["dump", "-symbols", "-types", pdb.as_str()];
+    let out = match process::output("llvm-pdbutil", args[..]) {
+        Ok(o) => o,
+        Err(e) => panic("could not run llvm-pdbutil: {e}"),
+    };
+    let t = out.stdout.as_str();
+    expect(t, "S_LPROC32 [size = 56] `demo::describe`");
+    expect(t, "`demo::biggest::<i32>`");
+    expect(t, "`demo::describe::{closure#0}`");
+    expect(t, "S_LOCAL [size = 16] `total`");
+    expect(t, "type=0x");
+    expect(t, "LF_UNION [size = 40] `demo::Shape`");
+    expect(t, "LF_STRUCTURE [size = 48] `demo::Point`");
+    expect(t, "`slice$<i32>`");
+    expect(t, "`String`");
+    // The executable names its PDB without a directory.
+    let bytes = match fs::read(exe.as_str()) {
+        Ok(b) => b,
+        Err(e) => panic("could not read {exe}: {e}"),
+    };
+    let mut found = false;
+    let want = "demo.pdb".as_bytes();
+    let mut i: usize = 0;
+    while i + want.len() + 1 < bytes.len() {
+        if bytes[i] == 0 && bytes[i + 1..i + 1 + want.len()] == want {
+            found = true;
+        }
+        i += 1;
+    }
+    assert!(found);
+    let _ = fs::remove_file(exe.as_str());
+    remove_debug_files(exe.as_str());
+    cleanup(file.as_str());
+}

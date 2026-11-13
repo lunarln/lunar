@@ -375,7 +375,7 @@ fn build_program(): Program {
 }
 
 fn opts(opt_level: u32, test: bool, overflow_checks: bool): Options {
-    return Options { opt_level, test, overflow_checks, emit_llvm: None };
+    return Options::new(opt_level, test, overflow_checks);
 }
 
 #[test]

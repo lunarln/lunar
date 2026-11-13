@@ -20,6 +20,10 @@ pub struct Cli {
     pub output: Option::<str>,
     pub target_os: Option::<str>,
     pub emit_llvm: Option::<str>,
+    /// `none`, `lines` or `full` (checked).
+    pub debug_info: Option::<str>,
+    /// `FROM=TO` (checked).
+    pub remap: Option::<str>,
     pub path: Option::<str>,
     pub git: Option::<str>,
     pub tag: Option::<str>,
@@ -60,6 +64,8 @@ fn commands(): [(str, str); 14] {
 fn options(cmd: str, out: &mut +[Opt; ..+]) {
     let p = Opt { long: "package", short: "p", value: "PACKAGE" };
     let release = Opt { long: "release", short: "", value: "" };
+    let debug_info = Opt { long: "debug-info", short: "", value: "DEBUG_INFO" };
+    let remap = Opt { long: "remap-path-prefix", short: "", value: "FROM=TO" };
     if cmd == "new" || cmd == "init" {
         out.push(Opt { long: "lib", short: "", value: "" });
     } else if cmd == "check" {
@@ -70,9 +76,13 @@ fn options(cmd: str, out: &mut +[Opt; ..+]) {
         out.push(Opt { long: "output", short: "o", value: "OUTPUT" });
         out.push(release);
         out.push(Opt { long: "emit-llvm", short: "", value: "EMIT_LLVM" });
+        out.push(debug_info);
+        out.push(remap);
     } else if cmd == "run" || cmd == "test" {
         out.push(p);
         out.push(release);
+        out.push(debug_info);
+        out.push(remap);
     } else if cmd == "add" {
         out.push(Opt { long: "path", short: "", value: "PATH" });
         out.push(Opt { long: "git", short: "", value: "GIT" });
@@ -84,6 +94,8 @@ fn options(cmd: str, out: &mut +[Opt; ..+]) {
         out.push(Opt { long: "output", short: "o", value: "OUTPUT" });
         out.push(release);
         out.push(Opt { long: "test", short: "", value: "" });
+        out.push(debug_info);
+        out.push(remap);
     } else if cmd == "lsp" {
         // Accepted for compatibility with LSP clients (hidden).
         out.push(Opt { long: "stdio", short: "", value: "" });
@@ -191,13 +203,13 @@ fn sections(cmd: str): str {
         return "Arguments:\n  [FILE]  \n\nOptions:\n  -p, --package <PACKAGE>      In a workspace, only this member package\n      --target-os <TARGET_OS>  Evaluate `#[cfg]` for this OS instead of the host (linux, macos, windows)\n  -h, --help                   Print help\n";
     }
     if cmd == "build" {
-        return "Arguments:\n  [FILE]  \n\nOptions:\n  -p, --package <PACKAGE>      In a workspace, only this member package\n  -o, --output <OUTPUT>        Output path (defaults to the file name without extension, or target/<profile>/<package> in a project)\n      --release                Optimize (and disable overflow checks)\n      --emit-llvm <EMIT_LLVM>  Also write the (optimized) LLVM IR to this file\n  -h, --help                   Print help\n";
+        return "Arguments:\n  [FILE]  \n\nOptions:\n  -p, --package <PACKAGE>            In a workspace, only this member package\n  -o, --output <OUTPUT>              Output path (defaults to the file name without extension, or target/<profile>/<package> in a project)\n      --release                      Optimize (and disable overflow checks)\n      --emit-llvm <EMIT_LLVM>        Also write the (optimized) LLVM IR to this file\n      --debug-info <DEBUG_INFO>      Debug information: none, lines or full (default: full, or none with --release)\n      --remap-path-prefix <FROM=TO>  Record source directories under FROM as under TO in the debug information\n  -h, --help                         Print help\n";
     }
     if cmd == "run" {
-        return "Arguments:\n  [FILE]     \n  [ARGS]...  Arguments passed to the program (after `--`)\n\nOptions:\n  -p, --package <PACKAGE>  In a workspace, the member package whose program to run\n      --release            \n  -h, --help               Print help\n";
+        return "Arguments:\n  [FILE]     \n  [ARGS]...  Arguments passed to the program (after `--`)\n\nOptions:\n  -p, --package <PACKAGE>            In a workspace, the member package whose program to run\n      --release                      \n      --debug-info <DEBUG_INFO>      Debug information: none, lines or full (default: full, or none with --release)\n      --remap-path-prefix <FROM=TO>  Record source directories under FROM as under TO in the debug information\n  -h, --help                         Print help\n";
     }
     if cmd == "test" {
-        return "Arguments:\n  [ARGS]...  A `.ln` file and/or a filter: only tests whose name contains it run\n\nOptions:\n  -p, --package <PACKAGE>  In a workspace, only this member package\n      --release            \n  -h, --help               Print help\n";
+        return "Arguments:\n  [ARGS]...  A `.ln` file and/or a filter: only tests whose name contains it run\n\nOptions:\n  -p, --package <PACKAGE>            In a workspace, only this member package\n      --release                      \n      --debug-info <DEBUG_INFO>      Debug information: none, lines or full (default: full, or none with --release)\n      --remap-path-prefix <FROM=TO>  Record source directories under FROM as under TO in the debug information\n  -h, --help                         Print help\n";
     }
     if cmd == "add" {
         return "Arguments:\n  <NAME>  The dependency's name, optionally with a version: `json` or `json@1.2`\n\nOptions:\n      --path <PATH>        A local package directory\n      --git <GIT>          A git repository URL\n      --tag <TAG>          \n      --branch <BRANCH>    \n      --rev <REV>          \n      --package <PACKAGE>  The package's real name, if the dependency is renamed\n  -h, --help               Print help\n";
@@ -206,7 +218,7 @@ fn sections(cmd: str): str {
         return "Arguments:\n  <NAME>  \n\nOptions:\n  -h, --help  Print help\n";
     }
     if cmd == "emit-llvm" {
-        return "Arguments:\n  <FILE>  \n\nOptions:\n  -o, --output <OUTPUT>  Write the IR to this file instead of stdout\n      --release          Optimize (and disable overflow checks), as `build --release` does\n      --test             Emit the `#[test]` harness instead of `main`\n  -h, --help             Print help\n";
+        return "Arguments:\n  <FILE>  \n\nOptions:\n  -o, --output <OUTPUT>              Write the IR to this file instead of stdout\n      --release                      Optimize (and disable overflow checks), as `build --release` does\n      --test                         Emit the `#[test]` harness instead of `main`\n      --debug-info <DEBUG_INFO>      Debug information: none, lines or full (default: full, or none with --release)\n      --remap-path-prefix <FROM=TO>  Record source directories under FROM as under TO in the debug information\n  -h, --help                         Print help\n";
     }
     if cmd == "explain" {
         return "Arguments:\n  [CODE]  The code, as `scope::name` or pasted as `err(scope::name)`. Without one, list every code\n\nOptions:\n      --list  List every code with a one-line summary\n  -h, --help  Print help\n";
@@ -330,6 +342,8 @@ pub fn parse(): Result::<Cli, i32> {
         output: None,
         target_os: None,
         emit_llvm: None,
+        debug_info: None,
+        remap: None,
         path: None,
         git: None,
         tag: None,
@@ -481,6 +495,16 @@ pub fn parse(): Result::<Cli, i32> {
                 }
             }
         };
+        if o.long == "debug-info" && value != "none" && value != "lines" && value != "full" {
+            let mut m = String::new();
+            m.write("invalid value '{value}' for '{shown}'\n  [possible values: none, lines, full]");
+            return Err(usage_error(m.as_str(), "", ""));
+        }
+        if o.long == "remap-path-prefix" && value.find("=").is_none() {
+            let mut m = String::new();
+            m.write("invalid value '{value}' for '{shown}': expected FROM=TO");
+            return Err(usage_error(m.as_str(), "", ""));
+        }
         set_value(&mut cli, cmd, o.long, value);
     }
     if cli.positionals.len() < min_pos {
@@ -538,6 +562,10 @@ fn set_value(cli: &mut Cli, cmd: str, long: str, kept v: str) {
         cli.target_os = Some(v);
     } else if long == "emit-llvm" {
         cli.emit_llvm = Some(v);
+    } else if long == "debug-info" {
+        cli.debug_info = Some(v);
+    } else if long == "remap-path-prefix" {
+        cli.remap = Some(v);
     } else if long == "path" {
         cli.path = Some(v);
     } else if long == "git" {

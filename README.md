@@ -204,6 +204,42 @@ wrapping arithmetic.
 pass `--release` to see optimized code) to stdout without building anything.
 `build --emit-llvm out.ll` writes the same IR alongside a normal build.
 
+### Debugging
+
+The self-hosted compiler ([craters](craters/README.md)) generates debug
+information the way cargo does: full in the debug profile, none with
+`--release`. `--debug-info none|lines|full` overrides that for `build`,
+`run`, `test` and `emit-llvm` (`lines` is functions and line tables only,
+enough for backtraces and stepping).
+
+* Windows: CodeView, in `<program>.pdb` next to the executable, with the
+  visualizers of [std/debugger/lunar.natvis](std/debugger/lunar.natvis)
+  embedded for Visual Studio and WinDbg. `LUNAR_DEBUG_FORMAT=dwarf` puts
+  DWARF in the executable instead (linked with `lld`), for lldb, which reads
+  no PDBs as LLVM's Windows installer builds it.
+* Linux: DWARF 5 in the executable. macOS: DWARF 4, collected by
+  `dsymutil` into `<program>.dSYM`.
+
+Functions are named by their path (`demo::Point::sum`, `demo::max::<i32>`,
+`demo::main::{closure#0}`), and parameters and variables are visible with
+their types: structs with their fields, `str` and `String` as `data_ptr` and
+`length`, arrays and slices as `data_ptr`, `length` (and `capacity`), and
+enums as a `tag` naming the variant beside a member per variant. With lldb,
+[std/debugger/lunar_lldb.py](std/debugger/lunar_lldb.py) shows text,
+elements and only the active variant:
+
+```text
+(lldb) command script import <lunar>/std/debugger/lunar_lldb.py
+(lldb) frame variable
+(String) label = "hello world"
+(demo::Shape) shape = Rect { w = 2, h = 5 }
+(core::option::Option::<i32>) maybe = Some(7)
+```
+
+Source paths under the directory the build runs in are recorded relative to
+it; `--remap-path-prefix FROM=TO` rewrites the directories, so builds in
+different places can record the same paths.
+
 `explain` prints a longer write-up of a diagnostic code, with an erroneous
 and a fixed example. It also accepts the code as printed, e.g.
 `lunar explain 'err(type::mismatch)'`; without a code it lists every code.

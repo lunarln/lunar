@@ -13,8 +13,9 @@ use ln_sema::codes::{build, manifest};
 use ln_sema::diag::dummy_span;
 use ln_sema::program::Program;
 use ln_sema::render::render_all;
-use crater::compile::{analyze_file, analyze_specs, build_exe, check_main, emit_ir, finish_front};
+use crater::compile::{Profile, analyze_file, analyze_specs, build_exe, check_main, emit_ir, finish_front};
 use crater::explain;
+use crater::link::remove_debug_files;
 use crater::paths::{cwd, display, exe_suffix, file_stem, join, parent, with_extension};
 use crater::project::{DepSpec, Project, ProjectError, Target, find_project, init};
 use crater::testing::{Tally, run_tests, summary};
@@ -71,10 +72,6 @@ pub fn report_project(e: &ProjectError) {
     if hint.len() > 0 {
         eprintln("\n{hint}");
     }
-}
-
-fn profile(release: bool): str {
-    return if release { "release" } else { "debug" };
 }
 
 /// The project around the current directory, resolved; `None` after
@@ -223,26 +220,26 @@ fn temp_exe(file: str, tag: str): String {
 }
 
 /// Build the file `file` into `out`; false after reporting a failure.
-fn compile_file(file: str, out: str, release: bool, emit_llvm: Option::<str>): bool {
+fn compile_file(file: str, out: str, prof: Profile, emit_llvm: Option::<str>): bool {
     let mut s = analyze_file(file, false, None);
     check_main(&mut s, file, false);
     if !finish_front(&s) {
         return false;
     }
-    return build_exe(&mut s, out, release, false, emit_llvm);
+    return build_exe(&mut s, out, prof, false, emit_llvm);
 }
 
-pub fn build_file(file: str, output: Option::<str>, release: bool, emit_llvm: Option::<str>): i32 {
+pub fn build_file(file: str, output: Option::<str>, prof: Profile, emit_llvm: Option::<str>): i32 {
     let out = match output {
         Some(o) => String::from(o),
         None => default_exe(file),
     };
-    return if compile_file(file, out.as_str(), release, emit_llvm) { 0 } else { 1 };
+    return if compile_file(file, out.as_str(), prof, emit_llvm) { 0 } else { 1 };
 }
 
 /// Build the selected packages' programs (and check library-only
 /// packages): the last executable built, or `None` after a failure.
-fn build_selected(package: Option::<str>, output: Option::<str>, release: bool, emit_llvm: Option::<str>): Option::<String> {
+fn build_selected(package: Option::<str>, output: Option::<str>, prof: Profile, emit_llvm: Option::<str>): Option::<String> {
     let mut proj = match load(false) {
         Some(p) => p,
         None => return None,
@@ -290,7 +287,7 @@ fn build_selected(package: Option::<str>, output: Option::<str>, release: bool, 
             Some(o) => String::from(o),
             None => {
                 let mut rel = String::new();
-                rel.write("target/{profile(release)}/{name}{exe_suffix()}");
+                rel.write("target/{prof.name()}/{name}{exe_suffix()}");
                 display(join(proj.text(proj.root), rel.as_str()).as_str())
             }
         };
@@ -309,33 +306,34 @@ fn build_selected(package: Option::<str>, output: Option::<str>, release: bool, 
         if !finish_front(&s) {
             return None;
         }
-        if !build_exe(&mut s, out.as_str(), release, false, emit_llvm) {
+        if !build_exe(&mut s, out.as_str(), prof, false, emit_llvm) {
             return None;
         }
         built = out;
     }
-    status("Finished", core::fmt::format("`{profile(release)}` profile").as_str());
+    status("Finished", core::fmt::format("`{prof.name()}` profile").as_str());
     return Some(built);
 }
 
-pub fn build_project(package: Option::<str>, output: Option::<str>, release: bool, emit_llvm: Option::<str>): i32 {
-    return match build_selected(package, output, release, emit_llvm) {
+pub fn build_project(package: Option::<str>, output: Option::<str>, prof: Profile, emit_llvm: Option::<str>): i32 {
+    return match build_selected(package, output, prof, emit_llvm) {
         Some(_) => 0,
         None => 1,
     };
 }
 
-pub fn run_file(file: str, release: bool, args: [str; &]): i32 {
+pub fn run_file(file: str, prof: Profile, args: [str; &]): i32 {
     let out = temp_exe(file, "run");
-    if !compile_file(file, out.as_str(), release, None) {
+    if !compile_file(file, out.as_str(), prof, None) {
         return 1;
     }
     let code = run_program(out.as_str(), args);
     let _ = fs::remove_file(out.as_str());
+    remove_debug_files(out.as_str());
     return code;
 }
 
-pub fn run_project(package: Option::<str>, release: bool, args: [str; &]): i32 {
+pub fn run_project(package: Option::<str>, prof: Profile, args: [str; &]): i32 {
     let proj = match load(false) {
         Some(p) => p,
         None => return 1,
@@ -382,7 +380,7 @@ pub fn run_project(package: Option::<str>, release: bool, args: [str; &]): i32 {
         return 1;
     }
     let name = String::from(proj.text(proj.packages[programs[0]].name));
-    let exe = match build_selected(Some(name.as_str()), None, release, None) {
+    let exe = match build_selected(Some(name.as_str()), None, prof, None) {
         Some(e) => e,
         None => return 1,
     };
@@ -433,7 +431,7 @@ fn hex(n: u32): String {
 // ===================================================================== test
 
 /// `lunar test file.ln [filter]` or, in a project, `lunar test [filter]`.
-pub fn test(args: [str; &], package: Option::<str>, release: bool): i32 {
+pub fn test(args: [str; &], package: Option::<str>, prof: Profile): i32 {
     let file_mode = args.len() > 0 && args[0].ends_with(".ln");
     let mut tally = Tally::new();
     let mut ok = true;
@@ -442,11 +440,12 @@ pub fn test(args: [str; &], package: Option::<str>, release: bool): i32 {
         let mut s = analyze_file(file, true, None);
         let out = temp_exe(file, "test");
         let filter = if args.len() > 1 { Some(args[1]) } else { None };
-        ok = run_tests(&mut s, file, out.as_str(), filter, release, &mut tally);
+        ok = run_tests(&mut s, file, out.as_str(), filter, prof, &mut tally);
         let _ = fs::remove_file(out.as_str());
+        remove_debug_files(out.as_str());
     } else {
         let filter = if args.len() > 0 { Some(args[0]) } else { None };
-        match test_project(package, filter, release, &mut tally) {
+        match test_project(package, filter, prof, &mut tally) {
             Some(r) => ok = r,
             None => return 1,
         }
@@ -456,7 +455,7 @@ pub fn test(args: [str; &], package: Option::<str>, release: bool): i32 {
 
 /// Run the tests of each selected package's library, program and
 /// `tests/*.ln`; `None` after a project error.
-fn test_project(package: Option::<str>, filter: Option::<str>, release: bool, tally: &mut Tally): Option::<bool> {
+fn test_project(package: Option::<str>, filter: Option::<str>, prof: Profile, tally: &mut Tally): Option::<bool> {
     let mut proj = match load(false) {
         Some(p) => p,
         None => return None,
@@ -469,7 +468,7 @@ fn test_project(package: Option::<str>, filter: Option::<str>, release: bool, ta
         }
     };
     let mut rel = String::new();
-    rel.write("target/{profile(release)}/tests");
+    rel.write("target/{prof.name()}/tests");
     let dir = join(proj.text(proj.root), rel.as_str());
     if let Err(e) = fs::create_dir_all(dir.as_str()) {
         fail(core::fmt::format("could not create `{display(dir.as_str())}`: {e}").as_str());
@@ -520,7 +519,7 @@ fn test_project(package: Option::<str>, filter: Option::<str>, release: bool, ta
             let mut file = String::new();
             file.write("{name}-{exe}{exe_suffix()}");
             let out = display(join(dir.as_str(), file.as_str()).as_str());
-            if !run_tests(&mut s, label.as_str(), out.as_str(), filter, release, tally) {
+            if !run_tests(&mut s, label.as_str(), out.as_str(), filter, prof, tally) {
                 ok = false;
             }
         }
@@ -604,13 +603,13 @@ pub fn clean(): i32 {
 
 // ===================================================================== emit-llvm
 
-pub fn emit_llvm(file: str, output: Option::<str>, release: bool, test: bool): i32 {
+pub fn emit_llvm(file: str, output: Option::<str>, prof: Profile, test: bool): i32 {
     let mut s = analyze_file(file, test, None);
     check_main(&mut s, file, test);
     if !finish_front(&s) {
         return 1;
     }
-    let ir = match emit_ir(&mut s, release, test) {
+    let ir = match emit_ir(&mut s, prof, test) {
         Some(ir) => ir,
         None => return 1,
     };
