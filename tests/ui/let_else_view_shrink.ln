@@ -1,0 +1,30 @@
+// error: borrow::shrink_while_borrowed
+// A view bound by `let .. else` from a `&mut self` method's result points
+// into the receiver: shrinking the receiver ends it.
+struct Store {
+    nums: [i32; -..+],
+}
+
+impl Store {
+    fn find_mut(&mut self, k: i32): Option::<[i32; &mut]> {
+        for i in 0..self.nums.len() {
+            if self.nums[i] == k {
+                return Some(self.nums[i..i + 1]);
+            }
+        }
+        return None;
+    }
+
+    fn reset(&mut self) {
+        self.nums.clear();
+    }
+}
+
+fn main() {
+    let mut c = Store { nums: [1, 2, 3] };
+    let Some(x) = c.find_mut(2) else {
+        return;
+    };
+    c.reset();
+    x[0] = 5;
+}

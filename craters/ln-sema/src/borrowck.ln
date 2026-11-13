@@ -2525,6 +2525,16 @@ impl Cx {
         };
     }
 
+    /// Remove the locals pattern `pat` binds from `live`: they are given
+    /// new values where it matches.
+    fn kill_bindings(&self, p: &Program, pat: Id::<Pat>, live: &mut LiveSet) {
+        let mut binds: [LocalId; ..+] = [];
+        pat_bindings(&p.thir, pat, &mut binds);
+        for l in binds {
+            ls_remove(live, l);
+        }
+    }
+
     /// Report views of `root` that are live after an invalidating event.
     fn invalidate(&mut self, p: &mut +Program, root: LocalId, live_after: [u64; &], span: Span, what: str) {
         let rname = p.text(self.local(p, root).name);
@@ -2792,6 +2802,12 @@ impl Cx {
                     if let Some(g) = a.guard {
                         x = self.live(p, g, x);
                     }
+                    // The arm's bindings get their values here, after the
+                    // scrutinee: what they held before is dead (as for
+                    // `let`). Otherwise a binding of `while let`, `for` or
+                    // `let .. else` in a loop would look live at the call
+                    // that makes its value, and around the loop.
+                    self.kill_bindings(p, a.pat, &mut x);
                     ls_union(&mut l, x[..]);
                 }
                 self.use_place(p, scrut, l)
@@ -2839,12 +2855,14 @@ impl Cx {
                 }
                 self.live(p, start, head)
             }
-            ExprKind::ForArray { array, body, id, .. } => {
+            ExprKind::ForArray { pat, array, body, id, .. } => {
                 self.set_loop_exit(id, after[..]);
                 let mut head = self.use_place(p, array, after.clone());
                 for _ in 0..8 {
                     self.set_loop_head(id, head[..]);
                     let mut b = self.live_block(p, body, head.clone());
+                    // Each pass binds the pattern afresh.
+                    self.kill_bindings(p, pat, &mut b);
                     ls_union(&mut b, after[..]);
                     let new = self.use_place(p, array, b);
                     if ls_subset(new[..], head[..]) {
